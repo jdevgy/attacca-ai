@@ -3,7 +3,7 @@
   "owner": { "name": "agentg" },
   "plugins": [
     {
-      "name": "continuity",
+      "name": "attacca",
       "source": "./",
       "description": "Shared project memory for AI coding tools: ledger, task claims, decisions, room, and cold-start handoffs."
     }

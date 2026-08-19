@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "continuity": {
-      "command": "python3",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/continuity.py", "connect"],
-      "env": { "CONTINUITY_ACTOR": "claude_director" }
-    }
-  }
-}

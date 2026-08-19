@@ -8,13 +8,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-# Isolate tests from any machine identity (~/.continuity/identity.json)
-os.environ["CONTINUITY_OWNER"] = ""
+# Isolate tests from any machine identity (~/.attacca/identity.json)
+os.environ["ATTACCA_OWNER"] = ""
 
 ROOT = Path(__file__).resolve().parent.parent
-SCRIPT = str(ROOT / "continuity.py")
+SCRIPT = str(ROOT / "attacca.py")
 
-spec = importlib.util.spec_from_file_location("continuity", ROOT / "continuity.py")
+spec = importlib.util.spec_from_file_location("attacca", ROOT / "attacca.py")
 c = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(c)
 
@@ -24,13 +24,13 @@ class McpClient:
 
     def __init__(self, db, project=None, actor=None, extra_env=None):
         env = dict(os.environ)
-        env.pop("CONTINUITY_ACTOR", None)
-        env.pop("CONTINUITY_PROJECT", None)
-        env["CONTINUITY_DB"] = str(db)
+        env.pop("ATTACCA_ACTOR", None)
+        env.pop("ATTACCA_PROJECT", None)
+        env["ATTACCA_DB"] = str(db)
         if project:
-            env["CONTINUITY_PROJECT"] = project
+            env["ATTACCA_PROJECT"] = project
         if actor:
-            env["CONTINUITY_ACTOR"] = actor
+            env["ATTACCA_ACTOR"] = actor
         env.update(extra_env or {})
         self.proc = subprocess.Popen(
             [sys.executable, SCRIPT, "mcp"],
@@ -113,7 +113,7 @@ class McpTestCase(unittest.TestCase):
         client = self.client(actor="a1")
         resp = client.initialize(protocol="2024-11-05")
         self.assertEqual(resp["result"]["protocolVersion"], "2024-11-05")
-        self.assertEqual(resp["result"]["serverInfo"]["name"], "continuity")
+        self.assertEqual(resp["result"]["serverInfo"]["name"], "attacca")
         self.assertIn("instructions", resp["result"])
         self.assertIn("tools", resp["result"]["capabilities"])
 
@@ -188,7 +188,7 @@ class McpTestCase(unittest.TestCase):
         self.assertTrue(fresh["stale"])
 
     def test_actor_defaults_to_client_info(self):
-        client = self.client()  # no CONTINUITY_ACTOR
+        client = self.client()  # no ATTACCA_ACTOR
         client.initialize(client_name="My IDE Tool")
         _, _, sent = client.call_tool("room_send", {"body": "who am I"})
         self.assertEqual(sent["event"]["actor_id"], "my-ide-tool")
@@ -272,7 +272,7 @@ class McpTestCase(unittest.TestCase):
             {"jsonrpc": "2.0", "id": 101, "method": "ping"},
             {"jsonrpc": "2.0", "method": "notifications/whatever"},
             {"jsonrpc": "2.0", "id": 102, "method": "tools/call",
-             "params": {"name": "continuity_status", "arguments": {}}},
+             "params": {"name": "attacca_status", "arguments": {}}},
         ]))
         batch = json.loads(client.proc.stdout.readline())
         self.assertIsInstance(batch, list)
@@ -281,8 +281,8 @@ class McpTestCase(unittest.TestCase):
         self.assertEqual(client.request("ping")["result"], {})
 
     def test_invalid_utf8_does_not_kill_server(self):
-        env = dict(os.environ, CONTINUITY_DB=str(self.db),
-                   CONTINUITY_PROJECT="proj", CONTINUITY_ACTOR="bin")
+        env = dict(os.environ, ATTACCA_DB=str(self.db),
+                   ATTACCA_PROJECT="proj", ATTACCA_ACTOR="bin")
         proc = subprocess.Popen(
             [sys.executable, SCRIPT, "mcp"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -304,12 +304,12 @@ class McpTestCase(unittest.TestCase):
 
     def test_inbox_autoregister_and_owner_via_mcp(self):
         alice = self.client(actor="claude_director",
-                            extra_env={"CONTINUITY_OWNER": "jack"})
+                            extra_env={"ATTACCA_OWNER": "jack"})
         alice.initialize(client_name="claude-code")
         alice.call_tool("room_send", {"body": "ping bob",
                                       "mentions": ["mia.codex_director"]})
         bob = self.client(actor="codex_director",
-                          extra_env={"CONTINUITY_OWNER": "mia"})
+                          extra_env={"ATTACCA_OWNER": "mia"})
         bob.initialize(client_name="codex-cli")
         is_err, _, inbox = bob.call_tool("check_inbox", {})
         self.assertFalse(is_err)

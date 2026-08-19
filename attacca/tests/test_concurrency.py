@@ -12,11 +12,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-# Isolate tests from any machine identity (~/.continuity/identity.json)
-os.environ["CONTINUITY_OWNER"] = ""
+# Isolate tests from any machine identity (~/.attacca/identity.json)
+os.environ["ATTACCA_OWNER"] = ""
 
 ROOT = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_file_location("continuity", ROOT / "continuity.py")
+spec = importlib.util.spec_from_file_location("attacca", ROOT / "attacca.py")
 c = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(c)
 
@@ -44,7 +44,7 @@ def _claim_worker(args):
     try:
         c.task_claim(conn, "stress", "claimant-%d" % worker_id, "agent", task_id)
         return ("won", worker_id)
-    except c.ContinuityError:
+    except c.AttaccaError:
         return ("lost", worker_id)
     except Exception as err:  # pragma: no cover
         return ("error", "%r" % err)

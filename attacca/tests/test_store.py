@@ -1,4 +1,4 @@
-"""Storage-layer semantics tests for continuity.py (stdlib unittest)."""
+"""Storage-layer semantics tests for attacca.py (stdlib unittest)."""
 import importlib.util
 import json
 import os
@@ -7,11 +7,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-# Isolate tests from any machine identity (~/.continuity/identity.json)
-os.environ["CONTINUITY_OWNER"] = ""
+# Isolate tests from any machine identity (~/.attacca/identity.json)
+os.environ["ATTACCA_OWNER"] = ""
 
 ROOT = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_file_location("continuity", ROOT / "continuity.py")
+spec = importlib.util.spec_from_file_location("attacca", ROOT / "attacca.py")
 c = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(c)
 
@@ -85,7 +85,7 @@ class StoreTestCase(unittest.TestCase):
     def test_claim_contention_and_lease(self):
         tid = c.task_create(self.conn, "p1", "a", "agent", "contended")["task_id"]
         c.task_claim(self.conn, "p1", "alice", "agent", tid)
-        with self.assertRaises(c.ContinuityError):
+        with self.assertRaises(c.AttaccaError):
             c.task_claim(self.conn, "p1", "bob", "agent", tid)
         # same claimant renews
         renewed = c.task_claim(self.conn, "p1", "alice", "agent", tid)
@@ -108,7 +108,7 @@ class StoreTestCase(unittest.TestCase):
         c.task_claim(self.conn, "p1", "a", "agent", tid)
         released = c.task_release(self.conn, "p1", "a", "agent", tid, reason="nope")
         self.assertEqual(released["status"], "queued")
-        with self.assertRaises(c.ContinuityError):
+        with self.assertRaises(c.AttaccaError):
             c.task_release(self.conn, "p1", "a", "agent", tid)
         moved = c.task_set_status(self.conn, "p1", "rev", "human", tid, "done",
                                   reason="reviewed ok")
@@ -155,7 +155,7 @@ class StoreTestCase(unittest.TestCase):
         self.assertEqual(count, 2)  # history preserved
 
     def test_handoff_requires_a_field(self):
-        with self.assertRaises(c.ContinuityError):
+        with self.assertRaises(c.AttaccaError):
             c.update_handoff(self.conn, "p1", "a", "agent", {})
 
     def test_freshness(self):
@@ -175,7 +175,7 @@ class StoreTestCase(unittest.TestCase):
         v_before = c.get_project(self.conn, "p1")["context_version"]
         resolved = c.decision_resolve(self.conn, "p1", "h", "human", did, "accepted")
         self.assertEqual(resolved["context_version"], v_before + 1)
-        with self.assertRaises(c.ContinuityError):
+        with self.assertRaises(c.AttaccaError):
             c.decision_resolve(self.conn, "p1", "h", "human", did, "rejected")
         # superseding an already-resolved decision is allowed
         c.decision_resolve(self.conn, "p1", "h", "human", did, "superseded")
@@ -206,9 +206,9 @@ class StoreTestCase(unittest.TestCase):
         self.assertEqual(c.room_read(self.conn, "p1")["messages"], [])
 
     def test_room_rejects_bad_type(self):
-        with self.assertRaises(c.ContinuityError):
+        with self.assertRaises(c.AttaccaError):
             c.room_send(self.conn, "p1", "a", "agent", "x", msg_type="shout")
-        with self.assertRaises(c.ContinuityError):
+        with self.assertRaises(c.AttaccaError):
             c.room_send(self.conn, "p1", "a", "agent", "   ")
 
     # -- projects / resolution ----------------------------------------------
@@ -225,13 +225,13 @@ class StoreTestCase(unittest.TestCase):
         c.project_init(self.conn, "t", "human",
                        path=str(Path(self.tmp.name) / "other"),
                        project_id="p2", name="Two")
-        with self.assertRaises(c.ContinuityError):
+        with self.assertRaises(c.AttaccaError):
             c.resolve_project_id(self.conn, cwd=self.tmp.name)
         self.assertEqual(
             c.resolve_project_id(self.conn, explicit="p2", cwd=self.tmp.name), "p2")
 
     def test_unknown_project(self):
-        with self.assertRaises(c.ContinuityError):
+        with self.assertRaises(c.AttaccaError):
             c.get_project(self.conn, "nope")
 
     def test_agent_registry(self):
@@ -262,7 +262,7 @@ class StoreTestCase(unittest.TestCase):
     def test_task_report_requires_active_claimant(self):
         tid = c.task_create(self.conn, "p1", "a", "agent", "guarded")["task_id"]
         c.task_claim(self.conn, "p1", "alice", "agent", tid)
-        with self.assertRaises(c.ContinuityError):
+        with self.assertRaises(c.AttaccaError):
             c.task_report(self.conn, "p1", "bob", "agent", tid, summary="hijack")
         # after lease expiry the reporter may take over
         self.conn.execute(
@@ -274,7 +274,7 @@ class StoreTestCase(unittest.TestCase):
         self.assertEqual(report["status"], "done")
         # duplicate done report is rejected, context version bumped only once
         version = c.get_project(self.conn, "p1")["context_version"]
-        with self.assertRaises(c.ContinuityError):
+        with self.assertRaises(c.AttaccaError):
             c.task_report(self.conn, "p1", "bob", "agent", tid, summary="again",
                           requested_state="done")
         self.assertEqual(c.get_project(self.conn, "p1")["context_version"], version)
@@ -293,7 +293,7 @@ class StoreTestCase(unittest.TestCase):
     def test_task_release_requires_claimant_while_lease_active(self):
         tid = c.task_create(self.conn, "p1", "a", "agent", "mine")["task_id"]
         c.task_claim(self.conn, "p1", "alice", "agent", tid)
-        with self.assertRaises(c.ContinuityError):
+        with self.assertRaises(c.AttaccaError):
             c.task_release(self.conn, "p1", "bob", "agent", tid)
         self.conn.execute(
             "UPDATE tasks SET lease_until='2000-01-01T00:00:00.000Z'"
@@ -302,7 +302,7 @@ class StoreTestCase(unittest.TestCase):
 
     def test_task_set_status_claimed_rejected(self):
         tid = c.task_create(self.conn, "p1", "a", "agent", "t")["task_id"]
-        with self.assertRaises(c.ContinuityError):
+        with self.assertRaises(c.AttaccaError):
             c.task_set_status(self.conn, "p1", "a", "agent", tid, "claimed")
 
     def test_zombie_claim_row_is_recoverable(self):
@@ -316,7 +316,7 @@ class StoreTestCase(unittest.TestCase):
     def test_project_init_root_move_guard(self):
         other = Path(self.tmp.name) / "elsewhere"
         other.mkdir()
-        with self.assertRaises(c.ContinuityError):
+        with self.assertRaises(c.AttaccaError):
             c.project_init(self.conn, "t", "human", path=str(other),
                            project_id="p1")
         moved = c.project_init(self.conn, "t", "human", path=str(other),
@@ -325,15 +325,15 @@ class StoreTestCase(unittest.TestCase):
         self.assertTrue(moved["already_existed"])
 
     def test_array_argument_validation(self):
-        with self.assertRaises(c.ContinuityError):
+        with self.assertRaises(c.AttaccaError):
             c.task_create(self.conn, "p1", "a", "agent", "bad",
                           expected_scope="src/**")  # string, not list
-        with self.assertRaises(c.ContinuityError):
+        with self.assertRaises(c.AttaccaError):
             c.room_send(self.conn, "p1", "a", "agent", "hi",
                         mentions=[{"not": "a string"}])
         tid = c.task_create(self.conn, "p1", "a", "agent", "ev")["task_id"]
         c.task_claim(self.conn, "p1", "a", "agent", tid)
-        with self.assertRaises(c.ContinuityError):
+        with self.assertRaises(c.AttaccaError):
             c.task_report(self.conn, "p1", "a", "agent", tid, summary="x",
                           evidence="pytest passed")  # string, not list
         # a single evidence object is tolerated and wrapped
@@ -420,7 +420,7 @@ class StoreTestCase(unittest.TestCase):
             c.get_project(self.conn, "p1")["lead_director"], "claude_director")
         handoff = c.get_handoff(self.conn, "p1")
         self.assertEqual(handoff["lead_director"], "claude_director")
-        with self.assertRaises(c.ContinuityError):  # no-op set rejected
+        with self.assertRaises(c.AttaccaError):  # no-op set rejected
             c.set_lead_director(self.conn, "p1", "boss", "human",
                                 "claude_director")
         c.set_lead_director(self.conn, "p1", "boss", "human", None)  # clear
@@ -451,7 +451,7 @@ class StoreTestCase(unittest.TestCase):
         # mirrored copies never re-mirror (no ping-pong)
         self.assertEqual(
             len(c.room_read(self.conn, "p1", limit=100)["messages"]), 3)
-        with self.assertRaises(c.ContinuityError):  # duplicate bridge
+        with self.assertRaises(c.AttaccaError):  # duplicate bridge
             c.bridge_add(self.conn, p2, "admin", "human", "p1")
 
     def test_bridge_master_and_advisor_authority_tags(self):
@@ -476,7 +476,7 @@ class StoreTestCase(unittest.TestCase):
                     msg_type="directive")
         advised = c.room_read(self.conn, "p1", limit=100)["messages"]
         self.assertEqual(advised[-1]["authority"], "advice")
-        with self.assertRaises(c.ContinuityError):  # bad principal
+        with self.assertRaises(c.AttaccaError):  # bad principal
             c.bridge_add(self.conn, p2, "x", "human", p3, boss="p1")
 
     def test_owner_attribution_on_events_and_agents(self):
@@ -530,7 +530,7 @@ class StoreTestCase(unittest.TestCase):
         event = c.event_show(self.conn, "p1", 1)
         self.assertEqual(event["event_type"], "project.created")
         self.assertIsInstance(event["payload"], dict)
-        with self.assertRaises(c.ContinuityError):
+        with self.assertRaises(c.AttaccaError):
             c.event_show(self.conn, "p1", 99999)
 
     def test_claude_md_symlinks_to_agents_md(self):
@@ -538,7 +538,7 @@ class StoreTestCase(unittest.TestCase):
         claude_md = self.proj_dir / "CLAUDE.md"
         self.assertTrue(claude_md.is_symlink())
         self.assertEqual(os.readlink(claude_md), "AGENTS.md")
-        self.assertIn("MANAGED_CONTINUITY:BEGIN", claude_md.read_text())
+        self.assertIn("MANAGED_ATTACCA:BEGIN", claude_md.read_text())
         # a pre-existing REAL CLAUDE.md is never replaced by a link
         real_dir = Path(self.tmp.name) / "realclaude"
         real_dir.mkdir()
@@ -549,20 +549,20 @@ class StoreTestCase(unittest.TestCase):
         self.assertFalse((real_dir / "CLAUDE.md").is_symlink())
         text = (real_dir / "CLAUDE.md").read_text()
         self.assertIn("# mine", text)
-        self.assertIn("MANAGED_CONTINUITY:BEGIN", text)
+        self.assertIn("MANAGED_ATTACCA:BEGIN", text)
 
     def test_managed_instruction_block_idempotent(self):
         result = c.install_instructions("p1", str(self.proj_dir), self.db)
         self.assertEqual(len(result["files"]), 2)
         claude_md = self.proj_dir / "CLAUDE.md"
         text1 = claude_md.read_text()
-        self.assertIn("MANAGED_CONTINUITY:BEGIN", text1)
+        self.assertIn("MANAGED_ATTACCA:BEGIN", text1)
         # user content above the block survives a re-run
         claude_md.write_text("# My own notes\n\n" + text1)
         c.install_instructions("p1", str(self.proj_dir), self.db)
         text2 = claude_md.read_text()
         self.assertIn("# My own notes", text2)
-        self.assertEqual(text2.count("MANAGED_CONTINUITY:BEGIN"), 1)
+        self.assertEqual(text2.count("MANAGED_ATTACCA:BEGIN"), 1)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "attacca": {
+      "command": "python3",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/attacca.py", "connect"],
+      "env": { "ATTACCA_ACTOR": "claude_director" }
+    }
+  }
+}

@@ -1,6 +1,6 @@
 """Hosted-server tests: REST API + MCP over streamable HTTP.
 
-Starts one real `continuity.py serve` subprocess per test class and drives it
+Starts one real `attacca.py serve` subprocess per test class and drives it
 with stdlib urllib — the same wire surface Claude Code / Codex / curl use.
 """
 import importlib.util
@@ -15,13 +15,13 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-# Isolate tests from any machine identity (~/.continuity/identity.json)
-os.environ["CONTINUITY_OWNER"] = ""
+# Isolate tests from any machine identity (~/.attacca/identity.json)
+os.environ["ATTACCA_OWNER"] = ""
 
 ROOT = Path(__file__).resolve().parent.parent
-SCRIPT = str(ROOT / "continuity.py")
+SCRIPT = str(ROOT / "attacca.py")
 
-spec = importlib.util.spec_from_file_location("continuity", ROOT / "continuity.py")
+spec = importlib.util.spec_from_file_location("attacca", ROOT / "attacca.py")
 c = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(c)
 
@@ -29,9 +29,9 @@ spec.loader.exec_module(c)
 class ServerFixture:
     def __init__(self, db):
         env = dict(os.environ)
-        for k in ("CONTINUITY_ACTOR", "CONTINUITY_PROJECT"):
+        for k in ("ATTACCA_ACTOR", "ATTACCA_PROJECT"):
             env.pop(k, None)
-        env["CONTINUITY_DB"] = str(db)
+        env["ATTACCA_DB"] = str(db)
         self.proc = subprocess.Popen(
             [sys.executable, SCRIPT, "serve", "--port", "0"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
@@ -82,7 +82,7 @@ class HttpTestCase(unittest.TestCase):
         cls.tmp.cleanup()
 
     def rest(self, method, path, body=None, actor=None):
-        headers = {"X-Continuity-Actor": actor} if actor else {}
+        headers = {"X-Attacca-Actor": actor} if actor else {}
         return self.server.request(method, path, body, headers)
 
     # -- REST ---------------------------------------------------------------
@@ -107,12 +107,12 @@ class HttpTestCase(unittest.TestCase):
             blob = resp.read()
         archive = zf.ZipFile(iolib.BytesIO(blob))
         names = set(archive.namelist())
-        for required in ("continuity.py", ".claude-plugin/plugin.json",
+        for required in ("attacca.py", ".claude-plugin/plugin.json",
                          "plugin-mcp.json", "commands/brief.md"):
             self.assertIn(required, names)
         # the downloaded plugin is pre-wired to the server it came from
         cfg = json.loads(archive.read("plugin-mcp.json"))
-        self.assertEqual(cfg["mcpServers"]["continuity"]["env"]["CONTINUITY_URL"],
+        self.assertEqual(cfg["mcpServers"]["attacca"]["env"]["ATTACCA_URL"],
                          self.server.base)
 
     def test_unknown_route_404_and_bad_json_400(self):
@@ -196,9 +196,9 @@ class HttpTestCase(unittest.TestCase):
         if session:
             headers["Mcp-Session-Id"] = session
         if actor:
-            headers["X-Continuity-Actor"] = actor
+            headers["X-Attacca-Actor"] = actor
         if project:
-            headers["X-Continuity-Project"] = project
+            headers["X-Attacca-Project"] = project
         return self.server.request("POST", "/mcp", msg, headers)
 
     def mcp_init(self, actor=None, client="http-test"):
@@ -213,7 +213,7 @@ class HttpTestCase(unittest.TestCase):
         status, resp, sid = self.mcp_init(actor="mcp_alice")
         self.assertEqual(status, 200)
         self.assertTrue(sid)
-        self.assertEqual(resp["result"]["serverInfo"]["name"], "continuity")
+        self.assertEqual(resp["result"]["serverInfo"]["name"], "attacca")
         status, tools, _ = self.mcp(
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, session=sid)
         self.assertGreaterEqual(len(tools["result"]["tools"]), 15)
@@ -250,7 +250,7 @@ class HttpTestCase(unittest.TestCase):
     def test_mcp_sessionless_request_still_works(self):
         status, resp, _ = self.mcp(
             {"jsonrpc": "2.0", "id": 9, "method": "tools/call",
-             "params": {"name": "continuity_status", "arguments": {}}},
+             "params": {"name": "attacca_status", "arguments": {}}},
             actor="ephemeral")
         self.assertEqual(status, 200)
         body = json.loads(resp["result"]["content"][0]["text"])
@@ -300,7 +300,7 @@ class HttpTestCase(unittest.TestCase):
                   {"project_id": "sidecar", "name": "Sidecar"}, actor="admin")
         status, resp, _ = self.mcp(
             {"jsonrpc": "2.0", "id": 41, "method": "tools/call",
-             "params": {"name": "continuity_status", "arguments": {}}},
+             "params": {"name": "attacca_status", "arguments": {}}},
             actor="router", project="sidecar")
         body = json.loads(resp["result"]["content"][0]["text"])
         self.assertEqual(body["project"], "sidecar")
@@ -342,14 +342,14 @@ class HttpHardeningTestCase(unittest.TestCase):
                                "clientInfo": {"name": "a", "version": "0"}}}
             conn_a.request("POST", "/mcp", json.dumps(init),
                            {"Content-Type": "application/json",
-                            "X-Continuity-Project": "hub",
-                            "X-Continuity-Actor": "threaded"})
+                            "X-Attacca-Project": "hub",
+                            "X-Attacca-Actor": "threaded"})
             resp = conn_a.getresponse()
             sid = resp.getheader("Mcp-Session-Id")
             resp.read()
             self.assertTrue(sid)
             call = {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                    "params": {"name": "continuity_status", "arguments": {}}}
+                    "params": {"name": "attacca_status", "arguments": {}}}
             headers = {"Content-Type": "application/json", "Mcp-Session-Id": sid}
             conn_a.request("POST", "/mcp", json.dumps(call), headers)
             resp = conn_a.getresponse()
@@ -458,7 +458,7 @@ class HttpHardeningTestCase(unittest.TestCase):
 
 
 class AutoRegisterTestCase(unittest.TestCase):
-    """Zero-setup: X-Continuity-Root auto-registers projects server-side."""
+    """Zero-setup: X-Attacca-Root auto-registers projects server-side."""
 
     @classmethod
     def setUpClass(cls):
@@ -476,8 +476,8 @@ class AutoRegisterTestCase(unittest.TestCase):
         status, resp, _ = self.server.request(
             "POST", "/mcp",
             {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-             "params": {"name": "continuity_status", "arguments": {}}},
-            {"X-Continuity-Root": str(root), "X-Continuity-Actor": "auto"})
+             "params": {"name": "attacca_status", "arguments": {}}},
+            {"X-Attacca-Root": str(root), "X-Attacca-Actor": "auto"})
         assert status == 200, (status, resp)
         body = resp["result"]["content"][0]["text"]
         assert not resp["result"].get("isError"), body
@@ -528,11 +528,11 @@ class ConnectProxyTestCase(unittest.TestCase):
     def _proxy(self, url=None, cwd=None):
         env = dict(os.environ)
         env.pop("CLAUDE_PROJECT_DIR", None)
-        env.pop("CONTINUITY_PROJECT", None)
-        env["CONTINUITY_DB"] = str(self.db)
-        env["CONTINUITY_URL"] = url or self.server.base
-        env["CONTINUITY_ACTOR"] = "proxy_actor"
-        env["CONTINUITY_AUTOSTART"] = "0"
+        env.pop("ATTACCA_PROJECT", None)
+        env["ATTACCA_DB"] = str(self.db)
+        env["ATTACCA_URL"] = url or self.server.base
+        env["ATTACCA_ACTOR"] = "proxy_actor"
+        env["ATTACCA_AUTOSTART"] = "0"
         return subprocess.Popen(
             [sys.executable, SCRIPT, "connect"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -553,14 +553,14 @@ class ConnectProxyTestCase(unittest.TestCase):
                 "jsonrpc": "2.0", "id": 1, "method": "initialize",
                 "params": {"protocolVersion": "2025-06-18", "capabilities": {},
                            "clientInfo": {"name": "proxy-test", "version": "0"}}})
-            self.assertEqual(init["result"]["serverInfo"]["name"], "continuity")
+            self.assertEqual(init["result"]["serverInfo"]["name"], "attacca")
             # notification: forwarded, no local echo
             proc.stdin.write(json.dumps(
                 {"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
             proc.stdin.flush()
             status = self._rpc(proc, {
                 "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                "params": {"name": "continuity_status", "arguments": {}}})
+                "params": {"name": "attacca_status", "arguments": {}}})
             body = json.loads(status["result"]["content"][0]["text"])
             # project auto-registered from the proxy's cwd; actor from env
             self.assertEqual(body["project"], "proxied-app")
@@ -622,10 +622,10 @@ class OneShotSetupTestCase(unittest.TestCase):
             self.assertEqual(info["mode"], "server")
             merged = json.loads((proj / ".mcp.json").read_text())
             self.assertIn("other", merged["mcpServers"])
-            entry = merged["mcpServers"]["continuity"]
+            entry = merged["mcpServers"]["attacca"]
             self.assertEqual(entry["type"], "http")
             self.assertTrue(entry["url"].endswith("/mcp"))
-            self.assertEqual(entry["headers"]["X-Continuity-Project"],
+            self.assertEqual(entry["headers"]["X-Attacca-Project"],
                              info["project_id"])
             self.assertTrue((proj / "CLAUDE.md").exists())
             self.assertTrue((proj / "AGENTS.md").exists())
@@ -640,7 +640,7 @@ class OneShotSetupTestCase(unittest.TestCase):
             c.one_shot_setup(conn, "me", "human", db, path=str(proj),
                              stdio=True, manage_server=False, home=str(home))
             entry = json.loads((proj / ".mcp.json").read_text())[
-                "mcpServers"]["continuity"]
+                "mcpServers"]["attacca"]
             self.assertIn("command", entry)
             conn.close()
 
@@ -701,33 +701,33 @@ class UniversalConnectTestCase(unittest.TestCase):
             # backup kept — one GLOBAL config, project auto-detected per cwd
             codex = (home / ".codex" / "config.toml").read_text()
             self.assertIn('[model]', codex)
-            self.assertIn("[mcp_servers.continuity]", codex)
+            self.assertIn("[mcp_servers.attacca]", codex)
             self.assertIn('"connect"', codex)
-            self.assertIn('"CONTINUITY_URL" = "http://127.0.0.1:9999"', codex)
-            self.assertTrue((home / ".codex" / "config.toml.continuity-backup").exists())
+            self.assertIn('"ATTACCA_URL" = "http://127.0.0.1:9999"', codex)
+            self.assertTrue((home / ".codex" / "config.toml.attacca-backup").exists())
             # rerun replaces (idempotent), not duplicates
             c.connect_tools("proj", str(root), db,
                             url="http://127.0.0.1:8888", home=str(home))
             codex = (home / ".codex" / "config.toml").read_text()
-            self.assertEqual(codex.count("[mcp_servers.continuity]"), 1)
-            self.assertIn('"CONTINUITY_URL" = "http://127.0.0.1:8888"', codex)
+            self.assertEqual(codex.count("[mcp_servers.attacca]"), 1)
+            self.assertIn('"ATTACCA_URL" = "http://127.0.0.1:8888"', codex)
             # cursor: existing entry preserved, connect proxy with actor env
             cursor = json.loads((home / ".cursor" / "mcp.json").read_text())
             self.assertIn("existing", cursor["mcpServers"])
-            entry = cursor["mcpServers"]["continuity"]
+            entry = cursor["mcpServers"]["attacca"]
             self.assertIn("connect", entry["args"])
-            self.assertEqual(entry["env"]["CONTINUITY_ACTOR"], "cursor_worker")
+            self.assertEqual(entry["env"]["ATTACCA_ACTOR"], "cursor_worker")
             # cline gets the stdio form (portable across cline versions)
             cline = json.loads(
                 (cline_dir / "cline_mcp_settings.json").read_text())
-            self.assertIn("command", cline["mcpServers"]["continuity"])
+            self.assertIn("command", cline["mcpServers"]["attacca"])
             # vscode uses the "servers" key
             vscode = json.loads((root / ".vscode" / "mcp.json").read_text())
-            self.assertIn("continuity", vscode["servers"])
+            self.assertIn("attacca", vscode["servers"])
             # gemini project settings written
             gemini = json.loads(
                 (root / ".gemini" / "settings.json").read_text())
-            self.assertIn("httpUrl", gemini["mcpServers"]["continuity"])
+            self.assertIn("httpUrl", gemini["mcpServers"]["attacca"])
             # skip filter respected
             configured, _ = c.connect_tools(
                 "proj", str(root), db, home=str(home),

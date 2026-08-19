@@ -7,4 +7,4 @@ server.log
 venv/
 .venv/
 vnev/
-*.continuity-backup
+*.attacca-backup

@@ -2,7 +2,7 @@
 description: Show the shared task board (all agents, all tools)
 ---
 
-Call the `task_list` continuity MCP tool for this project.
+Call the `task_list` attacca MCP tool for this project.
 
 Summarize the board for the user: what's claimed and by whom (flag expired
 leases — those tasks are up for grabs), what's queued, blocked, or waiting in

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Two AI tools talking through the continuity layer — over real MCP.
+"""Two AI tools talking through the attacca layer — over real MCP.
 
 Spawns two independent MCP server processes (exactly what Claude Code and
 Codex do when they start a stdio MCP server) with different actor identities,
@@ -21,15 +21,19 @@ import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SCRIPT = str(HERE.parent / "continuity.py")
+SCRIPT = str(HERE.parent / "attacca.py")
+
+# Isolate the demo from any machine identity (~/.attacca/identity.json):
+# actor ids must stay exactly claude_director / codex_director.
+os.environ["ATTACCA_OWNER"] = ""
 
 
 class Tool:
     """A minimal MCP client, standing in for one AI coding tool."""
 
     def __init__(self, name, actor, db):
-        env = dict(os.environ, CONTINUITY_DB=db, CONTINUITY_PROJECT="mcpdemo",
-                   CONTINUITY_ACTOR=actor)
+        env = dict(os.environ, ATTACCA_DB=db, ATTACCA_PROJECT="mcpdemo",
+                   ATTACCA_ACTOR=actor)
         self.name = name
         self.proc = subprocess.Popen(
             [sys.executable, SCRIPT, "mcp"], stdin=subprocess.PIPE,
@@ -69,7 +73,7 @@ class Tool:
 
 def main():
     tmp = tempfile.TemporaryDirectory()
-    db = str(Path(tmp.name) / "continuity.db")
+    db = str(Path(tmp.name) / "attacca.db")
     subprocess.run([sys.executable, SCRIPT, "--db", db, "init",
                     "--project-id", "mcpdemo", "--name", "MCP Demo",
                     tmp.name], check=True, capture_output=True)
@@ -143,7 +147,7 @@ def main():
     codex.close()
     tmp.cleanup()
     print("\nOK: two separate MCP sessions coordinated entirely through the "
-          "shared continuity layer.")
+          "shared attacca layer.")
 
 
 if __name__ == "__main__":

@@ -7,20 +7,23 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-CONTINUITY="$HERE/../continuity.py"
+ATTACCA="$HERE/../attacca.py"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
-export CONTINUITY_DB="$WORK/continuity.db"
+export ATTACCA_DB="$WORK/attacca.db"
+# Isolate the demo from any machine identity (~/.attacca/identity.json):
+# actor ids must stay exactly claude_director / codex_director.
+export ATTACCA_OWNER=""
 mkdir -p "$WORK/acme-app"
 
 step() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
-A() { python3 "$CONTINUITY" --actor claude_director --actor-type agent "$@"; }
-B() { python3 "$CONTINUITY" --actor codex_director --actor-type agent "$@"; }
+A() { python3 "$ATTACCA" --actor claude_director --actor-type agent "$@"; }
+B() { python3 "$ATTACCA" --actor codex_director --actor-type agent "$@"; }
 
 cd "$WORK/acme-app"
 
 step "Setup: register the project once"
-python3 "$CONTINUITY" init --project-id acme --name "Acme App" >/dev/null
+python3 "$ATTACCA" init --project-id acme --name "Acme App" >/dev/null
 echo "project registered: acme"
 
 step "SESSION A (Claude Director, e.g. inside Claude Code on Computer A)"
@@ -77,19 +80,19 @@ B task report T-2 --state review \
 echo "reported T-2 -> review"
 
 step "The shared project log both sessions produced (one ledger)"
-python3 "$CONTINUITY" log
+python3 "$ATTACCA" log
 
 step "Ledger integrity"
-python3 "$CONTINUITY" event verify
+python3 "$ATTACCA" event verify
 
 step "ASSERTIONS"
 fail() { echo "DEMO FAILED: $1" >&2; exit 1; }
 echo "$HANDOFF" | grep -q "PKCE auth migration" || fail "handoff objective missing"
 echo "$HANDOFF" | grep -q "access_token"        || fail "handoff what_changed missing"
-python3 "$CONTINUITY" --json task list | grep -q '"claimed_by": "codex_director"' \
+python3 "$ATTACCA" --json task list | grep -q '"claimed_by": "codex_director"' \
   || fail "codex_director claim not recorded"
-python3 "$CONTINUITY" --json event verify | grep -q '"ok": true' \
+python3 "$ATTACCA" --json event verify | grep -q '"ok": true' \
   || fail "ledger verification failed"
-python3 "$CONTINUITY" --json decision list | grep -q '"status": "accepted"' \
+python3 "$ATTACCA" --json decision list | grep -q '"status": "accepted"' \
   || fail "decision not recorded"
 echo "OK: fresh worker resumed the project cold from shared state alone."

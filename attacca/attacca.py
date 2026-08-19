@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-continuity.py — Local Project Continuity Layer (blueprint Phase 0 dogfood build).
+attacca.py — Local Project Attacca Layer (blueprint Phase 0 dogfood build).
 
 One zero-dependency file (Python 3.8+, stdlib only) implementing the
-"Project Continuity Layer" from the Multi-Agent Developer SaaS blueprint:
+"Project Attacca Layer" from the Multi-Agent Developer SaaS blueprint:
 
   * Append-only event ledger (SQLite, per-project sequence, hash-chained)
   * Project Room (structured messages: chat/directive/claim/handoff/...)
@@ -19,12 +19,12 @@ spawns its own MCP server process; SQLite in WAL mode is the coordination
 point, so concurrent sessions across tools are safe.
 
 Usage:
-  continuity.py init [--project-id ID] [--name NAME] [PATH]
-  continuity.py mcp                     # run MCP stdio server
-  continuity.py status | log | handoff | room | task | decision | agent ...
-  continuity.py setup [--write-mcp-json]   # per-tool config snippets
-  continuity.py install-instructions       # managed CLAUDE.md/AGENTS.md block
-Run `continuity.py --help` for everything.
+  attacca.py init [--project-id ID] [--name NAME] [PATH]
+  attacca.py mcp                     # run MCP stdio server
+  attacca.py status | log | handoff | room | task | decision | agent ...
+  attacca.py setup [--write-mcp-json]   # per-tool config snippets
+  attacca.py install-instructions       # managed CLAUDE.md/AGENTS.md block
+Run `attacca.py --help` for everything.
 """
 
 import argparse
@@ -51,12 +51,47 @@ VERSION = "0.1.0"
 MCP_SUPPORTED_PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18")
 MCP_DEFAULT_PROTOCOL = "2025-06-18"
 
-ENV_DB = "CONTINUITY_DB"
-ENV_PROJECT = "CONTINUITY_PROJECT"
-ENV_ACTOR = "CONTINUITY_ACTOR"
-ENV_ACTOR_TYPE = "CONTINUITY_ACTOR_TYPE"
+ENV_DB = "ATTACCA_DB"
+ENV_PROJECT = "ATTACCA_PROJECT"
+ENV_ACTOR = "ATTACCA_ACTOR"
+ENV_ACTOR_TYPE = "ATTACCA_ACTOR_TYPE"
 
-DEFAULT_DB = Path(os.environ.get(ENV_DB) or (Path.home() / ".continuity" / "continuity.db"))
+
+def _migrate_legacy_state():
+    """One-time rename for pre-Attacca installs: ~/.continuity -> ~/.attacca,
+    and continuity.db -> attacca.db inside it. Skipped when ATTACCA_DB points
+    somewhere explicit. If BOTH dirs exist (something recreated the legacy
+    one), the legacy database is still moved over, provided the new home has
+    no database of its own yet."""
+    if os.environ.get(ENV_DB):
+        return
+    old_home = Path.home() / ".continuity"
+    new_home = Path.home() / ".attacca"
+    try:
+        if old_home.is_dir() and not new_home.exists():
+            old_home.rename(new_home)
+        elif old_home.is_dir() and new_home.is_dir():
+            for name in ("identity.json",):
+                src, dst = old_home / name, new_home / name
+                if src.exists() and not dst.exists():
+                    src.rename(dst)
+            for suffix in ("", "-wal", "-shm"):
+                src = old_home / ("continuity.db" + suffix)
+                dst = new_home / ("attacca.db" + suffix)
+                if src.exists() and not dst.exists():
+                    src.rename(dst)
+        if new_home.is_dir():
+            for suffix in ("", "-wal", "-shm"):
+                src = new_home / ("continuity.db" + suffix)
+                if src.exists():
+                    src.rename(new_home / ("attacca.db" + suffix))
+    except OSError:
+        pass  # best effort; an explicit path still works via ATTACCA_DB
+
+
+_migrate_legacy_state()
+
+DEFAULT_DB = Path(os.environ.get(ENV_DB) or (Path.home() / ".attacca" / "attacca.db"))
 
 GENESIS_HASH = "0" * 64
 
@@ -71,11 +106,11 @@ HANDOFF_FIELDS = ["objective", "what_changed", "active_work", "blockers",
 # Room chat/status noise is excluded from the curated project log.
 LOG_EXCLUDED_MSG_TYPES = {"chat", "status"}
 
-MANAGED_BEGIN = "<!-- MANAGED_CONTINUITY:BEGIN"
-MANAGED_END = "<!-- MANAGED_CONTINUITY:END -->"
+MANAGED_BEGIN = "<!-- MANAGED_ATTACCA:BEGIN"
+MANAGED_END = "<!-- MANAGED_ATTACCA:END -->"
 
 
-class ContinuityError(Exception):
+class AttaccaError(Exception):
     """User-facing error (bad input, unknown project, conflict...)."""
 
 
@@ -119,8 +154,8 @@ def slugify(text):
     return slug or "project"
 
 
-ENV_OWNER = "CONTINUITY_OWNER"
-IDENTITY_FILE = Path.home() / ".continuity" / "identity.json"
+ENV_OWNER = "ATTACCA_OWNER"
+IDENTITY_FILE = Path.home() / ".attacca" / "identity.json"
 
 
 def load_owner():
@@ -330,7 +365,7 @@ def connect(db_path):
                 except sqlite3.OperationalError:
                     pass  # another process migrated concurrently
     except (sqlite3.Error, OSError) as err:
-        raise ContinuityError("cannot open database at %s: %s" % (db_path, err))
+        raise AttaccaError("cannot open database at %s: %s" % (db_path, err))
     return conn
 
 
@@ -340,14 +375,14 @@ def _require_str_list(name, value):
     if value is None:
         return None
     if isinstance(value, str):
-        raise ContinuityError(
+        raise AttaccaError(
             "%s must be an array of strings, not a string (got %r)" % (name, value))
     try:
         items = list(value)
     except TypeError:
-        raise ContinuityError("%s must be an array of strings" % name)
+        raise AttaccaError("%s must be an array of strings" % name)
     if not all(isinstance(item, str) for item in items):
-        raise ContinuityError("%s must contain only strings" % name)
+        raise AttaccaError("%s must contain only strings" % name)
     return items
 
 
@@ -358,7 +393,7 @@ def _normalize_evidence(evidence):
         evidence = [evidence]
     if not isinstance(evidence, list) \
             or not all(isinstance(item, dict) for item in evidence):
-        raise ContinuityError(
+        raise AttaccaError(
             'evidence must be an array of objects, e.g. '
             '[{"kind":"test","name":"pytest","result":"pass"}]')
     return evidence
@@ -384,7 +419,7 @@ class write_tx:
                     time.sleep(min(0.05 * (i + 1), 0.5) + random.uniform(0, 0.05))
                     continue
                 raise
-        raise ContinuityError("database busy, could not begin transaction: %s" % last_err)
+        raise AttaccaError("database busy, could not begin transaction: %s" % last_err)
 
     def __exit__(self, exc_type, exc, tb):
         if exc_type is None:
@@ -463,8 +498,8 @@ def get_project(conn, project_id):
     if not row:
         known = [r["project_id"] for r in
                  conn.execute("SELECT project_id FROM projects ORDER BY project_id")]
-        raise ContinuityError(
-            "unknown project '%s'. Known projects: %s. Run `continuity.py init` "
+        raise AttaccaError(
+            "unknown project '%s'. Known projects: %s. Run `attacca.py init` "
             "in the project directory to register one." % (project_id, known or "none"))
     return dict(row)
 
@@ -511,9 +546,9 @@ def resolve_project_id(conn, explicit=None, default=None, cwd=None, use_cwd=True
     if len(all_rows) == 1:
         return all_rows[0]["project_id"]
     known = [r["project_id"] for r in all_rows]
-    raise ContinuityError(
+    raise AttaccaError(
         "cannot determine project%s. Pass project explicitly, set %s (or the "
-        "X-Continuity-Project header over HTTP), or run `continuity.py init` "
+        "X-Attacca-Project header over HTTP), or run `attacca.py init` "
         "in the project directory. Known projects: %s"
         % ((" (cwd=%s)" % cwd) if use_cwd else "", ENV_PROJECT, known or "none"))
 
@@ -532,7 +567,7 @@ def project_init(conn, actor_id, actor_type, path=None, project_id=None,
         if existing:
             if existing["root_path"] not in (None, str(root)):
                 if not move:
-                    raise ContinuityError(
+                    raise AttaccaError(
                         "project '%s' is already registered at %s. Re-run with "
                         "--move to re-point it to %s (this affects every tool "
                         "using this project)."
@@ -645,7 +680,7 @@ def update_handoff(conn, project_id, actor_id, actor_type, updates):
     updates = {k: v for k, v in updates.items()
                if k in HANDOFF_FIELDS and v is not None}
     if not updates:
-        raise ContinuityError(
+        raise AttaccaError(
             "update_handoff needs at least one of: %s" % ", ".join(HANDOFF_FIELDS))
     with write_tx(conn):
         get_project(conn, project_id)
@@ -670,10 +705,10 @@ def update_handoff(conn, project_id, actor_id, actor_type, updates):
 def room_send(conn, project_id, actor_id, actor_type, body, msg_type="chat",
               mentions=None, task_id=None, reply_to=None, origin_project=None):
     if not body or not str(body).strip():
-        raise ContinuityError("room_send: body is required")
+        raise AttaccaError("room_send: body is required")
     msg_type = (msg_type or "chat").lower()
     if msg_type not in MSG_TYPES:
-        raise ContinuityError(
+        raise AttaccaError(
             "room_send: msg_type must be one of %s" % ", ".join(MSG_TYPES))
     mentions = _require_str_list("mentions", mentions)
     payload = {"msg_type": msg_type, "body": str(body)}
@@ -758,7 +793,9 @@ def room_read(conn, project_id, since_seq=None, limit=30):
 def _room_message_dict(row, payload=None):
     payload = payload if payload is not None else json.loads(row["payload"])
     return {"seq": row["seq"], "at": row["created_at"], "actor": row["actor_id"],
-            "actor_type": row["actor_type"], "msg_type": payload.get("msg_type"),
+            "actor_type": row["actor_type"],
+            "owner": row["owner"] if "owner" in row.keys() else None,
+            "msg_type": payload.get("msg_type"),
             "body": payload.get("body"), "mentions": payload.get("mentions"),
             "task_id": row["task_id"], "reply_to": payload.get("reply_to"),
             "origin_project": payload.get("origin_project"),
@@ -847,13 +884,13 @@ def bridge_add(conn, project_id, actor_id, actor_type, other_project,
     get_project(conn, project_id)
     other = get_project(conn, other_project)["project_id"]
     if other == project_id:
-        raise ContinuityError("cannot bridge a project to itself")
+        raise AttaccaError("cannot bridge a project to itself")
     if boss and advisor:
-        raise ContinuityError("choose either boss or advisor, not both")
+        raise AttaccaError("choose either boss or advisor, not both")
     principal = boss or advisor or None
     relation = "master" if boss else ("advisor" if advisor else "peer")
     if principal and principal not in (project_id, other):
-        raise ContinuityError(
+        raise AttaccaError(
             "%s must be one of the bridged projects (%s, %s)"
             % ("boss" if boss else "advisor", project_id, other))
     a, b = sorted([project_id, other])
@@ -862,7 +899,7 @@ def bridge_add(conn, project_id, actor_id, actor_type, other_project,
             "SELECT 1 FROM bridges WHERE project_a=? AND project_b=?",
             (a, b)).fetchone()
         if exists:
-            raise ContinuityError(
+            raise AttaccaError(
                 "%s and %s are already bridged (remove it first to change "
                 "the relationship)" % (a, b))
         conn.execute(
@@ -887,7 +924,7 @@ def bridge_remove(conn, project_id, actor_id, actor_type, other_project):
         cur = conn.execute(
             "DELETE FROM bridges WHERE project_a=? AND project_b=?", (a, b))
         if cur.rowcount != 1:
-            raise ContinuityError("%s and %s are not bridged" % (a, b))
+            raise AttaccaError("%s and %s are not bridged" % (a, b))
         for side, peer in ((project_id, other), (other, project_id)):
             append_event(conn, side, actor_id, actor_type, "bridge.removed",
                          {"with": peer}, in_tx=True)
@@ -907,7 +944,7 @@ def set_lead_director(conn, project_id, actor_id, actor_type, lead_id):
         project = get_project(conn, project_id)
         previous = project.get("lead_director")
         if previous == lead_id:
-            raise ContinuityError("lead director is already %s" % (lead_id or "unset"))
+            raise AttaccaError("lead director is already %s" % (lead_id or "unset"))
         conn.execute("UPDATE projects SET lead_director=? WHERE project_id=?",
                      (lead_id, project_id))
         context_version = bump_context_version(conn, project_id)
@@ -933,7 +970,7 @@ def _task_row(conn, project_id, task_id):
         "SELECT * FROM tasks WHERE project_id=? AND task_id=?",
         (project_id, task_id)).fetchone()
     if not row:
-        raise ContinuityError("unknown task %s in project %s" % (task_id, project_id))
+        raise AttaccaError("unknown task %s in project %s" % (task_id, project_id))
     return row
 
 
@@ -952,10 +989,10 @@ def _task_dict(row):
 def task_create(conn, project_id, actor_id, actor_type, title, description=None,
                 expected_scope=None, dependencies=None, risk_level="medium"):
     if not title or not str(title).strip():
-        raise ContinuityError("task_create: title is required")
+        raise AttaccaError("task_create: title is required")
     risk_level = (risk_level or "medium").lower()
     if risk_level not in RISK_LEVELS:
-        raise ContinuityError("risk_level must be one of %s" % ", ".join(RISK_LEVELS))
+        raise AttaccaError("risk_level must be one of %s" % ", ".join(RISK_LEVELS))
     expected_scope = _require_str_list("expected_scope", expected_scope) or []
     dependencies = _require_str_list("dependencies", dependencies) or []
     with write_tx(conn):
@@ -981,7 +1018,7 @@ def task_list(conn, project_id, status=None):
     get_project(conn, project_id)
     if status:
         if status not in TASK_STATUSES:
-            raise ContinuityError("status must be one of %s" % ", ".join(TASK_STATUSES))
+            raise AttaccaError("status must be one of %s" % ", ".join(TASK_STATUSES))
         rows = conn.execute(
             "SELECT * FROM tasks WHERE project_id=? AND status=? ORDER BY task_id",
             (project_id, status)).fetchall()
@@ -1064,7 +1101,7 @@ def task_claim(conn, project_id, actor_id, actor_type, task_id,
              project_id, task_id, actor_id, nowi))
         if cur.rowcount != 1:
             fresh = _task_row(conn, project_id, task_id)
-            raise ContinuityError(
+            raise AttaccaError(
                 "task %s not claimable: status=%s claimed_by=%s lease_until=%s"
                 % (task_id, fresh["status"], fresh["claimed_by"], fresh["lease_until"]))
         renewal = row["status"] == "claimed" and row["claimed_by"] == actor_id
@@ -1098,10 +1135,10 @@ def task_claim(conn, project_id, actor_id, actor_type, task_id,
 def task_report(conn, project_id, actor_id, actor_type, task_id, summary,
                 evidence=None, requested_state="review"):
     if not summary or not str(summary).strip():
-        raise ContinuityError("task_report: summary is required")
+        raise AttaccaError("task_report: summary is required")
     requested_state = (requested_state or "review").lower()
     if requested_state not in ("review", "done", "blocked", "queued"):
-        raise ContinuityError("requested_state must be review|done|blocked|queued")
+        raise AttaccaError("requested_state must be review|done|blocked|queued")
     evidence = _normalize_evidence(evidence)
     project = get_project(conn, project_id)
     base_revision = git_head(project.get("root_path"))
@@ -1131,10 +1168,10 @@ def task_report(conn, project_id, actor_id, actor_type, task_id, summary,
         if cur.rowcount != 1:
             fresh = _task_row(conn, project_id, task_id)
             if fresh["status"] in ("done", "cancelled"):
-                raise ContinuityError(
+                raise AttaccaError(
                     "task %s is already %s; use task_set_status to reopen it "
                     "before reporting again" % (task_id, fresh["status"]))
-            raise ContinuityError(
+            raise AttaccaError(
                 "task %s is claimed by %s (lease until %s); only the claimant "
                 "can report it while the lease is active"
                 % (task_id, fresh["claimed_by"], fresh["lease_until"]))
@@ -1173,11 +1210,11 @@ def task_release(conn, project_id, actor_id, actor_type, task_id, reason=None):
         get_project(conn, project_id)
         row = _task_row(conn, project_id, task_id)
         if row["status"] != "claimed":
-            raise ContinuityError("task %s is not claimed (status=%s)"
+            raise AttaccaError("task %s is not claimed (status=%s)"
                                   % (task_id, row["status"]))
         if row["claimed_by"] and row["claimed_by"] != actor_id \
                 and row["lease_until"] and row["lease_until"] >= now_iso():
-            raise ContinuityError(
+            raise AttaccaError(
                 "task %s is claimed by %s (lease until %s); only the claimant "
                 "can release an active claim"
                 % (task_id, row["claimed_by"], row["lease_until"]))
@@ -1196,16 +1233,16 @@ def task_set_status(conn, project_id, actor_id, actor_type, task_id, status,
                     reason=None):
     status = (status or "").lower()
     if status not in TASK_STATUSES:
-        raise ContinuityError("status must be one of %s" % ", ".join(TASK_STATUSES))
+        raise AttaccaError("status must be one of %s" % ", ".join(TASK_STATUSES))
     if status == "claimed":
-        raise ContinuityError(
+        raise AttaccaError(
             "use task_claim to claim tasks — set-status cannot create a claim "
             "with a claimant and lease")
     with write_tx(conn):
         get_project(conn, project_id)
         row = _task_row(conn, project_id, task_id)
         if row["status"] == status:
-            raise ContinuityError("task %s already has status %s" % (task_id, status))
+            raise AttaccaError("task %s already has status %s" % (task_id, status))
         conn.execute(
             "UPDATE tasks SET status=?, updated_at=?, lease_until=NULL,"
             " claimed_by=CASE WHEN ?='queued' THEN NULL ELSE claimed_by END"
@@ -1230,7 +1267,7 @@ def task_set_status(conn, project_id, actor_id, actor_type, task_id, status,
 def decision_propose(conn, project_id, actor_id, actor_type, title, detail=None,
                      rationale=None):
     if not title or not str(title).strip():
-        raise ContinuityError("decision_propose: title is required")
+        raise AttaccaError("decision_propose: title is required")
     with write_tx(conn):
         get_project(conn, project_id)
         decision_id = _next_counter_id(conn, "decisions", "decision_id",
@@ -1252,7 +1289,7 @@ def decision_resolve(conn, project_id, actor_id, actor_type, decision_id,
                      resolution, rationale=None):
     resolution = (resolution or "").lower()
     if resolution not in DECISION_RESOLUTIONS:
-        raise ContinuityError(
+        raise AttaccaError(
             "resolution must be one of %s" % ", ".join(DECISION_RESOLUTIONS))
     with write_tx(conn):
         get_project(conn, project_id)
@@ -1260,9 +1297,9 @@ def decision_resolve(conn, project_id, actor_id, actor_type, decision_id,
             "SELECT * FROM decisions WHERE project_id=? AND decision_id=?",
             (project_id, decision_id)).fetchone()
         if not row:
-            raise ContinuityError("unknown decision %s" % decision_id)
+            raise AttaccaError("unknown decision %s" % decision_id)
         if row["status"] != "proposed" and resolution != "superseded":
-            raise ContinuityError(
+            raise AttaccaError(
                 "decision %s already resolved (status=%s)" % (decision_id, row["status"]))
         conn.execute(
             "UPDATE decisions SET status=?, resolved_by=?, resolved_at=?,"
@@ -1353,6 +1390,9 @@ def render_log_line(row):
     etype = row["event_type"]
     at = row["created_at"][:19].replace("T", " ")
     actor = row["actor_id"]
+    owner = row["owner"] if "owner" in row.keys() else None
+    if owner:
+        actor = "%s (OWNER: %s)" % (actor, owner)
     task = (" [%s]" % row["task_id"]) if row["task_id"] else ""
 
     if etype == "room.message":
@@ -1506,7 +1546,7 @@ def search_project(conn, project_id, query, limit=20):
     """Substring search across everything stored for a project."""
     get_project(conn, project_id)
     if not query or not str(query).strip():
-        raise ContinuityError("search: query is required")
+        raise AttaccaError("search: query is required")
     like = "%" + str(query) + "%"
     limit = max(1, min(int(limit or 20), 100))
     events = []
@@ -1560,7 +1600,7 @@ def event_show(conn, project_id, seq):
         "SELECT * FROM events WHERE project_id=? AND seq=?",
         (project_id, int(seq))).fetchone()
     if not row:
-        raise ContinuityError("no event with seq %s in %s" % (seq, project_id))
+        raise AttaccaError("no event with seq %s in %s" % (seq, project_id))
     event = dict(row)
     event["payload"] = json.loads(event["payload"])
     return event
@@ -1616,10 +1656,10 @@ PROJECT_PROP = _s("Project id. Optional — defaults to the configured/detected 
 
 MCP_TOOLS = [
     {
-        "name": "continuity_status",
+        "name": "attacca_status",
         "description": "Who am I and where am I? Returns your actor identity, the resolved "
                        "project, context version, open task/decision counts and git state. "
-                       "Cheap sanity check that the continuity layer is wired up.",
+                       "Cheap sanity check that the attacca layer is wired up.",
         "inputSchema": {"type": "object", "properties": {"project": PROJECT_PROP}},
     },
     {
@@ -1872,7 +1912,7 @@ MCP_TOOLS = [
     },
     {
         "name": "list_projects",
-        "description": "List all projects registered in this continuity database (for "
+        "description": "List all projects registered in this attacca database (for "
                        "cross-project coordination/messaging).",
         "inputSchema": {"type": "object", "properties": {}},
     },
@@ -1902,7 +1942,7 @@ MCP_TOOLS = [
     },
 ]
 
-MCP_INSTRUCTIONS = """This server is the project's shared continuity layer (event ledger, task
+MCP_INSTRUCTIONS = """This server is the project's shared attacca layer (event ledger, task
 board, decision records, handoff, and a human+AI project room) shared by ALL
 workers across tools (Claude Code, Codex, GLM, humans).
 
@@ -2031,7 +2071,7 @@ class McpSession:
         try:
             return self.process(msg)
         except Exception as err:  # never let the server die on one message
-            sys.stderr.write("continuity mcp: internal error: %r\n" % err)
+            sys.stderr.write("attacca mcp: internal error: %r\n" % err)
             sys.stderr.flush()
             if msg.get("id") is not None:
                 return self._err(msg.get("id"), -32603, "internal error: %s" % err)
@@ -2059,7 +2099,7 @@ class McpSession:
             return self._res(msg_id, {
                 "protocolVersion": protocol,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "continuity", "version": VERSION},
+                "serverInfo": {"name": "attacca", "version": VERSION},
                 "instructions": MCP_INSTRUCTIONS,
             })
         if method == "ping":
@@ -2075,12 +2115,12 @@ class McpSession:
                 return self._res(msg_id, {
                     "content": [{"type": "text", "text": text}],
                     "isError": False})
-            except ContinuityError as err:
+            except AttaccaError as err:
                 return self._res(msg_id, {
                     "content": [{"type": "text", "text": "error: %s" % err}],
                     "isError": True})
             except Exception as err:
-                sys.stderr.write("continuity mcp: tool %s failed: %r\n" % (name, err))
+                sys.stderr.write("attacca mcp: tool %s failed: %r\n" % (name, err))
                 sys.stderr.flush()
                 return self._res(msg_id, {
                     "content": [{"type": "text",
@@ -2110,7 +2150,7 @@ class McpSession:
         try:
             agent_register(conn, project, actor, self.actor_type,
                            runtime=self.client_name)
-        except ContinuityError:
+        except AttaccaError:
             pass
 
     def _project(self, args):
@@ -2150,7 +2190,7 @@ class McpSession:
         if name == "list_projects":
             return list_projects(conn)
 
-        if name == "continuity_status":
+        if name == "attacca_status":
             project = self._project(args)
             return project_status(conn, project, actor, atype, self.db_path)
 
@@ -2205,7 +2245,7 @@ class McpSession:
                 try:
                     origin = resolve_project_id(conn, default=self.default_project,
                                                 use_cwd=self.detect_cwd)
-                except ContinuityError:
+                except AttaccaError:
                     origin = None
             return room_send(conn, target, actor, atype,
                              body=args.get("body"),
@@ -2299,10 +2339,10 @@ class McpSession:
             project = self._project(args)
             event_type = args.get("event_type")
             if not event_type:
-                raise ContinuityError("append_event: event_type is required")
+                raise AttaccaError("append_event: event_type is required")
             payload = args.get("payload")
             if payload is not None and not isinstance(payload, dict):
-                raise ContinuityError("append_event: payload must be a JSON object")
+                raise AttaccaError("append_event: payload must be a JSON object")
             return {"ok": True,
                     "event": append_event(conn, project, actor, atype,
                                           str(event_type), payload or {},
@@ -2318,7 +2358,7 @@ class McpSession:
                 self.briefed_versions[project] = result["current_context_version"]
             return result
 
-        raise ContinuityError("unknown tool: %s" % name)
+        raise AttaccaError("unknown tool: %s" % name)
 
 
 # ---------------------------------------------------------------------------
@@ -2339,7 +2379,7 @@ def _api_project_init(conn, actor_id, actor_type, body):
                             name=body.get("name"), move=bool(body.get("move")))
     raw_id = body.get("project_id") or body.get("name")
     if not raw_id:
-        raise ContinuityError("provide project_id or name (root_path optional)")
+        raise AttaccaError("provide project_id or name (root_path optional)")
     project_id = slugify(str(raw_id))
     name = body.get("name") or project_id
     with write_tx(conn):
@@ -2375,11 +2415,15 @@ def _api_events_sync(conn, project_id, after, limit):
 
 
 # Files that make up the downloadable plugin (paths relative to this script).
+# One zip, two plugin manifests: Claude Code reads .claude-plugin/plugin.json
+# (+ plugin-mcp.json), Kimi Code reads kimi.plugin.json — each ignores the
+# other, so the same zip installs natively in both.
 PLUGIN_FILES = [
-    "continuity.py",
+    "attacca.py",
     "requirements.txt",
     "README.md",
     "plugin-mcp.json",
+    "kimi.plugin.json",
     ".claude-plugin/plugin.json",
     ".claude-plugin/marketplace.json",
     "commands/setup.md",
@@ -2392,8 +2436,9 @@ PLUGIN_FILES = [
 
 
 def build_plugin_zip(base_url):
-    """Zip the plugin, with plugin-mcp.json pre-wired to the serving host so
-    a downloaded copy talks to the server it came from."""
+    """Zip the plugin, with the MCP configs in both plugin manifests
+    pre-wired to the serving host so a downloaded copy talks to the server
+    it came from."""
     src_root = Path(script_path()).parent
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -2402,22 +2447,24 @@ def build_plugin_zip(base_url):
             if not path.is_file():
                 continue
             data = path.read_bytes()
-            if rel == "plugin-mcp.json":
+            if rel in ("plugin-mcp.json", "kimi.plugin.json"):
                 cfg = json.loads(data)
                 for server in cfg.get("mcpServers", {}).values():
-                    server.setdefault("env", {})["CONTINUITY_URL"] = base_url
+                    server.setdefault("env", {})["ATTACCA_URL"] = base_url
                 data = (json.dumps(cfg, indent=2) + "\n").encode()
             zf.writestr(rel, data)
     return buf.getvalue()
 
 
 INSTALL_SH_TEMPLATE = """#!/bin/sh
-# continuity plugin installer — served by the continuity server itself.
+# attacca installer — served by the attacca server itself.
+# One line wires every AI coding tool it finds on this machine:
+#   curl -s {base}/install.sh | sh
 set -e
 BASE="{base}"
-DEST="$HOME/.continuity/plugin/continuity"
+DEST="$HOME/.attacca/plugin/attacca"
 TMP="$(mktemp -d)"
-echo "downloading plugin from $BASE/plugin.zip ..."
+echo "downloading attacca from $BASE/plugin.zip ..."
 if command -v curl >/dev/null 2>&1; then
   curl -fsS "$BASE/plugin.zip" -o "$TMP/plugin.zip"
 else
@@ -2432,30 +2479,48 @@ os.makedirs(dest, exist_ok=True)
 zipfile.ZipFile(zip_path).extractall(dest)
 PYEOF
 rm -rf "$TMP"
-echo "plugin downloaded to $DEST (wired to $BASE)"
+echo "attacca downloaded to $DEST (wired to $BASE)"
+echo ""
+
+# Claude Code: native plugin install.
 if command -v claude >/dev/null 2>&1; then
   claude plugin marketplace add "$DEST" >/dev/null 2>&1 \\
     || claude plugin marketplace update agentg >/dev/null 2>&1 || true
-  if claude plugin install continuity@agentg --scope user >/dev/null 2>&1; then
-    echo "installed: continuity plugin — restart Claude Code and open any project."
+  if claude plugin install attacca@agentg --scope user >/dev/null 2>&1; then
+    echo "claude code: plugin installed — restart it and open any project."
   else
-    echo "marketplace added — finish inside Claude Code with: /plugin install continuity@agentg"
+    echo "claude code: marketplace added — finish inside Claude Code with:"
+    echo "  /plugin install attacca@agentg"
   fi
 else
-  echo "claude CLI not found — install later with:"
-  echo "  claude plugin marketplace add $DEST"
-  echo "  claude plugin install continuity@agentg --scope user"
+  echo "claude code: CLI not found — skipping (install later from $DEST)."
 fi
+
+# Every other detected tool — Kimi Code, Codex, Cline, Cursor, Windsurf:
+# write each one's global MCP config. Touches no project files.
+echo ""
+python3 "$DEST/attacca.py" setup --tools-only --url "$BASE" || true
+
+echo ""
+echo "kimi code: also installable as a native plugin — inside Kimi run:"
+echo "  /plugins install $BASE/plugin.zip"
+echo "any other MCP tool (grok, zed, ...):"
+echo "  python3 $DEST/attacca.py setup --details"
 """
 
 
-LANDING_TEMPLATE = """continuity server {version}
+LANDING_TEMPLATE = """attacca server {version}
 
-Install the Claude Code plugin from this server:
+One-line install — wires every AI coding tool on this machine
+(Claude Code, Kimi Code, Codex, Cline, Cursor, Windsurf, ...):
   curl -s {base}/install.sh | sh
 
+Native plugin installs (same zip, both manifests included):
+  Claude Code:  /plugin install attacca@agentg   (marketplace is added by the one-liner)
+  Kimi Code:    /plugins install {base}/plugin.zip
+
 Endpoints:
-  GET  /install.sh     one-line plugin installer
+  GET  /install.sh     one-line universal installer
   GET  /plugin.zip     the plugin, pre-wired to this server
   GET  /healthz        health check
   /mcp                 MCP endpoint (streamable HTTP)
@@ -2463,12 +2528,12 @@ Endpoints:
 """
 
 
-class ContinuityServer(ThreadingHTTPServer):
+class AttaccaServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
     def __init__(self, addr, db_path, default_project=None, verbose=False):
-        super().__init__(addr, ContinuityHandler)
+        super().__init__(addr, AttaccaHandler)
         self.db_path = db_path
         self.default_project = default_project
         self.verbose = verbose
@@ -2515,8 +2580,8 @@ class _UnquotedMatch:
         return self._groups[index - 1]
 
 
-class ContinuityHandler(BaseHTTPRequestHandler):
-    server_version = "continuity/" + VERSION
+class AttaccaHandler(BaseHTTPRequestHandler):
+    server_version = "attacca/" + VERSION
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
@@ -2574,14 +2639,14 @@ class ContinuityHandler(BaseHTTPRequestHandler):
         try:
             body = json.loads(raw.decode("utf-8", "replace"))
         except json.JSONDecodeError as err:
-            raise ContinuityError("request body must be valid JSON: %s" % err)
+            raise AttaccaError("request body must be valid JSON: %s" % err)
         if not isinstance(body, dict):
-            raise ContinuityError("request body must be a JSON object")
+            raise AttaccaError("request body must be a JSON object")
         return body
 
     def _actor(self):
-        return (self.headers.get("X-Continuity-Actor") or "api-client",
-                self.headers.get("X-Continuity-Actor-Type") or "agent")
+        return (self.headers.get("X-Attacca-Actor") or "api-client",
+                self.headers.get("X-Attacca-Actor-Type") or "agent")
 
     def _conn(self):
         return self.server.conn()
@@ -2616,7 +2681,7 @@ class ContinuityHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = {k: v[-1] for k, v in
                  urllib.parse.parse_qs(parsed.query).items()}
-        set_current_owner(self.headers.get("X-Continuity-Owner"))
+        set_current_owner(self.headers.get("X-Attacca-Owner"))
         try:
             if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
                 # We only read Content-Length-framed bodies; silently treating
@@ -2640,14 +2705,14 @@ class ContinuityHandler(BaseHTTPRequestHandler):
                     return fn(self, _UnquotedMatch(match), query)
             self._reply_json(404, {"error": "not found: %s %s"
                                    % (http_method, path)})
-        except ContinuityError as err:
+        except AttaccaError as err:
             self._reply_json(400, {"error": str(err)})
         except ValueError as err:
             self._reply_json(400, {"error": "bad parameter: %s" % err})
         except BrokenPipeError:
             pass
         except Exception as err:
-            sys.stderr.write("continuity serve: internal error: %r\n" % err)
+            sys.stderr.write("attacca serve: internal error: %r\n" % err)
             sys.stderr.flush()
             try:
                 self._reply_json(500, {"error": "internal error: %s" % err})
@@ -2677,16 +2742,16 @@ class ContinuityHandler(BaseHTTPRequestHandler):
                                    "error": {"code": -32700,
                                              "message": "parse error"}})
             return
-        actor = self.headers.get("X-Continuity-Actor")
-        actor_type = self.headers.get("X-Continuity-Actor-Type") or "agent"
-        owner_header = self.headers.get("X-Continuity-Owner")
-        default_project = self.headers.get("X-Continuity-Project") \
+        actor = self.headers.get("X-Attacca-Actor")
+        actor_type = self.headers.get("X-Attacca-Actor-Type") or "agent"
+        owner_header = self.headers.get("X-Attacca-Owner")
+        default_project = self.headers.get("X-Attacca-Project") \
             or self.server.default_project
-        if not default_project and self.headers.get("X-Continuity-Root"):
+        if not default_project and self.headers.get("X-Attacca-Root"):
             # Zero-setup: the client declared its project root; register it
             # on first contact.
             default_project = resolve_or_register_root(
-                self._conn(), self.headers["X-Continuity-Root"],
+                self._conn(), self.headers["X-Attacca-Root"],
                 actor or "system")
         extra_headers = {}
         is_init = isinstance(msg, dict) and msg.get("method") == "initialize"
@@ -2785,19 +2850,19 @@ def _r_install_sh(h, m, q):
 
 def _r_plugin_zip(h, m, q):
     _reply_bytes(h, 200, "application/zip", build_plugin_zip(_base_url(h)),
-                 download_name="continuity-plugin.zip")
+                 download_name="attacca-plugin.zip")
 
 
 def _r_marketplace_json(h, m, q):
     """Marketplace manifest for URL installs: the plugin source is this
     server's own git-over-HTTP endpoint, so `/plugin marketplace add <url>`
-    followed by `/plugin install continuity@agentg` works natively."""
+    followed by `/plugin install attacca@agentg` works natively."""
     base = _base_url(h)
     manifest = {
         "name": "agentg",
         "owner": {"name": "agentg"},
         "plugins": [{
-            "name": "continuity",
+            "name": "attacca",
             # Valid but version-gated in Claude Code: newer versions install
             # straight from this URL marketplace; older ones use /install.sh.
             "source": {"source": "git", "url": base + "/plugin.git"},
@@ -2823,16 +2888,16 @@ def ensure_plugin_git_repo(base_url, cache_root):
             return repo
         import shutil
         import tempfile as tmpmod
-        work = Path(tmpmod.mkdtemp(prefix="continuity-plugin-"))
+        work = Path(tmpmod.mkdtemp(prefix="attacca-plugin-"))
         try:
             blob = build_plugin_zip(base_url)
             zipfile.ZipFile(io.BytesIO(blob)).extractall(work)
-            git = ["git", "-c", "user.name=continuity",
-                   "-c", "user.email=continuity@localhost"]
+            git = ["git", "-c", "user.name=attacca",
+                   "-c", "user.email=attacca@localhost"]
             subprocess.run(git + ["-C", str(work), "init", "-q"], check=True)
             subprocess.run(git + ["-C", str(work), "add", "-A"], check=True)
             subprocess.run(git + ["-C", str(work), "commit", "-q", "-m",
-                                  "continuity plugin (wired to %s)" % base_url],
+                                  "attacca plugin (wired to %s)" % base_url],
                            check=True)
             repo.parent.mkdir(parents=True, exist_ok=True)
             if repo.exists():
@@ -2901,10 +2966,10 @@ def _r_events_append(h, m, q):
     body = h._body_json()
     event_type = body.get("event_type")
     if not event_type:
-        raise ContinuityError("event_type is required")
+        raise AttaccaError("event_type is required")
     payload = body.get("payload") or {}
     if not isinstance(payload, dict):
-        raise ContinuityError("payload must be a JSON object")
+        raise AttaccaError("payload must be a JSON object")
     h._reply_json(200, {"ok": True, "event": append_event(
         h._conn(), m.group(1), actor, atype, str(event_type), payload,
         task_id=body.get("task_id"))})
@@ -2920,7 +2985,7 @@ def _r_room_read(h, m, q):
 def _r_room_send(h, m, q):
     actor, atype = h._actor()
     body = h._body_json()
-    origin = h.headers.get("X-Continuity-Project")
+    origin = h.headers.get("X-Attacca-Project")
     h._reply_json(200, room_send(
         h._conn(), m.group(1), actor, atype, body=body.get("body"),
         msg_type=body.get("msg_type") or "chat", mentions=body.get("mentions"),
@@ -3062,11 +3127,11 @@ ROUTES = [
 
 def run_server(db_path, host="127.0.0.1", port=DEFAULT_PORT,
                default_project=None, verbose=False):
-    server = ContinuityServer((host, port), db_path,
+    server = AttaccaServer((host, port), db_path,
                               default_project=default_project, verbose=verbose)
     real_port = server.server_address[1]
     base = "http://%s:%d" % (host, real_port)
-    print("continuity server listening on %s" % base, flush=True)
+    print("attacca server listening on %s" % base, flush=True)
     print("  db:   %s" % db_path, flush=True)
     print("  MCP:  %s/mcp    REST: %s/v1/projects" % (base, base), flush=True)
     print("  plugin install: curl -s %s/install.sh | sh" % base, flush=True)
@@ -3089,16 +3154,16 @@ def run_connect_proxy(url=None, actor=None, actor_type=None,
     it owns NO state and NO logic — it forwards JSON-RPC lines to the
     server's /mcp endpoint, declaring the project root so the server can
     auto-register the project on first contact. If the server is local and
-    down, it boots it in the background (disable: CONTINUITY_AUTOSTART=0).
+    down, it boots it in the background (disable: ATTACCA_AUTOSTART=0).
     """
     import urllib.error
     import urllib.request as urlreq
-    url = (url or os.environ.get("CONTINUITY_URL") or DEFAULT_URL).rstrip("/")
+    url = (url or os.environ.get("ATTACCA_URL") or DEFAULT_URL).rstrip("/")
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
     root = str(Path(os.environ.get("CLAUDE_PROJECT_DIR")
                     or os.getcwd()).resolve())
-    autostart = os.environ.get("CONTINUITY_AUTOSTART", "1") != "0"
+    autostart = os.environ.get("ATTACCA_AUTOSTART", "1") != "0"
     state = {"session": None, "ensured": False}
 
     def send_line(obj):
@@ -3109,20 +3174,20 @@ def run_connect_proxy(url=None, actor=None, actor_type=None,
     def post(body, retry=True):
         headers = {"Content-Type": "application/json",
                    "Accept": "application/json",
-                   "X-Continuity-Root": root}
+                   "X-Attacca-Root": root}
         owner = load_owner()
         if owner:
-            headers["X-Continuity-Owner"] = owner
+            headers["X-Attacca-Owner"] = owner
         actor_id = qualify_actor(actor or os.environ.get(ENV_ACTOR),
                                  owner=owner)
         if actor_id:
-            headers["X-Continuity-Actor"] = actor_id
+            headers["X-Attacca-Actor"] = actor_id
         atype = actor_type or os.environ.get(ENV_ACTOR_TYPE)
         if atype:
-            headers["X-Continuity-Actor-Type"] = atype
+            headers["X-Attacca-Actor-Type"] = atype
         project = os.environ.get(ENV_PROJECT)
         if project:
-            headers["X-Continuity-Project"] = project
+            headers["X-Attacca-Project"] = project
         if state["session"]:
             headers["Mcp-Session-Id"] = state["session"]
         req = urlreq.Request(url + "/mcp", data=body, headers=headers,
@@ -3168,7 +3233,7 @@ def run_connect_proxy(url=None, actor=None, actor_type=None,
                     ensure_server_running(
                         url, Path(os.environ.get(ENV_DB) or DEFAULT_DB))
                 except Exception as err:
-                    sys.stderr.write("continuity connect: autostart failed: "
+                    sys.stderr.write("attacca connect: autostart failed: "
                                      "%s\n" % err)
         try:
             status, data = post(line.encode("utf-8"))
@@ -3176,8 +3241,8 @@ def run_connect_proxy(url=None, actor=None, actor_type=None,
             if expects_reply:
                 send_line({"jsonrpc": "2.0", "id": msg_id, "error": {
                     "code": -32000,
-                    "message": "continuity server unreachable at %s (%s) — "
-                               "start it with `python3 continuity.py serve`"
+                    "message": "attacca server unreachable at %s (%s) — "
+                               "start it with `python3 attacca.py serve`"
                                % (url, err)}})
             continue
         if status == 202 or not data:
@@ -3223,26 +3288,26 @@ def mcp_server_config(actor, project_id, db_path):
 
 def mcp_http_config(actor, project_id, url):
     """HTTP MCP config: the tool is a thin client of the hosted server."""
-    headers = {"X-Continuity-Actor": actor}
+    headers = {"X-Attacca-Actor": actor}
     if project_id:
-        headers["X-Continuity-Project"] = project_id
+        headers["X-Attacca-Project"] = project_id
     return {"type": "http", "url": url.rstrip("/") + "/mcp", "headers": headers}
 
 
 def mcp_connect_config(actor, url):
     """Stdio-shaped config that is still a pure server client: the tool
-    spawns `continuity.py connect`, which forwards to the server and lets it
+    spawns `attacca.py connect`, which forwards to the server and lets it
     auto-register the project from the tool's working directory."""
     return {"command": "python3", "args": [script_path(), "connect"],
-            "env": {ENV_ACTOR: actor, "CONTINUITY_URL": url.rstrip("/")}}
+            "env": {ENV_ACTOR: actor, "ATTACCA_URL": url.rstrip("/")}}
 
 
 def codex_http_toml(project_id, url):
-    pairs = ['"X-Continuity-Actor" = "codex_director"']
+    pairs = ['"X-Attacca-Actor" = "codex_director"']
     if project_id:
-        pairs.append('"X-Continuity-Project" = "%s"' % project_id)
+        pairs.append('"X-Attacca-Project" = "%s"' % project_id)
     return "\n".join([
-        "[mcp_servers.continuity]",
+        "[mcp_servers.attacca]",
         'url = "%s/mcp"' % url.rstrip("/"),
         "http_headers = { %s }" % ", ".join(pairs),
     ])
@@ -3252,10 +3317,10 @@ def codex_connect_toml(url):
     """Global Codex config: connect proxy, project auto-detected per cwd.
     Works on every Codex version (plain stdio server from Codex's view)."""
     return "\n".join([
-        "[mcp_servers.continuity]",
+        "[mcp_servers.attacca]",
         'command = "python3"',
         'args = ["%s", "connect"]' % script_path(),
-        'env = { "%s" = "codex_director", "CONTINUITY_URL" = "%s" }'
+        'env = { "%s" = "codex_director", "ATTACCA_URL" = "%s" }'
         % (ENV_ACTOR, url.rstrip("/")),
     ])
 
@@ -3267,7 +3332,7 @@ def codex_stdio_toml(project_id, db_path):
     if project_id:
         env_pairs.append('"%s" = "%s"' % (ENV_PROJECT, project_id))
     return "\n".join([
-        "[mcp_servers.continuity]",
+        "[mcp_servers.attacca]",
         'command = "python3"',
         'args = ["%s", "mcp"]' % path,
         "env = { %s }" % ", ".join(env_pairs),
@@ -3275,21 +3340,21 @@ def codex_stdio_toml(project_id, db_path):
 
 
 def write_mcp_json_file(root_path, server_config):
-    """Create or merge <root>/.mcp.json with the continuity server entry."""
+    """Create or merge <root>/.mcp.json with the attacca server entry."""
     target = Path(root_path) / ".mcp.json"
     existing = {}
     if target.exists():
         try:
             existing = json.loads(target.read_text())
         except Exception:
-            raise ContinuityError(
+            raise AttaccaError(
                 "%s exists but is not valid JSON; fix it first" % target)
     if not isinstance(existing, dict) or \
             not isinstance(existing.get("mcpServers", {}), dict):
-        raise ContinuityError(
+        raise AttaccaError(
             "%s exists but does not look like an MCP config (expected a "
             "JSON object with an optional mcpServers object)" % target)
-    existing.setdefault("mcpServers", {})["continuity"] = server_config
+    existing.setdefault("mcpServers", {})["attacca"] = server_config
     target.write_text(json.dumps(existing, indent=2) + "\n")
     return str(target)
 
@@ -3304,17 +3369,17 @@ def server_alive(url):
 
 
 def ensure_server_running(url, db_path):
-    """Start the continuity server in the background if it isn't up yet.
+    """Start the attacca server in the background if it isn't up yet.
     Returns {"started": bool, "log": path|None, "pid": int|None}."""
     if server_alive(url):
         return {"started": False, "log": None, "pid": None}
     parsed = urllib.parse.urlparse(url)
     host = parsed.hostname or "127.0.0.1"
     if host not in ("127.0.0.1", "localhost", "::1"):
-        raise ContinuityError(
+        raise AttaccaError(
             "server at %s is not reachable, and it is not local so setup "
             "cannot start it for you — start it on that machine with "
-            "`continuity.py serve`" % url)
+            "`attacca.py serve`" % url)
     port = parsed.port or DEFAULT_PORT
     log_path = Path(db_path).resolve().parent / "server.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3330,13 +3395,13 @@ def ensure_server_running(url, db_path):
         if proc.poll() is not None:
             break
         time.sleep(0.1)
-    raise ContinuityError(
+    raise AttaccaError(
         "tried to start the server but %s/healthz did not come up — "
         "see the log at %s" % (url, log_path))
 
 
 def configure_codex(project_id, url, db_path, stdio=False, home=None):
-    """Write the continuity block into ~/.codex/config.toml (with a one-time
+    """Write the attacca block into ~/.codex/config.toml (with a one-time
     backup). Returns the config path, or None when Codex isn't installed."""
     codex_dir = Path(home or Path.home()) / ".codex"
     if not codex_dir.is_dir():
@@ -3344,10 +3409,10 @@ def configure_codex(project_id, url, db_path, stdio=False, home=None):
     block = codex_stdio_toml(project_id, db_path) if stdio \
         else codex_connect_toml(url)
     target = codex_dir / "config.toml"
-    marker = "[mcp_servers.continuity]"
+    marker = "[mcp_servers.attacca]"
     if target.exists():
         text = target.read_text()
-        backup = codex_dir / "config.toml.continuity-backup"
+        backup = codex_dir / "config.toml.attacca-backup"
         if not backup.exists():
             backup.write_text(text)
         if marker in text:
@@ -3376,24 +3441,24 @@ def _merge_json_config(path, top_key, entry_name, value, backup=True):
         try:
             data = json.loads(raw or "{}")
         except Exception:
-            raise ContinuityError("%s exists but is not valid JSON; fix it first" % path)
+            raise AttaccaError("%s exists but is not valid JSON; fix it first" % path)
         if not isinstance(data, dict):
-            raise ContinuityError("%s is not a JSON object" % path)
-        backup_path = path.with_name(path.name + ".continuity-backup")
+            raise AttaccaError("%s is not a JSON object" % path)
+        backup_path = path.with_name(path.name + ".attacca-backup")
         if backup and not backup_path.exists():
             backup_path.write_text(raw)
     section = data.setdefault(top_key, {})
     if not isinstance(section, dict):
-        raise ContinuityError("%s: %r is not an object" % (path, top_key))
+        raise AttaccaError("%s: %r is not an object" % (path, top_key))
     section[entry_name] = value
     path.write_text(json.dumps(data, indent=2) + "\n")
     return str(path)
 
 
 def _http_headers(actor, project_id):
-    headers = {"X-Continuity-Actor": actor}
+    headers = {"X-Attacca-Actor": actor}
     if project_id:
-        headers["X-Continuity-Project"] = project_id
+        headers["X-Attacca-Project"] = project_id
     return headers
 
 
@@ -3438,7 +3503,7 @@ def connect_tools(project_id, root, db_path, url=DEFAULT_URL, stdio=False,
             # stdio-shaped but still a server client (connect proxy)
             value = stdio_cfg("cline_worker") if stdio \
                 else mcp_connect_config("cline_worker", url)
-            record("cline", _merge_json_config(hit, "mcpServers", "continuity",
+            record("cline", _merge_json_config(hit, "mcpServers", "attacca",
                                                value))
         else:
             missing.append("cline")
@@ -3450,7 +3515,7 @@ def connect_tools(project_id, root, db_path, url=DEFAULT_URL, stdio=False,
             value = stdio_cfg("cursor_worker") if stdio \
                 else mcp_connect_config("cursor_worker", url)
             record("cursor", _merge_json_config(home / ".cursor" / "mcp.json",
-                                                "mcpServers", "continuity", value))
+                                                "mcpServers", "attacca", value))
         else:
             missing.append("cursor")
 
@@ -3460,10 +3525,21 @@ def connect_tools(project_id, root, db_path, url=DEFAULT_URL, stdio=False,
             value = stdio_cfg("windsurf_worker") if stdio \
                 else mcp_connect_config("windsurf_worker", url)
             record("windsurf", _merge_json_config(
-                windsurf_dir / "mcp_config.json", "mcpServers", "continuity",
+                windsurf_dir / "mcp_config.json", "mcpServers", "attacca",
                 value))
         else:
             missing.append("windsurf")
+
+    if "kimi" not in skip:
+        if (home / ".kimi-code").is_dir():
+            # ~/.kimi-code/mcp.json is user-level (every project): use the
+            # connect proxy so the project is auto-detected per directory.
+            value = stdio_cfg("kimi_worker") if stdio \
+                else mcp_connect_config("kimi_worker", url)
+            record("kimi", _merge_json_config(home / ".kimi-code" / "mcp.json",
+                                              "mcpServers", "attacca", value))
+        else:
+            missing.append("kimi")
 
     if "gemini" not in skip:
         if (home / ".gemini").is_dir() and root:
@@ -3472,7 +3548,7 @@ def connect_tools(project_id, root, db_path, url=DEFAULT_URL, stdio=False,
                  "headers": _http_headers("gemini_worker", project_id)}
             record("gemini", _merge_json_config(
                 Path(root) / ".gemini" / "settings.json", "mcpServers",
-                "continuity", value, backup=False))
+                "attacca", value, backup=False))
         else:
             missing.append("gemini")
 
@@ -3483,7 +3559,7 @@ def connect_tools(project_id, root, db_path, url=DEFAULT_URL, stdio=False,
                 else {"type": "http", "url": mcp_url,
                       "headers": _http_headers("vscode_worker", project_id)}
             record("vscode", _merge_json_config(
-                Path(root) / ".vscode" / "mcp.json", "servers", "continuity",
+                Path(root) / ".vscode" / "mcp.json", "servers", "attacca",
                 value, backup=False))
         else:
             missing.append("vscode")
@@ -3500,7 +3576,7 @@ def connect_tools(project_id, root, db_path, url=DEFAULT_URL, stdio=False,
                 value = {"type": "remote", "url": mcp_url,
                          "headers": _http_headers("opencode_worker", project_id)}
             record("opencode", _merge_json_config(
-                Path(root) / "opencode.json", "mcp", "continuity", value,
+                Path(root) / "opencode.json", "mcp", "attacca", value,
                 backup=False))
         else:
             missing.append("opencode")
@@ -3524,12 +3600,12 @@ def resolve_or_register_root(conn, root, actor_id):
             try:
                 return project_init(conn, actor_id, "system", path=root,
                                     project_id=candidate)["project_id"]
-            except ContinuityError:
+            except AttaccaError:
                 pass  # lost a race for this id; try the next suffix
         elif row["root_path"] == root:
             return candidate
         candidate = "%s-%d" % (base, attempt)
-    raise ContinuityError("could not register project for %s" % root)
+    raise AttaccaError("could not register project for %s" % root)
 
 
 def _project_for_cwd(conn, cwd):
@@ -3551,20 +3627,35 @@ def _project_for_cwd(conn, cwd):
 def one_shot_setup(conn, actor_id, actor_type, db_path, url=DEFAULT_URL,
                    stdio=False, write_instructions=True, path=None, here=False,
                    manage_server=True, manage_tools=True, skip_tools=None,
-                   home=None):
+                   home=None, tools_only=False):
     """`setup` with no arguments: make THIS directory a fully wired project.
 
     1. Registers the cwd as a project (if not already inside one; here=True
        forces the cwd to become its own project).
-    2. Starts the continuity server in the background if it is not running
+    2. Starts the attacca server in the background if it is not running
        (server mode only).
     3. Writes/merges .mcp.json — Claude Code and Claude-compatible CLIs
        (GLM etc.) pick it up automatically.
     4. Universal installer: writes the config of every DETECTED tool
-       (codex, cline, cursor, windsurf, gemini, vscode, opencode), with
-       one-time backups for global files.
+       (codex, cline, cursor, windsurf, kimi, gemini, vscode, opencode),
+       with one-time backups for global files.
     5. Writes the agent protocol block into CLAUDE.md / AGENTS.md.
+
+    tools_only=True is the install.sh mode: only step 4, and only the
+    GLOBAL tool configs (project-level tools need a root, so they are
+    skipped) — no project registration, no server, no files in the cwd.
     """
+    if tools_only:
+        configured, not_detected = connect_tools(
+            None, None, db_path, url=url, stdio=stdio, skip=skip_tools,
+            home=home)
+        return {"project_id": None, "root_path": None, "project_created": False,
+                "mode": "stdio" if stdio else "server", "tools_only": True,
+                "cwd_inside_root": False, "url": url,
+                "server": {"started": False, "log": None, "pid": None,
+                           "managed": False},
+                "mcp_json": None, "configured_tools": configured,
+                "not_detected": not_detected, "instruction_files": []}
     cwd = Path(path or os.getcwd()).resolve()
     project_id = None if here else _project_for_cwd(conn, cwd)
     created = False
@@ -3604,32 +3695,45 @@ def setup_details_text(project_id, db_path, url=DEFAULT_URL, tools=None):
 
     def stdio_config_json(actor):
         return json.dumps({"mcpServers": {
-            "continuity": mcp_server_config(actor, project_id, db_path)}}, indent=2)
+            "attacca": mcp_server_config(actor, project_id, db_path)}}, indent=2)
 
-    out.append("Continuity configuration reference")
+    out.append("Attacca configuration reference")
     out.append("=" * 60)
     out.append("Script:   %s" % path)
     out.append("Database: %s" % db_path)
     out.append("Server:   %s   (start with: python3 %s serve)" % (url, path))
     out.append("Project:  %s" % (project_id or "(none resolved)"))
     out.append("")
-    out.append("Give each tool its own actor identity (X-Continuity-Actor header /")
+    out.append("Give each tool its own actor identity (X-Attacca-Actor header /")
     out.append("%s env) so the room shows who is who." % ENV_ACTOR)
     out.append("")
 
-    selected = tools or ["claude", "codex", "gemini", "opencode", "glm", "cli"]
+    selected = tools or ["claude", "kimi", "codex", "gemini", "opencode",
+                         "glm", "cli"]
 
     if "claude" in selected:
         out.append("-- Claude Code (server mode, recommended) " + "-" * 18)
-        out.append("  claude mcp add --transport http continuity %s/mcp \\" % url.rstrip("/"))
-        out.append("    --header \"X-Continuity-Actor: claude_director\"%s"
-                   % (" \\\n    --header \"X-Continuity-Project: %s\"" % project_id
+        out.append("  claude mcp add --transport http attacca %s/mcp \\" % url.rstrip("/"))
+        out.append("    --header \"X-Attacca-Actor: claude_director\"%s"
+                   % (" \\\n    --header \"X-Attacca-Project: %s\"" % project_id
                       if project_id else ""))
         out.append("or merge into <project>/.mcp.json (run `setup` to do this for you):")
-        out.append(indent_block(json.dumps({"mcpServers": {"continuity":
+        out.append(indent_block(json.dumps({"mcpServers": {"attacca":
                    mcp_http_config("claude_director", project_id, url)}}, indent=2)))
         out.append("-- Claude Code (stdio fallback, no server needed) " + "-" * 10)
         out.append(indent_block(stdio_config_json("claude_director")))
+        out.append("")
+
+    if "kimi" in selected:
+        out.append("-- Kimi Code " + "-" * 47)
+        out.append("Native plugin (easiest): inside Kimi run "
+                   "/plugins install %s/plugin.zip" % url.rstrip("/"))
+        out.append("or merge into ~/.kimi-code/mcp.json (user level — every")
+        out.append("project; the server auto-detects the project per directory):")
+        out.append(indent_block(json.dumps({"mcpServers": {"attacca":
+                   mcp_connect_config("kimi_worker", url)}}, indent=2)))
+        out.append("Stdio fallback (no server):")
+        out.append(indent_block(stdio_config_json("kimi_worker")))
         out.append("")
 
     if "codex" in selected:
@@ -3646,10 +3750,10 @@ def setup_details_text(project_id, db_path, url=DEFAULT_URL, tools=None):
     if "gemini" in selected:
         out.append("-- Gemini CLI " + "-" * 46)
         out.append("Merge into <project>/.gemini/settings.json (httpUrl = server mode):")
-        gem = {"mcpServers": {"continuity": {
+        gem = {"mcpServers": {"attacca": {
             "httpUrl": url.rstrip("/") + "/mcp",
-            "headers": {"X-Continuity-Actor": "gemini_worker",
-                        **({"X-Continuity-Project": project_id} if project_id else {})}}}}
+            "headers": {"X-Attacca-Actor": "gemini_worker",
+                        **({"X-Attacca-Project": project_id} if project_id else {})}}}}
         out.append(indent_block(json.dumps(gem, indent=2)))
         out.append("Stdio fallback:")
         out.append(indent_block(stdio_config_json("gemini_worker")))
@@ -3657,10 +3761,10 @@ def setup_details_text(project_id, db_path, url=DEFAULT_URL, tools=None):
 
     if "opencode" in selected:
         out.append("-- opencode " + "-" * 48)
-        oc = {"mcp": {"continuity": {
+        oc = {"mcp": {"attacca": {
             "type": "remote", "url": url.rstrip("/") + "/mcp",
-            "headers": {"X-Continuity-Actor": "opencode_worker",
-                        **({"X-Continuity-Project": project_id} if project_id else {})}}}}
+            "headers": {"X-Attacca-Actor": "opencode_worker",
+                        **({"X-Attacca-Project": project_id} if project_id else {})}}}}
         out.append("Merge into opencode.json (remote = server mode):")
         out.append(indent_block(json.dumps(oc, indent=2)))
         out.append("")
@@ -3676,7 +3780,7 @@ def setup_details_text(project_id, db_path, url=DEFAULT_URL, tools=None):
     if "cli" in selected:
         out.append("-- Any other MCP client (Grok, Zed, Cline, ...) " + "-" * 12)
         out.append("HTTP (server mode):  url %s/mcp" % url.rstrip("/"))
-        out.append("  headers: X-Continuity-Actor: <name>, X-Continuity-Project: %s"
+        out.append("  headers: X-Attacca-Actor: <name>, X-Attacca-Project: %s"
                    % (project_id or "<project>"))
         out.append("Stdio (no server):   command python3, args [\"%s\", \"mcp\"]" % path)
         out.append("  env: %s=<name>, %s=%s, %s=%s"
@@ -3701,18 +3805,18 @@ def managed_instruction_block(project_id, db_path):
     path = script_path()
     lines = []
     lines.append("%s v=1 project=%s do_not_edit=true -->" % (MANAGED_BEGIN, project_id))
-    lines.append("## Project Continuity Protocol (managed block)")
+    lines.append("## Project Attacca Protocol (managed block)")
     lines.append("")
-    lines.append("This project uses a local **Project Continuity Layer** shared by ALL")
-    lines.append("workers — Claude Code, Codex, GLM, other agents and humans. It is the")
-    lines.append("source of truth for project state: append-only event ledger, shared task")
-    lines.append("board with work claims, decision records, a human+AI project room, and")
-    lines.append("the current handoff. The project owns the knowledge; your session is")
-    lines.append("replaceable.")
+    lines.append("This project uses **Attacca**, a local project continuity layer")
+    lines.append("shared by ALL workers — Claude Code, Kimi Code, Codex, GLM, Cline,")
+    lines.append("other agents and humans. It is the source of truth for project")
+    lines.append("state: append-only event ledger, shared task board with work claims,")
+    lines.append("decision records, a human+AI project room, and the current handoff.")
+    lines.append("The project owns the knowledge; your session is replaceable.")
     lines.append("")
-    lines.append("MCP server `continuity` exposes the tools (get_handoff, room_send,")
-    lines.append("task_claim, ...; via the Claude Code plugin they appear under the")
-    lines.append("mcp__plugin_continuity_continuity__ prefix). Follow this protocol:")
+    lines.append("MCP server `attacca` exposes the tools (get_handoff, room_send,")
+    lines.append("task_claim, ...; installed via a tool plugin they appear under a")
+    lines.append("prefix like mcp__plugin_attacca_attacca__). Follow this protocol:")
     lines.append("")
     lines.append("1. **Session start**: call `get_handoff`, then `check_inbox` (messages")
     lines.append("   addressed to you) and `room_read`. Do not rely on prior chat memory")
@@ -3742,7 +3846,7 @@ def managed_instruction_block(project_id, db_path):
 
 def install_instructions(project_id, root_path, db_path, files=None):
     if not root_path or not Path(root_path).is_dir():
-        raise ContinuityError(
+        raise AttaccaError(
             "project root %s does not exist; re-run init in the project dir"
             % (root_path or "(unset)"))
     block = managed_instruction_block(project_id, db_path)
@@ -3784,7 +3888,7 @@ def install_instructions(project_id, root_path, db_path, files=None):
 
 
 GIT_HOOK_TEMPLATE = """#!/bin/sh
-# continuity post-commit hook (managed): record commits in the project ledger.
+# attacca post-commit hook (managed): record commits in the project ledger.
 sha=$(git rev-parse --short HEAD)
 branch=$(git rev-parse --abbrev-ref HEAD)
 subject=$(git log -1 --pretty=%s)
@@ -3801,7 +3905,7 @@ python3 "{script}" --db "{db}" --project "{project}" --actor "$author" \\
 def install_git_hook(project_id, root_path, db_path):
     git_dir = Path(root_path or ".") / ".git"
     if not git_dir.is_dir():
-        raise ContinuityError("%s is not a git repository (no .git directory)" % root_path)
+        raise AttaccaError("%s is not a git repository (no .git directory)" % root_path)
     hooks_dir = git_dir / "hooks"
     hooks_dir.mkdir(exist_ok=True)
     hook_path = hooks_dir / "post-commit"
@@ -3809,9 +3913,9 @@ def install_git_hook(project_id, root_path, db_path):
                                        project=project_id)
     if hook_path.exists():
         existing = hook_path.read_text()
-        if "continuity post-commit hook" not in existing:
-            raise ContinuityError(
-                "%s already exists and is not managed by continuity; merge manually"
+        if "attacca post-commit hook" not in existing:
+            raise AttaccaError(
+                "%s already exists and is not managed by attacca; merge manually"
                 % hook_path)
     hook_path.write_text(content)
     hook_path.chmod(0o755)
@@ -3824,8 +3928,8 @@ def install_git_hook(project_id, root_path, db_path):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        prog="continuity.py",
-        description="Local Project Continuity Layer: shared event ledger, task "
+        prog="attacca.py",
+        description="Local Project Attacca Layer: shared event ledger, task "
                     "claims, decisions, project room and handoff for humans and "
                     "AI coding agents (Claude Code, Codex, GLM, ...).")
     parser.add_argument("--db", default=None,
@@ -3848,7 +3952,7 @@ def build_parser():
     p.add_argument("--move", action="store_true",
                    help="allow re-pointing an existing project id to a new root")
 
-    sub.add_parser("projects", help="list projects in this continuity database")
+    sub.add_parser("projects", help="list projects in this attacca database")
     sub.add_parser("status", help="project + actor status")
     p = sub.add_parser("log", help="curated project log")
     p.add_argument("-n", "--limit", type=int, default=40)
@@ -3977,7 +4081,7 @@ def build_parser():
     p = sub.add_parser("freshness", help="Drift Guard check")
     p.add_argument("--context-version", type=int, default=None)
 
-    p = sub.add_parser("serve", help="host the continuity server "
+    p = sub.add_parser("serve", help="host the attacca server "
                                      "(REST API + MCP over HTTP) — the app "
                                      "owns the state; tools are clients")
     p.add_argument("--host", default="127.0.0.1")
@@ -3988,7 +4092,7 @@ def build_parser():
                                        "server (what the plugin and stdio-only "
                                        "tools spawn; auto-registers the project)")
     p.add_argument("--url", default=None,
-                   help="server URL (default $CONTINUITY_URL or %s)" % DEFAULT_URL)
+                   help="server URL (default $ATTACCA_URL or %s)" % DEFAULT_URL)
 
     p = sub.add_parser("mcp", help="run the MCP stdio server (direct-DB "
                                    "fallback for tools without HTTP MCP)")
@@ -3997,9 +4101,10 @@ def build_parser():
                                      "directory, write .mcp.json, install the "
                                      "agent protocol block")
     p.add_argument("tools", nargs="*", default=None,
-                   help="with --details: subset (claude codex gemini opencode glm cli)")
+                   help="with --details: subset (claude kimi codex gemini "
+                        "opencode glm cli)")
     p.add_argument("--url", default=DEFAULT_URL,
-                   help="continuity server URL (default %s)" % DEFAULT_URL)
+                   help="attacca server URL (default %s)" % DEFAULT_URL)
     p.add_argument("--stdio", action="store_true",
                    help="wire tools as local stdio shims instead of clients "
                         "of the hosted server")
@@ -4009,11 +4114,15 @@ def build_parser():
                    help="register THIS directory as its own project even if "
                         "it sits inside another registered project")
     p.add_argument("--no-server", action="store_true",
-                   help="do not auto-start the continuity server")
+                   help="do not auto-start the attacca server")
     p.add_argument("--skip-tools", default=None,
                    help="comma-separated tools NOT to configure "
-                        "(codex,cline,cursor,windsurf,gemini,vscode,opencode); "
-                        "'all' configures none of them")
+                        "(codex,cline,cursor,windsurf,kimi,gemini,vscode,"
+                        "opencode); 'all' configures none of them")
+    p.add_argument("--tools-only", action="store_true",
+                   help="only write GLOBAL tool configs (codex, cline, cursor, "
+                        "windsurf, kimi) — no project registration, no server, "
+                        "no files in this directory; used by install.sh")
     p.add_argument("-i", "--interactive", action="store_true",
                    help="ask questions: your identity, extra projects to "
                         "register, tools to wire, bridges + relationships")
@@ -4026,7 +4135,7 @@ def build_parser():
                         "instead of running setup")
 
     p = sub.add_parser("install-instructions",
-                       help="write managed continuity block into CLAUDE.md/AGENTS.md")
+                       help="write managed attacca block into CLAUDE.md/AGENTS.md")
     p.add_argument("--files", default=None,
                    help="comma-separated filenames (default CLAUDE.md,AGENTS.md)")
 
@@ -4047,11 +4156,12 @@ def human_print(result, command=None):
             origin = (" via %s" % msg["origin_project"]) if msg.get("origin_project") else ""
             task = (" [%s]" % msg["task_id"]) if msg.get("task_id") else ""
             auth = (" [%s]" % msg["authority"].upper()) if msg.get("authority") else ""
+            owner = (" (OWNER: %s)" % msg["owner"]) if msg.get("owner") else ""
             mentions = (" @" + ",@".join(str(m) for m in msg["mentions"])) \
                 if msg.get("mentions") else ""
-            print("#%-4d %s  %s%s (%s)%s%s%s: %s" % (
-                msg["seq"], msg["at"][:19].replace("T", " "), msg["actor"], origin,
-                msg["msg_type"], auth, task, mentions, msg["body"]))
+            print("#%-4d %s  %s%s%s (%s)%s%s%s: %s" % (
+                msg["seq"], msg["at"][:19].replace("T", " "), msg["actor"], owner,
+                origin, msg["msg_type"], auth, task, mentions, msg["body"]))
         if "next_since_seq" in result:
             print("-- next_since_seq: %s" % result["next_since_seq"])
         if "unread_broadcasts" in result:
@@ -4220,7 +4330,7 @@ def cli_main(argv=None):
             if args.to_project:
                 try:
                     origin = project()
-                except ContinuityError:
+                except AttaccaError:
                     origin = None
             result = room_send(conn, target, actor, actor_type, body=args.body,
                                msg_type=args.msg_type,
@@ -4277,7 +4387,7 @@ def cli_main(argv=None):
             try:
                 evidence = json.loads(args.evidence) if args.evidence else None
             except json.JSONDecodeError as err:
-                raise ContinuityError(
+                raise AttaccaError(
                     "--evidence must be valid JSON (an array of objects): %s" % err)
             result = task_report(conn, project(), actor, actor_type, args.task_id,
                                  summary=args.summary, evidence=evidence,
@@ -4315,9 +4425,9 @@ def cli_main(argv=None):
             try:
                 payload = json.loads(args.payload)
             except json.JSONDecodeError as err:
-                raise ContinuityError("--payload must be valid JSON: %s" % err)
+                raise AttaccaError("--payload must be valid JSON: %s" % err)
             if not isinstance(payload, dict):
-                raise ContinuityError("--payload must be a JSON object")
+                raise AttaccaError("--payload must be a JSON object")
             result = {"ok": True,
                       "event": append_event(conn, project(), actor, actor_type,
                                             args.event_type, payload,
@@ -4343,10 +4453,32 @@ def cli_main(argv=None):
             proj_id = None
             try:
                 proj_id = project()
-            except ContinuityError:
+            except AttaccaError:
                 pass
             print(setup_details_text(proj_id, db_path, url=args.url,
                                      tools=args.tools or None))
+            return 0
+        if args.tools_only:
+            # install.sh mode: global tool configs only — no identity
+            # interview, no project registration, nothing written to cwd.
+            skip = None
+            if args.skip_tools:
+                skip = ({"codex", "cline", "cursor", "windsurf", "kimi",
+                         "gemini", "vscode", "opencode"}
+                        if args.skip_tools.strip() == "all"
+                        else {t.strip() for t in args.skip_tools.split(",")})
+            info = one_shot_setup(conn, actor, actor_type, db_path,
+                                  url=args.url, stdio=args.stdio,
+                                  manage_server=False, skip_tools=skip,
+                                  tools_only=True)
+            for entry in info["configured_tools"]:
+                print("✔ %s: %s" % (entry["tool"], entry["path"]))
+            if info["not_detected"]:
+                print("· not detected (skipped): %s"
+                      % ", ".join(info["not_detected"]))
+            if not info["configured_tools"]:
+                print("· no supported tools detected — `setup --details` "
+                      "prints configs to paste by hand")
             return 0
         wanted_bridges = []
         if args.owner:
@@ -4363,7 +4495,7 @@ def cli_main(argv=None):
                     return input(prompt).strip()
                 except EOFError:
                     return ""
-            print("continuity interactive setup — press Enter to accept defaults")
+            print("attacca interactive setup — press Enter to accept defaults")
             current = load_owner() or os.environ.get("USER") or ""
             name_in = ask("your name, for attribution in all logs [%s]: "
                           % (current or "none"))
@@ -4416,7 +4548,7 @@ def cli_main(argv=None):
                   "(change with: setup --owner NAME)" % owner)
         skip = None
         if args.skip_tools:
-            skip = ({"codex", "cline", "cursor", "windsurf", "gemini",
+            skip = ({"codex", "cline", "cursor", "windsurf", "kimi", "gemini",
                      "vscode", "opencode"} if args.skip_tools.strip() == "all"
                     else {t.strip() for t in args.skip_tools.split(",")})
         info = one_shot_setup(conn, actor, actor_type, db_path, url=args.url,
@@ -4439,7 +4571,7 @@ def cli_main(argv=None):
                 print("✔ bridged with %s (%s%s)"
                       % (other, added["relation"],
                          ": %s" % added["principal"] if added["principal"] else ""))
-            except ContinuityError as err:
+            except AttaccaError as err:
                 print("· bridge with %s skipped: %s" % (other, err))
         if info["mode"] == "server":
             server = info["server"]
@@ -4489,7 +4621,7 @@ def cli_main(argv=None):
 def main():
     try:
         sys.exit(cli_main())
-    except ContinuityError as err:
+    except AttaccaError as err:
         sys.stderr.write("error: %s\n" % err)
         sys.exit(2)
     except BrokenPipeError:

@@ -1,9 +1,9 @@
 ---
-description: Interactive continuity setup — identity, other AI tools, projects and inter-project relationships
+description: Interactive attacca setup — identity, other AI tools, projects and inter-project relationships
 allowed-tools: Bash
 ---
 
-Walk the user through continuity setup conversationally. Claude Code itself
+Walk the user through attacca setup conversationally. Claude Code itself
 needs no wiring (this plugin already connects it, and the server auto-registers
 projects on first contact). Ask them, one at a time:
 
@@ -11,7 +11,7 @@ projects on first contact). Ask them, one at a time:
    agent gets tagged with this owner name, and agent ids become
    `<you>.<agent>` so two people's `claude_director`s can never collide.
 2. **Other AI tools** — wire Codex / Cline / Cursor / Windsurf / Gemini /
-   VS Code / opencode into this project's continuity? (auto-detected; global
+   VS Code / opencode into this project's attacca? (auto-detected; global
    configs get a one-time backup). Any to skip?
 3. **More projects** — other folders to register as projects?
 4. **Bridges** — link this project's AI team with another project's? For
@@ -21,13 +21,13 @@ projects on first contact). Ask them, one at a time:
 
 Then execute with Bash (never run bare `setup -i`; pass their answers as flags):
 
-- Identity: `python3 ${CLAUDE_PLUGIN_ROOT}/continuity.py setup --no-server --skip-tools all --owner "NAME"`
+- Identity: `python3 ${CLAUDE_PLUGIN_ROOT}/attacca.py setup --no-server --skip-tools all --owner "NAME"`
 - Tools: append `--skip-tools x,y` (or drop the flag to wire all detected)
-- Extra project: `python3 ${CLAUDE_PLUGIN_ROOT}/continuity.py init PATH`
-- Bridge: `python3 ${CLAUDE_PLUGIN_ROOT}/continuity.py bridge add OTHER [--boss PROJECT_ID | --advisor PROJECT_ID]`
+- Extra project: `python3 ${CLAUDE_PLUGIN_ROOT}/attacca.py init PATH`
+- Bridge: `python3 ${CLAUDE_PLUGIN_ROOT}/attacca.py bridge add OTHER [--boss PROJECT_ID | --advisor PROJECT_ID]`
 
 Finally summarize: identity set, project + root, tools configured/skipped,
 bridges + relationships created, and that they can watch it all live with
-`python3 ${CLAUDE_PLUGIN_ROOT}/continuity.py room tail`.
+`python3 ${CLAUDE_PLUGIN_ROOT}/attacca.py room tail`.
 
 $ARGUMENTS

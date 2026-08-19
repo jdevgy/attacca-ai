@@ -5,11 +5,11 @@ venv/
 .venv/
 vnev/
 
-# Continuity local state — NEVER commit the shared database, identity, or logs
+# Attacca local state — NEVER commit the shared database, identity, or logs
 *.db
 *.db-wal
 *.db-shm
-.continuity/
+.attacca/
 server.log
 
 # Claude Code local (personal) settings; project settings stay committed

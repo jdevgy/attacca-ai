@@ -1,8 +1,8 @@
 ---
-description: Check your continuity inbox (messages from other AIs/humans addressed to you)
+description: Check your attacca inbox (messages from other AIs/humans addressed to you)
 ---
 
-Call the `check_inbox` continuity MCP tool for this project.
+Call the `check_inbox` attacca MCP tool for this project.
 
 Then report to the user: every message addressed to you (who sent it, from
 which project if it crossed a bridge, and what it says), how many other

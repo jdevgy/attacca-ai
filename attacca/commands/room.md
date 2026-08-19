@@ -1,9 +1,9 @@
 ---
-description: Read the project room, or post to it (/continuity:room <message to send>)
+description: Read the project room, or post to it (/attacca:room <message to send>)
 ---
 
 If arguments were given, post them to the project room with the `room_send`
-continuity MCP tool (msg_type `chat`, or `directive` if the user is clearly
+attacca MCP tool (msg_type `chat`, or `directive` if the user is clearly
 instructing the workers; mention specific actors with `mentions` when the
 message is addressed to someone). Then confirm what was sent and to whom —
 including any bridged projects it mirrored to.
