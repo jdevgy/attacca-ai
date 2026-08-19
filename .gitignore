@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+vnev/
+
+# Continuity local state — NEVER commit the shared database, identity, or logs
+*.db
+*.db-wal
+*.db-shm
+.continuity/
+server.log
+
+# Claude Code local (personal) settings; project settings stay committed
+.claude/settings.local.json
+
+# Office lock files
+.~lock.*#
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp

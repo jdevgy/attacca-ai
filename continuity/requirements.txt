@@ -1,0 +1,9 @@
+# continuity has NO third-party dependencies — deliberately.
+# Everything (SQLite storage, MCP stdio server, CLI) uses the Python 3.8+
+# standard library only, so it runs anywhere Claude Code / Codex / GLM run
+# without pip install, virtualenvs, or version conflicts.
+#
+# Requires: Python >= 3.8 (sqlite3 compiled in, which is the default on
+# every mainstream distribution).
+#
+# `pip install -r requirements.txt` is a no-op and will succeed.
