@@ -8322,6 +8322,8 @@ def _sync_projection(conn, scope):
         "project": snapshot["project"],
         "handoffs": snapshot["handoffs"],
         "rules": rules,
+        "cloud_context": cloud_context_get(
+            conn, scope["project_id"])["cloud_context"],
         "tasks": snapshot["tasks"],
         "decisions": snapshot["decisions"],
         "room_messages": room_messages,
@@ -12358,6 +12360,9 @@ class OfflineProxySession:
                                 "hint": "cached verified bridge authority"}
                                if rules_over or follows or advised else None),
                 "project_rules": adapter.rules_for_role(scope["role"]),
+                "cloud_context": projection.get("cloud_context") or {
+                    "content": "", "version": 0, "updated_by": None,
+                    "updated_owner": None, "updated_at": None},
                 "handoff": handoff,
                 "handoff_updated_by": (latest or {}).get("updated_by"),
                 "handoff_updated_owner": (handoff_event or {}).get("owner"),

@@ -157,5 +157,47 @@ class CloudContextBriefWiringTestCase(unittest.TestCase):
         self.assertEqual(out["cloud_context"]["content"], "cc")
 
 
+
+
+
+class CloudContextOfflineMirrorTestCase(unittest.TestCase):
+    """T-49 integration: cloud context is durable state, so it rides in the
+    offline mirror projection and validates for the caller's scope."""
+
+    def setUp(self):
+        self.sp = _load("attacca_sync_protocol_cc", ROOT / "sync_protocol.py")
+
+    def _projection(self, **extra):
+        base = {
+            "project": {"project_id": "p1"},
+            "handoffs": [], "rules": [], "tasks": [], "decisions": [],
+            "room_messages": [], "agents": [], "bridges": [],
+            "inbox_cursor": None,
+        }
+        base.update(extra)
+        return base
+
+    def test_cloud_context_is_a_whitelisted_projection_resource(self):
+        self.assertIn("cloud_context", self.sp._IDENTITY_PROJECTION_OPTIONAL)
+
+    def test_projection_with_cloud_context_validates(self):
+        scope = {"server_id": "srv", "project_id": "p1",
+                 "principal_id": "jack", "actor_id": "p1.director.claude",
+                 "actor_type": "agent", "role": "director"}
+        projection = self._projection(cloud_context={
+            "content": "deploy prod only", "version": 2, "updated_by": None,
+            "updated_owner": None, "updated_at": None})
+        validated = self.sp.validate_identity_projection(projection, scope)
+        self.assertEqual(validated["cloud_context"]["content"],
+                         "deploy prod only")
+
+    def test_projection_without_cloud_context_still_valid(self):
+        # optional: a mirror produced before this feature must still validate
+        scope = {"server_id": "srv", "project_id": "p1",
+                 "principal_id": "jack", "actor_id": "p1.worker.kimi",
+                 "actor_type": "agent", "role": "worker"}
+        self.sp.validate_identity_projection(self._projection(), scope)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -72,7 +72,7 @@ _IDENTITY_PROJECTION_REQUIRED = {
     "agents", "bridges", "inbox_cursor",
 }
 _IDENTITY_PROJECTION_OPTIONAL = {
-    "task_plans", "full_log", "actor_aliases",
+    "task_plans", "full_log", "actor_aliases", "cloud_context",
 }
 _SECRET_KEYS = {
     "api_token", "auth_sessions", "auth_tokens", "credentials",
