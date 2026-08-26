@@ -142,7 +142,7 @@ LOG_EXCLUDED_MSG_TYPES = {"chat", "status"}
 
 MANAGED_BEGIN = "<!-- MANAGED_ATTACCA:BEGIN"
 MANAGED_END = "<!-- MANAGED_ATTACCA:END -->"
-MANAGED_BLOCK_VERSION = 8
+MANAGED_BLOCK_VERSION = 9
 _MANAGED_TEMPLATE_PROJECT = "attacca-project"
 _MANAGED_BEGIN_LINE = re.compile(
     r"(?m)^<!-- MANAGED_ATTACCA:BEGIN\b[^\r\n]*-->[ \t]*\r?$")
@@ -6925,6 +6925,15 @@ MCP_TOOLS = [
         }, "required": ["content"]},
     },
     {
+        "name": "migration_directive",
+        "description": "Fetch the Attacca project-migration directive: the server-side "
+                       "steps to migrate an existing project’s history/logs into Attacca "
+                       "(archive logs; populate Cloud Context and Rules; record decisions "
+                       "and tasks) so Attacca becomes the source of truth. Read this when "
+                       "setup offers migration. Includes any detected source docs.",
+        "inputSchema": {"type": "object", "properties": {"project": PROJECT_PROP}},
+    },
+    {
         "name": "agent_register",
         "description": "Register (or refresh) your agent identity for this project: role, "
                        "display name, runtime. Do this once when you first join a project.",
@@ -7594,6 +7603,15 @@ class McpSession:
             return self._guarded_write(project, lambda: cloud_context_set(
                 conn, project, actor, atype, content=args.get("content"),
                 expected_version=args.get("expected_version")))
+
+        if name == "migration_directive":
+            root = None
+            try:
+                project = self._project(args)
+                root = get_project(conn, project).get("root_path")
+            except Exception:
+                root = os.getcwd() if self.detect_cwd else None
+            return migration_directive(root)
 
         if name == "agent_register":
             project, actor = self._project_actor(args)
@@ -11635,6 +11653,17 @@ def _r_cloud_context_set(h, m, q):
         expected_version=body.get("expected_version")))
 
 
+def _r_migration_directive(h, m, q):
+    root = None
+    pid = q.get("project")
+    if pid:
+        row = h._conn().execute(
+            "SELECT root_path FROM projects WHERE project_id=?", (pid,)
+        ).fetchone()
+        root = row["root_path"] if row else None
+    h._reply_json(200, migration_directive(root))
+
+
 def _r_agents_list(h, m, q):
     h._reply_json(200, agent_list(h._conn(), m.group(1)))
 
@@ -11695,6 +11724,7 @@ ROUTES = [
     (*_route_def("GET", "/plugin\\.git/(.+)"), _r_plugin_git),
     (*_route_def("GET", "/healthz"), _r_healthz),
     (*_route_def("GET", "/v1/auth/status"), _r_auth_status),
+    (*_route_def("GET", "/v1/migration-directive"), _r_migration_directive),
     (*_route_def("POST", "/v1/auth/bootstrap"), _r_auth_bootstrap),
     (*_route_def("POST", "/v1/auth/login"), _r_auth_login),
     (*_route_def("POST", "/v1/auth/logout"), _r_auth_logout),
@@ -15201,6 +15231,7 @@ def discover_remote_setup(url=None, path=None, here=False,
             "suggested_new_name": remote_name or folder_name,
             "match_reason": match_reason,
             "action": action, "workspaces": workspaces,
+            "migration_sources": detect_migration_sources(str(local_root)),
             "network": network}
 
 
@@ -15619,6 +15650,15 @@ def managed_instruction_block(project_id, db_path):
     lines.append("   before acting. Reload them after a context/staleness warning and on")
     lines.append("   automatic refresh. Only humans and registered Directors may create, edit,")
     lines.append("   enable, or disable rules.")
+    lines.append("   **Cloud Context — the shared project context file**: Attacca Cloud Context")
+    lines.append("   is this project’s authoritative “cloud” AGENTS.md/CLAUDE.md — injected into")
+    lines.append("   every brief and editable only by humans and registered Directors")
+    lines.append("   (`cloud_context_get` / `cloud_context_set`). Read it every turn as the")
+    lines.append("   current project context. When it is richer than the human’s local")
+    lines.append("   AGENTS.md/CLAUDE.md (the content OUTSIDE these managed markers), offer to")
+    lines.append("   sync it down into that local file so the checkout keeps the best context —")
+    lines.append("   never modifying this managed block, which Attacca maintains and syncs")
+    lines.append("   separately.")
     lines.append("3. **History first**: when work depends on what happened, why, or who did it,")
     lines.append("   call `search` with relevant terms before filesystem or Git archaeology.")
     lines.append("   Follow with `get_project_log`, `task_show`, or the matching durable record.")
@@ -16066,6 +16106,97 @@ def install_instructions(project_id, root_path, db_path, files=None):
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+PROJECT_MIGRATION_DIRECTIVE_VERSION = 1
+PROJECT_MIGRATION_DIRECTIVE = """# Attacca Project Migration Directive (v%d)
+
+Run this when a project is first connected to Attacca and already has history or
+docs, so Attacca becomes the authoritative source of truth. Put the migrated
+knowledge in Attacca (Cloud Context, Rules, decisions, tasks) — NOT in the
+AGENTS.md/CLAUDE.md managed block, so that block stays small.
+
+1. Archive existing project logs/records.
+   - Archive the project's existing log/decision docs (for example docs/LOG.md,
+     CHANGELOG, ADRs): rename to *.archive.md and prepend a header —
+     "ARCHIVE — historical only. Attacca is the authoritative source of truth."
+   - Transfer all relevant historical records, decisions, directives, bugs,
+     implementation history, and prior rulings into Attacca. Lose nothing.
+   - Add completed work as done tasks and still-open work as open tasks
+     (task_create); record durable choices as decisions (decision_propose /
+     decision_resolve).
+   - After migration the archived file is historical-only and is no longer an
+     active authority.
+
+2. Populate Attacca Cloud Context (cloud_context_set).
+   - Capture the project's current architecture, systems, terminology,
+     responsibilities, key implementation details, active decisions,
+     dependencies, and essential historical context — enough for a new agent
+     to understand the project without the old logs.
+
+3. Consolidate Core Rules into Attacca Rules (rule_create).
+   - Transfer core rules, owner directives, coding/safety/architecture/workflow
+     rules, and non-negotiable requirements. Remove obsolete or superseded
+     rules; where rules conflict, the latest explicit owner ruling wins.
+     Attacca Rules are mandatory project law for every agent.
+
+Authority order going forward:
+  1. Latest explicit owner directive
+  2. Attacca Rules
+  3. Attacca Cloud Context / recorded decisions
+  4. Current project / source documentation
+  5. Archived logs (historical reference only)
+Never treat archived material as active law when Attacca has a newer ruling.
+
+Only humans and registered Directors may write Cloud Context and Rules.
+""" % PROJECT_MIGRATION_DIRECTIVE_VERSION
+
+MIGRATION_SOURCE_CANDIDATES = (
+    "docs/LOG.md", "LOG.md", "docs/CHANGELOG.md", "CHANGELOG.md", "CHANGELOG",
+    "HISTORY.md", "docs/DECISIONS.md", "docs/decisions", "docs/adr", "ADR.md",
+)
+
+
+def detect_migration_sources(root_path):
+    """Best-effort discovery of existing history/decision docs worth migrating."""
+    if not root_path:
+        return []
+    root = Path(root_path)
+    found = []
+    for rel in MIGRATION_SOURCE_CANDIDATES:
+        try:
+            candidate = root / rel
+            if candidate.exists():
+                upper = rel.upper()
+                kind = "decisions" if ("DECISION" in upper or "ADR" in upper) \
+                    else "log"
+                found.append({"rel": rel, "path": str(candidate), "kind": kind,
+                              "is_dir": candidate.is_dir()})
+        except OSError:
+            continue
+    return found
+
+
+def migration_directive(root_path=None):
+    """The server-side project-migration directive plus any detected sources.
+
+    The directive is bundled with the Attacca binary (versioned with the code)
+    and served on demand; it is deliberately not part of the managed
+    AGENTS.md/CLAUDE.md block."""
+    return {
+        "version": PROJECT_MIGRATION_DIRECTIVE_VERSION,
+        "directive": PROJECT_MIGRATION_DIRECTIVE,
+        "storage": ("bundled with the Attacca binary and served on demand; not "
+                    "written into the AGENTS.md/CLAUDE.md managed block"),
+        "authority_order": [
+            "latest explicit owner directive",
+            "Attacca Rules",
+            "Attacca Cloud Context / recorded decisions",
+            "current project/source documentation",
+            "archived logs (historical reference only)",
+        ],
+        "migration_sources": detect_migration_sources(root_path),
+    }
+
 
 def build_parser():
     parser = argparse.ArgumentParser(

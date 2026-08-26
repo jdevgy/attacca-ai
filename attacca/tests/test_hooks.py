@@ -958,8 +958,8 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             self.assertEqual(agents.read_text(), before + desired + after)
             self.assertIn("AGENTS.md", notice["context"])
 
-    def test_managed_law_v7_auto_refreshes_to_v8_without_touching_user_bytes(self):
-        self.assertEqual(c.MANAGED_BLOCK_VERSION, 8)
+    def test_managed_law_v8_auto_refreshes_to_v9_without_touching_user_bytes(self):
+        self.assertEqual(c.MANAGED_BLOCK_VERSION, 9)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             checkout = root / "repo"
@@ -970,8 +970,8 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                 "schema_version": 1, "project_id": "shared"}))
             desired = c.managed_instruction_block("shared", None)
             previous = desired.replace(
-                "MANAGED_ATTACCA:BEGIN v=8",
-                "MANAGED_ATTACCA:BEGIN v=7", 1).replace(
+                "MANAGED_ATTACCA:BEGIN v=9",
+                "MANAGED_ATTACCA:BEGIN v=8", 1).replace(
                     "compact banner at the TOP of every turn",
                     "read the `project_rules` in the startup brief before",
                     1)

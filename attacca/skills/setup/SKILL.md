@@ -197,7 +197,27 @@ If the current MCP host cannot hot-reload the new connection, report the exact
 unverified checks and let its native reconnect mechanism run; never infer
 success from configuration files and never make restart the default recovery.
 
-## 5. Offer conversation work as tasks
+## 5. Offer project migration into Attacca
+
+Read `migration_sources` from discovery (Step 1). If it is non-empty—or the
+checkout otherwise has substantial prior history (a `docs/LOG.md`, CHANGELOG,
+ADRs, or a long-lived README of decisions)—offer to migrate it so Attacca
+becomes the authoritative source of truth. Ask once, using the client's choice
+UI: "This project has existing history (for example `docs/LOG.md`). Migrate it
+into Attacca now—archive it, and populate Cloud Context, Core Rules, decisions,
+and tasks?" with **Yes (recommended)** and **No, not now**.
+
+Only on an explicit Yes: call `migration_directive` to fetch the server-side
+directive (it is bundled with the binary, not the managed block) and follow it
+exactly—archive each detected source to `*.archive.md` with a historical-only
+header, transfer its records, then `cloud_context_set` the project context,
+`rule_create` the consolidated Core Rules, and record decisions/tasks. Writing
+Cloud Context and Rules requires a human or registered Director, so confirm this
+AI's role first (from Step 2); if it is not a Director, have the human run it or
+promote the AI. Never write the migrated project context into the managed
+AGENTS.md/CLAUDE.md block. On No, make no write and continue.
+
+## 6. Offer conversation work as tasks
 
 Finally inspect the **CURRENT AI CONVERSATION**—not the repository—for
 concrete unresolved, pending, deferred, or shelved work. Call `task_list` and
