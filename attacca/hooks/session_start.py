@@ -103,6 +103,8 @@ except Exception:
 
 _SYNC_MODULE_CACHE = {}
 _TERMINAL_MODULE_CACHE = {}
+_RUNTIME_SOURCE_CACHE = {}
+_RUNTIME_SOURCE_CACHE_LIMIT = 32
 
 
 def _runtime_name():
@@ -125,23 +127,17 @@ def _stable_plugin_root():
 
 
 def _plugin_root():
-    """Use a client-provided cache root only while it is still executable.
+    """Run one coherent plugin image beside this stable hook launcher.
 
-    Open clients retain the environment they started with. A plugin upgrade
-    may legitimately remove that versioned cache directory, so an inherited
-    ``*_PLUGIN_ROOT`` is only a hint. The hook itself lives under the stable
-    machine install and remains able to recover without restarting the client.
+    Codex and Claude export versioned cache roots for plugin discovery, but
+    this hook is deliberately invoked from the machine-stable Attacca install.
+    Mixing that newer launcher with dependencies from an older cache produced
+    a split runtime: direct MCP stayed online while the watcher loaded an old
+    schema (or could not find a newly packaged module). Runtime identity still
+    comes from the client markers in :func:`_runtime_name`; executable code and
+    configuration come from the directory containing the hook that is actually
+    running. Kimi's relative hook naturally resolves its own installed root.
     """
-    runtime = _runtime_name()
-    candidate = {
-        "claude": os.environ.get("CLAUDE_PLUGIN_ROOT"),
-        "codex": os.environ.get("PLUGIN_ROOT"),
-        "kimi": os.environ.get("KIMI_PLUGIN_ROOT"),
-    }.get(runtime)
-    if candidate:
-        root = Path(candidate).expanduser().resolve()
-        if (root / "attacca.py").is_file():
-            return root
     return _stable_plugin_root()
 
 
@@ -460,8 +456,7 @@ def _normalized_server_url(value):
     # URL parsing is part of this hook's own code identity. Load the sibling
     # module beside the executing hook rather than trusting a stale/incomplete
     # PLUGIN_ROOT marker left by a removed native cache directory.
-    own_root = Path(__file__).resolve().parent.parent
-    return _terminal_flow_module(own_root).canonical_server_url(value)
+    return _terminal_flow_module().canonical_server_url(value)
 
 
 def _local_version(plugin_root):
@@ -1235,6 +1230,8 @@ def _register_watcher_subscription(status, plugin_root, config, runtime=None,
     def mutate(state):
         subscriptions = state.setdefault("subscriptions", {})
         entry = subscriptions.setdefault(key, {})
+        previous_plugin_root = entry.get("plugin_root")
+        installed_plugin_root = str(Path(plugin_root).resolve())
         entry.update({
             "key": key,
             "server_url": _normalized_server_url(config.get("url")),
@@ -1245,11 +1242,17 @@ def _register_watcher_subscription(status, plugin_root, config, runtime=None,
             "device_id": _local_device_id(),
             "root": str(Path(status["root"]).resolve()),
             "link_path": status.get("link_path"),
-            "plugin_root": str(Path(plugin_root).resolve()),
+            "plugin_root": installed_plugin_root,
             "offline_directory": str(_watcher_offline_directory(key)),
             "last_registered_at": datetime.now(timezone.utc).isoformat(),
         })
-        entry.setdefault("next_poll_at_epoch", now)
+        if previous_plugin_root \
+                and previous_plugin_root != installed_plugin_root:
+            entry["next_poll_at_epoch"] = 0
+            entry["wake_reason"] = "executable_root_rebound"
+            entry["wake_requested_at_epoch"] = now
+        else:
+            entry.setdefault("next_poll_at_epoch", now)
         entry.setdefault("pending", [])
         entry.setdefault("cursor_registered_at_epoch", now)
         entry.setdefault("offline_failure_count", 0)
@@ -1304,20 +1307,98 @@ def _watcher_wake_subscription(key, reason="local_write", now=None):
     return {"ok": found["value"], "key": key, "signalled": signalled}
 
 
-def _watcher_sync_modules(plugin_root=None):
-    """Load the packaged schema-v1 client without importing the app server."""
-    root = Path(plugin_root or _plugin_root()).resolve()
-    key = str(root)
+def _runtime_file_signatures(root, relative_files):
+    signatures = []
+    for relative in relative_files:
+        path = root / relative
+        try:
+            metadata = path.stat()
+        except OSError as error:
+            raise RuntimeError(
+                "installed Attacca plugin lacks runtime module: %s" %
+                relative) from error
+        if not path.is_file():
+            raise RuntimeError(
+                "installed Attacca runtime module is not a regular file: %s" %
+                relative)
+        signatures.append((
+            relative, metadata.st_dev, metadata.st_ino, metadata.st_size,
+            metadata.st_mtime_ns, metadata.st_ctime_ns))
+    return tuple(signatures)
+
+
+def _runtime_module_snapshot(root, relative_files):
+    """Read one exact module image, cheaply reusing unchanged source bytes.
+
+    A watcher checks many subscriptions every five seconds. Rehashing every
+    packaged module per subscription is needless steady-state IO, while using
+    only a path or Python's timestamp-based bytecode cache can retain old code
+    after a same-version in-place repair. Two matching stat snapshots provide
+    the cheap cache key; cache misses retain and compile the exact bytes whose
+    SHA-256 names the runtime module image.
+    """
+    root = Path(root).resolve()
+    relative_files = tuple(relative_files)
+    for _ in range(3):
+        before = _runtime_file_signatures(root, relative_files)
+        source_key = (str(root), before)
+        cached = _RUNTIME_SOURCE_CACHE.get(source_key)
+        if cached is not None:
+            if before == _runtime_file_signatures(root, relative_files):
+                return cached
+            continue
+        sources = {
+            relative: (root / relative).read_bytes()
+            for relative in relative_files
+        }
+        if before != _runtime_file_signatures(root, relative_files):
+            continue
+        digest = hashlib.sha256()
+        for relative in relative_files:
+            data = sources[relative]
+            encoded = relative.encode("utf-8")
+            digest.update(len(encoded).to_bytes(4, "big"))
+            digest.update(encoded)
+            digest.update(len(data).to_bytes(8, "big"))
+            digest.update(data)
+        result = ((str(root), digest.hexdigest()), sources)
+        _RUNTIME_SOURCE_CACHE[source_key] = result
+        while len(_RUNTIME_SOURCE_CACHE) > _RUNTIME_SOURCE_CACHE_LIMIT:
+            _RUNTIME_SOURCE_CACHE.pop(next(iter(_RUNTIME_SOURCE_CACHE)))
+        return result
+    raise RuntimeError(
+        "installed Attacca runtime changed while it was being loaded")
+
+
+def _exec_runtime_module(qualified, path, source, package):
+    """Execute exact source bytes without consulting a stale ``__pycache__``."""
+    module = types.ModuleType(qualified)
+    module.__file__ = str(path)
+    module.__package__ = package
+    module.__loader__ = None
+    module.__spec__ = None
+    sys.modules[qualified] = module
+    try:
+        exec(compile(source, str(path), "exec", dont_inherit=True),
+             module.__dict__)
+    except Exception:
+        sys.modules.pop(qualified, None)
+        raise
+    return module
+
+
+def _watcher_sync_modules():
+    """Load schema-v1 clients only from this stable lifecycle image."""
+    root = _plugin_root().resolve()
+    load_order = ("sync_protocol", "terminal_flow", "offline_sync",
+                  "sync_client")
+    relative_files = tuple(name + ".py" for name in load_order)
+    key, sources = _runtime_module_snapshot(root, relative_files)
     if key in _SYNC_MODULE_CACHE:
         return _SYNC_MODULE_CACHE[key]
-    required = ("sync_protocol", "offline_sync", "sync_client")
-    missing = [name for name in required if not (root / (name + ".py")).is_file()]
-    if missing:
-        raise RuntimeError(
-            "installed Attacca plugin lacks offline sync module(s): %s" %
-            ", ".join(missing))
     package_name = "_attacca_hook_sync_%s" % hashlib.sha256(
-        key.encode("utf-8")).hexdigest()[:16]
+        json.dumps(key, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
     package = sys.modules.get(package_name)
     if package is None:
         package = types.ModuleType(package_name)
@@ -1326,21 +1407,13 @@ def _watcher_sync_modules(plugin_root=None):
         sys.modules[package_name] = package
 
     loaded = {}
-    for name in required:
+    for name in load_order:
         qualified = "%s.%s" % (package_name, name)
         module = sys.modules.get(qualified)
         if module is None:
-            specification = importlib.util.spec_from_file_location(
-                qualified, root / (name + ".py"))
-            if specification is None or specification.loader is None:
-                raise RuntimeError("cannot load packaged %s" % name)
-            module = importlib.util.module_from_spec(specification)
-            sys.modules[qualified] = module
-            try:
-                specification.loader.exec_module(module)
-            except Exception:
-                sys.modules.pop(qualified, None)
-                raise
+            relative = name + ".py"
+            module = _exec_runtime_module(
+                qualified, root / relative, sources[relative], package_name)
         loaded[name] = module
     result = (loaded["sync_protocol"], loaded["offline_sync"],
               loaded["sync_client"])
@@ -1348,29 +1421,20 @@ def _watcher_sync_modules(plugin_root=None):
     return result
 
 
-def _terminal_flow_module(plugin_root=None):
-    """Load the packaged device flow without importing the hosted server."""
-    root = Path(plugin_root or _plugin_root()).resolve()
-    key = str(root)
+def _terminal_flow_module():
+    """Load terminal auth only from this stable lifecycle image."""
+    root = _plugin_root().resolve()
+    key, sources = _runtime_module_snapshot(root, ("terminal_flow.py",))
     if key in _TERMINAL_MODULE_CACHE:
         return _TERMINAL_MODULE_CACHE[key]
     path = root / "terminal_flow.py"
-    if not path.is_file():
-        raise RuntimeError("installed Attacca plugin lacks terminal_flow.py")
     qualified = "_attacca_hook_terminal_%s" % hashlib.sha256(
-        key.encode("utf-8")).hexdigest()[:16]
+        json.dumps(key, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
     module = sys.modules.get(qualified)
     if module is None:
-        specification = importlib.util.spec_from_file_location(qualified, path)
-        if specification is None or specification.loader is None:
-            raise RuntimeError("cannot load packaged terminal_flow.py")
-        module = importlib.util.module_from_spec(specification)
-        sys.modules[qualified] = module
-        try:
-            specification.loader.exec_module(module)
-        except Exception:
-            sys.modules.pop(qualified, None)
-            raise
+        module = _exec_runtime_module(
+            qualified, path, sources["terminal_flow.py"], "")
     _TERMINAL_MODULE_CACHE[key] = module
     return module
 
@@ -1391,8 +1455,7 @@ def _terminal_requested_bindings(status, entry=None):
 def _terminal_flow_progress(status, config, entry=None, *, force_poll=False,
                             open_browser=False):
     """Advance one bounded browser/device step and return public fields only."""
-    module = _terminal_flow_module(
-        (entry or {}).get("plugin_root") if isinstance(entry, dict) else None)
+    module = _terminal_flow_module()
     bindings = _terminal_requested_bindings(status, entry)
     device_id = _local_device_id()
     client_instance = _client_instance_id()
@@ -1416,8 +1479,7 @@ def _terminal_flow_notice(status, config, event_name, entry=None,
                           result=None, migration=False, open_browser=False):
     """Build a secret-free lifecycle notice; never hand the user a command."""
     try:
-        module = _terminal_flow_module(
-            (entry or {}).get("plugin_root") if isinstance(entry, dict) else None)
+        module = _terminal_flow_module()
         result = result or _terminal_flow_progress(
             status, config, entry, open_browser=open_browser)
         message = module.format_recovery_message(
@@ -1446,8 +1508,7 @@ def _terminal_flow_notice(status, config, event_name, entry=None,
 def _terminal_migration_notice(status, config, event_name, entry=None):
     """Offer one shared terminal credential while legacy actor keys still work."""
     try:
-        module = _terminal_flow_module(
-            (entry or {}).get("plugin_root") if isinstance(entry, dict) else None)
+        module = _terminal_flow_module()
         binding = _terminal_requested_bindings(status, entry)
         exact = binding[0] if len(binding) == 1 else {}
         credential = module.terminal_credential_status(
@@ -1503,7 +1564,7 @@ def _watcher_validated_sync_scope(entry, protocol):
 
 
 def _watcher_default_offline_factory(entry, wake):
-    protocol, offline, _ = _watcher_sync_modules(entry.get("plugin_root"))
+    protocol, offline, _ = _watcher_sync_modules()
     identity = _watcher_validated_sync_scope(entry, protocol)
     if identity is None:
         return None
@@ -1516,7 +1577,7 @@ def _watcher_default_offline_factory(entry, wake):
 
 
 def _watcher_default_remote_factory(entry):
-    protocol, _, client = _watcher_sync_modules(entry.get("plugin_root"))
+    protocol, _, client = _watcher_sync_modules()
     identity = _watcher_validated_sync_scope(entry, protocol)
     if identity is None:
         return None
@@ -1656,7 +1717,7 @@ def _watcher_api_token(entry):
     if not server_url or not runtime or not project_id or not actor_id:
         return None
     try:
-        terminal = _terminal_flow_module(entry.get("plugin_root"))
+        terminal = _terminal_flow_module()
         device_id = entry.get("device_id") or _local_device_id()
         status = terminal.terminal_credential_status(
             server_url, device_id=device_id, project_id=project_id,
@@ -1705,7 +1766,7 @@ def _watcher_api_token(entry):
 
 def _watcher_fetch_sync_snapshot(entry, transport=None):
     """Fetch a freshly authorized identity snapshot for cache bootstrap."""
-    protocol, offline, client = _watcher_sync_modules(entry.get("plugin_root"))
+    protocol, offline, client = _watcher_sync_modules()
     token = _watcher_api_token(entry)
     if token is not None and (
             not isinstance(token, str) or not token.strip() or
@@ -1805,7 +1866,7 @@ def _watcher_fetch_sync_snapshot(entry, transport=None):
 
 def _watcher_install_sync_snapshot(key, entry, snapshot):
     """Atomically seed/rebind the real mirror, then persist its exact scope."""
-    protocol, offline, _ = _watcher_sync_modules(entry.get("plugin_root"))
+    protocol, offline, _ = _watcher_sync_modules()
     checked = protocol.validate_snapshot(snapshot)
     scope = checked["scope"]
     visibility = checked["visibility_fingerprint"]
@@ -3203,16 +3264,22 @@ def _restart_background_watcher_after_upgrade(plugin_root):
                         "checkout is saved on this machine"),
         }
     valid_keys = {item[0] for item in candidates}
+    rebound_at = time.time()
 
     def rebind(current):
         subscriptions = current.get("subscriptions") or {}
         for key in valid_keys:
             entry = subscriptions.get(key)
             if isinstance(entry, dict):
-                # This is the only subscription field an executable upgrade
-                # changes. Auth latches, cursors, pending notices, exact sync
-                # scope, and offline/outbox paths remain byte-for-byte intact.
+                # Rebind executable metadata and make every valid subscription
+                # due immediately so a repaired daemon proves convergence now,
+                # rather than preserving an earlier outage backoff for up to
+                # fifteen minutes. Auth latches, cursors, pending notices,
+                # exact sync scope, and offline/outbox paths remain intact.
                 entry["plugin_root"] = str(plugin_root)
+                entry["next_poll_at_epoch"] = 0
+                entry["wake_reason"] = "executable_root_rebound"
+                entry["wake_requested_at_epoch"] = rebound_at
 
     _mutate_state(path, rebind)
     chosen_key, chosen_root, _ = candidates[0]
@@ -3537,7 +3604,7 @@ def _watcher_validated_convergence(entry, adapter, require_online=False):
     """Bind a core proof to the exact subscription and on-disk snapshot."""
     if adapter is None or not isinstance(entry, dict):
         raise RuntimeError("offline sync adapter/subscription is unavailable")
-    protocol, offline, _ = _watcher_sync_modules(entry.get("plugin_root"))
+    protocol, offline, _ = _watcher_sync_modules()
     identity = _watcher_validated_sync_scope(entry, protocol)
     if identity is None:
         raise RuntimeError("subscription has no authenticated sync identity")
@@ -3580,7 +3647,7 @@ def _watcher_validated_convergence(entry, adapter, require_online=False):
 
 
 def _offline_snapshot_projection(snapshot, entry):
-    protocol, _, _ = _watcher_sync_modules(entry.get("plugin_root"))
+    protocol, _, _ = _watcher_sync_modules()
     identity = _watcher_validated_sync_scope(entry, protocol)
     if identity is None:
         raise RuntimeError("subscription has no authenticated sync identity")

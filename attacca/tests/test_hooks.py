@@ -244,7 +244,7 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             commands.append(command["command"])
         self.assertEqual(len(set(commands)), 1)
 
-    def test_codex_marker_wins_over_its_claude_compatibility_alias(self):
+    def test_codex_marker_sets_identity_without_mixing_cached_runtime(self):
         with tempfile.TemporaryDirectory() as tmp:
             claude_root = Path(tmp) / "claude-plugin"
             codex_root = Path(tmp) / "codex-cache"
@@ -261,7 +261,7 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                 "ATTACCA_ACTOR": "codex"}, clear=True):
                 self.assertEqual(hook_module._runtime_name(), "codex")
                 plugin_root, config = hook_module._plugin_and_config()
-                self.assertEqual(plugin_root, codex_root.resolve())
+                self.assertEqual(plugin_root, ROOT.resolve())
                 self.assertEqual(config["actor"], "codex")
                 self.assertEqual(
                     hook_module._runtime_actor(config, "shared")["runtime"],
@@ -321,7 +321,9 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             plugin_root, config = hook_module._plugin_and_config()
             self.assertEqual(plugin_root, ROOT.resolve())
             self.assertEqual(config["actor"], "kimi")
-            self.assertEqual(config["url"], "http://127.0.0.1:8722")
+            expected_url = next(iter(
+                manifest["mcpServers"].values()))["env"]["ATTACCA_URL"]
+            self.assertEqual(config["url"], expected_url)
             self.assertEqual(hook_module._runtime_actor(
                 config, "shared")["runtime"], "kimi")
 
@@ -401,7 +403,10 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             data = root / "plugin-data"
             home.mkdir()
             checkout.mkdir(parents=True)
-            first = self._hook(checkout, data, home)
+            # Keep this setup-choice contract independent of any compatible
+            # managed-law update advertised by a developer's running server.
+            first = self._hook(
+                checkout, data, home, url="http://127.0.0.1:1")
             payload = json.loads(first.stdout)
             self.assertIn("type 1 or 2", payload["systemMessage"])
             context = payload["hookSpecificOutput"]["additionalContext"]
@@ -414,7 +419,8 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
 
             # The trusted hook records that it showed the offer, so saying No
             # needs no second out-of-workspace shell approval.
-            second = self._hook(checkout, data, home)
+            second = self._hook(
+                checkout, data, home, url="http://127.0.0.1:1")
             self.assertEqual(second.stdout, "")
             status = subprocess.run(
                 [sys.executable, str(HOOK), "--status", "--cwd",

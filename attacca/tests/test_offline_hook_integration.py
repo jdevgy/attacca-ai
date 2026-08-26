@@ -927,7 +927,7 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
             entry.pop("sync_visibility_fingerprint", None)
 
         hook._mutate_state(hook._watcher_state_path(), remove_scope)
-        _, _, packaged_client = hook._watcher_sync_modules(ROOT)
+        _, _, packaged_client = hook._watcher_sync_modules()
         captured = []
         expected = self.snapshot()
 
@@ -983,7 +983,7 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
             entry.pop("sync_visibility_fingerprint", None)
 
         hook._mutate_state(hook._watcher_state_path(), remove_scope)
-        _, _, packaged_client = hook._watcher_sync_modules(ROOT)
+        _, _, packaged_client = hook._watcher_sync_modules()
         expected = self.snapshot()
         captured = []
 
@@ -1026,7 +1026,7 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
         hook._watcher_queue_auth_required(
             self.key, entry,
             hook.HostedAuthenticationRequired("old token revoked", 401), 0)
-        _, _, packaged_client = hook._watcher_sync_modules(ROOT)
+        _, _, packaged_client = hook._watcher_sync_modules()
         expected = self.snapshot()
 
         class Transport:

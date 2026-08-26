@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import shutil
 import tempfile
 import threading
 import unittest
@@ -167,7 +168,7 @@ class AutonomousWatcherTestCase(unittest.TestCase):
             }}},
         }))
         credential_path.chmod(0o600)
-        terminal = watch._terminal_flow_module(ROOT)
+        terminal = watch._terminal_flow_module()
         terminal.save_terminal_credential(
             url, credential, device_id="office-device",
             credentials_path=credential_path)
@@ -233,7 +234,7 @@ class AutonomousWatcherTestCase(unittest.TestCase):
             self.assertEqual(
                 watch._watcher_state_path(),
                 link.absolute() / "watcher-state.json")
-            _, offline, _ = watch._watcher_sync_modules(ROOT)
+            _, offline, _ = watch._watcher_sync_modules()
             scope = {
                 "server_id": "server-one",
                 "project_id": "shared",
@@ -248,6 +249,139 @@ class AutonomousWatcherTestCase(unittest.TestCase):
                     watch._watcher_offline_directory("unused"),
                     "http://attacca.test:4173", scope,
                     "watcher-client", "office-device")
+
+    def test_runtime_modules_reload_when_same_root_contents_change(self):
+        """Stable code wins over poisoned metadata and bypasses stale pyc."""
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_root = Path(tmp) / "runtime"
+            runtime_root.mkdir()
+            for relative in (
+                    "sync_protocol.py", "offline_sync.py", "sync_client.py",
+                    "terminal_flow.py"):
+                shutil.copy2(ROOT / relative, runtime_root / relative)
+            protocol_path = runtime_root / "sync_protocol.py"
+            poisoned = protocol_path.read_text().replace(
+                '"cloud_context",', '"cloud_contexx",')
+            self.assertNotEqual(poisoned, protocol_path.read_text())
+            protocol_path.write_text(poisoned)
+            fixed_mtime_ns = 1_700_000_000_000_000_000
+            os.utime(protocol_path, ns=(fixed_mtime_ns, fixed_mtime_ns))
+
+            with mock.patch.object(
+                    watch, "_stable_plugin_root",
+                    return_value=runtime_root):
+                old_protocol = watch._watcher_sync_modules()[0]
+            scope = {
+                "server_id": "server-one",
+                "project_id": "shared",
+                "principal_id": "jack",
+                "actor_id": "shared.director.codex",
+                "actor_type": "agent",
+                "role": "director",
+            }
+            with self.assertRaisesRegex(ValueError, "unknown field"):
+                old_protocol.validate_identity_projection(
+                    {"cloud_context": {}}, scope, partial=True)
+
+            current_protocol = watch._watcher_sync_modules()[0]
+            visibility = current_protocol.visibility_fingerprint(
+                scope, {"role": "director"})
+            projection = {
+                "project": {"project_id": "shared"},
+                "handoffs": [], "rules": [], "tasks": [],
+                "decisions": [], "room_messages": [], "agents": [],
+                "bridges": [], "inbox_cursor": None,
+                "cloud_context": {"content": "current managed context"},
+            }
+            snapshot = current_protocol.make_snapshot(
+                scope, visibility,
+                current_protocol.make_cursor(
+                    0, current_protocol.GENESIS_HASH, 0),
+                projection, [])
+            stale_entry = {
+                "project_id": "shared",
+                "canonical_actor_id": "shared.director.codex",
+                "actor_role": "director",
+                "sync_scope": scope,
+                "sync_visibility_fingerprint": visibility,
+                "plugin_root": str(runtime_root),
+            }
+            # Subscription plugin_root is migration metadata, never an
+            # executable source. A complete old cache cannot reject the new
+            # stable projection schema.
+            self.assertEqual(
+                watch._offline_snapshot_projection(
+                    snapshot, stale_entry)["cloud_context"]["content"],
+                "current managed context")
+
+            # Replace the poisoned source with equal-length current content and
+            # restore its exact mtime. Exact-byte execution must still avoid a
+            # timestamp-valid stale .pyc image.
+            protocol_path.write_bytes((ROOT / "sync_protocol.py").read_bytes())
+            os.utime(protocol_path, ns=(fixed_mtime_ns, fixed_mtime_ns))
+            with mock.patch.object(
+                    watch, "_stable_plugin_root",
+                    return_value=runtime_root):
+                new_protocol = watch._watcher_sync_modules()[0]
+            self.assertIsNot(old_protocol, new_protocol)
+            self.assertEqual(
+                new_protocol.validate_identity_projection(
+                    {"cloud_context": {}}, scope, partial=True),
+                {"cloud_context": {}})
+
+    def test_upgrade_rebind_makes_backed_off_subscription_due_now(self):
+        link = self.checkout / ".attacca" / "project.json"
+        link.parent.mkdir()
+        link.write_text(json.dumps({
+            "schema_version": 1, "project_id": "shared"}))
+        key = self.register(now=0)
+
+        def back_off(state):
+            entry = state["subscriptions"][key]
+            entry["next_poll_at_epoch"] = 9999999999
+            entry["last_error"] = "old schema rejected cloud_context"
+
+        watch._mutate_state(watch._watcher_state_path(), back_off)
+        with mock.patch.object(
+                watch, "_ensure_registered_watcher",
+                return_value={"ok": True, "started": True}):
+            result = watch._restart_background_watcher_after_upgrade(ROOT)
+        self.assertTrue(result["upgrade_restart"])
+        entry = self.state()["subscriptions"][key]
+        self.assertEqual(entry["next_poll_at_epoch"], 0)
+        self.assertEqual(entry["wake_reason"], "executable_root_rebound")
+        self.assertEqual(entry["last_error"],
+                         "old schema rejected cloud_context")
+        with mock.patch.object(watch, "_settings_interval", return_value=60):
+            tick = watch._watcher_tick(
+                key, now=1, force=False,
+                offline_factory=lambda *_: None,
+                delta_loader=lambda after: delta(next_after=after),
+                notifier=lambda *_: None)
+        self.assertTrue(tick["ok"])
+        self.assertTrue(tick["due"])
+        self.assertIsNone(
+            self.state()["subscriptions"][key]["last_error"])
+
+    def test_registration_rebind_also_bypasses_existing_backoff(self):
+        key = self.register(now=0)
+
+        def stale_cache(state):
+            entry = state["subscriptions"][key]
+            entry["plugin_root"] = "/old/codex/cache"
+            entry["next_poll_at_epoch"] = 9999999999
+            entry["last_error"] = "old schema"
+
+        watch._mutate_state(watch._watcher_state_path(), stale_cache)
+        renewed = watch._register_watcher_subscription(
+            self.status, ROOT, self.config, runtime="codex", now=123)
+        self.assertEqual(renewed, key)
+        entry = self.state()["subscriptions"][key]
+        self.assertEqual(entry["plugin_root"], str(ROOT.resolve()))
+        self.assertEqual(entry["next_poll_at_epoch"], 0)
+        self.assertEqual(entry["wake_reason"], "executable_root_rebound")
+        self.assertEqual(entry["wake_requested_at_epoch"], 123)
+        self.assertEqual(entry["last_error"], "old schema")
 
     def test_idle_tick_queues_changed_state_once_and_hook_drains_it(self):
         key = self.register()
@@ -531,6 +665,50 @@ class AutonomousWatcherTestCase(unittest.TestCase):
         state = self.state()
         self.assertEqual(state["daemon"]["nonce"], "old-nonce")
         self.assertNotIn("daemon_launch", state)
+
+    def test_same_version_old_dependency_fingerprint_forces_daemon_restart(self):
+        key = self.register()
+        current = watch._watcher_launch_identity_for_root(ROOT)
+        stale_identity = dict(
+            current, launch_fingerprint="sha256:" + "0" * 64)
+
+        def install_daemon(state):
+            state["daemon"] = {
+                "nonce": "same-version-old-code", "pid": 4243,
+                "running": True, "plugin_root": str(ROOT),
+                "plugin_version": current["launch_version"],
+                **stale_identity,
+            }
+
+        watch._mutate_state(watch._watcher_state_path(), install_daemon)
+        child = mock.Mock(pid=7373)
+        with mock.patch.object(
+                watch, "_watcher_process_matches",
+                side_effect=[True, False, False]), \
+             mock.patch.object(
+                 watch, "_signal_watcher_process",
+                 return_value=True) as signal_process, \
+             mock.patch.object(
+                 watch, "_watcher_lock_available", return_value=True), \
+             mock.patch.object(
+                 watch.subprocess, "Popen", return_value=child) as spawn:
+            result = watch._ensure_registered_watcher(
+                key, self.checkout, ROOT)
+        self.assertTrue(result["started"])
+        self.assertEqual(result["pid"], 7373)
+        signal_process.assert_called_once_with(
+            4243, "same-version-old-code", watch.signal.SIGTERM,
+            launch_fingerprint=stale_identity["launch_fingerprint"],
+            hook_path=ROOT / "hooks" / "session_start.py")
+        command = spawn.call_args.args[0]
+        self.assertEqual(Path(command[1]),
+                         ROOT / "hooks" / "session_start.py")
+        launch = self.state()["daemon_launch"]
+        self.assertEqual(launch["pid"], 7373)
+        self.assertEqual(launch["launch_version"],
+                         current["launch_version"])
+        self.assertEqual(launch["launch_fingerprint"],
+                         current["launch_fingerprint"])
 
     def test_held_lifetime_lock_never_overwrites_stale_daemon_metadata(self):
         key = self.register()
