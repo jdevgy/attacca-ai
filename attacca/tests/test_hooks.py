@@ -836,6 +836,43 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                         status, ROOT, config))
                 self.assertFalse(Path(status["state_path"]).exists())
 
+    def test_damaged_local_hash_never_bypasses_law_version_ordering(self):
+        cases = (
+            ({"version": c.MANAGED_BLOCK_VERSION, "sha256": None},
+             {"version": c.MANAGED_BLOCK_VERSION - 1,
+              "sha256": "a" * 64}, False),
+            ({"version": c.MANAGED_BLOCK_VERSION + 1,
+              "sha256": "A" * 64},
+             {"version": c.MANAGED_BLOCK_VERSION,
+              "sha256": "a" * 64}, False),
+            (None,
+             {"version": c.MANAGED_BLOCK_VERSION,
+              "sha256": "a" * 64}, False),
+            ({"version": c.MANAGED_BLOCK_VERSION, "sha256": None},
+             {"version": c.MANAGED_BLOCK_VERSION,
+              "sha256": "a" * 64}, True),
+        )
+        for index, (local_laws, server_laws, expected) in enumerate(cases):
+            with self.subTest(local_laws=local_laws,
+                              server_laws=server_laws), \
+                    tempfile.TemporaryDirectory() as tmp:
+                status = {"state_path": str(
+                    Path(tmp) / hook_module.STATE_NAME)}
+                config = {"url": "http://server-%d" % index}
+                with mock.patch.object(
+                        hook_module, "_local_version",
+                        return_value=c.VERSION), \
+                     mock.patch.object(
+                        hook_module, "_local_managed_instructions",
+                        return_value=local_laws), \
+                     mock.patch.object(
+                        hook_module, "_server_release",
+                        return_value={"version": c.VERSION,
+                                      "managed_instructions": server_laws}):
+                    offer = hook_module._update_offer(status, ROOT, config)
+                self.assertEqual(offer is not None, expected)
+                self.assertEqual(Path(status["state_path"]).exists(), expected)
+
     def test_unlinked_project_offers_update_before_setup_and_then_honors_skip(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
