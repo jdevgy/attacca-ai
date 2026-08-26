@@ -712,12 +712,16 @@ def _update_offer(status, plugin_root, config, setup_cwd=None,
         software_update = available_key > installed_key
         server_laws = release.get("managed_instructions") or {}
         local_laws = _local_managed_instructions(plugin_root) or {}
+        server_law_version = server_laws.get("version")
+        local_law_version = local_laws.get("version")
         law_update = (
             available_key == installed_key and
-            isinstance(server_laws.get("version"), int) and
+            isinstance(server_law_version, int) and
             bool(server_laws.get("sha256")) and
-            (server_laws.get("version") != local_laws.get("version") or
-             server_laws.get("sha256") != local_laws.get("sha256")))
+            (not isinstance(local_law_version, int) or
+             server_law_version > local_law_version or
+             (server_law_version == local_law_version and
+              server_laws.get("sha256") != local_laws.get("sha256"))))
         if not software_update and not law_update:
             return None
     except Exception:

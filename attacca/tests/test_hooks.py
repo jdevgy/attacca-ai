@@ -761,6 +761,28 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                     status, ROOT, config)
             self.assertIsNotNone(changed_again)
 
+    def test_older_server_managed_laws_never_offer_a_downgrade(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            status = {"state_path": str(data / hook_module.STATE_NAME)}
+            config = {"url": "http://server"}
+            local_laws = {"version": c.MANAGED_BLOCK_VERSION,
+                          "sha256": "newer-local-law"}
+            server_laws = {"version": c.MANAGED_BLOCK_VERSION - 1,
+                           "sha256": "older-server-law"}
+            with mock.patch.object(
+                    hook_module, "_local_version", return_value=c.VERSION), \
+                 mock.patch.object(
+                    hook_module, "_local_managed_instructions",
+                    return_value=local_laws), \
+                 mock.patch.object(
+                    hook_module, "_server_release",
+                    return_value={"version": c.VERSION,
+                                  "managed_instructions": server_laws}):
+                self.assertIsNone(hook_module._update_offer(
+                    status, ROOT, config))
+            self.assertFalse(Path(status["state_path"]).exists())
+
     def test_unlinked_project_offers_update_before_setup_and_then_honors_skip(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
