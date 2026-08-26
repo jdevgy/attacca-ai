@@ -23,6 +23,15 @@ from datetime import datetime, timezone
 
 SCHEMA_VERSION = 1
 
+# The outer snapshot/pull/push envelopes remain schema-v1.  Projection
+# resources evolve independently and are negotiated before the server emits a
+# snapshot or delta.  This separation is deliberate: adding an optional
+# projection key must never make an otherwise compatible, still-running
+# schema-v1 client reject the entire offline mirror.
+PROJECTION_SCHEMA_VERSION = 2
+LEGACY_PROJECTION_SCHEMA_VERSION = 1
+PROJECTION_CAPABILITIES_FORMAT = "attacca.sync.projection-capabilities"
+
 SNAPSHOT_FORMAT = "attacca.sync.snapshot"
 PULL_REQUEST_FORMAT = "attacca.sync.pull-request"
 PULL_RESULT_FORMAT = "attacca.sync.pull-result"
@@ -73,7 +82,24 @@ _IDENTITY_PROJECTION_REQUIRED = {
 }
 _IDENTITY_PROJECTION_OPTIONAL = {
     "task_plans", "full_log", "actor_aliases", "cloud_context",
+    "message_dispositions",
 }
+_PROJECTION_V2_RESOURCES = {"cloud_context", "message_dispositions"}
+_PROJECTION_RESOURCE_INTRODUCED = {
+    key: LEGACY_PROJECTION_SCHEMA_VERSION
+    for key in (_IDENTITY_PROJECTION_REQUIRED |
+                (_IDENTITY_PROJECTION_OPTIONAL - _PROJECTION_V2_RESOURCES))
+}
+for _resource in _PROJECTION_V2_RESOURCES:
+    _PROJECTION_RESOURCE_INTRODUCED[_resource] = 2
+_PROJECTION_RESOURCES = set(_PROJECTION_RESOURCE_INTRODUCED)
+_LEGACY_PROJECTION_RESOURCES = {
+    key for key, version in _PROJECTION_RESOURCE_INTRODUCED.items()
+    if version <= LEGACY_PROJECTION_SCHEMA_VERSION
+}
+_PROJECTION_CAPABILITY_KEYS = {"format", "schema_version", "resources"}
+_PROJECTION_RESOURCE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_MAX_PROJECTION_RESOURCES = 64
 _SECRET_KEYS = {
     "api_token", "auth_sessions", "auth_tokens", "credentials",
     "csrf_hash", "password_hash", "password_salt", "session_hash",
@@ -91,6 +117,20 @@ class SyncProtocolError(ValueError):
 
 class EnvelopeTooLarge(SyncProtocolError):
     """A syntactically valid JSON object exceeds a protocol size limit."""
+
+
+_SCHEMA_COMPATIBILITY_ERROR_CODES = {
+    "unknown_field", "unsupported_snapshot", "unsupported_pull_request",
+    "unsupported_pull_result", "unsupported_push_request",
+    "unsupported_push_result", "unsupported_mutation",
+    "unsupported_projection_capabilities", "unsupported_projection_schema",
+    "unsupported_projection_resource", "unnegotiated_projection_resource",
+}
+
+
+def is_schema_compatibility_error(error):
+    """Return true only for version/resource incompatibility, never auth."""
+    return getattr(error, "code", None) in _SCHEMA_COMPATIBILITY_ERROR_CODES
 
 
 def _error(code, message):
@@ -228,6 +268,172 @@ def _digest(value, label="digest"):
 
 def _sha256(value):
     return "sha256:" + hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+
+
+def validate_projection_capabilities(capabilities, *, allow_unknown=False):
+    """Validate one explicit projection-resource offer or selection.
+
+    A newer client may offer resource names an older server does not know.
+    Servers validate their bounded syntax and negotiate the known intersection;
+    they never echo or persist an unknown resource.  A selected capability set
+    used to validate a local mirror is stricter and rejects unknown names.
+    """
+    _exact_keys(
+        capabilities, _PROJECTION_CAPABILITY_KEYS,
+        label="projection capabilities")
+    value = _json_copy(capabilities, max_bytes=16 * 1024)
+    if value["format"] != PROJECTION_CAPABILITIES_FORMAT:
+        _error(
+            "unsupported_projection_capabilities",
+            "unsupported projection-capabilities format")
+    version = value["schema_version"]
+    if not _is_int(version) or not 1 <= version <= 2 ** 31 - 1:
+        _error(
+            "unsupported_projection_schema",
+            "projection schema_version must be a positive integer")
+    resources = value["resources"]
+    if not isinstance(resources, list) \
+            or not len(_IDENTITY_PROJECTION_REQUIRED) <= len(resources) \
+            <= _MAX_PROJECTION_RESOURCES:
+        _error(
+            "invalid_projection_capabilities",
+            "projection resources must be a bounded array")
+    seen = set()
+    for resource in resources:
+        if not isinstance(resource, str) \
+                or not _PROJECTION_RESOURCE_RE.fullmatch(resource):
+            _error(
+                "invalid_projection_capabilities",
+                "projection resource has unsafe syntax")
+        if resource in seen:
+            _error(
+                "invalid_projection_capabilities",
+                "projection resources contain a duplicate")
+        seen.add(resource)
+        introduced = _PROJECTION_RESOURCE_INTRODUCED.get(resource)
+        if introduced is None:
+            if not allow_unknown:
+                _error(
+                    "unsupported_projection_resource",
+                    "projection resource %s is unsupported" % resource)
+            continue
+        if introduced > version:
+            _error(
+                "unsupported_projection_resource",
+                "projection resource %s requires schema %d" %
+                (resource, introduced))
+    if not _IDENTITY_PROJECTION_REQUIRED <= set(resources):
+        _error(
+            "invalid_projection_capabilities",
+            "projection capabilities omit a required schema-v1 resource")
+    value["resources"] = sorted(resources)
+    return value
+
+
+def make_projection_capabilities(schema_version=PROJECTION_SCHEMA_VERSION,
+                                 resources=None):
+    """Build a known local projection capability set."""
+    if resources is None:
+        if not _is_int(schema_version) or schema_version < 1:
+            _error(
+                "unsupported_projection_schema",
+                "projection schema_version must be a positive integer")
+        resources = [
+            key for key, introduced in _PROJECTION_RESOURCE_INTRODUCED.items()
+            if introduced <= schema_version
+        ]
+    return validate_projection_capabilities({
+        "format": PROJECTION_CAPABILITIES_FORMAT,
+        "schema_version": schema_version,
+        "resources": sorted(resources),
+    })
+
+
+def legacy_projection_capabilities():
+    """Capabilities of clients shipped before explicit negotiation."""
+    return make_projection_capabilities(
+        LEGACY_PROJECTION_SCHEMA_VERSION,
+        _LEGACY_PROJECTION_RESOURCES)
+
+
+def current_projection_capabilities():
+    return make_projection_capabilities(PROJECTION_SCHEMA_VERSION)
+
+
+def negotiate_projection_capabilities(offered=None):
+    """Return the safe known intersection of a client offer and this build.
+
+    Absence means a legacy schema-v1 client.  This default is the compatibility
+    guarantee that was missing when newer optional resources were first
+    introduced.
+    """
+    if offered is None:
+        return legacy_projection_capabilities()
+    checked = validate_projection_capabilities(offered, allow_unknown=True)
+    selected_version = min(
+        checked["schema_version"], PROJECTION_SCHEMA_VERSION)
+    selected = {
+        resource for resource in checked["resources"]
+        if resource in _PROJECTION_RESOURCES
+        and _PROJECTION_RESOURCE_INTRODUCED[resource] <= selected_version
+    }
+    # Required v1 resources cannot be negotiated away.  The offer validator
+    # already proves they were explicitly present.
+    selected |= _IDENTITY_PROJECTION_REQUIRED
+    return make_projection_capabilities(selected_version, selected)
+
+
+def projection_capabilities_query(capabilities=None):
+    """Encode a bounded capability offer for snapshot/pull query strings."""
+    checked = validate_projection_capabilities(
+        capabilities or current_projection_capabilities())
+    return {
+        "projection_schema_version": str(checked["schema_version"]),
+        "projection_resources": ",".join(checked["resources"]),
+    }
+
+
+def projection_capabilities_from_query(schema_version=None, resources=None):
+    """Parse a query offer; an entirely absent offer is legacy schema-v1."""
+    if schema_version is None and resources is None:
+        return legacy_projection_capabilities()
+    if schema_version is None or resources is None:
+        _error(
+            "invalid_projection_capabilities",
+            "projection schema version and resources must be sent together")
+    if isinstance(schema_version, bool) or not re.fullmatch(
+            r"[1-9][0-9]{0,9}", str(schema_version)):
+        _error(
+            "unsupported_projection_schema",
+            "projection schema version has unsafe syntax")
+    if not isinstance(resources, str) or len(resources.encode("utf-8")) > 4096:
+        _error(
+            "invalid_projection_capabilities",
+            "projection resource query is invalid")
+    rows = resources.split(",") if resources else []
+    offered = {
+        "format": PROJECTION_CAPABILITIES_FORMAT,
+        "schema_version": int(schema_version),
+        "resources": rows,
+    }
+    return negotiate_projection_capabilities(offered)
+
+
+def projection_visibility_policy(visibility_policy, capabilities=None):
+    """Bind non-legacy projection shape to the visibility fingerprint.
+
+    The exact legacy policy material is preserved for clients which do not
+    negotiate.  Negotiated mirrors receive a distinct fingerprint, forcing a
+    safe full reset instead of silently relabelling an older projection.
+    """
+    policy = _json_copy(visibility_policy, max_bytes=512 * 1024)
+    selected = negotiate_projection_capabilities(capabilities)
+    if selected == legacy_projection_capabilities():
+        return policy
+    return {
+        "visibility_policy": policy,
+        "projection_capabilities": selected,
+    }
 
 
 def validate_scope(scope, expected_scope=None):
@@ -469,7 +675,8 @@ def validate_identity_projection(projection, scope, partial=False):
                 or project.get("project_id") != scope["project_id"]:
             _error("cross_project_projection", "projection project does not match scope")
     for key in ("handoffs", "rules", "tasks", "decisions", "room_messages",
-                "agents", "bridges", "task_plans", "full_log", "actor_aliases"):
+                "agents", "bridges", "task_plans", "full_log",
+                "actor_aliases", "message_dispositions"):
         if key in value and not isinstance(value[key], list):
             _error("invalid_projection", "projection.%s must be an array" % key)
         if key in value and key != "full_log":
@@ -498,6 +705,38 @@ def validate_identity_projection(projection, scope, partial=False):
             if actor_id is not None and actor_id != scope["actor_id"]:
                 _error("cross_actor_inbox", "inbox cursor belongs to another actor")
     return value
+
+
+def validate_projection_for_capabilities(projection, scope, capabilities,
+                                         partial=False):
+    """Validate both projection content and its negotiated resource shape."""
+    value = validate_identity_projection(projection, scope, partial=partial)
+    selected = validate_projection_capabilities(capabilities)
+    unexpected = set(value) - set(selected["resources"])
+    if unexpected:
+        _error(
+            "unnegotiated_projection_resource",
+            "projection contains unnegotiated resource(s): %s" %
+            ", ".join(sorted(unexpected)))
+    return value
+
+
+def filter_projection_for_capabilities(projection, scope, capabilities,
+                                       partial=False):
+    """Validate a server projection, then emit only negotiated resources.
+
+    Validation occurs *before* filtering so a server adapter cannot hide a
+    secret, cross-project row, or malformed known resource merely because the
+    requesting client did not negotiate that resource.
+    """
+    value = validate_identity_projection(projection, scope, partial=partial)
+    selected = negotiate_projection_capabilities(capabilities)
+    filtered = {
+        key: item for key, item in value.items()
+        if key in set(selected["resources"])
+    }
+    return validate_projection_for_capabilities(
+        filtered, scope, selected, partial=partial)
 
 
 def make_snapshot(scope, visibility, cursor, projection, records, generated_at=None):
@@ -1083,14 +1322,23 @@ __all__ = [
     "SCHEMA_VERSION", "SNAPSHOT_FORMAT", "PULL_REQUEST_FORMAT",
     "PULL_RESULT_FORMAT", "PUSH_REQUEST_FORMAT", "PUSH_RESULT_FORMAT",
     "MUTATION_FORMAT", "MUTATION_RESULT_FORMAT", "STORED_RECEIPT_FORMAT",
-    "GENESIS_HASH", "MAX_SNAPSHOT_BYTES", "MAX_PULL_BYTES",
+    "PROJECTION_SCHEMA_VERSION", "LEGACY_PROJECTION_SCHEMA_VERSION",
+    "PROJECTION_CAPABILITIES_FORMAT", "GENESIS_HASH",
+    "MAX_SNAPSHOT_BYTES", "MAX_PULL_BYTES",
     "MAX_PUSH_BYTES", "MAX_MUTATION_BYTES", "MAX_MUTATIONS",
     "MAX_PULL_RECORDS", "SyncProtocolError", "EnvelopeTooLarge",
+    "is_schema_compatibility_error",
     "canonical_json_bytes", "utc_now", "validate_scope",
     "scope_fingerprint", "visibility_fingerprint",
     "validate_visibility_fingerprint", "make_cursor", "validate_cursor",
     "make_visible_record", "make_redacted_anchor", "validate_chain_record",
-    "validate_chain", "validate_identity_projection", "make_snapshot",
+    "validate_chain", "validate_projection_capabilities",
+    "make_projection_capabilities", "legacy_projection_capabilities",
+    "current_projection_capabilities", "negotiate_projection_capabilities",
+    "projection_capabilities_query", "projection_capabilities_from_query",
+    "projection_visibility_policy", "validate_identity_projection",
+    "validate_projection_for_capabilities",
+    "filter_projection_for_capabilities", "make_snapshot",
     "validate_snapshot", "make_pull_request", "validate_pull_request",
     "make_pull_result", "make_reset_required", "validate_pull_result",
     "local_ref", "mutation_sha256", "make_client_mutation",

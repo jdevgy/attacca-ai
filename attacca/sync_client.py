@@ -47,9 +47,27 @@ class SyncTransportError(ConnectionError):
 class SyncResponseError(SyncClientError):
     """The server returned malformed, unsafe, or unexpected data."""
 
+    def __init__(self, message, *, http_status=None, protocol_code=None):
+        super().__init__(message)
+        self.http_status = http_status
+        self.protocol_code = protocol_code
+
+
+class SyncSchemaCompatibilityError(SyncResponseError):
+    """The endpoint is reachable/authenticated but wire schemas differ."""
+
 
 class SyncIdentityChangedError(SyncResponseError):
     """A response is valid but belongs to another authenticated scope."""
+
+    def __init__(self, message, scope=None, visibility_fingerprint=None):
+        super().__init__(message)
+        self.scope = scope
+        self.visibility_fingerprint = visibility_fingerprint
+
+
+class SyncVisibilityChangedError(SyncResponseError):
+    """The same identity has a newer visibility/projection generation."""
 
     def __init__(self, message, scope=None, visibility_fingerprint=None):
         super().__init__(message)
@@ -117,7 +135,8 @@ class AuthenticatedSyncHttpClient:
                  client_id, device_id, token_loader, *, transport=None,
                  timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
                  client_instance_id=None,
-                 compatibility_optional_auth=False):
+                 compatibility_optional_auth=False,
+                 projection_capabilities=None):
         self.server_url = normalize_server_url(server_url)
         self.project_id = str(project_id or "").strip()
         if not self.project_id:
@@ -148,6 +167,10 @@ class AuthenticatedSyncHttpClient:
         self._compatibility_optional_auth = False
         self._compatibility_probe_allowed = bool(
             compatibility_optional_auth)
+        self.projection_capabilities = \
+            protocol.validate_projection_capabilities(
+                projection_capabilities or
+                protocol.current_projection_capabilities())
 
     @property
     def route_base(self):
@@ -267,8 +290,30 @@ class AuthenticatedSyncHttpClient:
             raise SyncAuthenticationError(
                 "Attacca rejected the current terminal credential or AI scope")
         if not 200 <= response.status < 300:
-            raise SyncResponseError(
-                "Attacca sync endpoint returned HTTP %d" % response.status)
+            protocol_code = None
+            try:
+                error_value = json.loads(response.body.decode("utf-8"))
+                if isinstance(error_value, dict) and isinstance(
+                        error_value.get("code"), str):
+                    protocol_code = error_value["code"][:128]
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                pass
+            error_class = SyncSchemaCompatibilityError \
+                if protocol_code in {
+                    "unknown_field", "unsupported_snapshot",
+                    "unsupported_pull_request", "unsupported_pull_result",
+                    "unsupported_push_request", "unsupported_push_result",
+                    "unsupported_mutation",
+                    "unsupported_projection_capabilities",
+                    "unsupported_projection_schema",
+                    "unsupported_projection_resource",
+                    "unnegotiated_projection_resource",
+                } else SyncResponseError
+            suffix = " (%s)" % protocol_code if protocol_code else ""
+            raise error_class(
+                "Attacca sync endpoint returned HTTP %d%s" %
+                (response.status, suffix),
+                http_status=response.status, protocol_code=protocol_code)
         content_type = str(response.headers.get("content-type") or "")
         if "application/json" not in content_type.lower():
             raise SyncResponseError("Attacca sync response is not JSON")
@@ -292,19 +337,29 @@ class AuthenticatedSyncHttpClient:
     def fetch_snapshot(self, allow_scope_change=False):
         value = self._request(
             "GET", "/snapshot",
+            query=protocol.projection_capabilities_query(
+                self.projection_capabilities),
             max_response_bytes=protocol.MAX_SNAPSHOT_BYTES)
         try:
             checked = protocol.validate_snapshot(value)
+            protocol.validate_projection_for_capabilities(
+                checked["projection"], checked["scope"],
+                self.projection_capabilities)
         except protocol.SyncProtocolError as error:
-            raise SyncResponseError(
-                "snapshot failed schema-v1 validation: %s" % error) from error
+            error_class = SyncSchemaCompatibilityError \
+                if protocol.is_schema_compatibility_error(error) \
+                else SyncResponseError
+            raise error_class(
+                "snapshot failed schema-v1/projection-v%d validation: %s" %
+                (self.projection_capabilities["schema_version"], error),
+                protocol_code=error.code) from error
         self._check_scope(
             checked["scope"], allow_scope_change=allow_scope_change)
         if self.visibility_fingerprint is not None \
                 and not allow_scope_change \
                 and checked["visibility_fingerprint"] != \
                 self.visibility_fingerprint:
-            raise SyncIdentityChangedError(
+            raise SyncVisibilityChangedError(
                 "snapshot visibility changed; reset required",
                 scope=checked["scope"],
                 visibility_fingerprint=checked["visibility_fingerprint"])
@@ -324,19 +379,29 @@ class AuthenticatedSyncHttpClient:
                 "visibility_fingerprint": request[
                     "visibility_fingerprint"],
                 "limit": request["limit"],
-            },
+            } | protocol.projection_capabilities_query(
+                self.projection_capabilities),
             max_response_bytes=protocol.MAX_PULL_BYTES)
         try:
             checked = protocol.validate_pull_result(value)
+            if checked["status"] == "ok":
+                protocol.validate_projection_for_capabilities(
+                    checked["changes"], checked["scope"],
+                    self.projection_capabilities, partial=True)
         except protocol.SyncProtocolError as error:
-            raise SyncResponseError(
-                "pull failed schema-v1 validation: %s" % error) from error
+            error_class = SyncSchemaCompatibilityError \
+                if protocol.is_schema_compatibility_error(error) \
+                else SyncResponseError
+            raise error_class(
+                "pull failed schema-v1/projection-v%d validation: %s" %
+                (self.projection_capabilities["schema_version"], error),
+                protocol_code=error.code) from error
         self._check_scope(
             checked["scope"],
             allow_scope_change=checked["status"] == "reset_required")
         if checked["status"] == "ok" \
                 and checked["visibility_fingerprint"] != visibility:
-            raise SyncIdentityChangedError(
+            raise SyncVisibilityChangedError(
                 "successful pull changed visibility without reset",
                 scope=checked["scope"],
                 visibility_fingerprint=checked["visibility_fingerprint"])
@@ -371,6 +436,7 @@ class AuthenticatedSyncHttpClient:
 __all__ = [
     "DEFAULT_TIMEOUT_SECONDS", "MAX_TOKEN_BYTES", "SyncClientError",
     "SyncAuthenticationError", "SyncTransportError", "SyncResponseError",
-    "SyncIdentityChangedError", "JsonHttpResponse", "UrllibJsonTransport",
+    "SyncSchemaCompatibilityError", "SyncIdentityChangedError",
+    "SyncVisibilityChangedError", "JsonHttpResponse", "UrllibJsonTransport",
     "AuthenticatedSyncHttpClient",
 ]

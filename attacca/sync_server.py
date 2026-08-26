@@ -332,7 +332,8 @@ class SyncServerEngine:
         return [_json_copy(item, max_bytes=protocol.MAX_MUTATION_BYTES * 2)
                 for item in events]
 
-    def _project_view(self, scope, mode, start, through, events):
+    def _project_view(self, scope, mode, start, through, events,
+                      projection_capabilities=None):
         raw = self.adapters.visibility_projector(
             self.connection, _json_copy(scope), mode,
             _json_copy(start) if start is not None else None,
@@ -343,14 +344,20 @@ class SyncServerEngine:
             raise SyncServerStateError(
                 "visibility_projector must return visibility_policy")
         policy = _json_copy(raw["visibility_policy"], max_bytes=512 * 1024)
-        fingerprint = protocol.visibility_fingerprint(scope, policy)
+        selected_capabilities = protocol.negotiate_projection_capabilities(
+            projection_capabilities)
+        fingerprint = protocol.visibility_fingerprint(
+            scope, protocol.projection_visibility_policy(
+                policy, selected_capabilities))
         if mode == "policy":
             return fingerprint, {}, set()
         if "projection" not in raw or "visible_event_seqs" not in raw:
             raise SyncServerStateError(
                 "visibility_projector omitted projection/event visibility")
-        projection = _json_copy(
-            raw["projection"], max_bytes=protocol.MAX_SNAPSHOT_BYTES)
+        projection = protocol.filter_projection_for_capabilities(
+            _json_copy(
+                raw["projection"], max_bytes=protocol.MAX_SNAPSHOT_BYTES),
+            scope, selected_capabilities, partial=mode == "pull")
         visible_raw = raw["visible_event_seqs"]
         if not isinstance(visible_raw, (list, tuple, set)):
             raise SyncServerStateError("visible_event_seqs must be a collection")
@@ -386,7 +393,7 @@ class SyncServerEngine:
         return protocol.make_cursor(
             event.get("seq"), event.get("hash"), context_version)
 
-    def snapshot(self, authenticated_scope):
+    def snapshot(self, authenticated_scope, *, projection_capabilities=None):
         """Return a complete identity-filtered snapshot for a trusted caller."""
         scope = self._trusted_scope(authenticated_scope)
         self._require_authorized(scope, "sync.read")
@@ -394,7 +401,8 @@ class SyncServerEngine:
             head = self._head(scope)
             events = self._events(scope, 0, head["event_seq"], None)
             fingerprint, projection, visible = self._project_view(
-                scope, "snapshot", None, head, events)
+                scope, "snapshot", None, head, events,
+                projection_capabilities=projection_capabilities)
             records = self._chain_records(events, visible)
             return protocol.make_snapshot(
                 scope, fingerprint, head, projection, records)
@@ -414,7 +422,8 @@ class SyncServerEngine:
         return event_cursor["event_hash"] == cursor["event_hash"] \
             and event_cursor["context_version"] <= cursor["context_version"]
 
-    def pull(self, authenticated_scope, envelope):
+    def pull(self, authenticated_scope, envelope, *,
+             projection_capabilities=None):
         """Return a bounded delta or ``reset_required`` for a stale/forked view."""
         scope = self._trusted_scope(authenticated_scope)
         self._require_authorized(scope, "sync.read")
@@ -423,7 +432,8 @@ class SyncServerEngine:
         with self._lock, self._transaction():
             head = self._head(scope)
             fingerprint, _, _ = self._project_view(
-                scope, "policy", request["cursor"], head, [])
+                scope, "policy", request["cursor"], head, [],
+                projection_capabilities=projection_capabilities)
             if request["visibility_fingerprint"] != fingerprint:
                 return protocol.make_reset_required(
                     scope, fingerprint, "visibility_changed",
@@ -446,7 +456,8 @@ class SyncServerEngine:
                 # does not repeat an otherwise empty pull forever.
                 end = head
             fingerprint_after, changes, visible = self._project_view(
-                scope, "pull", start, end, events)
+                scope, "pull", start, end, events,
+                projection_capabilities=projection_capabilities)
             if fingerprint_after != fingerprint:
                 return protocol.make_reset_required(
                     scope, fingerprint_after, "visibility_changed",

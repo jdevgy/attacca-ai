@@ -53,6 +53,8 @@ SYNC_STATE_FORMAT = "attacca.offline.identity-sync-state"
 JOURNAL_RECORD_FORMAT = "attacca.offline.identity-outbox-record"
 CONVERGENCE_PROOF_FORMAT = "attacca.offline.convergence-proof"
 OFFLINE_SYNC_SCHEMA_VERSION = 1
+MIRROR_SCHEMA_VERSION = 2
+SYNC_STATE_SCHEMA_VERSION = 2
 JOURNAL_GENESIS_HASH = "0" * 64
 
 _SYNC_STATE_MUTABLE_KEYS = {
@@ -63,7 +65,7 @@ _SYNC_STATE_MUTABLE_KEYS = {
 }
 _SYNC_STATE_IDENTITY_KEYS = {
     "format", "schema_version", "storage_key", "scope_fingerprint",
-    "client_id", "device_id",
+    "client_id", "device_id", "mirror_key", "projection_capabilities",
 }
 _SYNC_STATE_KEYS = (
     _SYNC_STATE_MUTABLE_KEYS | _SYNC_STATE_IDENTITY_KEYS | {"state_sha256"})
@@ -93,6 +95,14 @@ _RESOURCE_ALIASES = {
     "full_log": "full_log", "events": "events", "records": "records",
     "actor_aliases": "actor_aliases", "inbox": "inbox_cursor",
     "inbox_cursor": "inbox_cursor", "project": "project",
+    "cloud": "cloud_context", "cloud_context": "cloud_context",
+    "disposition": "message_dispositions",
+    "dispositions": "message_dispositions",
+    "message_disposition": "message_dispositions",
+    "message_dispositions": "message_dispositions",
+}
+_OPERATION_RESOURCE_ALIASES = {
+    "message.dispose": "message_dispositions",
 }
 
 
@@ -104,6 +114,10 @@ class OfflineMirrorError(OfflineSyncError):
     """The local identity-scoped mirror is missing or failed validation."""
 
 
+class OfflineSchemaCompatibilityError(OfflineMirrorError):
+    """Verified local/remote bytes use an unsupported projection schema."""
+
+
 class OfflineJournalError(OfflineSyncError):
     """The append-only outbox is malformed or its hash chain changed."""
 
@@ -113,7 +127,11 @@ class OfflineConflictError(OfflineSyncError):
 
 
 class OfflineIdentityChangedError(OfflineSyncError):
-    """Authenticated identity/visibility changed and needs safe rebinding."""
+    """Authenticated principal/actor/role changed and needs safe rebinding."""
+
+
+class OfflineVisibilityChangedError(OfflineSyncError):
+    """The same identity has a newer visibility/projection generation."""
 
 
 class RemoteUnavailableError(ConnectionError):
@@ -349,14 +367,18 @@ class ConvergenceProof:
     convergence_awaiting_receipts: tuple
     own_canonical_events_observed: tuple
     online: bool
+    projection_capabilities: dict = None
 
     def as_dict(self):
         value = {
             "format": CONVERGENCE_PROOF_FORMAT,
-            "schema_version": OFFLINE_SYNC_SCHEMA_VERSION,
+            "schema_version": MIRROR_SCHEMA_VERSION,
             "normalized_server_url": self.normalized_server_url,
             "storage_key": self.storage_key,
             "scope": _json_copy(self.scope),
+            "projection_capabilities": _json_copy(
+                self.projection_capabilities or
+                protocol.current_projection_capabilities()),
             "visibility_fingerprint": self.visibility_fingerprint,
             "cursor": _json_copy(self.cursor),
             "snapshot_sha256": self.snapshot_sha256,
@@ -367,7 +389,8 @@ class ConvergenceProof:
             "own_canonical_events_observed": list(
                 self.own_canonical_events_observed),
             "online": bool(self.online),
-            "validation": "sync_protocol.schema-v1+scope+visibility+chain",
+            "validation": (
+                "sync_protocol.schema-v1+projection-v2+scope+visibility+chain"),
         }
         value["proof_sha256"] = _sha256(value)
         return value
@@ -375,11 +398,13 @@ class ConvergenceProof:
 
 def validate_convergence_proof(value, *, expected_server_url=None,
                                expected_project=None, expected_scope=None,
+                               expected_projection_capabilities=None,
                                require_online=False):
     """Validate a proof before a hook treats cached authority as binding."""
     required = {
         "format", "schema_version", "normalized_server_url", "storage_key",
-        "scope", "visibility_fingerprint", "cursor", "snapshot_sha256",
+        "scope", "projection_capabilities", "visibility_fingerprint",
+        "cursor", "snapshot_sha256",
         "mirror_verified_at", "mirror_stale",
         "convergence_awaiting_receipts", "own_canonical_events_observed",
         "online", "validation", "proof_sha256",
@@ -392,9 +417,9 @@ def validate_convergence_proof(value, *, expected_server_url=None,
         raise OfflineMirrorError("convergence proof digest mismatch")
     checked["proof_sha256"] = digest
     if checked["format"] != CONVERGENCE_PROOF_FORMAT \
-            or checked["schema_version"] != OFFLINE_SYNC_SCHEMA_VERSION \
+            or checked["schema_version"] != MIRROR_SCHEMA_VERSION \
             or checked["validation"] != \
-            "sync_protocol.schema-v1+scope+visibility+chain":
+            "sync_protocol.schema-v1+projection-v2+scope+visibility+chain":
         raise OfflineMirrorError("unsupported convergence proof")
     try:
         verified_at = datetime.fromisoformat(
@@ -406,6 +431,13 @@ def validate_convergence_proof(value, *, expected_server_url=None,
             "convergence proof verified_at is invalid") from error
     scope = protocol.validate_scope(
         checked["scope"], expected_scope=expected_scope)
+    capabilities = protocol.validate_projection_capabilities(
+        checked["projection_capabilities"])
+    if expected_projection_capabilities is not None and capabilities != \
+            protocol.validate_projection_capabilities(
+                expected_projection_capabilities):
+        raise OfflineMirrorError(
+            "convergence proof projection capabilities mismatch")
     protocol.validate_visibility_fingerprint(
         checked["visibility_fingerprint"])
     protocol.validate_cursor(checked["cursor"])
@@ -444,7 +476,8 @@ class OfflineProjectSync:
     """One authenticated identity mirror and one device's durable outbox."""
 
     def __init__(self, storage_root, server_url, scope, client_id, device_id,
-                 visibility_fingerprint=None, wake_callback=None):
+                 visibility_fingerprint=None, wake_callback=None,
+                 projection_capabilities=None):
         self.storage_root = Path(storage_root).absolute()
         self.normalized_server_url = normalize_server_url(server_url)
         self.scope = protocol.validate_scope(scope)
@@ -455,6 +488,10 @@ class OfflineProjectSync:
         self.visibility_fingerprint = (
             protocol.validate_visibility_fingerprint(visibility_fingerprint)
             if visibility_fingerprint is not None else None)
+        self.projection_capabilities = \
+            protocol.validate_projection_capabilities(
+                projection_capabilities or
+                protocol.current_projection_capabilities())
         self.storage_key = mirror_storage_key(
             self.normalized_server_url, self.project_id, self.principal_id)
         self.directory = self.storage_root / self.storage_key
@@ -466,15 +503,26 @@ class OfflineProjectSync:
         self._lock_local = threading.local()
         self._configure_identity_paths()
         self._ensure_layout()
+        self._migrate_legacy_mirror_if_safe()
 
     @staticmethod
-    def _identity_key(scope):
+    def _identity_key(scope, projection_capabilities):
+        return "v1_" + hashlib.sha256(_canonical_bytes({
+            "scope_fingerprint": protocol.scope_fingerprint(scope),
+            "projection_capabilities":
+                protocol.validate_projection_capabilities(
+                    projection_capabilities),
+        })).hexdigest()
+
+    @staticmethod
+    def _legacy_identity_key(scope):
+        """Return the schema-v1 mirror key used before capability binding."""
         return "v1_" + hashlib.sha256(_canonical_bytes({
             "scope_fingerprint": protocol.scope_fingerprint(scope),
         })).hexdigest()
 
     def _mirror_path_for_scope(self, scope):
-        key = self._identity_key(scope)
+        key = self._identity_key(scope, self.projection_capabilities)
         directory = self.mirrors_directory / key
         return key, directory, directory / "snapshot.json"
 
@@ -491,7 +539,12 @@ class OfflineProjectSync:
         self.outbox_directory = self.outboxes_directory / self.outbox_key
         self.journal_directory = self.outbox_directory / "records"
         self.temporary_directory = self.outbox_directory / ".pending"
-        self.state_path = self.outbox_directory / "sync-state.json"
+        # Journal records are shared across compatible projection upgrades so
+        # an already-fsynced write is never lost.  Mutable mirror freshness is
+        # capability-specific and must not let a newer client mark an older
+        # mirror current (or vice versa).
+        self.state_path = self.outbox_directory / (
+            "sync-state-%s.json" % self.mirror_key)
 
     def _ensure_layout(self):
         for path in (
@@ -499,6 +552,93 @@ class OfflineProjectSync:
                 self.mirror_directory, self.outboxes_directory, self.outbox_directory,
                 self.journal_directory, self.temporary_directory):
             _ensure_private_directory(path)
+
+    def _migrate_legacy_mirror_if_safe(self):
+        """Copy a fully verified pre-capability mirror into this partition.
+
+        The old bytes remain untouched for a still-running legacy client.  A
+        migrated mirror is deliberately stale/pending because its visibility
+        fingerprint did not bind projection capabilities; reconnect must
+        negotiate and refresh it before this client can claim to be online.
+        Invalid, cross-scope, or visibility-mismatched legacy bytes are simply
+        not authority and are never copied.
+        """
+        if self.has_mirror():
+            return False
+        legacy_key = self._legacy_identity_key(self.scope)
+        legacy_path = self.mirrors_directory / legacy_key / "snapshot.json"
+        if not legacy_path.exists() or legacy_path.is_symlink():
+            return False
+        with self._locked():
+            if self.has_mirror():
+                return False
+            try:
+                wrapper = _read_json_file(
+                    legacy_path,
+                    protocol.MAX_SNAPSHOT_BYTES + 1024 * 1024)
+                required = {
+                    "format", "schema_version", "normalized_server_url",
+                    "storage_key", "mirror_key", "scope_fingerprint",
+                    "scope", "visibility_fingerprint", "verified_at",
+                    "reset_reason", "snapshot_sha256", "snapshot",
+                }
+                if not isinstance(wrapper, dict) or set(wrapper) != required \
+                        or wrapper.get("format") != MIRROR_FORMAT \
+                        or wrapper.get("schema_version") != \
+                        OFFLINE_SYNC_SCHEMA_VERSION \
+                        or wrapper.get("normalized_server_url") != \
+                        self.normalized_server_url \
+                        or wrapper.get("storage_key") != self.storage_key:
+                    return False
+                scope = protocol.validate_scope(
+                    wrapper["scope"], expected_scope=self.scope)
+                visibility = protocol.validate_visibility_fingerprint(
+                    wrapper["visibility_fingerprint"])
+                if self.visibility_fingerprint is not None \
+                        and visibility != self.visibility_fingerprint:
+                    return False
+                snapshot = protocol.validate_snapshot(
+                    wrapper["snapshot"], expected_scope=scope,
+                    expected_visibility=visibility)
+                protocol.validate_projection_for_capabilities(
+                    snapshot["projection"], scope,
+                    self.projection_capabilities)
+                if wrapper["mirror_key"] != legacy_key \
+                        or wrapper["scope_fingerprint"] != \
+                        protocol.scope_fingerprint(scope) \
+                        or wrapper["snapshot_sha256"] != _sha256(snapshot):
+                    return False
+                if not isinstance(wrapper["verified_at"], str):
+                    return False
+                _validate_optional_timestamp(
+                    wrapper["verified_at"], "legacy mirror verified_at")
+                if wrapper["reset_reason"] is not None \
+                        and not isinstance(wrapper["reset_reason"], str):
+                    return False
+            except (OfflineSyncError, protocol.SyncProtocolError):
+                return False
+
+            migrated = self._mirror_wrapper(
+                snapshot, reset_reason="migrated from schema-v1 mirror")
+            migrated["verified_at"] = wrapper["verified_at"]
+            _atomic_replace_json(
+                self.mirror_path, migrated,
+                max_bytes=protocol.MAX_SNAPSHOT_BYTES + 1024 * 1024)
+            if self.visibility_fingerprint is None:
+                self.visibility_fingerprint = visibility
+            state = self._read_state_locked()
+            state.update({
+                "mode": "pending", "pending_sync": True,
+                "mirror_stale": True,
+                "mirror_verified_at": wrapper["verified_at"],
+                "last_verified_remote_cursor": _json_copy(
+                    snapshot["cursor"]),
+                "last_reset_reason": "migrated from schema-v1 mirror",
+                "last_error": (
+                    "projection capabilities require a hosted refresh"),
+            })
+            self._write_state_locked(state)
+            return True
 
     @contextmanager
     def _locked(self):
@@ -535,9 +675,18 @@ class OfflineProjectSync:
                                         allow_visibility_change=False):
         try:
             checked = protocol.validate_snapshot(envelope)
+            protocol.validate_projection_for_capabilities(
+                checked["projection"], checked["scope"],
+                self.projection_capabilities)
         except protocol.SyncProtocolError as error:
-            raise OfflineMirrorError(
-                "identity snapshot failed schema-v1 validation: %s" % error) from error
+            error_class = OfflineSchemaCompatibilityError \
+                if protocol.is_schema_compatibility_error(error) \
+                else OfflineMirrorError
+            raise error_class(
+                "identity snapshot failed schema-v1/projection-v%d "
+                "validation: %s" % (
+                    self.projection_capabilities["schema_version"], error)
+                ) from error
         if not _same_principal_scope(checked["scope"], self.scope):
             raise OfflineIdentityChangedError(
                 "snapshot belongs to another server/project/principal")
@@ -548,17 +697,20 @@ class OfflineProjectSync:
                 and not allow_visibility_change \
                 and checked["visibility_fingerprint"] != \
                 self.visibility_fingerprint:
-            raise OfflineIdentityChangedError(
+            raise OfflineVisibilityChangedError(
                 "snapshot visibility differs from the pinned mirror")
         return checked
 
     def _mirror_wrapper(self, snapshot, reset_reason=None):
         return {
             "format": MIRROR_FORMAT,
-            "schema_version": OFFLINE_SYNC_SCHEMA_VERSION,
+            "schema_version": MIRROR_SCHEMA_VERSION,
             "normalized_server_url": self.normalized_server_url,
             "storage_key": self.storage_key,
-            "mirror_key": self._identity_key(snapshot["scope"]),
+            "mirror_key": self._identity_key(
+                snapshot["scope"], self.projection_capabilities),
+            "projection_capabilities": _json_copy(
+                self.projection_capabilities),
             "scope_fingerprint": protocol.scope_fingerprint(snapshot["scope"]),
             "scope": _json_copy(snapshot["scope"]),
             "visibility_fingerprint": snapshot["visibility_fingerprint"],
@@ -581,29 +733,41 @@ class OfflineProjectSync:
         required = {
             "format", "schema_version", "normalized_server_url",
             "storage_key", "mirror_key", "scope_fingerprint", "scope",
-            "visibility_fingerprint", "verified_at", "reset_reason",
+            "projection_capabilities", "visibility_fingerprint",
+            "verified_at", "reset_reason",
             "snapshot_sha256", "snapshot",
         }
         if not isinstance(wrapper, dict) or set(wrapper) != required \
                 or wrapper.get("format") != MIRROR_FORMAT \
-                or wrapper.get("schema_version") != OFFLINE_SYNC_SCHEMA_VERSION:
+                or wrapper.get("schema_version") != MIRROR_SCHEMA_VERSION:
             raise OfflineMirrorError("unsupported identity mirror wrapper")
         if wrapper["normalized_server_url"] != self.normalized_server_url \
                 or wrapper["storage_key"] != self.storage_key:
             raise OfflineMirrorError("identity mirror storage key mismatch")
         try:
             scope = protocol.validate_scope(wrapper["scope"])
+            capabilities = protocol.validate_projection_capabilities(
+                wrapper["projection_capabilities"])
             visibility = protocol.validate_visibility_fingerprint(
                 wrapper["visibility_fingerprint"])
             snapshot = protocol.validate_snapshot(
                 wrapper["snapshot"], expected_scope=scope,
                 expected_visibility=visibility)
+            protocol.validate_projection_for_capabilities(
+                snapshot["projection"], scope, capabilities)
         except protocol.SyncProtocolError as error:
-            raise OfflineMirrorError(
+            error_class = OfflineSchemaCompatibilityError \
+                if protocol.is_schema_compatibility_error(error) \
+                else OfflineMirrorError
+            raise error_class(
                 "stored identity mirror failed validation: %s" % error) from error
         if not _same_principal_scope(scope, self.scope):
             raise OfflineMirrorError("stored mirror belongs to another identity")
-        if wrapper["mirror_key"] != self._identity_key(scope) \
+        if capabilities != self.projection_capabilities:
+            raise OfflineSchemaCompatibilityError(
+                "stored mirror projection capabilities differ from this client")
+        if wrapper["mirror_key"] != self._identity_key(
+                scope, capabilities) \
                 or wrapper["scope_fingerprint"] != \
                 protocol.scope_fingerprint(scope):
             raise OfflineMirrorError("stored mirror scope partition mismatch")
@@ -612,7 +776,7 @@ class OfflineProjectSync:
                 "stored mirror actor/role differs from this client scope")
         if require_current_scope and self.visibility_fingerprint is not None \
                 and visibility != self.visibility_fingerprint:
-            raise OfflineIdentityChangedError(
+            raise OfflineVisibilityChangedError(
                 "stored mirror visibility differs from this client scope")
         if wrapper["snapshot_sha256"] != _sha256(snapshot):
             raise OfflineMirrorError("stored snapshot digest mismatch")
@@ -904,11 +1068,14 @@ class OfflineProjectSync:
         if not self.state_path.exists():
             return {
                 "format": SYNC_STATE_FORMAT,
-                "schema_version": OFFLINE_SYNC_SCHEMA_VERSION,
+                "schema_version": SYNC_STATE_SCHEMA_VERSION,
                 "storage_key": self.storage_key,
                 "scope_fingerprint": protocol.scope_fingerprint(self.scope),
                 "client_id": self.client_id,
                 "device_id": self.device_id,
+                "mirror_key": self.mirror_key,
+                "projection_capabilities": _json_copy(
+                    self.projection_capabilities),
                 "mode": "uninitialized" if not self.has_mirror() else "pending",
                 "pending_sync": False,
                 "mirror_stale": not self.has_mirror(),
@@ -935,13 +1102,24 @@ class OfflineProjectSync:
                 or digest != _sha256(unsigned):
             raise OfflineSyncError("sync state digest mismatch")
         if state.get("format") != SYNC_STATE_FORMAT \
-                or state.get("schema_version") != OFFLINE_SYNC_SCHEMA_VERSION \
+                or state.get("schema_version") != SYNC_STATE_SCHEMA_VERSION \
                 or state.get("storage_key") != self.storage_key \
                 or state.get("scope_fingerprint") != \
                 protocol.scope_fingerprint(self.scope) \
                 or state.get("client_id") != self.client_id \
-                or state.get("device_id") != self.device_id:
+                or state.get("device_id") != self.device_id \
+                or state.get("mirror_key") != self.mirror_key:
             raise OfflineSyncError("sync state identity or format mismatch")
+        try:
+            state_capabilities = protocol.validate_projection_capabilities(
+                state.get("projection_capabilities"))
+        except protocol.SyncProtocolError as error:
+            raise OfflineSyncError(
+                "sync state projection capabilities are invalid: %s" % error) \
+                from error
+        if state_capabilities != self.projection_capabilities:
+            raise OfflineSyncError(
+                "sync state projection capabilities mismatch")
         if state.get("mode") not in _SYNC_MODES \
                 or not isinstance(state.get("pending_sync"), bool) \
                 or not isinstance(state.get("mirror_stale"), bool):
@@ -975,11 +1153,14 @@ class OfflineProjectSync:
         value.pop("state_sha256", None)
         value.update({
             "format": SYNC_STATE_FORMAT,
-            "schema_version": OFFLINE_SYNC_SCHEMA_VERSION,
+            "schema_version": SYNC_STATE_SCHEMA_VERSION,
             "storage_key": self.storage_key,
             "scope_fingerprint": protocol.scope_fingerprint(self.scope),
             "client_id": self.client_id,
             "device_id": self.device_id,
+            "mirror_key": self.mirror_key,
+            "projection_capabilities": _json_copy(
+                self.projection_capabilities),
         })
         if set(value) != _SYNC_STATE_KEYS - {"state_sha256"}:
             raise OfflineSyncError("refusing to write an incomplete sync state")
@@ -1261,9 +1442,19 @@ class OfflineProjectSync:
                 checked = protocol.validate_pull_result(
                     result, expected_scope=self.scope,
                     expected_visibility=self.visibility_fingerprint)
+                if checked["status"] == "ok":
+                    protocol.validate_projection_for_capabilities(
+                        checked["changes"], checked["scope"],
+                        self.projection_capabilities, partial=True)
             except protocol.SyncProtocolError as error:
-                raise OfflineMirrorError(
-                    "pull result failed schema-v1 validation: %s" % error) from error
+                error_class = OfflineSchemaCompatibilityError \
+                    if protocol.is_schema_compatibility_error(error) \
+                    else OfflineMirrorError
+                raise error_class(
+                    "pull result failed schema-v1/projection-v%d "
+                    "validation: %s" % (
+                        self.projection_capabilities["schema_version"], error)
+                    ) from error
             if checked["status"] != "ok" \
                     or checked["from_cursor"] != snapshot["cursor"]:
                 raise OfflineMirrorError(
@@ -1277,7 +1468,10 @@ class OfflineProjectSync:
                     checked["next_cursor"], projection, records,
                     generated_at=checked["generated_at"])
             except protocol.SyncProtocolError as error:
-                raise OfflineMirrorError(
+                error_class = OfflineSchemaCompatibilityError \
+                    if protocol.is_schema_compatibility_error(error) \
+                    else OfflineMirrorError
+                raise error_class(
                     "merged pull projection failed validation: %s" % error) from error
             self.install_snapshot(advanced)
             return bool(checked["records"] or checked["changes"] \
@@ -1287,6 +1481,29 @@ class OfflineProjectSync:
     def _is_unavailable(error):
         return isinstance(error, (
             RemoteUnavailableError, ConnectionError, TimeoutError, OSError))
+
+    @staticmethod
+    def _remote_contract_failure_kind(error):
+        if error.__class__.__name__ == "SyncSchemaCompatibilityError" \
+                or isinstance(error, OfflineSchemaCompatibilityError):
+            return "schema_incompatible"
+        if error.__class__.__name__ == "SyncResponseError":
+            return "remote_contract_invalid"
+        return None
+
+    def _remote_contract_report(self, error, report, failure_kind):
+        """Keep a verified mirror/outbox usable after non-auth contract drift."""
+        usable = self.has_mirror()
+        self._set_state(
+            mode="offline" if usable else "offline_uninitialized",
+            pending_sync=True, mirror_stale=True, last_error=str(error))
+        report.update({
+            "error": str(error),
+            "failure_kind": failure_kind,
+            "authentication_required": False,
+            "offline_usable": usable,
+        })
+        return self._sync_report("offline", report)
 
     def _remote_snapshot(self, remote, allow_scope_change=False):
         method = getattr(remote, "fetch_snapshot", None)
@@ -1308,8 +1525,15 @@ class OfflineProjectSync:
             limit=protocol.MAX_PULL_RECORDS)
         try:
             checked = protocol.validate_pull_result(result)
+            if checked["status"] == "ok":
+                protocol.validate_projection_for_capabilities(
+                    checked["changes"], checked["scope"],
+                    self.projection_capabilities, partial=True)
         except protocol.SyncProtocolError as error:
-            raise OfflineMirrorError(
+            error_class = OfflineSchemaCompatibilityError \
+                if protocol.is_schema_compatibility_error(error) \
+                else OfflineMirrorError
+            raise error_class(
                 "remote pull response failed validation: %s" % error) from error
         if checked["status"] == "ok":
             if checked["scope"] != self.scope:
@@ -1317,7 +1541,7 @@ class OfflineProjectSync:
                     "successful pull changed actor or role without a reset")
             if checked["visibility_fingerprint"] != \
                     self.visibility_fingerprint:
-                raise OfflineIdentityChangedError(
+                raise OfflineVisibilityChangedError(
                     "successful pull changed visibility without a reset")
         elif not _same_principal_scope(checked["scope"], self.scope):
             raise OfflineIdentityChangedError(
@@ -1338,7 +1562,10 @@ class OfflineProjectSync:
                 expected_mutation_ids=[
                     item["client_mutation_id"] for item in mutations])
         except protocol.SyncProtocolError as error:
-            raise OfflineSyncError(
+            error_class = OfflineSchemaCompatibilityError \
+                if protocol.is_schema_compatibility_error(error) \
+                else OfflineSyncError
+            raise error_class(
                 "remote push response failed validation: %s" % error) from error
 
     def _pull_until_current(self, remote, allow_initialize=True):
@@ -1356,7 +1583,8 @@ class OfflineProjectSync:
             try:
                 with self._locked():
                     cursor = self._cursor_locked()
-            except OfflineIdentityChangedError:
+            except (OfflineIdentityChangedError,
+                    OfflineVisibilityChangedError):
                 # Another authenticated process for this exact actor may have
                 # atomically installed a newer visibility generation in the
                 # shared principal cache. Reauthenticate and replace it from a
@@ -1435,9 +1663,14 @@ class OfflineProjectSync:
                 self._pull_until_current(remote)
             report["converged"].extend(first_converged)
         except Exception as error:
+            contract_failure = self._remote_contract_failure_kind(error)
+            if contract_failure:
+                return self._remote_contract_report(
+                    error, report, contract_failure)
             if not self._is_unavailable(error):
                 if isinstance(error, (OfflineMirrorError,
-                                      OfflineIdentityChangedError)):
+                                      OfflineIdentityChangedError,
+                                      OfflineVisibilityChangedError)):
                     self._set_state(
                         mode="conflict", pending_sync=True, mirror_stale=True,
                         last_error=str(error))
@@ -1469,6 +1702,10 @@ class OfflineProjectSync:
             try:
                 pushed = self._remote_push(remote, ready, known_receipts)
             except Exception as error:
+                contract_failure = self._remote_contract_failure_kind(error)
+                if contract_failure:
+                    return self._remote_contract_report(
+                        error, report, contract_failure)
                 if not self._is_unavailable(error):
                     raise
                 self._set_state(
@@ -1525,9 +1762,14 @@ class OfflineProjectSync:
                 item for item in final_converged
                 if item not in report["converged"])
         except Exception as error:
+            contract_failure = self._remote_contract_failure_kind(error)
+            if contract_failure:
+                return self._remote_contract_report(
+                    error, report, contract_failure)
             if not self._is_unavailable(error):
                 if isinstance(error, (OfflineMirrorError,
-                                      OfflineIdentityChangedError)):
+                                      OfflineIdentityChangedError,
+                                      OfflineVisibilityChangedError)):
                     self._set_state(
                         mode="conflict", pending_sync=True, mirror_stale=True,
                         last_error=str(error))
@@ -1566,6 +1808,8 @@ class OfflineProjectSync:
                 normalized_server_url=self.normalized_server_url,
                 storage_key=self.storage_key,
                 scope=_json_copy(wrapper["scope"]),
+                projection_capabilities=_json_copy(
+                    wrapper["projection_capabilities"]),
                 visibility_fingerprint=wrapper["visibility_fingerprint"],
                 cursor=_json_copy(wrapper["snapshot"]["cursor"]),
                 snapshot_sha256=wrapper["snapshot_sha256"],
@@ -1577,7 +1821,9 @@ class OfflineProjectSync:
             ).as_dict()
             return validate_convergence_proof(
                 proof, expected_server_url=self.normalized_server_url,
-                expected_project=self.project_id, expected_scope=self.scope)
+                expected_project=self.project_id, expected_scope=self.scope,
+                expected_projection_capabilities=
+                    self.projection_capabilities)
 
     def status(self):
         with self._locked():
@@ -1609,6 +1855,8 @@ class OfflineProjectSync:
                 "storage_key": self.storage_key,
                 "mirror_key": self.mirror_key,
                 "scope": _json_copy(self.scope),
+                "projection_capabilities": _json_copy(
+                    self.projection_capabilities),
                 "visibility_fingerprint": self.visibility_fingerprint,
                 "read_source": "verified_local_mirror" if mirror_valid else None,
                 "mirror_valid": mirror_valid,
@@ -1656,7 +1904,11 @@ class OfflineProjectSync:
 
     @staticmethod
     def _resource_for_operation(operation):
-        prefix = str(operation or "").split(".", 1)[0].lower()
+        normalized = str(operation or "").strip().lower()
+        exact = _OPERATION_RESOURCE_ALIASES.get(normalized)
+        if exact is not None:
+            return exact
+        prefix = normalized.split(".", 1)[0]
         return _RESOURCE_ALIASES.get(prefix)
 
     def pending_overlays(self, section=None):
@@ -1775,8 +2027,11 @@ class OfflineProjectSync:
 __all__ = [
     "MIRROR_FORMAT", "SYNC_STATE_FORMAT", "JOURNAL_RECORD_FORMAT",
     "CONVERGENCE_PROOF_FORMAT", "OFFLINE_SYNC_SCHEMA_VERSION",
-    "OfflineSyncError", "OfflineMirrorError", "OfflineJournalError",
+    "MIRROR_SCHEMA_VERSION", "SYNC_STATE_SCHEMA_VERSION",
+    "OfflineSyncError", "OfflineMirrorError",
+    "OfflineSchemaCompatibilityError", "OfflineJournalError",
     "OfflineConflictError", "OfflineIdentityChangedError",
+    "OfflineVisibilityChangedError",
     "RemoteUnavailableError", "ConvergenceProof", "normalize_server_url",
     "mirror_storage_key", "validate_convergence_proof", "OfflineProjectSync",
 ]
