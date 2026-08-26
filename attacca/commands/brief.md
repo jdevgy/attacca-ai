@@ -10,9 +10,12 @@ truth using the `attacca` MCP tools (NOT from chat memory):
    open tasks, standing decisions, context version.
 2. Call `room_read` — recent coordination messages from other workers
    (Claude, Codex, GLM, humans).
-3. Report a concise briefing to the user: where the project stands, what is
+3. Call `rule_list` and obey the rules for `everyone` plus your registered role.
+   If the work depends on earlier history, call `search` before filesystem/Git
+   archaeology, then open the matching log/task/decision record.
+4. Report a concise briefing to the user: where the project stands, what is
    in flight and by whom, and which task you would pick up next.
-4. If the user confirms (or $ARGUMENTS names a task), `task_claim` it before
+5. If the user confirms (or $ARGUMENTS names a task), `task_claim` it before
    working, and follow the attacca protocol: coordinate via `room_send`,
    record choices via `decision_propose`, and finish with `task_report` +
    `update_handoff`.

@@ -9,7 +9,8 @@ vnev/
 *.db
 *.db-wal
 *.db-shm
-.attacca/
+.attacca/*
+!.attacca/project.json
 server.log
 
 # Claude Code local (personal) settings; project settings stay committed

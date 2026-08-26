@@ -11,14 +11,13 @@ ATTACCA="$HERE/../attacca.py"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 export ATTACCA_DB="$WORK/attacca.db"
-# Isolate the demo from any machine identity (~/.attacca/identity.json):
-# actor ids must stay exactly claude_director / codex_director.
+# Owner is separate attribution and deliberately blank in this demo.
 export ATTACCA_OWNER=""
 mkdir -p "$WORK/acme-app"
 
 step() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
-A() { python3 "$ATTACCA" --actor claude_director --actor-type agent "$@"; }
-B() { python3 "$ATTACCA" --actor codex_director --actor-type agent "$@"; }
+A() { python3 "$ATTACCA" --actor acme.director.claude --actor-type agent "$@"; }
+B() { python3 "$ATTACCA" --actor acme.director.codex --actor-type agent "$@"; }
 
 cd "$WORK/acme-app"
 
@@ -89,8 +88,8 @@ step "ASSERTIONS"
 fail() { echo "DEMO FAILED: $1" >&2; exit 1; }
 echo "$HANDOFF" | grep -q "PKCE auth migration" || fail "handoff objective missing"
 echo "$HANDOFF" | grep -q "access_token"        || fail "handoff what_changed missing"
-python3 "$ATTACCA" --json task list | grep -q '"claimed_by": "codex_director"' \
-  || fail "codex_director claim not recorded"
+python3 "$ATTACCA" --json task list | grep -q '"claimed_by": "acme.director.codex"' \
+  || fail "Acme · Director · Codex claim not recorded"
 python3 "$ATTACCA" --json event verify | grep -q '"ok": true' \
   || fail "ledger verification failed"
 python3 "$ATTACCA" --json decision list | grep -q '"status": "accepted"' \

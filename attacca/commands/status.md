@@ -1,14 +1,10 @@
 ---
-description: Show attacca status for this project (handoff, tasks, room, context version)
-allowed-tools: Bash
+description: Show Attacca status for this workspace
 ---
 
-Current attacca state:
-
-!`python3 ${CLAUDE_PLUGIN_ROOT}/attacca.py --json status 2>&1`
-
-Recent project log:
-
-!`python3 ${CLAUDE_PLUGIN_ROOT}/attacca.py log -n 15 2>&1`
-
-Summarize the project state for the user in a few sentences: context version, open/claimed tasks, pending decisions, recent activity, and anything that needs their attention. If the output says the project is unknown, call any attacca MCP tool (e.g. attacca_status) once — the server auto-registers the project on first contact — then re-run this command.
+Call `attacca_status`, `get_handoff`, `task_list`, and `room_read` through the
+Attacca MCP server. Summarize the workspace, current actor and role, context
+version, lead, open or claimed tasks, pending decisions, recent coordination,
+and anything requiring user attention. If the checkout is unattached or stale,
+invoke the native setup or recovery flow rather than selecting, creating, or
+substituting a workspace silently. $ARGUMENTS

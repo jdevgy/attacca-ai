@@ -1,5 +1,6 @@
 {
   "name": "agentg",
+  "description": "Attacca project continuity plugins for AI coding tools.",
   "owner": { "name": "agentg" },
   "plugins": [
     {

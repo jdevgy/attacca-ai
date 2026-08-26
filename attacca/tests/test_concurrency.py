@@ -6,6 +6,7 @@ database. Appends must never lose or duplicate a sequence number, and a task
 claim must have exactly one winner.
 """
 import importlib.util
+import json
 import multiprocessing
 import os
 import tempfile
@@ -69,6 +70,31 @@ def _mixed_worker(args):
         conn.close()
 
 
+def _handoff_worker(db, actor_id, expected_version, value, barrier, outcomes):
+    """Race one optimistic handoff write from an independent connection."""
+    conn = c.connect(db)
+    try:
+        # Both directors have opened their own WAL connections and share the
+        # same stale-able version before either is allowed to BEGIN IMMEDIATE.
+        barrier.wait(timeout=10)
+        result = c.update_handoff(
+            conn, "stress", actor_id, "agent",
+            {"what_changed": value},
+            expected_context_version=expected_version)
+        outcomes.put({"status": "won", "actor": actor_id, "value": value,
+                      "context_version": result["context_version"]})
+    except c.AttaccaError as err:
+        text = str(err)
+        outcomes.put({"status": "conflict" if "handoff conflict" in text
+                      else "error", "actor": actor_id, "value": value,
+                      "error": text})
+    except Exception as err:  # pragma: no cover - failure information
+        outcomes.put({"status": "error", "actor": actor_id, "value": value,
+                      "error": repr(err)})
+    finally:
+        conn.close()
+
+
 class ConcurrencyTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -119,6 +145,90 @@ class ConcurrencyTestCase(unittest.TestCase):
         task = c._task_dict(c._task_row(conn, "stress", task_id))
         self.assertEqual(task["status"], "claimed")
         self.assertEqual(task["claimed_by"], "claimant-%d" % wins[0][1])
+        conn.close()
+
+    def test_parallel_directors_have_one_optimistic_handoff_winner(self):
+        conn = c.connect(self.db)
+        for actor in ("director-a", "director-b"):
+            c.agent_register(conn, "stress", actor, "agent",
+                             role="director", runtime="concurrency-test")
+        c.set_lead_director(
+            conn, "stress", "admin", "human", "director-a")
+        seed_expected = c.get_handoff(conn, "stress")["context_version"]
+        c.update_handoff(
+            conn, "stress", "director-a", "agent",
+            {"objective": "shared objective", "notes": "seed is preserved"},
+            expected_context_version=seed_expected)
+        expected = c.get_handoff(conn, "stress")["context_version"]
+        baseline_seq = conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS seq FROM events "
+            "WHERE project_id='stress'").fetchone()["seq"]
+        baseline_handoffs = conn.execute(
+            "SELECT COUNT(*) AS n FROM handoffs "
+            "WHERE project_id='stress'").fetchone()["n"]
+        conn.close()
+
+        barrier = multiprocessing.Barrier(2)
+        outcomes = multiprocessing.Queue()
+        candidates = [
+            ("director-a", "director A won the race"),
+            ("director-b", "director B won the race"),
+        ]
+        processes = [multiprocessing.Process(
+            target=_handoff_worker,
+            args=(self.db, actor, expected, value, barrier, outcomes))
+            for actor, value in candidates]
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=15)
+        hung = [process for process in processes if process.is_alive()]
+        for process in hung:
+            process.terminate()
+            process.join(timeout=5)
+        self.assertEqual(hung, [], "parallel handoff workers did not finish")
+        self.assertEqual([process.exitcode for process in processes], [0, 0])
+
+        results = [outcomes.get(timeout=5) for _ in processes]
+        outcomes.close()
+        outcomes.join_thread()
+        winners = [result for result in results if result["status"] == "won"]
+        conflicts = [result for result in results
+                     if result["status"] == "conflict"]
+        errors = [result for result in results if result["status"] == "error"]
+        self.assertEqual(errors, [], results)
+        self.assertEqual(len(winners), 1, results)
+        self.assertEqual(len(conflicts), 1, results)
+        self.assertIn("handoff conflict", conflicts[0]["error"])
+        winner = winners[0]
+        self.assertNotEqual(winner["actor"], conflicts[0]["actor"])
+        self.assertEqual(winner["context_version"], expected + 1)
+
+        conn = c.connect(self.db)
+        final = c.get_handoff(conn, "stress")
+        self.assertEqual(final["context_version"], expected + 1)
+        self.assertEqual(final["handoff_updated_by"], winner["actor"])
+        self.assertEqual(final["handoff"]["what_changed"], winner["value"])
+        self.assertEqual(final["handoff"]["objective"], "shared objective")
+        self.assertEqual(final["handoff"]["notes"], "seed is preserved")
+        self.assertNotEqual(final["handoff"]["what_changed"],
+                            conflicts[0]["value"])
+        handoff_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM handoffs "
+            "WHERE project_id='stress'").fetchone()["n"]
+        self.assertEqual(handoff_count, baseline_handoffs + 1)
+        events = conn.execute(
+            "SELECT actor_id, payload FROM events "
+            "WHERE project_id='stress' AND seq>? "
+            "AND event_type='handoff.updated' ORDER BY seq",
+            (baseline_seq,)).fetchall()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["actor_id"], winner["actor"])
+        event_payload = json.loads(events[0]["payload"])
+        self.assertEqual(event_payload["handoff"]["what_changed"],
+                         winner["value"])
+        verify = c.verify_ledger(conn, "stress")
+        self.assertTrue(verify["ok"], verify["problems"])
         conn.close()
 
     def test_mixed_parallel_workload(self):

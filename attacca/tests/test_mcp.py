@@ -139,8 +139,35 @@ class McpTestCase(unittest.TestCase):
                 self.assertIn(req, tool["inputSchema"]["properties"])
         for expected in ("get_handoff", "room_send", "room_read", "task_claim",
                          "task_report", "update_handoff", "decision_propose",
-                         "check_freshness", "list_projects"):
+                         "check_freshness", "list_projects", "bridge_remove"):
             self.assertIn(expected, names)
+
+    def test_bridge_remove_via_mcp_is_bidirectional_and_repeat_safe(self):
+        conn = c.connect(self.db)
+        other_root = Path(self.tmp.name) / "peer"
+        other_root.mkdir()
+        c.project_init(conn, "setup", "human", path=str(other_root),
+                       project_id="peer", name="Peer")
+        c.bridge_add(conn, "proj", "setup", "human", "peer")
+        c.agent_register(
+            conn, "proj", "setup", "human",
+            agent_id="proj.director.codex", role="director",
+            runtime="codex")
+        conn.close()
+        client = self.client(actor="proj.director.codex")
+        client.initialize(client_name="codex")
+        is_err, _, removed = client.call_tool(
+            "bridge_remove", {"other_project": "peer"})
+        self.assertFalse(is_err)
+        self.assertEqual(set(removed["removed"]), {"proj", "peer"})
+        conn = c.connect(self.db)
+        self.assertEqual(c.bridge_list(conn, "proj")["bridges"], [])
+        self.assertEqual(c.bridge_list(conn, "peer")["bridges"], [])
+        conn.close()
+        is_err, text, _ = client.call_tool(
+            "bridge_remove", {"other_project": "peer"})
+        self.assertTrue(is_err)
+        self.assertIn("not bridged", text)
 
     def test_tool_calls_and_shared_state(self):
         alice = self.client(actor="alice")
@@ -158,7 +185,8 @@ class McpTestCase(unittest.TestCase):
         bob.initialize()
         is_err, _, board = bob.call_tool("task_list", {})
         self.assertFalse(is_err)
-        self.assertEqual(board["tasks"][0]["claimed_by"], "alice")
+        self.assertEqual(board["tasks"][0]["claimed_by"],
+                         "proj.unassigned.alice")
         is_err, _, room = bob.call_tool("room_read", {})
         self.assertIn("claimed the shared task",
                       [m["body"] for m in room["messages"]])
@@ -191,7 +219,20 @@ class McpTestCase(unittest.TestCase):
         client = self.client()  # no ATTACCA_ACTOR
         client.initialize(client_name="My IDE Tool")
         _, _, sent = client.call_tool("room_send", {"body": "who am I"})
-        self.assertEqual(sent["event"]["actor_id"], "my-ide-tool")
+        self.assertEqual(sent["event"]["actor_id"],
+                         "proj.unassigned.my-ide-tool")
+
+    def test_unscoped_project_list_reports_effective_ai_identity_for_setup(self):
+        client = self.client(
+            actor="codex_director", extra_env={"ATTACCA_OWNER": "jack"})
+        client.initialize(client_name="codex")
+        is_err, _, projects = client.call_tool("list_projects", {})
+        self.assertFalse(is_err)
+        self.assertEqual(projects["you"]["actor_id"], "codex_director")
+        self.assertEqual(projects["you"]["actor_type"], "agent")
+        self.assertEqual(projects["you"]["runtime"], "codex")
+        self.assertEqual(projects["you"]["owner"], "jack")
+        self.assertTrue(projects["you"]["identity_pending"])
 
     def test_notifications_get_no_response_and_ping_works(self):
         client = self.client(actor="a1")
@@ -255,15 +296,42 @@ class McpTestCase(unittest.TestCase):
         bob = self.client(actor="bob")
         bob.initialize()
         bob.call_tool("update_handoff", {"objective": "bob's new direction"})
-        # alice overwrites the handoff while stale: warned, and STAYS stale
-        _, _, first = alice.call_tool("update_handoff", {"risks": "some risk"})
-        self.assertIn("stale_context_warning", first)
-        _, _, second = alice.call_tool("update_handoff", {"blockers": "none"})
-        self.assertIn("stale_context_warning", second)
-        # re-briefing clears it
+        # A stale Director must never silently overwrite another handoff.
+        is_err, first, _ = alice.call_tool(
+            "update_handoff", {"risks": "some risk"})
+        self.assertTrue(is_err)
+        self.assertIn("handoff conflict", first)
+        is_err, second, _ = alice.call_tool(
+            "update_handoff", {"blockers": "none"})
+        self.assertTrue(is_err)
+        self.assertIn("handoff conflict", second)
+        # Re-briefing supplies the new expected version and permits the write.
         alice.call_tool("get_handoff", {})
-        _, _, third = alice.call_tool("update_handoff", {"notes": "ok"})
-        self.assertNotIn("stale_context_warning", third)
+        is_err, _, third = alice.call_tool(
+            "update_handoff", {"notes": "ok"})
+        self.assertFalse(is_err)
+        self.assertEqual(third["updated_fields"], ["notes"])
+
+    def test_governed_handoff_rejects_worker_over_mcp(self):
+        conn = c.connect(self.db)
+        try:
+            c.agent_register(conn, "proj", "director", "agent",
+                             role="director", runtime="test")
+            c.agent_register(conn, "proj", "worker", "agent",
+                             role="worker", runtime="test")
+            c.set_lead_director(
+                conn, "proj", "admin", "human", "director")
+        finally:
+            conn.close()
+        worker = self.client(actor="worker")
+        worker.initialize()
+        _, _, brief = worker.call_tool("get_handoff", {})
+        is_err, text, _ = worker.call_tool(
+            "update_handoff",
+            {"notes": "worker should not replace the project brief",
+             "expected_context_version": brief["context_version"]})
+        self.assertTrue(is_err)
+        self.assertIn("director-only", text)
 
     def test_batch_request_gets_array_response(self):
         client = self.client(actor="batcher")
@@ -314,16 +382,18 @@ class McpTestCase(unittest.TestCase):
         is_err, _, inbox = bob.call_tool("check_inbox", {})
         self.assertFalse(is_err)
         self.assertEqual([m["body"] for m in inbox["messages"]], ["ping bob"])
-        self.assertEqual(inbox["messages"][0]["actor"], "jack.claude_director")
+        self.assertEqual(inbox["messages"][0]["actor"],
+                         "proj.unassigned.claude")
         # cursor: second check is empty
         _, _, again = bob.call_tool("check_inbox", {})
         self.assertEqual(again["messages"], [])
         # both agents were auto-registered with runtime + owner
         _, _, agents = bob.call_tool("agent_list", {})
         by_id = {a["agent_id"]: a for a in agents["agents"]}
-        self.assertEqual(by_id["jack.claude_director"]["runtime"], "claude-code")
-        self.assertEqual(by_id["jack.claude_director"]["owner"], "jack")
-        self.assertEqual(by_id["mia.codex_director"]["owner"], "mia")
+        self.assertEqual(by_id["proj.unassigned.claude"]["runtime"],
+                         "claude")
+        self.assertEqual(by_id["proj.unassigned.claude"]["owner"], "jack")
+        self.assertEqual(by_id["proj.unassigned.codex"]["owner"], "mia")
         # events carry the owner key
         conn = c.connect(self.db)
         row = conn.execute(
@@ -336,13 +406,15 @@ class McpTestCase(unittest.TestCase):
         c.project_init(conn, "setup", "human",
                        path=str(Path(self.tmp.name) / "repo2"),
                        project_id="proj2", name="Second Project")
+        c.bridge_add(conn, "proj", "setup", "human", "proj2")
         conn.close()
         client = self.client(actor="messenger")
         client.initialize()
         is_err, _, sent = client.call_tool("room_send", {
             "body": "hello other project", "project": "proj2"})
         self.assertFalse(is_err)
-        self.assertEqual(sent["delivered_to"], "proj2")
+        self.assertEqual(sent["delivered_to"], "proj")
+        self.assertEqual(sent["mirrored_to_bridged_projects"], ["proj2"])
         _, _, projects = client.call_tool("list_projects", {})
         self.assertEqual({p["project_id"] for p in projects["projects"]},
                          {"proj", "proj2"})

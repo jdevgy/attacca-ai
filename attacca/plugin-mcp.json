@@ -2,8 +2,14 @@
   "mcpServers": {
     "attacca": {
       "command": "python3",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/attacca.py", "connect"],
-      "env": { "ATTACCA_ACTOR": "claude_director" }
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/attacca.py",
+        "connect"
+      ],
+      "env": {
+        "ATTACCA_ACTOR": "claude",
+        "ATTACCA_URL": "http://127.0.0.1:4173"
+      }
     }
   }
 }

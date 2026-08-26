@@ -1,0 +1,46 @@
+{
+  "description": "Load Attacca at session start and poll shared updates automatically at active turn boundaries.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.attacca/plugin/attacca/hooks/session_start.py\"",
+            "timeout": 8,
+            "statusMessage": "Checking Attacca workspace",
+            "additionalContextLimit": 8000
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.attacca/plugin/attacca/hooks/session_start.py\"",
+            "timeout": 8,
+            "statusMessage": "Checking Attacca updates",
+            "additionalContextLimit": 4000
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.attacca/plugin/attacca/hooks/session_start.py\"",
+            "timeout": 8,
+            "statusMessage": "Checking Attacca updates"
+          }
+        ]
+      }
+    ]
+  }
+}

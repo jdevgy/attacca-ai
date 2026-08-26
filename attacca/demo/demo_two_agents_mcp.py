@@ -5,10 +5,10 @@ Spawns two independent MCP server processes (exactly what Claude Code and
 Codex do when they start a stdio MCP server) with different actor identities,
 and drives a coordination conversation between them:
 
-  claude_director: creates a task, posts a directive, waits for a reply
-  codex_director:  reads the room, claims the task, reports with evidence
-  claude_director: sees the report arrive via room polling, accepts the task,
-                   updates the handoff for the next worker
+  MCP Demo · Director · Claude: creates a task and posts a directive
+  MCP Demo · Worker · Codex: reads it, claims the task, reports with evidence
+  MCP Demo · Director · Claude: sees the report, accepts the task, and updates
+                                the handoff for the next worker
 
 Everything flows through the shared SQLite ledger; the two processes never
 talk to each other directly.
@@ -23,8 +23,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SCRIPT = str(HERE.parent / "attacca.py")
 
-# Isolate the demo from any machine identity (~/.attacca/identity.json):
-# actor ids must stay exactly claude_director / codex_director.
+# Owner is separate attribution and deliberately blank in this demo.
 os.environ["ATTACCA_OWNER"] = ""
 
 
@@ -82,7 +81,7 @@ def main():
     claude = Tool("claude-code", "claude_director", db)
     codex = Tool("codex-cli", "codex_director", db)
 
-    print("\n== claude_director: brief in, create + delegate work ==")
+    print("\n== MCP Demo · Director · Claude: brief + delegate work ==")
     handoff = claude.call("get_handoff")
     claude.say("briefed at context v%d" % handoff["context_version"])
     claude.call("agent_register", role="director", runtime="claude-code")
@@ -90,12 +89,12 @@ def main():
                        expected_scope=["src/api/token.ts"], risk_level="high")
     tid = task["task_id"]
     claude.call("room_send", msg_type="directive", task_id=tid,
-                mentions=["codex_director"],
+                mentions=["mcpdemo.worker.codex"],
                 body="Please take %s. Use a sliding window, 10 req/min per IP." % tid)
     cursor = claude.call("room_read")["next_since_seq"]
     claude.say("created %s and posted a directive; waiting for a reply" % tid)
 
-    print("\n== codex_director: cold start in a different tool ==")
+    print("\n== MCP Demo · Worker · Codex: cold start in another tool ==")
     codex.call("agent_register", role="worker", runtime="codex-cli")
     briefing = codex.call("get_handoff")
     codex.say("briefed at context v%d, sees open tasks: %s"
@@ -116,18 +115,20 @@ def main():
                body="%s ready for review; limiter behind RATE_LIMIT flag." % tid)
     codex.say("reported %s -> review with test evidence" % tid)
 
-    print("\n== claude_director: sees the reply arrive by polling the room ==")
+    print("\n== MCP Demo · Director · Claude: receives the reply by polling ==")
     new_msgs = claude.call("room_read", since_seq=cursor)["messages"]
     for msg in new_msgs:
         claude.say("new message from %s (%s): %s"
                    % (msg["actor"], msg["msg_type"], msg["body"]))
-    assert any(m["actor"] == "codex_director" for m in new_msgs), \
-        "claude_director did not receive codex_director's messages"
+    assert any(m["actor"] == "mcpdemo.worker.codex" for m in new_msgs), \
+        "the Claude Director did not receive the Codex Worker's messages"
     board = claude.call("task_list", status="review")
     assert board["tasks"][0]["task_id"] == tid
     claude.call("task_set_status", task_id=tid, status="done",
                 reason="review passed: evidence includes api:ratelimit pass")
+    latest = claude.call("get_handoff")
     claude.call("update_handoff",
+                expected_context_version=latest["context_version"],
                 what_changed="Rate limiting added to /token (%s, by codex)" % tid,
                 next_actions="Monitor limiter in staging; tune window if needed.")
     claude.say("accepted %s and updated the handoff" % tid)

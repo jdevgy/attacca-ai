@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 # Isolate tests from any machine identity (~/.attacca/identity.json)
@@ -158,6 +159,58 @@ class StoreTestCase(unittest.TestCase):
         with self.assertRaises(c.AttaccaError):
             c.update_handoff(self.conn, "p1", "a", "agent", {})
 
+    def test_governed_handoff_is_director_only_and_version_checked(self):
+        for agent_id, role in (("director-a", "director"),
+                               ("director-b", "director"),
+                               ("advisor", "advisor"),
+                               ("worker", "worker")):
+            c.agent_register(self.conn, "p1", agent_id, "agent",
+                             role=role, runtime="test")
+        c.set_lead_director(
+            self.conn, "p1", "admin", "human", "director-a")
+        brief = c.get_handoff(self.conn, "p1")
+        expected = brief["context_version"]
+        written = c.update_handoff(
+            self.conn, "p1", "director-a", "agent",
+            {"what_changed": "director A wrote first"},
+            expected_context_version=expected)
+        with self.assertRaisesRegex(c.AttaccaError, "handoff conflict"):
+            c.update_handoff(
+                self.conn, "p1", "director-b", "agent",
+                {"what_changed": "stale director B overwrite"},
+                expected_context_version=expected)
+        self.assertEqual(
+            c.get_handoff(self.conn, "p1")["handoff"]["what_changed"],
+            "director A wrote first")
+        for agent_id in ("advisor", "worker"):
+            with self.assertRaisesRegex(c.AttaccaError, "director-only"):
+                c.update_handoff(
+                    self.conn, "p1", agent_id, "agent",
+                    {"notes": "not allowed"},
+                    expected_context_version=written["context_version"])
+        # Humans retain the explicit prototype override.
+        human = c.update_handoff(
+            self.conn, "p1", "owner", "human", {"notes": "reviewed"},
+            expected_context_version=written["context_version"])
+        self.assertGreater(human["context_version"],
+                           written["context_version"])
+
+    def test_lead_director_cannot_be_registered_as_non_director(self):
+        c.agent_register(self.conn, "p1", "worker", "agent",
+                         role="worker", runtime="test")
+        with self.assertRaisesRegex(c.AttaccaError, "role to director"):
+            c.set_lead_director(
+                self.conn, "p1", "admin", "human", "worker")
+        with self.assertRaisesRegex(c.AttaccaError, "not registered"):
+            c.set_lead_director(
+                self.conn, "p1", "admin", "human", "ghost")
+        c.agent_register(self.conn, "p1", "lead", "agent",
+                         role="director", runtime="test")
+        c.set_lead_director(self.conn, "p1", "admin", "human", "lead")
+        with self.assertRaisesRegex(c.AttaccaError, "must keep the director"):
+            c.agent_register(self.conn, "p1", "lead", "agent",
+                             role="advisor", runtime="test")
+
     def test_freshness(self):
         v0 = c.get_project(self.conn, "p1")["context_version"]
         fresh = c.check_freshness(self.conn, "p1", v0)
@@ -199,11 +252,13 @@ class StoreTestCase(unittest.TestCase):
         c.project_init(self.conn, "tester", "human",
                        path=str(Path(self.tmp.name) / "other"),
                        project_id="p2", name="Project Two")
+        c.bridge_add(self.conn, "p1", "tester", "human", "p2")
         c.room_send(self.conn, "p2", "a", "agent", "hello p2",
                     origin_project="p1")
         msgs = c.room_read(self.conn, "p2")["messages"]
         self.assertEqual(msgs[-1]["origin_project"], "p1")
-        self.assertEqual(c.room_read(self.conn, "p1")["messages"], [])
+        source = c.room_read(self.conn, "p1")["messages"][-1]
+        self.assertEqual(source["mirrored_to"], ["p2"])
 
     def test_room_rejects_bad_type(self):
         with self.assertRaises(c.AttaccaError):
@@ -230,6 +285,48 @@ class StoreTestCase(unittest.TestCase):
         self.assertEqual(
             c.resolve_project_id(self.conn, explicit="p2", cwd=self.tmp.name), "p2")
 
+    def test_project_link_resolution_and_explicit_precedence(self):
+        other_root = Path(self.tmp.name) / "other-project"
+        checkout = Path(self.tmp.name) / "computer-b" / "checkout"
+        nested = checkout / "src" / "deep"
+        other_root.mkdir()
+        nested.mkdir(parents=True)
+        c.project_init(self.conn, "t", "human", path=str(other_root),
+                       project_id="p2", name="Two")
+        c.write_project_link(checkout, "p1")
+        self.assertEqual(c.resolve_project_id(self.conn, cwd=str(nested)), "p1")
+        self.assertEqual(c.resolve_project_id(
+            self.conn, explicit="p2", cwd=str(nested)), "p2")
+
+    def test_malformed_project_link_fails_loudly(self):
+        checkout = Path(self.tmp.name) / "broken-link"
+        link_dir = checkout / ".attacca"
+        link_dir.mkdir(parents=True)
+        (link_dir / "project.json").write_text("{not-json")
+        with self.assertRaisesRegex(c.AttaccaError, "not valid JSON"):
+            c.resolve_project_id(self.conn, cwd=str(checkout))
+
+    def test_git_remote_normalization(self):
+        expected = "github.com/jdevgy/attacca-ai"
+        self.assertEqual(c.canonical_git_remote(
+            "git@github.com:jdevgy/attacca-ai.git"), expected)
+        self.assertEqual(c.canonical_git_remote(
+            "https://token@github.com/jdevgy/attacca-ai.git"), expected)
+        self.assertEqual(c.canonical_git_remote(
+            "ssh://git@github.com/jdevgy/attacca-ai.git"), expected)
+
+    def test_repository_fingerprint_cannot_move_between_projects(self):
+        fingerprint = "sha256:" + "b" * 64
+        c.remember_repository_fingerprint(
+            self.conn, "p1", fingerprint, "me", "human")
+        other = Path(self.tmp.name) / "other"
+        other.mkdir()
+        c.project_init(self.conn, "me", "human", path=str(other),
+                       project_id="p2")
+        with self.assertRaisesRegex(c.AttaccaError, "already linked"):
+            c.remember_repository_fingerprint(
+                self.conn, "p2", fingerprint, "me", "human")
+
     def test_unknown_project(self):
         with self.assertRaises(c.AttaccaError):
             c.get_project(self.conn, "nope")
@@ -243,6 +340,44 @@ class StoreTestCase(unittest.TestCase):
         agents = c.agent_list(self.conn, "p1")["agents"]
         self.assertEqual(len(agents), 1)
         self.assertEqual(agents[0]["role"], "director")
+
+    def test_late_role_assignment_is_audited_and_idempotent(self):
+        c.agent_register(self.conn, "p1", "new-codex", "agent",
+                         runtime="codex")
+        assigned = c.agent_register(
+            self.conn, "p1", "new-codex", "agent",
+            role="advisor", runtime="codex")
+        self.assertTrue(assigned["already_registered"])
+        self.assertTrue(assigned["role_changed"])
+        self.assertEqual(assigned["role"], "advisor")
+        event = c.event_show(self.conn, "p1", assigned["event"]["seq"])
+        self.assertEqual(event["event_type"], "agent.role_changed")
+        self.assertEqual(event["payload"], {
+            "agent_id": "new-codex", "from": None, "to": "advisor"})
+        before = c.get_project(self.conn, "p1")["context_version"]
+        again = c.agent_register(
+            self.conn, "p1", "new-codex", "agent", role="advisor")
+        self.assertNotIn("event", again)
+        self.assertNotIn("role_changed", again)
+        self.assertEqual(c.get_project(self.conn, "p1")["context_version"],
+                         before)
+        with self.assertRaisesRegex(c.AttaccaError, "agent role"):
+            c.agent_register(self.conn, "p1", "new-codex", "agent",
+                             role="boss")
+
+    def test_worker_only_governance_still_blocks_handoff_and_master_orders(self):
+        subordinate = self._second_project("worker-subordinate")
+        c.agent_register(self.conn, "p1", "only-worker", "agent",
+                         role="worker", runtime="codex")
+        with self.assertRaisesRegex(c.AttaccaError, "director-only"):
+            c.update_handoff(self.conn, "p1", "only-worker", "agent",
+                             {"what_changed": "must not land"})
+        c.bridge_add(self.conn, "p1", "admin", "human", subordinate,
+                     boss="p1")
+        with self.assertRaisesRegex(c.AttaccaError, "only a Director"):
+            c.room_send(self.conn, "p1", "only-worker", "agent",
+                        "binding order", msg_type="directive",
+                        target_project=subordinate)
 
     # -- review-workflow regression tests ------------------------------------
 
@@ -366,28 +501,6 @@ class StoreTestCase(unittest.TestCase):
         config = c.mcp_server_config("claude_director", "p1", self.db)
         self.assertEqual(config["env"][c.ENV_DB], str(self.db))
 
-    def test_git_hook_survives_hostile_commit_subjects(self):
-        import subprocess
-        repo = self.proj_dir
-        run = lambda *cmd: subprocess.run(
-            cmd, cwd=str(repo), capture_output=True, text=True, check=True)
-        try:
-            run("git", "init", "-q", ".")
-        except Exception:
-            self.skipTest("git unavailable")
-        run("git", "-c", "user.email=t@t", "-c", "user.name=T e s t",
-            "commit", "-q", "--allow-empty", "-m", "boring first commit")
-        c.install_git_hook("p1", str(repo), self.db)
-        nasty = 'fix "quoted" `backticks` $(rm -rf /) \'single\' \\ end'
-        run("git", "-c", "user.email=t@t", "-c", "user.name=T e s t",
-            "commit", "-q", "--allow-empty", "-m", nasty)
-        rows = self.conn.execute(
-            "SELECT payload FROM events WHERE project_id='p1'"
-            " AND event_type='git.commit'").fetchall()
-        self.assertEqual(len(rows), 1)
-        payload = json.loads(rows[0]["payload"])
-        self.assertEqual(payload["subject"], nasty)
-
     # -- inbox / lead / bridges / identity / search --------------------------
 
     def test_inbox_mentions_replies_and_cursor(self):
@@ -413,6 +526,8 @@ class StoreTestCase(unittest.TestCase):
         self.assertEqual(len(c.inbox_read(self.conn, "p1", "bob")["messages"]), 1)
 
     def test_lead_director_flow(self):
+        c.agent_register(self.conn, "p1", "claude_director", "agent",
+                         role="director", runtime="claude-code")
         result = c.set_lead_director(self.conn, "p1", "boss", "human",
                                      "claude_director")
         self.assertIn("context_version", result)
@@ -435,9 +550,10 @@ class StoreTestCase(unittest.TestCase):
     def test_bridge_peer_mirroring_and_loop_protection(self):
         p2 = self._second_project()
         c.bridge_add(self.conn, "p1", "admin", "human", p2)
-        # structured message mirrors; chat does not
+        # Cross-project delivery is explicit; local chat remains local.
         sent = c.room_send(self.conn, "p1", "eng_director", "agent",
-                           "deploy at 5", msg_type="directive")
+                           "deploy at 5", msg_type="directive",
+                           target_project=p2)
         self.assertEqual(sent["mirrored_to_bridged_projects"], [p2])
         c.room_send(self.conn, "p1", "eng_director", "agent", "just chatting")
         p2_msgs = c.room_read(self.conn, p2)["messages"]
@@ -445,22 +561,89 @@ class StoreTestCase(unittest.TestCase):
         self.assertEqual(p2_msgs[0]["origin_project"], "p1")
         # mentions land in the bridged inbox
         c.room_send(self.conn, "p1", "eng_director", "agent",
-                    "adm, please review", mentions=["adm"])
+                    "adm, please review", mentions=["adm"],
+                    target_project=p2)
         inbox = c.inbox_read(self.conn, p2, "adm")
-        self.assertEqual(len(inbox["messages"]), 1)
+        self.assertEqual([m["body"] for m in inbox["messages"]],
+                         ["deploy at 5", "adm, please review"])
         # mirrored copies never re-mirror (no ping-pong)
         self.assertEqual(
             len(c.room_read(self.conn, "p1", limit=100)["messages"]), 3)
         with self.assertRaises(c.AttaccaError):  # duplicate bridge
             c.bridge_add(self.conn, p2, "admin", "human", "p1")
 
+    def test_targeted_room_chat_keeps_source_and_only_selected_destination(self):
+        p2 = self._second_project("selected-room")
+        p3 = self._second_project("other-room")
+        c.bridge_add(self.conn, "p1", "admin", "human", p2)
+        c.bridge_add(self.conn, "p1", "admin", "human", p3)
+        sent = c.room_send(
+            self.conn, "p1", "director", "agent", "hello selected room",
+            target_project=p2)
+        self.assertEqual(sent["mirrored_to_bridged_projects"], [p2])
+        source = c.room_read(self.conn, "p1")["messages"][-1]
+        target = c.room_read(self.conn, p2)["messages"][-1]
+        self.assertEqual(source["mirrored_to"], [p2])
+        self.assertEqual(target["origin_project"], "p1")
+        self.assertEqual(c.room_read(self.conn, p3)["messages"], [])
+        with self.assertRaisesRegex(c.AttaccaError, "not connected"):
+            c.room_send(
+                self.conn, p2, "director", "agent", "cannot jump",
+                target_project=p3)
+
+    def test_interproject_system_is_inbox_but_chat_and_status_are_broadcasts(self):
+        p2 = self._second_project("inbox-target")
+        c.bridge_add(self.conn, "p1", "admin", "human", p2)
+        c.agent_register(
+            self.conn, "p1", "legacy.claude_director", "agent",
+            display_name="Source Director", role="director",
+            runtime="claude-code")
+        c.room_send(self.conn, "p1", "legacy.claude_director", "agent",
+                    "schema changed", msg_type="system", target_project=p2)
+        c.room_send(self.conn, "p1", "legacy.claude_director", "agent",
+                    "hello", msg_type="chat", target_project=p2)
+        c.room_send(self.conn, "p1", "legacy.claude_director", "agent",
+                    "green", msg_type="status", target_project=p2)
+        inbox = c.inbox_read(self.conn, p2, "p2.worker.codex",
+                             mark_read=False)
+        self.assertEqual([m["body"] for m in inbox["messages"]],
+                         ["schema changed"])
+        self.assertEqual(inbox["unread_broadcasts"], 2)
+        structured = inbox["messages"][0]
+        self.assertEqual(structured["actor"], "p1.director.claude")
+        self.assertEqual(structured["ledger_actor"],
+                         "legacy.claude_director")
+        self.assertEqual(structured["identity"]["workspace"], "p1")
+        mirrored = c.room_read(self.conn, p2, limit=100)["messages"]
+        self.assertTrue(all(message["identity"]["workspace"] == "p1"
+                            for message in mirrored))
+
+    def test_explicit_current_room_prevents_structured_bridge_fanout(self):
+        p2 = self._second_project("local-only-peer")
+        p3 = self._second_project("local-only-master")
+        c.bridge_add(self.conn, "p1", "owner", "human", p2)
+        c.bridge_add(self.conn, "p1", "owner", "human", p3, boss="p1")
+        sent = c.room_send(
+            self.conn, "p1", "director", "agent", "stay here",
+            msg_type="directive", mentions=["local-worker"],
+            target_project="p1")
+        self.assertNotIn("mirrored_to_bridged_projects", sent)
+        self.assertEqual(
+            c.room_read(self.conn, "p1", limit=100)["messages"][-1]["body"],
+            "stay here")
+        for project_id in (p2, p3):
+            self.assertNotIn("stay here", [
+                message["body"] for message in
+                c.room_read(self.conn, project_id, limit=100)["messages"]])
+
     def test_bridge_master_and_advisor_authority_tags(self):
         p2 = self._second_project("adminpanel")
         c.bridge_add(self.conn, "p1", "owner", "human", p2, boss="p1")
         c.room_send(self.conn, "p1", "eng_director", "agent",
-                    "use schema v2", msg_type="directive")
+                    "use schema v2", msg_type="directive", target_project=p2)
         c.room_send(self.conn, p2, "admin_director", "agent",
-                    "could we get dark mode?", msg_type="directive")
+                    "could we get dark mode?", msg_type="directive",
+                    target_project="p1")
         master_side = c.room_read(self.conn, p2)["messages"]
         self.assertEqual(master_side[0]["authority"], "master-directive")
         upstream = c.room_read(self.conn, "p1", limit=100)["messages"]
@@ -473,11 +656,32 @@ class StoreTestCase(unittest.TestCase):
         p3 = self._second_project("consultants")
         c.bridge_add(self.conn, "p1", "owner", "human", p3, advisor=p3)
         c.room_send(self.conn, p3, "sage", "agent", "consider caching",
-                    msg_type="directive")
+                    msg_type="directive", target_project="p1")
         advised = c.room_read(self.conn, "p1", limit=100)["messages"]
         self.assertEqual(advised[-1]["authority"], "advice")
         with self.assertRaises(c.AttaccaError):  # bad principal
             c.bridge_add(self.conn, p2, "x", "human", p3, boss="p1")
+
+    def test_only_director_can_issue_governed_master_directive(self):
+        subordinate = self._second_project("subordinate")
+        c.bridge_add(
+            self.conn, "p1", "owner", "human", subordinate, boss="p1")
+        c.agent_register(self.conn, "p1", "lead", "agent",
+                         role="director", runtime="test")
+        c.agent_register(self.conn, "p1", "worker", "agent",
+                         role="worker", runtime="test")
+        c.set_lead_director(self.conn, "p1", "owner", "human", "lead")
+        with self.assertRaisesRegex(c.AttaccaError, "only a Director"):
+            c.room_send(self.conn, "p1", "worker", "agent", "do this",
+                        msg_type="directive", target_project=subordinate)
+        c.room_send(self.conn, "p1", "worker", "agent", "FYI",
+                    msg_type="chat", target_project=subordinate)
+        chat = c.room_read(self.conn, subordinate)["messages"][-1]
+        self.assertIsNone(chat["authority"])
+        c.room_send(self.conn, "p1", "lead", "agent", "do this",
+                    msg_type="directive", target_project=subordinate)
+        directive = c.room_read(self.conn, subordinate)["messages"][-1]
+        self.assertEqual(directive["authority"], "master-directive")
 
     def test_owner_attribution_on_events_and_agents(self):
         c.set_current_owner("jack")
@@ -498,12 +702,134 @@ class StoreTestCase(unittest.TestCase):
 
     def test_qualify_actor(self):
         self.assertEqual(c.qualify_actor("claude_director", owner="Jack"),
-                         "jack.claude_director")
+                         "claude_director")
         self.assertEqual(c.qualify_actor("jack.claude_director", owner="Jack"),
-                         "jack.claude_director")  # idempotent
+                         "jack.claude_director")  # legacy value is untouched
         self.assertEqual(c.qualify_actor("claude_director", owner=None),
                          "claude_director")
         self.assertIsNone(c.qualify_actor(None, owner="Jack"))
+
+    def test_canonical_identity_migrates_mutable_state_not_ledger(self):
+        legacy = "jack.codex_director"
+        c.set_current_owner("jack")
+        try:
+            c.agent_register(self.conn, "p1", legacy, "agent",
+                             role="director", runtime="codex-cli")
+            c.set_lead_director(
+                self.conn, "p1", "admin", "human", legacy)
+            task_id = c.task_create(
+                self.conn, "p1", legacy, "agent", "Keep claim")["task_id"]
+            c.task_claim(self.conn, "p1", legacy, "agent", task_id)
+            self.conn.execute(
+                "INSERT INTO inbox_cursors"
+                " (project_id, actor_id, last_read_seq, updated_at)"
+                " VALUES ('p1', ?, 7, ?)", (legacy, c.now_iso()))
+            old_event = c.append_event(
+                self.conn, "p1", legacy, "agent", "note.before_migration", {})
+            # Reproduce an older MCP/CLI path that left mutable references but
+            # no agents row. Guided setup must still adopt the claim/lead and
+            # alias historical activity without rewriting ledger events.
+            self.conn.execute(
+                "DELETE FROM agents WHERE project_id='p1' AND agent_id=?",
+                (legacy,))
+
+            result = c.agent_register(
+                self.conn, "p1", "codex", "agent", role="director",
+                runtime="codex-cli", canonical_identity=True)
+            canonical = "p1.director.codex"
+            self.assertEqual(result["agent_id"], canonical)
+            self.assertIn(legacy, result["migration"]["aliases"])
+            self.assertEqual(
+                c.get_project(self.conn, "p1")["lead_director"], canonical)
+            self.assertEqual(
+                c.task_show(self.conn, "p1", task_id)["claimed_by"], canonical)
+            cursor = self.conn.execute(
+                "SELECT last_read_seq FROM inbox_cursors"
+                " WHERE project_id='p1' AND actor_id=?", (canonical,)).fetchone()
+            self.assertEqual(cursor["last_read_seq"], 7)
+            immutable = self.conn.execute(
+                "SELECT actor_id FROM events WHERE event_id=?",
+                (old_event["event_id"],)).fetchone()
+            self.assertEqual(immutable["actor_id"], legacy)
+            self.assertTrue(c.verify_ledger(self.conn, "p1")["ok"])
+
+            # A later SessionStart sees the already-canonical cursor. It must
+            # not manufacture another migration event or context bump.
+            before_version = c.get_project(
+                self.conn, "p1")["context_version"]
+            before_events = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM events WHERE project_id='p1'") \
+                .fetchone()["n"]
+            repeated = c.agent_register(
+                self.conn, "p1", "codex", "agent", runtime="codex-cli",
+                canonical_identity=True)
+            self.assertNotIn("event", repeated)
+            self.assertEqual(
+                c.get_project(self.conn, "p1")["context_version"],
+                before_version)
+            self.assertEqual(self.conn.execute(
+                "SELECT COUNT(*) AS n FROM events WHERE project_id='p1'")
+                .fetchone()["n"], before_events)
+        finally:
+            c.set_current_owner(None)
+
+    def test_director_permission_is_role_based_not_runtime_or_lead_name(self):
+        claude = "p1.director.claude"
+        codex = "p1.director.codex"
+        c.agent_register(self.conn, "p1", claude, "agent",
+                         role="director", runtime="claude")
+        c.agent_register(self.conn, "p1", codex, "agent",
+                         role="director", runtime="codex")
+        c.set_lead_director(self.conn, "p1", "admin", "human", claude)
+        first = c.update_handoff(
+            self.conn, "p1", claude, "agent", {"objective": "from Claude"},
+            expected_context_version=c.get_project(
+                self.conn, "p1")["context_version"])
+        second = c.update_handoff(
+            self.conn, "p1", codex, "agent", {"what_changed": "from Codex"},
+            expected_context_version=first["context_version"])
+        self.assertGreater(second["context_version"], first["context_version"])
+        # Lead status alone is not authority if its registry role is corrupt or
+        # stale; only the current workspace role grants the write.
+        self.conn.execute(
+            "UPDATE agents SET role='worker' WHERE project_id='p1'"
+            " AND agent_id=?", (claude,))
+        with self.assertRaisesRegex(c.AttaccaError, "director-only"):
+            c.update_handoff(
+                self.conn, "p1", claude, "agent", {"risks": "must fail"},
+                expected_context_version=second["context_version"])
+
+    def test_canonical_identity_conflicting_roles_require_explicit_choice(self):
+        director = "jack.codex_director"
+        worker = "mia.codex_worker"
+        c.agent_register(self.conn, "p1", director, "agent",
+                         role="director", runtime="codex-cli")
+        c.agent_register(self.conn, "p1", worker, "agent",
+                         role="worker", runtime="codex")
+        c.set_lead_director(self.conn, "p1", "admin", "human", director)
+        with self.assertRaisesRegex(c.AttaccaError, "conflicting existing roles"):
+            c.agent_register(
+                self.conn, "p1", "codex", "agent", runtime="codex",
+                canonical_identity=True)
+        self.assertEqual(c.get_project(self.conn, "p1")["lead_director"],
+                         director)
+        self.assertEqual(
+            {(a["agent_id"], a["role"])
+             for a in c.agent_list(self.conn, "p1")["agents"]},
+            {(director, "director"), (worker, "worker")})
+
+        chosen = c.agent_register(
+            self.conn, "p1", "codex", "agent", role="worker",
+            runtime="codex", canonical_identity=True)
+        self.assertEqual(chosen["agent_id"], "p1.worker.codex")
+        # Explicit worker selection migrates that worker persona, but does not
+        # silently delete/demote the separate Director persona or its lead.
+        self.assertEqual(c.get_project(self.conn, "p1")["lead_director"],
+                         director)
+        self.assertEqual(
+            {(a["agent_id"], a["role"])
+             for a in c.agent_list(self.conn, "p1")["agents"]},
+            {(director, "director"), ("p1.worker.codex", "worker")})
 
     def test_search_everything(self):
         c.room_send(self.conn, "p1", "a", "agent", "the flux capacitor broke",
@@ -520,6 +846,40 @@ class StoreTestCase(unittest.TestCase):
         self.assertEqual(len(hits["handoff_versions"]), 1)
         self.assertEqual(c.search_project(self.conn, "p1", "zzznothing")
                          ["total_hits"], 0)
+
+    def test_search_normalizes_punctuation_and_never_hides_room_bodies(self):
+        c.task_create(
+            self.conn, "p1", "owner", "human",
+            "Implement the magic-link claim flow",
+            description="Guest checkout account attachment")
+        c.task_create(
+            self.conn, "p1", "owner", "human",
+            "Unrelated magic rendering",
+            description="Does not discuss the other required terms")
+        natural = c.search_project(self.conn, "p1", "magic link claim")
+        self.assertEqual(natural["query_terms"], ["magic", "link", "claim"])
+        self.assertEqual(natural["term_semantics"], "AND")
+        self.assertEqual(
+            [task["title"] for task in natural["tasks"]],
+            ["Implement the magic-link claim flow"])
+
+        bodies = {
+            "chat": "directive body retained from ordinary chat",
+            "status": "directive body retained from a status update",
+            "directive": "directive body retained from a directive",
+        }
+        for msg_type, body in bodies.items():
+            c.room_send(self.conn, "p1", "same.actor", "agent", body,
+                        msg_type=msg_type)
+        results = c.search_project(self.conn, "p1", "directive body")
+        messages = [event for event in results["events"]
+                    if event["event_type"] == "room.message"]
+        self.assertEqual({event["msg_type"] for event in messages},
+                         set(bodies))
+        self.assertEqual({event["body"] for event in messages},
+                         set(bodies.values()))
+        self.assertTrue(all(event["body"] in event["line"]
+                            for event in messages))
 
     def test_handoff_history_and_event_show(self):
         c.update_handoff(self.conn, "p1", "a", "agent", {"objective": "one"})
@@ -557,12 +917,247 @@ class StoreTestCase(unittest.TestCase):
         claude_md = self.proj_dir / "CLAUDE.md"
         text1 = claude_md.read_text()
         self.assertIn("MANAGED_ATTACCA:BEGIN", text1)
+        self.assertIn("lifecycle hooks are the primary continuity path", text1)
+        self.assertIn("ATTACCA ACTIVE SESSION BRIEF", text1)
+        self.assertIn("Messages are local by default", text1)
+        self.assertIn("feedback bridge carries feedback", text1)
+        self.assertIn(
+            "MANAGED_ATTACCA:BEGIN v=%d" % c.MANAGED_BLOCK_VERSION, text1)
+        self.assertNotIn("Maximum-effort completion and fan-out", text1)
+        self.assertNotIn("Two QA passes before completion", text1)
+        self.assertIn("minute by default (configurable)", text1)
+        self.assertIn("background watcher", text1)
+        self.assertIn("coding client is idle", text1)
+        self.assertIn("Project Rules — binding dynamic instructions", text1)
+        self.assertIn("History first", text1)
+        self.assertIn("call `search`", text1)
+        self.assertIn("Run by user", text1)
+        self.assertIn("Git branch and revision", text1)
+        self.assertIn("Tasks — owned, trackable work", text1)
+        self.assertIn("Decisions — durable choices", text1)
+        self.assertIn("Director-only", text1)
+        self.assertIn("workspace.role.runtime", text1)
+        self.assertIn("human and AI identities", text1)
+        self.assertIn("identical permissions", text1)
+        self.assertIn("another Attacca database/store", text1)
+        self.assertNotIn("another database/store", text1)
+        self.assertNotIn("install-hooks", text1)
+        self.assertNotIn("CLI equivalents", text1)
         # user content above the block survives a re-run
         claude_md.write_text("# My own notes\n\n" + text1)
         c.install_instructions("p1", str(self.proj_dir), self.db)
         text2 = claude_md.read_text()
         self.assertIn("# My own notes", text2)
         self.assertEqual(text2.count("MANAGED_ATTACCA:BEGIN"), 1)
+
+    def test_managed_instruction_metadata_is_deterministic(self):
+        first = c.managed_instruction_metadata("p1", self.db)
+        second = c.managed_instruction_metadata("p1", Path("/another/db"))
+        other_project = c.managed_instruction_metadata("p2", self.db)
+        self.assertEqual(first, second)
+        self.assertEqual(first["version"], c.MANAGED_BLOCK_VERSION)
+        self.assertEqual(first["project_id"], "p1")
+        self.assertEqual(len(first["sha256"]), 64)
+        self.assertEqual(first["law_sha256"], other_project["law_sha256"])
+        self.assertNotEqual(first["sha256"], other_project["sha256"])
+
+    def test_refresh_managed_instructions_is_atomic_and_preserves_outside(self):
+        old_block = c.managed_instruction_block("old-project", self.db).replace(
+            " v=%d " % c.MANAGED_BLOCK_VERSION, " v=1 ", 1)
+        prefix = b"# User rules\r\n\r\n"
+        suffix = b"\r\nUser tail without a final newline"
+        agents = self.proj_dir / "AGENTS.md"
+        agents.write_bytes(prefix + old_block.encode("utf-8") + suffix)
+        claude = self.proj_dir / "CLAUDE.md"
+        claude.symlink_to("AGENTS.md")
+        old_inode = agents.stat().st_ino
+
+        result = c.refresh_managed_instructions(
+            "p1", str(self.proj_dir), self.db)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["changed"])
+        self.assertTrue(claude.is_symlink())
+        self.assertEqual(os.readlink(claude), "AGENTS.md")
+        written = agents.read_bytes()
+        desired = c.managed_instruction_block("p1", self.db).encode("utf-8")
+        self.assertEqual(written, prefix + desired + suffix)
+        self.assertNotEqual(agents.stat().st_ino, old_inode)
+        self.assertFalse(list(self.proj_dir.glob(".AGENTS.md.*.tmp")))
+        inspection = c.inspect_managed_instruction_file(
+            agents, desired_project_id="p1", db_path=self.db)
+        self.assertTrue(inspection["present"])
+        self.assertTrue(inspection["matches_desired"])
+        self.assertEqual(inspection["metadata"]["sha256"],
+                         result["metadata"]["sha256"])
+        self.assertEqual(result["files"][0]["version_change"],
+                         "1→%d" % c.MANAGED_BLOCK_VERSION)
+
+        current_inode = agents.stat().st_ino
+        second = c.refresh_managed_instructions(
+            "p1", str(self.proj_dir), self.db)
+        self.assertFalse(second["changed"])
+        self.assertEqual(agents.stat().st_ino, current_inode)
+
+    def test_refresh_never_creates_or_appends_managed_instructions(self):
+        agents = self.proj_dir / "AGENTS.md"
+        original = b"# User-owned instructions only\n"
+        agents.write_bytes(original)
+
+        result = c.refresh_managed_instructions(
+            "p1", str(self.proj_dir), self.db)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["changed"])
+        self.assertEqual(agents.read_bytes(), original)
+        self.assertFalse((self.proj_dir / "CLAUDE.md").exists())
+        self.assertEqual([entry["status"] for entry in result["files"]],
+                         ["missing", "missing"])
+
+    def test_refresh_reports_malformed_block_without_writing(self):
+        agents = self.proj_dir / "AGENTS.md"
+        original = (b"# User rules\n\n"
+                    b"<!-- MANAGED_ATTACCA:BEGIN v=1 project=p1 -->\n"
+                    b"incomplete")
+        agents.write_bytes(original)
+
+        result = c.refresh_managed_instructions(
+            "p1", str(self.proj_dir), self.db, files=["AGENTS.md"])
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["files"][0]["status"], "malformed")
+        self.assertEqual(agents.read_bytes(), original)
+
+    def test_refresh_updates_real_claude_and_rejects_external_symlink(self):
+        agents = self.proj_dir / "AGENTS.md"
+        claude = self.proj_dir / "CLAUDE.md"
+        agents.write_text(c.managed_instruction_block("old", self.db) + "\n")
+        claude.write_text("# Claude only\n\n" +
+                          c.managed_instruction_block("old", self.db) + "\n")
+
+        result = c.refresh_managed_instructions(
+            "p1", str(self.proj_dir), self.db)
+        self.assertTrue(result["ok"])
+        self.assertFalse(claude.is_symlink())
+        self.assertIn("# Claude only", claude.read_text())
+        self.assertIn("project=p1", claude.read_text())
+
+        outside = Path(self.tmp.name) / "outside.md"
+        outside.write_text(c.managed_instruction_block("old", self.db) + "\n")
+        claude.unlink()
+        claude.symlink_to(outside)
+        original = outside.read_bytes()
+        unsafe = c.refresh_managed_instructions(
+            "p1", str(self.proj_dir), self.db)
+        self.assertFalse(unsafe["ok"])
+        self.assertEqual(unsafe["files"][1]["status"], "unsafe_symlink")
+        self.assertEqual(outside.read_bytes(), original)
+
+    def test_refresh_rejects_unowned_duplicate_and_non_utf8_blocks(self):
+        agents = self.proj_dir / "AGENTS.md"
+        unowned = c.managed_instruction_block("old", self.db).replace(
+            " do_not_edit=true", "")
+        agents.write_text("# mine\n" + unowned + "\n")
+        before = agents.read_bytes()
+        result = c.refresh_managed_instructions(
+            "p1", str(self.proj_dir), self.db, files=["AGENTS.md"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["files"][0]["status"], "unmanaged")
+        self.assertEqual(agents.read_bytes(), before)
+
+        block = c.managed_instruction_block("old", self.db)
+        agents.write_text(block + "\n" + block + "\n")
+        duplicate = agents.read_bytes()
+        result = c.refresh_managed_instructions(
+            "p1", str(self.proj_dir), self.db, files=["AGENTS.md"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["files"][0]["status"], "malformed")
+        self.assertEqual(agents.read_bytes(), duplicate)
+
+        partial_extra = (c.managed_instruction_block("old", self.db) +
+                         "\n<!-- MANAGED_ATTACCA:BEGIN broken\n")
+        agents.write_text(partial_extra)
+        result = c.refresh_managed_instructions(
+            "p1", str(self.proj_dir), self.db, files=["AGENTS.md"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["files"][0]["status"], "malformed")
+        self.assertEqual(agents.read_text(), partial_extra)
+
+        agents.write_bytes(b"\xff\xfe<!-- MANAGED_ATTACCA:BEGIN -->")
+        non_utf8 = agents.read_bytes()
+        result = c.refresh_managed_instructions(
+            "p1", str(self.proj_dir), self.db, files=["AGENTS.md"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["files"][0]["status"], "malformed")
+        self.assertEqual(agents.read_bytes(), non_utf8)
+
+    def test_refresh_rejects_end_before_begin_and_future_version(self):
+        agents = self.proj_dir / "AGENTS.md"
+        reversed_markers = (
+            c.MANAGED_END + "\ntext\n" + c.MANAGED_BEGIN +
+            " v=1 project=p1 do_not_edit=true -->\n")
+        agents.write_text(reversed_markers)
+        result = c.refresh_managed_instructions(
+            "p1", str(self.proj_dir), self.db, files=["AGENTS.md"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["files"][0]["status"], "malformed")
+        self.assertEqual(agents.read_text(), reversed_markers)
+
+        future = c.managed_instruction_block("p1", self.db).replace(
+            " v=%d " % c.MANAGED_BLOCK_VERSION, " v=999 ", 1)
+        agents.write_text("# mine\n" + future + "\n")
+        before = agents.read_bytes()
+        result = c.refresh_managed_instructions(
+            "p1", str(self.proj_dir), self.db, files=["AGENTS.md"])
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["files"][0]["status"], "future")
+        self.assertEqual(result["files"][0]["version_change"],
+                         "999→%d refused" % c.MANAGED_BLOCK_VERSION)
+        self.assertEqual(agents.read_bytes(), before)
+
+    def test_refresh_rejects_agents_symlink_chain_outside_checkout(self):
+        outside = Path(self.tmp.name) / "outside-agents.md"
+        outside.write_text(c.managed_instruction_block("old", self.db) + "\n")
+        agents = self.proj_dir / "AGENTS.md"
+        claude = self.proj_dir / "CLAUDE.md"
+        agents.symlink_to(outside)
+        claude.symlink_to("AGENTS.md")
+        before = outside.read_bytes()
+
+        result = c.refresh_managed_instructions(
+            "p1", str(self.proj_dir), self.db)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual([entry["status"] for entry in result["files"]],
+                         ["unsafe_symlink", "unsafe_symlink"])
+        self.assertEqual(outside.read_bytes(), before)
+
+    def test_refresh_preserves_mode_and_concurrent_calls_converge(self):
+        agents = self.proj_dir / "AGENTS.md"
+        old = c.managed_instruction_block("old", self.db)
+        agents.write_text("# mine\n\n" + old + "\n")
+        agents.chmod(0o444)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(
+                lambda _: c.refresh_managed_instructions(
+                    "p1", str(self.proj_dir), self.db, files=["AGENTS.md"]),
+                range(16)))
+
+        self.assertTrue(all(result["ok"] for result in results))
+        self.assertEqual(agents.stat().st_mode & 0o777, 0o444)
+        self.assertEqual(agents.read_text(), "# mine\n\n" +
+                         c.managed_instruction_block("p1", self.db) + "\n")
+        self.assertFalse(list(self.proj_dir.glob(".AGENTS.md.*.tmp")))
+        changed = [entry for result in results for entry in result["files"]
+                   if entry["changed"]]
+        self.assertTrue(changed)
+        self.assertTrue(all(entry["version_change"] == "%d→%d" % (
+                                c.MANAGED_BLOCK_VERSION,
+                                c.MANAGED_BLOCK_VERSION)
+                            for entry in changed))
 
 
 if __name__ == "__main__":

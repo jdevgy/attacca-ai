@@ -1,0 +1,675 @@
+"""Deterministic tests for the autonomous Attacca background watcher."""
+
+import importlib.util
+import json
+import os
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+from unittest import mock
+
+
+ROOT = Path(__file__).resolve().parent.parent
+HOOK = ROOT / "hooks" / "session_start.py"
+SPEC = importlib.util.spec_from_file_location("attacca_watcher_test", HOOK)
+watch = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(watch)
+CORE_SPEC = importlib.util.spec_from_file_location(
+    "attacca_watcher_core_test", ROOT / "attacca.py")
+core = importlib.util.module_from_spec(CORE_SPEC)
+CORE_SPEC.loader.exec_module(core)
+
+
+def event(seq, event_type, payload=None, task_id=None,
+          actor="shared.worker.claude", created_at=None):
+    value = {
+        "event_id": "ev-%d" % seq,
+        "seq": seq,
+        "event_type": event_type,
+        "actor_id": actor,
+        "operational_actor_id": actor,
+        "task_id": task_id,
+        "context_version": seq,
+        "payload": payload or {},
+    }
+    if created_at:
+        value["created_at"] = created_at
+    return value
+
+
+def delta(events=None, next_after=None, may_have_more=False):
+    rows = list(events or [])
+    if next_after is None:
+        next_after = rows[-1]["seq"] if rows else 0
+    return {"events": rows, "next_after": next_after,
+            "may_have_more": may_have_more}
+
+
+class FakeResponse:
+    def __init__(self, value):
+        self.body = json.dumps(value).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self):
+        return self.body
+
+
+class AutonomousWatcherTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.checkout = self.root / "checkout"
+        self.checkout.mkdir()
+        self.env = mock.patch.dict(os.environ, {
+            "HOME": str(self.root / "home"),
+            "ATTACCA_WATCHER_DIR": str(self.root / "watcher"),
+            "ATTACCA_RUNTIME": "codex",
+            "ATTACCA_DEVICE_ID": "office-device",
+        }, clear=False)
+        self.env.start()
+        self.status = {
+            "status": "linked", "project_id": "shared",
+            "root": str(self.checkout),
+            "link_path": str(self.checkout / ".attacca" / "project.json"),
+        }
+        self.config = {"url": "http://attacca.test:4173",
+                       "actor": "codex", "owner": "jack"}
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def register(self, now=0):
+        return watch._register_watcher_subscription(
+            self.status, ROOT, self.config, runtime="codex", now=now)
+
+    def state(self):
+        return json.loads(watch._watcher_state_path().read_text())
+
+    def test_default_is_one_minute_and_subscription_is_machine_global(self):
+        self.assertEqual(watch.DEFAULT_UPDATE_INTERVAL_SECONDS, 60)
+        key = self.register()
+        entry = self.state()["subscriptions"][key]
+        self.assertEqual(entry["device_id"], "office-device")
+        self.assertEqual(entry["server_url"], "http://attacca.test:4173")
+        self.assertNotIn("token", json.dumps(entry).lower())
+        self.assertEqual(watch._watcher_state_path(),
+                         self.root / "watcher" / "watcher-state.json")
+
+    def test_authenticated_exact_token_honors_custom_interval_and_off(self):
+        """Protected Settings uses the shared exact terminal credential."""
+        db = self.root / "authenticated-settings.db"
+        actor_id = "shared.director.codex"
+        conn = core.connect(db)
+        try:
+            core.project_init(
+                conn, "setup", "human", path=self.checkout,
+                project_id="shared", name="Shared")
+            core.agent_register(
+                conn, "shared", actor_id, "agent", agent_id=actor_id,
+                role="director", runtime="codex")
+            core.auth_create_user(
+                conn, "alice", "correct-horse", is_admin=True,
+                bootstrap=True)
+            user = conn.execute(
+                "SELECT * FROM auth_users WHERE username='alice'").fetchone()
+            principal = core._auth_principal(
+                conn, user, "session", actor_type="human")
+            flow = core.auth_device_start(
+                conn, "http://127.0.0.1", "office-device",
+                "Attacca terminal · device office-device",
+                requested_bindings=[{
+                    "project_id": "shared", "actor_id": actor_id,
+                }], client_instance="watcher-test-client")
+            core.auth_device_approve(
+                conn, flow["user_code"], principal, ["shared"], [{
+                    "project_id": "shared", "actor_id": actor_id,
+                }])
+            credential = core.auth_device_poll(
+                conn, flow["device_code"], "office-device",
+                client_instance="watcher-test-client")["credential"]
+            core.server_settings_store(conn, {
+                "auth.activation_requested": True,
+                "auth.activated": True,
+            })
+            token_kinds = [row["token_kind"] for row in conn.execute(
+                "SELECT token_kind FROM auth_tokens ORDER BY token_id")]
+            self.assertEqual(token_kinds, ["terminal"])
+        finally:
+            conn.close()
+
+        server = core.AttaccaServer(("127.0.0.1", 0), db, auth=True)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        url = "http://127.0.0.1:%d" % server.server_address[1]
+        config = {"url": url, "actor": "codex", "owner": "alice"}
+        entry = {
+            "server_url": url, "project_id": "shared",
+            "runtime": "codex", "actor": "codex",
+            "canonical_actor_id": actor_id,
+            "device_id": "office-device", "plugin_root": str(ROOT),
+        }
+        credential_path = Path.home() / ".attacca" / "credentials.json"
+        credential_path.parent.mkdir(parents=True, exist_ok=True)
+        poison_legacy = "legacy-actor-token-must-not-be-used"
+        credential_path.write_text(json.dumps({
+            "version": 2,
+            "servers": {url: {"agent_tokens": {
+                "shared": {actor_id: {
+                    "token": poison_legacy, "runtime": "codex",
+                }},
+            }}},
+        }))
+        credential_path.chmod(0o600)
+        terminal = watch._terminal_flow_module(ROOT)
+        terminal.save_terminal_credential(
+            url, credential, device_id="office-device",
+            credentials_path=credential_path)
+
+        try:
+            # Recovery preserves old records for rollback but must select the
+            # runtime-independent terminal principal for every protected call.
+            self.assertEqual(watch._watcher_api_token(entry),
+                             credential["token"])
+            self.assertNotEqual(watch._watcher_api_token(entry), poison_legacy)
+            server.update_interval_seconds = 300
+            self.assertEqual(
+                watch._settings_interval(config, entry=entry), 300)
+
+            key = watch._register_watcher_subscription(
+                self.status, ROOT, config, runtime="codex", now=0)
+
+            def verify_identity(state):
+                current = state["subscriptions"][key]
+                current["canonical_actor_id"] = actor_id
+                current["actor_role"] = "director"
+
+            watch._mutate_state(watch._watcher_state_path(), verify_identity)
+            custom = watch._watcher_tick(
+                key, now=0, force=True,
+                delta_loader=lambda after: delta(next_after=after),
+                notifier=lambda *_: None)
+            self.assertTrue(custom["ok"])
+            self.assertEqual(
+                self.state()["subscriptions"][key]["interval_seconds"], 300)
+            self.assertEqual(
+                self.state()["subscriptions"][key]["next_poll_at_epoch"],
+                300)
+
+            server.update_interval_seconds = 0
+            disabled = watch._watcher_tick(
+                key, now=300, force=True,
+                delta_loader=lambda after: delta(next_after=after),
+                notifier=lambda *_: None)
+            self.assertTrue(disabled["disabled"])
+            self.assertEqual(
+                self.state()["subscriptions"][key]["interval_seconds"], 0)
+
+            wrong_scope = dict(
+                entry, canonical_actor_id="other.director.codex")
+            self.assertEqual(
+                watch._settings_interval(config, entry=wrong_scope),
+                watch.DEFAULT_UPDATE_INTERVAL_SECONDS)
+            self.assertNotIn(credential["token"], json.dumps(self.state()))
+            self.assertNotIn(poison_legacy, json.dumps(self.state()))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_symlinked_watcher_root_is_not_resolved_past_storage_guard(self):
+        target = self.root / "watcher-target"
+        target.mkdir()
+        link = self.root / "watcher-link"
+        link.symlink_to(target, target_is_directory=True)
+        with mock.patch.dict(
+                os.environ, {"ATTACCA_WATCHER_DIR": str(link)}, clear=False):
+            self.assertEqual(
+                watch._watcher_state_path(),
+                link.absolute() / "watcher-state.json")
+            _, offline, _ = watch._watcher_sync_modules(ROOT)
+            scope = {
+                "server_id": "server-one",
+                "project_id": "shared",
+                "principal_id": "jack",
+                "actor_id": "shared.director.codex",
+                "actor_type": "agent",
+                "role": "director",
+            }
+            with self.assertRaisesRegex(
+                    offline.OfflineSyncError, "symlink traversal"):
+                offline.OfflineProjectSync(
+                    watch._watcher_offline_directory("unused"),
+                    "http://attacca.test:4173", scope,
+                    "watcher-client", "office-device")
+
+    def test_idle_tick_queues_changed_state_once_and_hook_drains_it(self):
+        key = self.register()
+        baseline = delta([event(
+            1, "project.created", {"name": "Shared"})])
+        changed = delta([
+            event(2, "task.created", {"title": "Review release"},
+                  task_id="T-7"),
+            event(3, "rule.created", {
+                "rule_id": "R-1", "version": 1, "title": "Build on v2"}),
+        ])
+        with mock.patch.object(watch, "_settings_interval", return_value=60):
+            first = watch._watcher_tick(
+                key, now=0, force=True, delta_loader=lambda after: baseline,
+                notifier=lambda *_: None)
+            second = watch._watcher_tick(
+                key, now=60, force=True, delta_loader=lambda after: changed,
+                notifier=lambda *_: None)
+            duplicate = watch._watcher_tick(
+                key, now=120, force=True,
+                delta_loader=lambda after: delta(next_after=3),
+                notifier=lambda *_: None)
+        self.assertFalse(first["queued"])
+        self.assertTrue(first["cursor_initialized"])
+        self.assertTrue(second["queued"])
+        self.assertFalse(duplicate["queued"])
+        self.assertEqual(len(self.state()["subscriptions"][key]["pending"]), 1)
+        notice = watch._watcher_pending_notice(self.status, self.config)
+        self.assertIn("Build on v2", notice["context"])
+        self.assertIn("client was idle", notice["context"])
+        self.assertEqual(self.state()["subscriptions"][key]["pending"], [])
+        self.assertIsNone(watch._watcher_pending_notice(
+            self.status, self.config))
+
+    def test_unchanged_delta_never_materializes_a_full_snapshot(self):
+        key = self.register()
+        watch._watcher_tick(
+            key, now=0, force=True,
+            delta_loader=lambda after: delta(next_after=10),
+            notifier=lambda *_: None)
+        cursors = []
+
+        def unchanged(after):
+            cursors.append(after)
+            return delta(next_after=after)
+
+        with mock.patch.object(watch, "_settings_interval", return_value=60), \
+                mock.patch.object(
+                    watch, "_mcp_snapshot",
+                    side_effect=AssertionError("full snapshot is forbidden")):
+            result = watch._watcher_tick(
+                key, now=60, force=True, delta_loader=unchanged,
+                notifier=lambda *_: None)
+        self.assertFalse(result["queued"])
+        self.assertEqual(result["event_count"], 0)
+        self.assertEqual(cursors, [10])
+        entry = self.state()["subscriptions"][key]
+        self.assertEqual(entry["event_cursor"], 10)
+        self.assertEqual(entry["next_poll_at_epoch"], 120)
+        self.assertNotIn("snapshot", entry)
+
+    def test_registration_race_event_is_not_lost_in_initial_baseline(self):
+        key = self.register(now=100)
+        with mock.patch.object(watch, "_settings_interval", return_value=60):
+            result = watch._watcher_tick(
+                key, now=101, force=True,
+                delta_loader=lambda after: delta([
+                    event(1, "room.message", {"body": "already in brief"},
+                          created_at="1970-01-01T00:01:00+00:00"),
+                    event(2, "room.message", {"body": "raced startup"},
+                          created_at="1970-01-01T00:02:00+00:00"),
+                ], next_after=2), notifier=lambda *_: None)
+        self.assertTrue(result["cursor_initialized"])
+        self.assertTrue(result["queued"])
+        self.assertEqual(result["relevant_count"], 1)
+        summary = self.state()["subscriptions"][key]["pending"][0]["summary"]
+        self.assertIn("raced startup", summary)
+        self.assertNotIn("already in brief", summary)
+
+    def test_all_relevant_event_families_are_durable_and_concise(self):
+        key = self.register()
+        with mock.patch.object(watch, "_settings_interval", return_value=60):
+            watch._watcher_tick(
+                key, now=0, force=True,
+                delta_loader=lambda after: delta(next_after=0),
+                notifier=lambda *_: None)
+            result = watch._watcher_tick(
+                key, now=60, force=True,
+                delta_loader=lambda after: delta([
+                    event(1, "room.message", {
+                        "msg_type": "directive", "body": "Ship the fix",
+                        "origin_project": "master", "authority":
+                        "master-directive"}),
+                    event(2, "task.status_changed", {
+                        "title": "Repair cache", "to": "review"},
+                        task_id="T-27"),
+                    event(3, "task.plan.suggested", {
+                        "plan_version": 2, "status": "changes_requested",
+                        "section_id": "tests", "note": "Add outage coverage"},
+                        task_id="T-35"),
+                    event(4, "rule.updated", {
+                        "rule_id": "R-4", "version": 3,
+                        "title": "History first"}),
+                    event(5, "decision.resolved", {
+                        "decision_id": "D-8", "resolution": "accepted",
+                        "title": "Use cursors"}),
+                    event(6, "handoff.updated", {
+                        "fields": ["active_work", "next_actions"]}),
+                    event(7, "bridge.created", {
+                        "with": "upstream", "relation": "master"}),
+                    event(8, "agent.registered", {"agent_id": "noise"}),
+                ], next_after=8), notifier=lambda *_: None)
+        self.assertTrue(result["queued"])
+        self.assertEqual(result["event_count"], 8)
+        self.assertEqual(result["relevant_count"], 7)
+        entry = self.state()["subscriptions"][key]
+        self.assertEqual(entry["event_cursor"], 8)
+        self.assertEqual(len(entry["pending"]), 1)
+        pending = entry["pending"][0]
+        self.assertEqual(pending["kind"], "project_delta")
+        self.assertEqual(pending["event_count"], 7)
+        self.assertNotIn("agent.registered", pending["event_types"])
+        summary = pending["summary"]
+        for expected in ("Ship the fix", "Task T-27", "Task plan T-35",
+                         "Project Rule R-4", "Decision D-8", "Handoff",
+                         "Bridge upstream"):
+            self.assertIn(expected, summary)
+        self.assertNotIn("agent.registered", summary)
+
+    def test_raw_event_feed_paginates_with_cursor_identity_and_token(self):
+        requests = []
+        responses = iter([
+            delta([event(1, "room.message", {"body": "one"}),
+                   event(2, "task.created", {"title": "two"}, "T-2")],
+                  next_after=2, may_have_more=True),
+            delta(next_after=2),
+        ])
+
+        def opener(request, timeout):
+            requests.append((request, timeout))
+            return FakeResponse(next(responses))
+
+        entry = {
+            "server_url": "https://attacca.test",
+            "project_id": "shared/space", "runtime": "codex",
+            "actor": "shared.director.codex", "owner": "jack",
+            "device_id": "office-device",
+        }
+        with mock.patch.object(watch, "_watcher_api_token",
+                               return_value="test-token"), \
+             mock.patch.object(watch, "_client_instance_id",
+                               return_value="codex-install-2"):
+            result = watch._watcher_event_delta(entry, 0, opener=opener)
+        self.assertEqual(result["next_after"], 2)
+        self.assertFalse(result["may_have_more"])
+        self.assertEqual(len(result["events"]), 2)
+        self.assertEqual(len(requests), 2)
+        self.assertIn("/shared%2Fspace/events?after=0", requests[0][0].full_url)
+        self.assertIn("events?after=2", requests[1][0].full_url)
+        self.assertEqual(requests[0][0].get_header("Authorization"),
+                         "Bearer test-token")
+        self.assertEqual(requests[0][0].get_header("X-attacca-actor"),
+                         "shared.director.codex")
+        self.assertEqual(requests[0][0].get_header(
+            "X-attacca-client-instance"), "codex-install-2")
+        self.assertEqual(requests[0][1],
+                         watch.AUXILIARY_HTTP_TIMEOUT_SECONDS)
+
+    def test_daemon_loop_ticks_without_any_lifecycle_event(self):
+        self.register()
+        ticks = []
+        waits = []
+        clock = iter([0, 0, 0, 300, 300, 300, 600, 600, 600, 600])
+
+        def fake_clock():
+            try:
+                return next(clock)
+            except StopIteration:
+                return 600
+
+        with mock.patch.object(
+                watch, "_watcher_tick",
+                side_effect=lambda key, now=None: ticks.append((key, now)) or
+                {"ok": True}):
+            result = watch._watcher_daemon_loop(
+                ROOT, "test-nonce", wait=waits.append,
+                clock=fake_clock, max_ticks=3)
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(ticks), 3)
+        self.assertEqual(waits, [watch.WATCHER_WAKE_SECONDS] * 2)
+
+    def test_one_machine_daemon_scans_every_registered_subscription(self):
+        first = self.register()
+        other_checkout = self.root / "other-checkout"
+        other_checkout.mkdir()
+        other_status = dict(
+            self.status, project_id="other", root=str(other_checkout),
+            link_path=str(other_checkout / ".attacca" / "project.json"))
+        second = watch._register_watcher_subscription(
+            other_status, ROOT,
+            {"url": self.config["url"], "actor": "claude", "owner": "jack"},
+            runtime="claude", now=0)
+        ticks = []
+        with mock.patch.object(
+                watch, "_watcher_tick",
+                side_effect=lambda key, now=None: ticks.append(key) or
+                {"ok": True}):
+            result = watch._watcher_daemon_loop(
+                ROOT, "all-subscriptions", wait=lambda _: None,
+                clock=lambda: 0, max_ticks=1)
+        self.assertTrue(result["ok"])
+        self.assertEqual(set(ticks), {first, second})
+        self.assertEqual(len(ticks), 2)
+
+    def test_daemon_passes_sync_factories_to_every_tick(self):
+        key = self.register()
+        local_factory = object()
+        remote_factory = object()
+        calls = []
+
+        def tick(subscription_key, now=None, **options):
+            calls.append((subscription_key, now, options))
+            return {"ok": True}
+
+        with mock.patch.object(watch, "_watcher_tick", side_effect=tick):
+            result = watch._watcher_daemon_loop(
+                ROOT, "factory-daemon", wait=lambda _: None,
+                clock=lambda: 17, max_ticks=1,
+                offline_factory=local_factory,
+                remote_factory=remote_factory)
+        self.assertTrue(result["ok"])
+        self.assertEqual(calls, [(key, 17, {
+            "offline_factory": local_factory,
+            "remote_factory": remote_factory,
+        })])
+
+    def test_two_checkouts_share_machine_global_mirror_root(self):
+        first = self.register()
+        second_checkout = self.root / "same-project-second-checkout"
+        second_checkout.mkdir()
+        second_status = dict(
+            self.status, root=str(second_checkout),
+            link_path=str(second_checkout / ".attacca" / "project.json"))
+        second = watch._register_watcher_subscription(
+            second_status, ROOT, self.config, runtime="codex", now=0)
+        self.assertNotEqual(first, second)
+        state = self.state()["subscriptions"]
+        self.assertEqual(state[first]["offline_directory"],
+                         state[second]["offline_directory"])
+        self.assertEqual(Path(state[first]["offline_directory"]),
+                         self.root / "watcher" / "offline")
+
+    def test_old_daemon_that_refuses_exit_is_preserved_without_respawn(self):
+        key = self.register()
+
+        def install_daemon(state):
+            state["daemon"] = {
+                "nonce": "old-nonce", "pid": 4242, "running": True,
+                "plugin_root": str(ROOT), "plugin_version": "0.0.0",
+            }
+
+        watch._mutate_state(watch._watcher_state_path(), install_daemon)
+        with mock.patch.object(
+                watch, "_watcher_process_matches",
+                side_effect=lambda pid, nonce: nonce == "old-nonce"), \
+             mock.patch.object(
+                 watch, "_signal_watcher_process", return_value=True) as signal, \
+             mock.patch.object(watch.time, "time", side_effect=[0, 0, 4]), \
+             mock.patch.object(
+                 watch.subprocess, "Popen",
+                 side_effect=AssertionError("must not spawn")):
+            result = watch._ensure_background_watcher(
+                self.status, ROOT, self.config, runtime="codex")
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["restart_pending"])
+        self.assertEqual(result["subscription_key"], key)
+        signal.assert_called_once_with(
+            4242, "old-nonce", watch.signal.SIGTERM,
+            launch_fingerprint=None,
+            hook_path=ROOT / "hooks" / "session_start.py")
+        state = self.state()
+        self.assertEqual(state["daemon"]["nonce"], "old-nonce")
+        self.assertNotIn("daemon_launch", state)
+
+    def test_held_lifetime_lock_never_overwrites_stale_daemon_metadata(self):
+        key = self.register()
+
+        def install_daemon(state):
+            state["daemon"] = {
+                "nonce": "stale-nonce", "pid": 5151, "running": True,
+                "plugin_root": str(ROOT), "plugin_version": "0.0.0",
+            }
+
+        watch._mutate_state(watch._watcher_state_path(), install_daemon)
+        with mock.patch.object(
+                watch, "_watcher_process_matches", return_value=False), \
+             mock.patch.object(watch, "_watcher_lock_available",
+                               return_value=False), \
+             mock.patch.object(
+                 watch.subprocess, "Popen",
+                 side_effect=AssertionError("must not spawn")):
+            result = watch._ensure_background_watcher(
+                self.status, ROOT, self.config, runtime="codex")
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["restart_pending"])
+        self.assertEqual(result["subscription_key"], key)
+        state = self.state()
+        self.assertEqual(state["daemon"]["nonce"], "stale-nonce")
+        self.assertNotIn("daemon_launch", state)
+
+    def test_concurrent_ensure_rechecks_winner_under_state_lock(self):
+        key = self.register()
+        identity = dict(watch._CAPTURED_WATCHER_LAUNCH_IDENTITY)
+
+        def winner_arrives():
+            def install(state):
+                state["daemon"] = {
+                    "nonce": "winner", "pid": 6161, "running": True,
+                    "plugin_root": str(ROOT),
+                    "plugin_version": identity["launch_version"],
+                    **identity,
+                }
+            watch._mutate_state(watch._watcher_state_path(), install)
+            return True
+
+        with mock.patch.object(
+                watch, "_watcher_process_matches",
+                side_effect=lambda pid, nonce: nonce == "winner"), \
+             mock.patch.object(
+                 watch, "_watcher_process_launch_matches",
+                 side_effect=lambda pid, nonce, **_: nonce == "winner"), \
+             mock.patch.object(watch, "_watcher_lock_available",
+                               side_effect=winner_arrives), \
+             mock.patch.object(
+                 watch.subprocess, "Popen",
+                 side_effect=AssertionError("must not spawn")):
+            result = watch._ensure_background_watcher(
+                self.status, ROOT, self.config, runtime="codex")
+        self.assertTrue(result["already_running"])
+        self.assertEqual(result["pid"], 6161)
+        self.assertEqual(result["subscription_key"], key)
+        state = self.state()
+        self.assertEqual(state["daemon"]["nonce"], "winner")
+        self.assertNotIn("daemon_launch", state)
+
+    def test_child_promotes_only_its_reserved_launch_after_flock(self):
+        self.register()
+        pid = os.getpid()
+        identity = dict(watch._CAPTURED_WATCHER_LAUNCH_IDENTITY)
+
+        def reserve(state):
+            state["daemon_launch"] = {
+                "nonce": "ours", "pid": pid, "running": False,
+                "plugin_root": str(ROOT),
+                "plugin_version": identity["launch_version"],
+                **identity,
+            }
+
+        watch._mutate_state(watch._watcher_state_path(), reserve)
+        watch._watcher_mark_daemon(
+            "ours", ROOT, launch_identity=identity,
+            running=True, heartbeat_at_epoch=1)
+        promoted = self.state()
+        self.assertNotIn("daemon_launch", promoted)
+        self.assertEqual(promoted["daemon"]["nonce"], "ours")
+        self.assertEqual(promoted["daemon"]["pid"], pid)
+        watch._watcher_mark_daemon(
+            "competitor", ROOT, launch_identity=identity,
+            running=True, heartbeat_at_epoch=2)
+        after = self.state()
+        self.assertEqual(after["daemon"]["nonce"], "ours")
+        self.assertEqual(after["daemon"]["heartbeat_at_epoch"], 1)
+
+    def test_child_cannot_promote_reserved_launch_with_changed_fingerprint(self):
+        """A same-nonce hot-upgrade cannot replace its reserved code identity."""
+        self.register()
+        identity = dict(watch._CAPTURED_WATCHER_LAUNCH_IDENTITY)
+        tampered = dict(identity, launch_fingerprint="sha256:" + "0" * 64)
+
+        def reserve(state):
+            state["daemon_launch"] = {
+                "nonce": "same-nonce", "pid": os.getpid(),
+                "running": False, "plugin_root": str(ROOT),
+                "plugin_version": identity["launch_version"],
+                **identity,
+            }
+
+        watch._mutate_state(watch._watcher_state_path(), reserve)
+        watch._watcher_mark_daemon(
+            "same-nonce", ROOT, launch_identity=tampered, running=True)
+        state = self.state()
+        self.assertNotIn("daemon", state)
+        self.assertEqual(state["daemon_launch"]["launch_fingerprint"],
+                         identity["launch_fingerprint"])
+
+    def test_outage_is_deduplicated_and_does_not_advance_cursor(self):
+        key = self.register()
+        failing = lambda after: (_ for _ in ()).throw(
+            RuntimeError("server offline"))
+        with mock.patch.object(watch, "_settings_interval", return_value=60):
+            watch._watcher_tick(key, now=0, force=True,
+                                delta_loader=failing)
+            watch._watcher_tick(key, now=60, force=True,
+                                delta_loader=failing)
+        entry = self.state()["subscriptions"][key]
+        self.assertNotIn("event_cursor", entry)
+        self.assertEqual(len(entry["pending"]), 1)
+        self.assertIn("retry automatically", entry["pending"][0]["summary"])
+
+    def test_legacy_snapshot_event_count_becomes_delta_cursor(self):
+        key = self.register()
+
+        def add_legacy_snapshot(state):
+            state["subscriptions"][key]["snapshot"] = {
+                "counts": {"events": 41}}
+
+        watch._mutate_state(watch._watcher_state_path(), add_legacy_snapshot)
+        self.register(now=30)
+        entry = self.state()["subscriptions"][key]
+        self.assertEqual(entry["event_cursor"], 41)
+        self.assertTrue(entry["event_cursor_initialized"])
+
+
+if __name__ == "__main__":
+    unittest.main()

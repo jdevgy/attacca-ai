@@ -1,0 +1,26 @@
+{
+  "name": "attacca",
+  "version": "0.4.5+codex.20260824115246",
+  "description": "Shared project memory and workspace continuity across AI coding tools.",
+  "author": {
+    "name": "agentg"
+  },
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Attacca",
+    "shortDescription": "Shared project memory across coding agents",
+    "longDescription": "Connect Codex to an Attacca workspace, then share handoffs, tasks, decisions, room messages, and history with other coding tools.",
+    "developerName": "agentg",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Set up Attacca for this project.",
+      "Resume this project from the latest Attacca handoff."
+    ]
+  }
+}

@@ -18,18 +18,25 @@ humans at the same project, and they all share:
   explicitly before re-reporting, and giving a task back clears the claimant.
 - **Decision records** — durable, out of chat history (§6.5, §9)
 - **Drift Guard lite** — context versions; stale workers get warned before writing (§11.3)
-- **Agent identities** — stable actor ids per tool/model, model-swappable (§5), tagged
-  with their **owner**: setup asks who you are, every ledger event carries an `owner`
-  key, actor ids become `you.agent` (`jdevgy.kimi_director`) so two people's
-  agents can never collide, and every log line is stamped `(OWNER: name)`;
-  agents auto-register with their runtime on first contact
-- **Per-agent inboxes** — `check_inbox`: messages that mention or reply to you, with
-  persistent read cursors that survive across sessions and tools
-- **Lead Director** — per-project boss mode (§6.4) via `set_lead_director` / `lead`
+- **Agent identities** — operational actor ids are
+  `workspace.role.runtime` (for example `analytics-engine.director.codex`).
+  The human **owner** is a separate event/agent field, never an actor prefix.
+  Runtime remains visible for audit, but authorization depends only on the
+  registered workspace role: Claude and Codex Directors are permission peers.
+  Legacy owner-prefixed ids are aliased without rewriting hashed ledger history.
+- **Per-agent inboxes** — `check_inbox`: messages that mention/reply to you plus
+  structured inter-workspace coordination, with persistent read cursors
+- **AI roles + Lead Director** — setup assigns Director, Advisor, or Worker;
+  only Directors can update a governed workspace's shared handoff or issue a
+  binding directive from a master workspace. Multiple Directors are allowed,
+  the Lead Director breaks ties, and optimistic context-version checks reject
+  stale handoff overwrites instead of silently replacing another Director.
 - **Bridges** — link two projects' AI teams with a chosen relationship: **peers**,
   **master/subordinate** (the boss project's messages arrive `[MASTER-DIRECTIVE]`,
-  the other side's arrive as `[SUGGESTION]`), or **advisor** (`[ADVICE]`); addressed
-  and structured messages mirror across rooms and inboxes, chat stays local
+  the other side's arrive as `[SUGGESTION]`), or **advisor** (`[ADVICE]`). Messages
+  remain local unless `target_project` names one connected workspace, retaining
+  a labeled copy in both rooms. Routine local work never fans out implicitly;
+  cross-project content must match the bridge's human-defined purpose.
 - **Explore everything** — `search` across events/messages/tasks/decisions/handoffs,
   `overview` one-screen tour, `handoff history`, `event show`, plus per-thing
   list/show commands
@@ -50,64 +57,122 @@ attacca server — it owns the state and exposes two client surfaces:
 - **REST API** under `/v1/…` (blueprint §22.1 shape) — for curl, scripts, dashboards
   and anything that isn't an MCP client.
 
-There is also a **stdio fallback** (`attacca.py mcp`) for tools that can't speak
-HTTP MCP: the tool spawns a local shim against the same SQLite store. Honest note:
-in this build the server is the *primary* writer, not the *sole* one — the CLI and
-stdio shims write to the same WAL-mode SQLite database directly, which is what makes
-the fallback and `room tail` work with no server running.
+The installed **`connect` stdio client** normally forwards MCP to the configured
+host. If that transport is unavailable, it can continue only from the exact
+schema-v1 mirror previously authenticated for this server, workspace, human
+principal, canonical AI role, checkout, and device. Cached reads are marked
+offline/stale; allowlisted writes are fsynced to a device outbox and replayed
+idempotently after reconnect. Missing, ambiguous, forged, or role-changed mirrors
+fail closed.
+
+`attacca.py mcp` is a separate, explicitly selected serverless/direct-database
+mode for local development (`setup --stdio`). It is not the installed plugins'
+automatic hosted fallback, and neither a local database nor the administrative
+full export can substitute for the verified identity-scoped mirror.
 
 - **Language:** Python 3.8+ standard library only. Nothing to install
   (`requirements.txt` exists and is intentionally empty of dependencies).
 - **One database, many projects.** Default `~/.attacca/attacca.db`
   (override: `ATTACCA_DB`). Claims use single conditional UPDATEs, appends use
   `BEGIN IMMEDIATE` — safe under many concurrent clients (`tests/test_concurrency.py`).
-- **Identity per tool.** Give each tool its own actor (`claude_director`,
-  `codex_director`, `glm_worker`, …) via the header (server mode) or
-  `ATTACCA_ACTOR` env (stdio mode) so the room shows who is who.
+- **Identity per workspace role + AI.** Clients send a runtime hint (`claude`,
+  `codex`, `kimi`, …); after setup the server resolves it to
+  `workspace.role.runtime`. Owner is transmitted and stored separately.
 
 ## Quickstart
 
 **The server is the app.** It runs standalone — its own directory, its own
-lifecycle — and owns all state. Tools are pure clients; users never run
-anything inside their projects.
+lifecycle — and owns all state. Tools are pure clients; no Attacca server or
+database is installed inside a user's project.
 
 **1. Host the server** (whoever runs the platform; once):
 
 ```bash
 cd attacca && python3 attacca.py serve     # http://127.0.0.1:8722
-# production-ish: nohup/systemd; --host/--port to taste
+# request auth migration/readiness checks at launch: add --auth
+# enforcement still requires an explicit owner activation after coverage + QA
+# remote prototype: --host 0.0.0.0 (put TLS in front of it)
 ```
 
 **2. Users install the plugin from the server — one line, every tool:**
 
 ```bash
-curl -s http://127.0.0.1:8722/install.sh | sh
+curl -fsSL http://127.0.0.1:8722/install.sh | sh
 ```
 
 The server serves its own plugin (`/install.sh`, `/plugin.zip`): the download
 comes **pre-wired to the server it came from**, and the script wires **every AI
-coding tool it finds on the machine** — Claude Code gets the native plugin
-(marketplace add + install), Kimi Code / Codex / Cline / Cursor / Windsurf get
-their global MCP configs written. Nothing is touched in the directory you run
-it from.
+coding tool it finds on the machine** — Claude Code, Codex CLI, and Kimi Code
+get their native plugins, while Codex / Cline / Cursor / Windsurf get global
+MCP configuration. Codex keeps the global entry too because Codex surfaces
+without plugin support still read it; Kimi's old global Attacca entry is removed
+when its native plugin is installed so only one server is active. An unlinked
+directory is untouched. In
+an already-linked checkout, a reinstall may remove only Attacca's obsolete
+project-level `.mcp.json` entry so Claude does not load it alongside the native
+plugin; unrelated MCP entries are preserved. Run the installer inside the same
+host/container where the coding tool runs; after configuring Codex it verifies
+the effective server with
+`codex mcp get attacca` instead of merely claiming success.
 
-Prefer a native in-tool install? The same zip carries both plugin manifests:
+The installer is deliberately rerunnable. It refreshes the native plugin and
+one managed MCP entry instead of stacking active copies, and it configures a
+newly installed client that was absent on the previous run. Claude user/project/
+local registrations in the current checkout are normalized to one user plugin;
+old `.orphaned_at` cache directories are inactive retention, not registrations.
 
-- **Claude Code:** `/plugin install attacca@agentg` (marketplace added by the one-liner)
+Prefer a native in-tool install? The same zip carries Claude, Kimi, and Codex
+plugin manifests:
+
+- **Claude Code:** after the one-liner adds the local marketplace, run
+  `/plugin install attacca@agentg` if needed
 - **Kimi Code:** `/plugins install http://127.0.0.1:8722/plugin.zip`
+- **Codex CLI:** the one-liner installs `attacca@attacca-local`; open
+  `/plugins` in a new session, or run
+  `codex plugin add attacca@attacca-local` again to refresh it.
 
-Open your tool in **any** project: the plugin connects to the server
-(`ATTACCA_URL`, default `http://127.0.0.1:8722`) and the server
-**auto-registers the project on first contact** — zero per-project commands.
+`plugin.zip` contains the zero-dependency `attacca.py` runtime, the Claude /
+Codex / Kimi manifests and MCP launch configs, setup/message/update commands
+and skills, lifecycle-hook code, this README, and the web-panel asset. It does
+not contain the server database, a checkout's `.attacca/project.json`, user
+identity, credentials, or project history.
+
+Start a new Codex, Claude, or native-plugin Kimi session in a project. Codex and
+Claude use their trusted SessionStart hooks; Kimi injects the equivalent startup
+bootstrap from its plugin manifest. Each checks whether the checkout is linked
+and offers setup once when it is not. Accepting invokes `$attacca:setup` in
+Codex or `/attacca:setup` in Claude/Kimi. All three use the same flow. It connects
+to the packaged server (`ATTACCA_URL`, default
+`http://127.0.0.1:8722`), detects the canonical Git remote, and checks it
+against existing Attacca workspaces. A match is shown for confirmation;
+otherwise setup lists every workspace plus **Create new**. It never silently
+creates or attaches a workspace from local path/Git identity. The confirmed
+non-secret id is stored in `.attacca/project.json`.
+That is the portable workspace link and is safe to commit so another clone
+selects the same workspace. A checkout `.mcp.json`, when needed by a client
+without the native plugin, contains a machine/site-specific server endpoint;
+regenerate it on each machine rather than using it as workspace identity.
+The same guided run then configures every detected tool, verifies MCP and the
+lifecycle hooks, asks this AI's workspace role (first-run default: Director +
+Lead Director), shows existing relationship/inbox evidence, asks how to connect
+another workspace (default: MASTER, with the direction stated explicitly), and
+finally inspects the current AI conversation for pending/deferred work. It
+compares candidates with the task board and asks once before creating anything;
+setup never silently imports or claims a task.
 Convenience for local dev: if the URL is localhost and no server is up, the
 plugin boots one in the background (`ATTACCA_AUTOSTART=0` disables).
-Plugin extras: `/attacca:status`, `/attacca:brief`, `/attacca:setup`;
-tools appear as `mcp__plugin_attacca_attacca__<name>`.
+Claude and Kimi expose `/attacca:brief`, `/attacca:inbox`, `/attacca:room`,
+`/attacca:tasks`, `/attacca:status`, `/attacca:setup`, `/attacca:msg`, and
+`/attacca:update`. Codex exposes the three packaged skills `$attacca:setup`,
+`$attacca:msg`, and `$attacca:update`; status, handoff, inbox, room, and tasks
+remain available through natural requests and the Attacca MCP tools. MCP tools
+appear as `mcp__plugin_attacca_attacca__<name>`.
 
-**3. Per-project setup / anything else** — one command, run once, from the project:
+**3. Per-project setup / anything else** — one complete command, run once, from
+the project:
 
 ```bash
-python3 attacca.py setup
+attacca setup
 ```
 
 It auto-detects installed tools and points each at the server: Codex, Cursor,
@@ -121,76 +186,235 @@ MCP-speaking tool** — for ones not auto-detected (Grok, Zed, …),
 `setup --details` prints generic configs; anything else can use the REST API
 or CLI.
 
-Setup variants: `-i/--interactive` (asks your identity, extra projects, tools,
-and bridges + relationships), `--owner NAME` (who you are — shown as
+When Claude's native Attacca plugin is installed, setup removes only Attacca's
+checkout `.mcp.json` entry (preserving unrelated MCP servers/settings), because
+the native plugin already contributes that MCP connection. This prevents the
+same Attacca tools appearing twice.
+
+Setup variants: `-i/--interactive` (detects Git, asks for confirmation, and
+lists existing/create-new choices), `--owner NAME` (who you are — shown as
 `(OWNER: name)` on every log line), `--here` (force this subfolder to be its
-own project; id comes from the folder name — collisions need
-`init --project-id`), `--stdio` (serverless mode: tools open the database
+own project), `--attach ID`, `--create NAME`, `--discover`, `--stdio`
+(serverless mode: tools open the database
 directly), `--url http://host:port`, `--tools-only` (global tool configs only,
 no project side effects — what install.sh uses),
-`--skip-tools codex,cline` / `--skip-tools all`, `--no-server`,
-`install-hooks` (git commits → ledger).
+`--skip-tools codex,cline` / `--skip-tools all`, and `--no-server`.
+
+## Hosted authentication (prototype)
+
+The Control Panel at `/app` is the first-run entry point. Before it loads any
+workspace data, it calls the public authentication status endpoint and asks for
+the first admin account. Creating that account bootstraps ownership but does
+**not** activate enforcement or freeze existing clients. The server stays in a
+bounded compatibility state until the owner explicitly activates authentication
+after required terminal coverage and two recorded QA passes. `serve --auth`
+records launch-time activation intent and exposes readiness blockers; it does
+not bypass that migration gate or make a normal restart enforce immediately.
+
+Browsers use an expiring `HttpOnly`, `SameSite=Strict` session cookie plus a
+separate CSRF token on every state-changing request. Sign out in Settings to
+revoke that session. Settings manages human-owned terminal enrollments and
+separately scoped automation/service credentials; creating new registered-AI
+actor tokens is disabled. For credentials that have a one-time copy step,
+Plaintext is shown exactly once and the server stores only a hash. Revoke a token
+there when a computer/client is retired. After explicit activation, a revoked,
+expired, wrong-device, wrong-workspace, or wrong-actor credential gets 401/403.
+Before activation, compatibility may treat an invalid legacy bearer as absent,
+but only the exact project/actor/device compatibility resolver can authorize a
+legacy sync; it never turns that bearer into a terminal principal.
+
+For an authenticated server, the native setup/update skill or lifecycle hook
+starts a browser/device enrollment itself. The human receives only the verified
+Control Panel login URL and a short approval code—never a recovery command to
+run. Codex, Claude, and Kimi all use this browser path. The helper polls in
+bounded steps, so headless or temporarily inactive terminals remain deferred
+without blocking project work.
+
+For an enforced brand-new checkout, the integrated helper first requests a
+zero-binding terminal enrollment. The owner/admin approves it in the browser;
+the client stores it as a provisional human setup principal with no AI/sync
+authority. This 0600 device credential—not the browser cookie—persists across
+separate discovery and apply processes, allowing protected workspace creation,
+membership, and confirmed actor registration. Setup then authenticates the
+terminal-binding endpoint with that same device credential, adds the exact
+existing `{project_id, actor_id}`, refreshes the saved record, and only then
+retries AI sync. It never mints a replacement actor token or claims a browser
+session crosses processes. Compatibility-unactivated servers may perform
+initial setup anonymously and add the exact terminal binding afterward.
+
+The high-entropy device code becomes the terminal Bearer after approval; the
+server stores only its hash. Retrying a dropped approval response therefore
+recovers the same credential instead of losing it or minting a duplicate. The
+client verifies and atomically stores one terminal credential in
+`~/.attacca/credentials.json` with mode `0600`, scoped by the full server base
+URL (including any path) and the machine device. Its server-approved bindings
+may cover multiple existing workspace AI actors, while every write still sends
+the exact unchanged actor selector. Human/device ownership and ledger actor
+attribution remain separate.
+
+Passwords, API tokens, and device codes are never accepted in AI chat or as
+command arguments and are never printed. A hidden paste fallback exists only
+when the helper proves a real foreground controlling TTY; otherwise the browser
+form is mandatory. Watcher/MCP clients hot-reload the credential, retry in the
+current host, and clear an authentication latch only after verified hosted
+identity sync; a forced client restart is not the normal recovery path.
+
+The landing page, `/install.sh`, plugin zip/marketplace, health check, auth
+status, bootstrap, and login remain public so a new machine can install and
+connect. This is prototype account security, not a claim of production
+hardening: Attacca does not terminate TLS, provide SSO/MFA, rate-limit login,
+or encrypt the database. Put TLS and appropriate network controls in front of
+any remotely reachable instance.
+
+The native plugins bundle lifecycle continuity. Claude/Codex use `SessionStart`,
+`UserPromptSubmit`, and `Stop`; Kimi uses its manifest startup skill plus native
+`UserPromptSubmit` and `Stop` hooks. Once setup writes `.attacca/project.json`,
+each new session loads handoff, Project Rules, inbox, room, tasks, agents, and
+status. Setup also starts one machine-global background watcher. It polls the
+hosted workspace at the server-configured interval (one minute by default,
+configurable or disableable in `/app` Settings) even while coding clients are
+idle, deduplicates changes, and queues a concise local notification. The next
+supported lifecycle boundary injects that queue into the AI's context. The user
+never has to type “check messages,” and there is no second project database.
+
+Lifecycle startup compares the installed Attacca `VERSION` and managed-law
+fingerprint with the configured server's `/healthz`. When either bundle is
+newer or different, the AI asks once per reminder window with **Install now /
+Later / Skip this version**; it never executes downloaded code without the
+user's explicit choice. An unanswered offer is deduplicated, Later snoozes the
+exact bundle for 24 hours, and Skip suppresses only that exact
+version+managed-law fingerprint. Simultaneous clients atomically claim the
+offer so they cannot all ask at once. A successful install still requires a
+client restart so the new plugin code is actually loaded.
+
+The universal installer downloads into same-filesystem staging, rejects
+missing/unsafe files or mismatched runtime/manifests, and only then swaps the
+validated bundle into place. If validation or the swap fails, the previously
+working plugin is retained or restored. The native Git marketplace cache is
+content-addressed by the served bundle, so a server upgrade cannot keep
+returning an older cached plugin.
+
+After the plugin is current, lifecycle startup automatically refreshes an
+existing `MANAGED_ATTACCA` block in `AGENTS.md` and a real `CLAUDE.md` (or its
+standard `CLAUDE.md -> AGENTS.md` link). The replacement is atomic and changes
+only the bytes between the managed markers; user-authored content outside them
+is preserved. Missing, malformed, hand-edited ownership, unsafe-symlink, or
+newer/future blocks are left untouched and reported for review. `/healthz`
+publishes the bundled managed-law version and hash for diagnostics.
 
 ## How a tool connects (three shapes, one server)
 
 | Shape | Who uses it | Project identity |
 |---|---|---|
-| `connect` stdio client | Claude plugin, Kimi Code, Codex, Cursor, Cline, Windsurf | auto: working directory sent as `X-Attacca-Root`; server registers on first contact |
+| `connect` stdio client | Claude plugin, Kimi Code, Codex, Cursor, Cline, Windsurf | explicit env → nearest `.attacca/project.json` → same-machine registered root; on transport outage only, the exact verified watcher identity activates its scoped mirror/outbox |
 | HTTP MCP (`/mcp`) | Gemini, VS Code, opencode, anything with native HTTP MCP | `X-Attacca-Project` header |
-| stdio direct (`mcp`) | serverless fallback (`setup --stdio`) | cwd walk-up against the local DB |
+| stdio direct (`mcp`) | explicit local/serverless development mode (`setup --stdio`) | cwd walk-up against the selected local DB; never an automatic hosted fallback |
+
+### Two computers, one workspace
+
+Both computers must use the **same Attacca server URL/database**. Absolute
+checkout paths are irrelevant. Computer A confirms or creates the workspace,
+then commits `.attacca/project.json`; computer B can clone anywhere and the
+client sends the same stable project id. Even before that file is committed,
+the normalized Git remote fingerprint lets setup suggest the same workspace
+for confirmation. The link contains no token, user identity, database path, or
+absolute directory.
+
+Each computer keeps a separate device outbox and the same principal-scoped
+verified mirror. During an outage, each can queue its own allowlisted mutations;
+the background watcher reconnects, pulls, replays immutable mutation IDs in
+order, and pulls again. Duplicate retries return the stored receipt, while real
+conflicts remain visible and block dependent work instead of being overwritten.
 
 Keep the server running across reboots with anything you like, e.g.
 `nohup python3 /abs/attacca.py serve >/tmp/attacca.log 2>&1 &` or a
 systemd user unit. It binds `127.0.0.1` by default; `--host 0.0.0.0` exposes an
-**unauthenticated** server (no encryption in this build) — only do that on a
-trusted network.
+unencrypted HTTP listener. Bootstrap an account, complete terminal migration,
+record both QA passes, explicitly activate, and put TLS in front of it before
+using it outside a trusted development network. `--auth` requests readiness; it
+does not skip those gates.
 
 ## REST API (server mode)
 
 ```
-GET  /healthz
+GET  /                         GET /app[/]                 GET /healthz
+GET  /v1/auth/status
+POST /v1/auth/bootstrap       POST /v1/auth/login         POST /v1/auth/logout
+GET  /v1/auth/access
+POST /v1/auth/device/start    POST /v1/auth/device/poll
+GET/POST /v1/auth/terminal-enrollments
+GET  /v1/auth/terminal-enrollments/{code}
+POST /v1/auth/terminal-enrollments/{code}/approve
+POST /v1/auth/terminal-enrollments/{code}/deny
+DELETE /v1/auth/terminals/{token_id}
+POST /v1/auth/terminals/{token_id}/bindings
+GET/POST /v1/auth/service-keys
+DELETE /v1/auth/service-keys/{token_id}
+GET/POST /v1/auth/invitations
+POST /v1/auth/invitations/accept
+DELETE /v1/auth/invitations/{invitation_id}
+POST /v1/auth/migration-scope POST /v1/auth/activation
+GET  /v1/auth/tokens          DELETE /v1/auth/tokens/{token_id}
+GET/PUT /v1/settings
 GET  /v1/projects                          POST /v1/projects
+GET  /v1/projects/{id}/status              GET  /v1/projects/{id}/inbox
+PUT  /v1/projects/{id}/lead
+GET/POST /v1/projects/{id}/bridges         DELETE /v1/projects/{id}/bridges/{other}
 GET  /v1/projects/{id}/handoff             POST /v1/projects/{id}/handoff
 GET  /v1/projects/{id}/log?limit=          GET  /v1/projects/{id}/events?after=&limit=
 POST /v1/projects/{id}/events              GET  /v1/projects/{id}/room?since_seq=&limit=
 POST /v1/projects/{id}/room                GET  /v1/projects/{id}/tasks?status=
 POST /v1/projects/{id}/tasks               GET  /v1/projects/{id}/tasks/{tid}
+GET/PUT /v1/projects/{id}/tasks/{tid}/plan
+POST /v1/projects/{id}/tasks/{tid}/plan/submit
+POST /v1/projects/{id}/tasks/{tid}/plan/review
 POST /v1/projects/{id}/tasks/{tid}/claim   POST /v1/projects/{id}/tasks/{tid}/report
 POST /v1/projects/{id}/tasks/{tid}/release POST /v1/projects/{id}/tasks/{tid}/status
 GET  /v1/projects/{id}/decisions           POST /v1/projects/{id}/decisions
 POST /v1/projects/{id}/decisions/{did}/resolve
 GET  /v1/projects/{id}/agents              POST /v1/projects/{id}/agents
+GET  /v1/projects/{id}/search?q=
 GET  /v1/projects/{id}/freshness?context_version=
 GET  /v1/projects/{id}/verify
 ```
 
-Actor identity via `X-Attacca-Actor` / `X-Attacca-Actor-Type` headers.
-Writes return the same payloads (and warnings) as the MCP tools.
+In legacy anonymous mode, actor identity uses `X-Attacca-Actor` /
+`X-Attacca-Actor-Type`. Once authenticated, browser/human writes derive an
+immutable `web.<username>` actor and owner from the account, while agent writes
+derive their exact project/actor/runtime from the token; spoofable identity
+headers are ignored or rejected. Writes return the same payloads (and warnings)
+as the MCP tools.
 
 ## The protocol agents follow
 
 Injected via the managed block and the MCP server's `instructions`:
 
-1. **Session start** — `get_handoff` (returns handoff + open tasks + standing decisions +
-   recent activity + `context_version`), then `room_read`. Register once with `agent_register`.
-2. **Before working** — `task_claim` (or `task_create` then claim). Declare
-   `expected_scope`; heed overlap warnings.
-3. **While working** — coordinate via `room_send` / poll `room_read since_seq=…`
+1. **Session start** — use the hook-injected brief, or call `get_handoff`,
+   `check_inbox`, `room_read`, `task_list`, and `attacca_status` if absent.
+2. **Tasks for owned, trackable work** — before editing, `task_claim` (or
+   `task_create` then claim). Declare `expected_scope`; heed overlap warnings.
+3. **Room for ephemeral coordination** — questions, directives, challenges,
+   and short updates use `room_send` / `room_read since_seq=…`
    (the cursor is lossless: a truncated batch sets `may_have_more` and the next poll
-   picks up exactly where the last one ended); record durable choices with
-   `decision_propose` / `decision_resolve`.
-4. **Session end** — `task_report` with evidence, then `update_handoff` so the next
-   worker (any tool, any model) resumes cold.
-5. **Drift Guard** — responses carry `stale_context_warning` when the project moved
+   picks up exactly where the last one ended).
+4. **Decisions for durable choices** — architecture, API, data, security,
+   workflow, or product choices use `decision_propose` / `decision_resolve`,
+   not chat; routine implementation details do not need a decision record.
+5. **Handoff at transitions/session end** — report task evidence first, then a
+   Director calls `update_handoff` with the version from `get_handoff`.
+   Advisors/workers report via tasks/room, and stale handoff writes fail.
+6. **Drift Guard** — responses carry `stale_context_warning` when the project moved
    after your briefing; re-run `get_handoff` before writing.
 
-## MCP tools (25)
+## MCP tools (35)
 
 `attacca_status`, `get_handoff`, `update_handoff`, `get_project_log`,
-`check_inbox`, `room_send`, `room_read`, `task_create`, `task_list`, `task_claim`,
-`task_report`, `task_release`, `task_set_status`, `decision_propose`,
+`check_inbox`, `room_send`, `room_read`, `task_create`, `task_list`, `task_show`,
+`task_plan_get`, `task_plan_set`, `task_plan_submit`, `task_plan_review`,
+`task_claim`, `task_report`, `task_release`, `task_set_status`, `decision_propose`,
 `decision_resolve`, `decision_list`, `set_lead_director`, `bridge_add`,
-`bridge_list`, `search`, `agent_register`, `agent_list`, `list_projects`,
+`bridge_update_access`, `bridge_remove`, `bridge_list`, `search`, `rule_list`,
+`rule_create`, `rule_update`, `agent_register`, `agent_list`, `list_projects`,
 `append_event`, `check_freshness`.
 
 In Claude Code they appear as `mcp__attacca__<name>`. Every tool takes an optional
@@ -205,27 +429,41 @@ init [PATH] [--project-id ID] [--name NAME] [--move]   register a project
                                                (--move re-points an existing id to a new root)
 projects | status | log [-n N] | freshness [--context-version N]
 handoff show | handoff set --objective ... --what-changed ... --next-actions ...
+            [--expected-context-version N]
 room send --type chat|directive|claim|handoff|challenge|decision|approval|status
           --body TEXT [--mentions a,b] [--task T-1] [--to OTHER_PROJECT]
 room read [--since SEQ] [-n N] | room tail [--interval SECS]
 task create TITLE [--scope a,b] [--depends-on T-1] [--risk low|medium|high]
+                  [--plan-required]
 task list [--status S] | task show T-1 | task claim T-1 [--scope a,b] [--lease MIN]
+task plan get T-1 [--version N]
+task plan set T-1 --title TEXT (--sections-json JSON | --sections-file PATH)
+              [--overview TEXT] [--expected-version N] [--submit]
+task plan submit T-1 --expected-version N
+task plan review T-1 --expected-version N --action approve|suggest_edit|comment
+                 [--section ID] [--note TEXT]
 task report T-1 --summary TEXT [--evidence JSON] [--state review|done|blocked|queued]
 task release T-1 [--reason TEXT] | task set-status T-1 STATUS [--reason TEXT]
 decision propose TITLE [--detail TEXT] [--rationale TEXT]
 decision resolve D-1 accepted|rejected|superseded | decision list
-inbox [-n N] [--keep-unread]                    your mentions/replies, cursor persists
+inbox [-n N] [--keep-unread]                    addressed/structured messages, cursor persists
 lead [ACTOR_ID] [--clear]                       show or set the Lead Director
 bridge add OTHER [--boss P | --advisor P] | bridge remove OTHER | bridge list
 search QUERY [-n N] | overview                  explore everything stored
 handoff history [-n N] | event show SEQ         version and event detail
 agent register [--id X] [--role R] [--runtime RT] | agent list
 event append --type note.x --payload '{"k":"v"}' | event tail | event verify
-serve [--host H] [--port P] [--verbose]        host the attacca server (REST + MCP/HTTP)
-mcp                                            stdio MCP fallback (direct DB, no server)
-setup [--url U] [--stdio] [--no-instructions]  one-shot project setup
+serve [--host H] [--port P] [--verbose] [--auth]
+                                               host REST + MCP/HTTP; --auth
+                                               requests gated auth readiness
+mcp                                            explicit stdio direct-DB mode (not hosted fallback)
+setup --discover | --attach ID | --create NAME  advanced/scripted workspace flags
+setup [--url U] [--stdio] [--no-instructions]  one-shot checkout setup
+      [-i|--interactive]
+      [--role director|advisor|worker] [--lead keep|current|clear]
+      [--bridge ID --relationship master|peer|advisor|none --principal current|other]
 setup --details [claude kimi codex gemini opencode glm cli]   full config reference
-install-instructions [--files CLAUDE.md,AGENTS.md] | install-hooks
+install-instructions [--files CLAUDE.md,AGENTS.md]
 ```
 
 ## Demos and tests
@@ -233,21 +471,30 @@ install-instructions [--files CLAUDE.md,AGENTS.md] | install-hooks
 ```bash
 ./demo/demo_cold_handoff.sh        # blueprint north-star: fresh worker resumes cold
 python3 demo/demo_two_agents_mcp.py  # two real MCP sessions coordinating via the ledger
-python3 -m unittest discover -s tests -v   # 95 tests: storage, MCP (stdio+HTTP), REST, concurrency
+python3 -m unittest discover -s tests -v   # storage, hooks, MCP, REST, UI, concurrency
 python3 attacca.py event verify  # hash-chain + sequence integrity of a real ledger
 ```
 
 ## Notes and limits (honest edges)
 
-- **No enforcement.** Prompt-level protocol only; hooks/permissions enforcement is a
-  later layer (blueprint §12.3, §28 "policy bypass").
+- **Prototype authentication, not production identity infrastructure.** Account
+  sessions, CSRF, hash-only terminal/service credentials, project/actor binding, Director-only
+  handoff/directive rules, and stale versions are enforced. SSO/MFA, login rate
+  limits, centralized key rotation, TLS termination, and hostile-host isolation
+  remain later layers (blueprint §12.3, §28 "policy bypass").
 - **No encryption.** Everything is plaintext on your machine. The E2E key hierarchy
   (§17) is the next milestone and slots in at the sync boundary.
+- **Offline mode is identity-scoped, not a second database.** It activates only
+  after an authenticated snapshot has bound server, project, human principal,
+  canonical AI actor/role, visibility policy and device. Bridge/agent/lead-policy
+  changes and cross-project sends remain unavailable offline. A timeout after a
+  mutation may be ambiguous, so `connect` refuses to queue that request; a proven
+  connection refusal can be queued safely.
 - **Leases are soft locks** for coordination, not Git locking. Use branches/worktrees
   as usual; `base_revision` is recorded at claim/report for later comparison.
 - **Hash chain is tamper-*evident*, not tamper-*proof*** (no signatures yet — §23.3).
-- **One actor id = one worker.** Two live sessions sharing a `ATTACCA_ACTOR` also
-  share task leases (a renewal warning is emitted). Give each concurrent session its
-  own actor id.
+- **One canonical actor = one workspace/role/runtime persona.** Two simultaneous
+  sessions of the same AI in the same role intentionally share its inbox cursor and
+  task leases; owner remains separately visible on every new event.
 - The room is a projection of `room.message` events in the ledger — chat is not the
   database (blueprint principle, §2.3).

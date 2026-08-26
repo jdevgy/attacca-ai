@@ -1,0 +1,20 @@
+{
+  "name": "attacca-local",
+  "interface": {
+    "displayName": "Attacca"
+  },
+  "plugins": [
+    {
+      "name": "attacca",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

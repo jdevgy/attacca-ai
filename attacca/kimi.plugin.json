@@ -1,20 +1,41 @@
 {
   "name": "attacca",
-  "version": "0.2.0",
+  "version": "0.4.5",
   "description": "Shared project memory for AI coding tools: event ledger, task claims, decisions, human+AI room, and cold-start handoffs across Kimi Code, Claude Code, Codex, GLM, Cline and any MCP client.",
   "interface": {
     "displayName": "Attacca — Project Continuity Layer",
     "shortDescription": "Shared project memory across AI coding tools"
   },
-  "commands": "./commands/",
+  "commands": "./kimi-commands/",
+  "skills": "./kimi-skills/",
+  "sessionStart": {
+    "skill": "attacca-session"
+  },
+  "hooks": [
+    {
+      "event": "UserPromptSubmit",
+      "matcher": "",
+      "command": "python3 ./hooks/session_start.py",
+      "timeout": 8
+    },
+    {
+      "event": "Stop",
+      "matcher": "",
+      "command": "python3 ./hooks/session_start.py",
+      "timeout": 8
+    }
+  ],
   "mcpServers": {
     "attacca": {
       "command": "python3",
-      "args": ["./attacca.py", "connect"],
+      "args": [
+        "./attacca.py",
+        "connect"
+      ],
       "cwd": "./",
       "env": {
-        "ATTACCA_ACTOR": "kimi_director",
-        "ATTACCA_URL": "http://127.0.0.1:8722"
+        "ATTACCA_ACTOR": "kimi",
+        "ATTACCA_URL": "http://127.0.0.1:4173"
       }
     }
   }
