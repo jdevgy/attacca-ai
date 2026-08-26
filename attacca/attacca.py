@@ -5529,9 +5529,11 @@ def _cloud_context_row(conn, project_id):
 
 def _cloud_context_dict(row):
     if not row:
-        return {"content": "", "version": 0, "updated_by": None,
-                "updated_owner": None, "updated_at": None}
+        return {"content": "", "version": 0, "sha256": sha256_hex(""),
+                "updated_by": None, "updated_owner": None,
+                "updated_at": None}
     return {"content": row["content"], "version": row["version"],
+            "sha256": sha256_hex(row["content"] or ""),
             "updated_by": row["updated_by"],
             "updated_owner": row["updated_owner"],
             "updated_at": row["updated_at"]}
@@ -16322,6 +16324,89 @@ def write_state_markdown(out_dir, projection):
         os.replace(str(tmp), str(target))
         written.append(str(target))
     return written
+
+
+CLOUD_CONTEXT_BEGIN = "<!-- ATTACCA_CLOUD_CONTEXT:BEGIN"
+CLOUD_CONTEXT_END = "<!-- ATTACCA_CLOUD_CONTEXT:END -->"
+_CLOUD_CONTEXT_BLOCK_RE = re.compile(
+    r"(?ms)^<!-- ATTACCA_CLOUD_CONTEXT:BEGIN\b[^\r\n]*-->.*?"
+    r"^<!-- ATTACCA_CLOUD_CONTEXT:END -->[ \t]*$")
+
+
+def cloud_context_block(cloud_context, project_id):
+    """Build the versioned, sha-stamped Cloud Context block for AGENTS.md /
+    CLAUDE.md. Like the managed block, it is a self-delimited region that
+    Attacca owns; content outside the markers is never touched."""
+    cc = cloud_context or {}
+    content = (cc.get("content") or "").strip()
+    version = cc.get("version") or 0
+    sha = cc.get("sha256") or sha256_hex(content)
+    header = "%s v=%s sha=%s project=%s do_not_edit=true -->" % (
+        CLOUD_CONTEXT_BEGIN, version, sha[:16], project_id)
+    body = content if content else "_No cloud context set yet._"
+    note = ("<!-- Attacca Cloud Context: the shared project summary, synced "
+            "from the server. Do not edit inside these markers; edit via the "
+            "control panel or cloud_context_set. -->")
+    return "%s\n%s\n%s\n%s" % (header, note, body, CLOUD_CONTEXT_END)
+
+
+def cloud_context_block_present(text):
+    """Return (present, version, sha) for a Cloud Context block in ``text``."""
+    match = _CLOUD_CONTEXT_BLOCK_RE.search(text or "")
+    if not match:
+        return False, None, None
+    head = match.group(0).splitlines()[0]
+    ver = re.search(r"\bv=(\S+)", head)
+    sha = re.search(r"\bsha=(\S+)", head)
+    return True, (ver.group(1) if ver else None), (sha.group(1) if sha else None)
+
+
+def refresh_cloud_context_block(conn, project_id, root_path, files=None,
+                                create=False):
+    """Sync the Cloud Context into AGENTS.md/CLAUDE.md as a managed block.
+
+    If the block already exists it is refreshed in place (auto, like the
+    managed law block). If it is absent it is only added when ``create`` is
+    true (the AI offers this first). Everything outside the markers, including
+    the managed protocol block and the human's own text, is preserved."""
+    cc = cloud_context_get(conn, project_id)["cloud_context"]
+    block = cloud_context_block(cc, project_id)
+    root = Path(root_path).resolve()
+    results = []
+    for filename in (files or ["AGENTS.md", "CLAUDE.md"]):
+        target = root / filename
+        if target.is_symlink():
+            # Follow the managed convention: a CLAUDE.md symlink to AGENTS.md
+            # is refreshed through AGENTS.md, not written twice.
+            results.append({"file": str(target), "changed": False,
+                            "status": "linked"})
+            continue
+        text = target.read_text(encoding="utf-8") if target.exists() else ""
+        match = _CLOUD_CONTEXT_BLOCK_RE.search(text)
+        if match:
+            if match.group(0).strip() == block.strip():
+                results.append({"file": str(target), "changed": False,
+                                "status": "current"})
+                continue
+            new_text = text[:match.start()] + block + text[match.end():]
+            status = "updated"
+        else:
+            if not create:
+                results.append({"file": str(target), "changed": False,
+                                "status": "absent"})
+                continue
+            if not text:
+                new_text = block + "\n"
+            else:
+                sep = "\n" if text.endswith("\n") else "\n\n"
+                new_text = text + sep + block + "\n"
+            status = "created"
+        tmp = target.with_name(target.name + ".attacca-tmp")
+        tmp.write_text(new_text, encoding="utf-8")
+        os.replace(str(tmp), str(target))
+        results.append({"file": str(target), "changed": True, "status": status})
+    return {"ok": True, "project": project_id, "files": results,
+            "version": cc.get("version"), "sha256": cc.get("sha256")}
 
 
 def build_parser():
