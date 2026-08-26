@@ -142,7 +142,7 @@ LOG_EXCLUDED_MSG_TYPES = {"chat", "status"}
 
 MANAGED_BEGIN = "<!-- MANAGED_ATTACCA:BEGIN"
 MANAGED_END = "<!-- MANAGED_ATTACCA:END -->"
-MANAGED_BLOCK_VERSION = 10
+MANAGED_BLOCK_VERSION = 11
 _MANAGED_TEMPLATE_PROJECT = "attacca-project"
 _MANAGED_BEGIN_LINE = re.compile(
     r"(?m)^<!-- MANAGED_ATTACCA:BEGIN\b[^\r\n]*-->[ \t]*\r?$")
@@ -3451,9 +3451,16 @@ def get_handoff(conn, project_id, actor_id=None, actor_type="agent"):
     if actor_id:
         peek = inbox_read(conn, project_id, actor_id, mark_read=False,
                           limit=200, actor_type=actor_type)
-        your_inbox = {"unread_addressed_to_you": len(peek["messages"]),
-                      "unread_broadcasts": peek["unread_broadcasts"],
-                      "hint": "read with check_inbox / room_read"}
+        your_inbox = {
+            "unread_total": peek["unread_total"],
+            "unread_addressed_to_you": peek["unread_addressed"],
+            "unread_everyone": peek["unread_everyone"],
+            "unread_group_context": peek["unread_group_context"],
+            "may_have_more": peek["may_have_more"],
+            "messages_include_all_visible": True,
+            "hint": ("read every message with check_inbox; mentions/replies "
+                     "assign attention, not visibility"),
+        }
     bridges = _bridge_rows(
         conn, project_id, actor_id=actor_id, actor_type=actor_type)
     governance = None
@@ -3756,6 +3763,38 @@ def _room_message_dict(row, payload=None):
             "mirrored_to": payload.get("mirrored_to") or []}
 
 
+def _inbox_message_attention(conn, actor_ids, payload):
+    """Classify response routing without turning it into a privacy filter.
+
+    The project room is a group conversation.  Every participation-visible
+    non-self message is an inbox item.  Mentions and replies merely identify
+    the expected responder; an untargeted chat/directive is addressed to the
+    whole group.  Other visible traffic remains required group context.
+    """
+    mentions = set(payload.get("mentions") or [])
+    mentioned = bool(actor_ids.intersection(mentions))
+    replied = False
+    reply_to = payload.get("reply_to")
+    if reply_to:
+        original = conn.execute(
+            "SELECT actor_id FROM events WHERE event_id=?", (reply_to,)
+        ).fetchone()
+        replied = bool(original and original["actor_id"] in actor_ids)
+    broadcast = bool(
+        payload.get("msg_type") in ("chat", "directive")
+        and not mentions and not reply_to)
+    direct = mentioned or replied
+    addressed = direct or broadcast
+    return {
+        "mentioned_to_you": mentioned,
+        "reply_to_you": replied,
+        "directed_to_you": direct,
+        "broadcast_to_everyone": broadcast,
+        "addressed_to_you": addressed,
+        "group_context": not addressed,
+    }
+
+
 def _room_message_signature(message):
     """Fields retained unchanged on both sides of a mirrored room event."""
     return (message.get("actor"), message.get("actor_type"),
@@ -3837,9 +3876,13 @@ def _infer_legacy_room_mirrors(conn, project_id, messages):
 
 def inbox_read(conn, project_id, actor_id, mark_read=True, limit=50,
                actor_type="agent"):
-    """Per-actor inbox: room messages that mention you or reply to one of
-    your messages, since your persisted read cursor. Other unread room
-    traffic is reported as a count (read it with room_read)."""
+    """Return every unread group-room message visible to this participant.
+
+    Bridge participation is the visibility boundary. Mentions/replies are
+    attention metadata only, and chat/directive messages without either are
+    broadcasts to every participant. The raw ledger cursor still advances
+    across self or bridge-hidden rows so polling cannot loop on invisible data.
+    """
     get_project(conn, project_id)
     limit = max(1, min(int(limit or 50), 500))
     alias_rows = conn.execute(
@@ -3856,7 +3899,9 @@ def inbox_read(conn, project_id, actor_id, mark_read=True, limit=50,
         (project_id, cursor, limit + 1)).fetchall()
     may_have_more = len(rows) > limit
     rows = rows[:limit]
-    messages, broadcasts = [], 0
+    messages = []
+    counts = {"addressed": 0, "direct": 0, "everyone": 0,
+              "group_context": 0}
     for r in rows:
         if r["actor_id"] in actor_ids:
             continue  # your own messages are not inbox items
@@ -3864,33 +3909,22 @@ def inbox_read(conn, project_id, actor_id, mark_read=True, limit=50,
         if not _bridge_message_visible(
                 conn, project_id, payload, actor_id, actor_type):
             continue
-        addressed = bool(actor_ids.intersection(payload.get("mentions") or []))
-        if not addressed and payload.get("reply_to"):
-            orig = conn.execute(
-                "SELECT actor_id FROM events WHERE event_id=?",
-                (payload["reply_to"],)).fetchone()
-            addressed = bool(orig and orig["actor_id"] in actor_ids)
-        # A structured message crossing a workspace relationship is project-
-        # level coordination, even when the sender did not know every actor id
-        # to mention. Surface it in each active actor's inbox instead of hiding
-        # a master directive/system notice behind a broadcast count. Plain
-        # chat and status remain broadcasts unless explicitly addressed.
-        if not addressed and payload.get("origin_project") \
-                and payload.get("msg_type") not in ("chat", "status"):
-            addressed = True
-        if addressed:
-            message = _room_message_dict(r, payload)
-            identity_project = message.get("origin_project") or project_id
-            attribution = immutable_event_attribution(
-                conn, identity_project, message["actor"],
-                message["actor_type"], message.get("owner"))
-            message["ledger_actor"] = message["actor"]
-            message["actor"] = attribution["actor_id"]
-            message["identity"] = attribution["identity"]
-            message["attribution"] = attribution
-            messages.append(message)
-        else:
-            broadcasts += 1
+        attention = _inbox_message_attention(conn, actor_ids, payload)
+        message = _room_message_dict(r, payload)
+        message.update(attention)
+        identity_project = message.get("origin_project") or project_id
+        attribution = immutable_event_attribution(
+            conn, identity_project, message["actor"],
+            message["actor_type"], message.get("owner"))
+        message["ledger_actor"] = message["actor"]
+        message["actor"] = attribution["actor_id"]
+        message["identity"] = attribution["identity"]
+        message["attribution"] = attribution
+        messages.append(message)
+        counts["addressed"] += int(attention["addressed_to_you"])
+        counts["direct"] += int(attention["directed_to_you"])
+        counts["everyone"] += int(attention["broadcast_to_everyone"])
+        counts["group_context"] += int(attention["group_context"])
     new_cursor = rows[-1]["seq"] if rows else cursor
     if mark_read and new_cursor > cursor:
         with write_tx(conn):
@@ -3901,13 +3935,27 @@ def inbox_read(conn, project_id, actor_id, mark_read=True, limit=50,
                 " last_read_seq=excluded.last_read_seq,"
                 " updated_at=excluded.updated_at",
                 (project_id, actor_id, new_cursor, now_iso()))
-    return {"project": project_id, "actor": actor_id, "messages": messages,
-            "unread_broadcasts": broadcasts, "may_have_more": may_have_more,
-            "read_cursor": new_cursor if mark_read else cursor,
-            "hint": ("more unread remains — call check_inbox again"
-                     if may_have_more else
-                     "unread_broadcasts counts room messages not addressed to "
-                     "you; read them with room_read")}
+    return {
+        "project": project_id,
+        "actor": actor_id,
+        "messages": messages,
+        "messages_include_all_visible": True,
+        "unread_total": len(messages),
+        "unread_addressed": counts["addressed"],
+        "unread_direct": counts["direct"],
+        "unread_everyone": counts["everyone"],
+        "unread_group_context": counts["group_context"],
+        # Compatibility name. These rows are INCLUDED in messages; callers
+        # must use unread_total rather than adding this field to len(messages).
+        "unread_broadcasts": counts["group_context"],
+        "may_have_more": may_have_more,
+        "read_cursor": new_cursor if mark_read else cursor,
+        "scanned_through_seq": new_cursor,
+        "hint": ("more unread group messages remain — call check_inbox again"
+                 if may_have_more else
+                 "all participation-visible unread room messages are included; "
+                 "mentions/replies assign attention, not visibility"),
+    }
 
 
 BRIDGE_RELATIONS = ["peer", "master", "advisor"]
@@ -11680,10 +11728,12 @@ def _r_managed_law(h, m, q):
 
 def _r_poll_status(h, m, q):
     actor, atype = h._actor()
-    actor = q.get("actor") or actor
+    # Identity comes only from the request's validated principal/headers.
+    # Query parameters may describe client versions, never impersonate a
+    # different inbox or actor type after authentication.
     h._reply_json(200, poll_status(
         h._conn(), m.group(1), actor_id=actor,
-        actor_type=q.get("actor_type") or atype,
+        actor_type=atype,
         plugin_version=q.get("plugin_version"),
         law_version=q.get("law_version")), {"Cache-Control": "no-store"})
 
@@ -16492,9 +16542,18 @@ def poll_status(conn, project_id, actor_id=None, actor_type="agent",
     if actor_id:
         peek = inbox_read(conn, project_id, actor_id, mark_read=False,
                           limit=200, actor_type=actor_type)
-        mail = {"unread_addressed": len(peek["messages"]),
-                "unread_broadcasts": peek.get("unread_broadcasts", 0),
-                "has_new_mail": bool(peek["messages"])}
+        mail = {
+            "unread_total": peek.get("unread_total", 0),
+            "unread_addressed": peek.get("unread_addressed", 0),
+            "unread_direct": peek.get("unread_direct", 0),
+            "unread_everyone": peek.get("unread_everyone", 0),
+            "unread_group_context": peek.get("unread_group_context", 0),
+            "unread_broadcasts": peek.get("unread_broadcasts", 0),
+            "may_have_more": bool(peek.get("may_have_more")),
+            "messages_include_all_visible": True,
+            "has_new_mail": bool(peek.get("unread_total") or
+                                 peek.get("may_have_more")),
+        }
     head = conn.execute(
         "SELECT MAX(seq) AS s FROM events WHERE project_id=?",
         (project_id,)).fetchone()

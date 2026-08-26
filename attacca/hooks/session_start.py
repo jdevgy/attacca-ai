@@ -37,7 +37,9 @@ except ImportError:  # pragma: no cover - Windows fallback remains atomic replac
 
 STATE_NAME = "setup-prompts.json"
 WATCHER_STATE_NAME = "watcher-state.json"
-WATCHER_QUEUE_LIMIT = 50
+WATCHER_QUEUE_LIMIT = 200
+WATCHER_DELTA_CHUNK_SIZE = 25
+WATCHER_NOTICE_BATCH_SIZE = 5
 WATCHER_WAKE_SECONDS = 5
 WATCHER_EVENT_PAGE_SIZE = 200
 WATCHER_EVENT_MAX_PAGES = 20
@@ -2158,7 +2160,7 @@ def _watcher_event_line(event):
         msg_type = payload.get("msg_type") or "chat"
         return "Room%s%s · %s · %s: %s" % (
             source, authority, msg_type, actor,
-            _trim(payload.get("body"), 180))
+            _trim(payload.get("body"), 500))
     if event_type.startswith("task.plan."):
         version = " v%s" % payload["plan_version"] \
             if payload.get("plan_version") is not None else ""
@@ -2213,12 +2215,11 @@ def _watcher_event_line(event):
 def _watcher_delta_summary(status, events, interval):
     if not events:
         return None
-    shown = events[-10:]
     lines = ["ATTACCA BACKGROUND DELTA · %s" % status["project_id"]]
-    lines.extend("- " + _watcher_event_line(event) for event in shown)
-    if len(events) > len(shown):
-        lines.append("- %d earlier relevant event(s) were coalesced." %
-                     (len(events) - len(shown)))
+    # The caller chunks events before this renderer. Never collapse a room
+    # message into a count: each queued delta must retain the content the AI
+    # is expected to read at the next lifecycle boundary.
+    lines.extend("- " + _watcher_event_line(event) for event in events)
     lines.extend([
         "Manual full update: `$attacca:update` (Codex) or `/attacca:update` "
         "(Claude/Kimi).",
@@ -2823,7 +2824,12 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
             and isinstance(registered_at, (int, float))
             and _watcher_event_epoch(event) >= registered_at]
     status = _watcher_subscription_status(entry)
-    summary = _watcher_delta_summary(status, relevant, interval)
+    summary_rows = []
+    for offset in range(0, len(relevant), WATCHER_DELTA_CHUNK_SIZE):
+        chunk = relevant[offset:offset + WATCHER_DELTA_CHUNK_SIZE]
+        summary = _watcher_delta_summary(status, chunk, interval)
+        if summary:
+            summary_rows.append({"events": chunk, "summary": summary})
     fingerprint = hashlib.sha256(json.dumps([
         [event.get("seq"), event.get("event_id"), event.get("event_type")]
         for event in relevant
@@ -2850,22 +2856,52 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
         # Discard the legacy materialized view after the first successful
         # delta request. Only cursors and concise pending summaries persist.
         live.pop("snapshot", None)
-        if not summary or live.get("last_queued_fingerprint") == fingerprint:
+        if not summary_rows or \
+                live.get("last_queued_fingerprint") == fingerprint:
             return
         live["last_queued_fingerprint"] = fingerprint
         pending = live.setdefault("pending", [])
-        pending.append({
-            "fingerprint": fingerprint,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "summary": summary,
-            "kind": "project_delta",
-            "after": cursor,
-            "through": next_cursor,
-            "event_count": len(relevant),
-            "event_types": sorted({event.get("event_type")
-                                   for event in relevant}),
-        })
-        del pending[:-WATCHER_QUEUE_LIMIT]
+        chunk_after = cursor
+        created_at = datetime.now(timezone.utc).isoformat()
+        for index, row in enumerate(summary_rows):
+            chunk = row["events"]
+            through = (next_cursor if index == len(summary_rows) - 1 else
+                       int(chunk[-1].get("seq") or chunk_after))
+            pending.append({
+                "fingerprint": "%s:%d" % (fingerprint, index),
+                "created_at": created_at,
+                "summary": row["summary"],
+                "kind": "project_delta",
+                "after": chunk_after,
+                "through": through,
+                "event_count": len(chunk),
+                "event_types": sorted({event.get("event_type")
+                                       for event in chunk}),
+            })
+            chunk_after = through
+        if len(pending) > WATCHER_QUEUE_LIMIT:
+            dropped = pending[:-WATCHER_QUEUE_LIMIT + 1]
+            retained = pending[-WATCHER_QUEUE_LIMIT + 1:]
+            pending[:] = [{
+                "fingerprint": "overflow:%s" % fingerprint,
+                "created_at": created_at,
+                "summary": (
+                    "ATTACCA UNREAD ROOM BACKLOG · %s\n"
+                    "- %d earlier queued event(s) exceeded the local desktop "
+                    "notice budget. The lifecycle snapshot is automatically "
+                    "loading their full content through check_inbox/room_read; "
+                    "the watcher did not advance the actor's inbox cursor."
+                    % (entry["project_id"], sum(
+                        int(item.get("event_count") or 0) for item in dropped))),
+                "kind": "project_delta_backlog",
+                "after": dropped[0].get("after") if dropped else cursor,
+                "through": dropped[-1].get("through") if dropped else cursor,
+                "event_count": sum(int(item.get("event_count") or 0)
+                                   for item in dropped),
+                "event_types": sorted({event_type for item in dropped
+                                       for event_type in
+                                       (item.get("event_types") or [])}),
+            }] + retained
         queued = True
 
     # Persistence happens before any optional desktop notification. A notifier
@@ -2873,7 +2909,8 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
     _mutate_state(_watcher_state_path(), persist)
     if queued:
         try:
-            (notifier or _desktop_notify)(entry["project_id"], summary)
+            (notifier or _desktop_notify)(
+                entry["project_id"], summary_rows[-1]["summary"])
         except Exception:
             pass
     return {"ok": True, "due": True,
@@ -2890,15 +2927,21 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
 
 def _watcher_pending_notice(status, config, runtime=None, consume=True):
     key = _watcher_subscription_key(status, config, runtime=runtime)
-    captured = {"rows": []}
+    captured = {"rows": [], "remaining": 0}
 
     def mutate(state):
         entry = (state.get("subscriptions") or {}).get(key)
         if not entry:
             return
-        captured["rows"] = list(entry.get("pending") or [])
+        pending = list(entry.get("pending") or [])
+        captured["rows"] = pending[:WATCHER_NOTICE_BATCH_SIZE]
+        captured["remaining"] = max(
+            0, len(pending) - len(captured["rows"]))
         if consume and captured["rows"]:
-            entry["pending"] = []
+            # Deliver oldest-first and retain every undisplayed update for the
+            # next lifecycle turn. Clearing the full queue after rendering a
+            # five-row suffix used to lose group-room content silently.
+            entry["pending"] = pending[len(captured["rows"]):]
             entry["last_delivered_at"] = datetime.now(timezone.utc).isoformat()
 
     if consume:
@@ -2908,17 +2951,17 @@ def _watcher_pending_notice(status, config, runtime=None, consume=True):
     rows = captured["rows"]
     if not rows:
         return None
-    shown = rows[-5:]
-    context = "\n\n".join(row["summary"] for row in shown)
-    if len(rows) > len(shown):
-        context += "\n\n- %d earlier queued update(s) were coalesced." % (
-            len(rows) - len(shown))
+    context = "\n\n".join(row["summary"] for row in rows)
+    if captured["remaining"]:
+        context += ("\n\n- %d queued update(s) remain and will be injected "
+                    "oldest-first at subsequent lifecycle boundaries; none "
+                    "were cleared or coalesced." % captured["remaining"])
     context += ("\n\nThe background watcher captured these ledger deltas while "
                 "the coding client was idle. Refresh the affected handoff, "
                 "room, task, plan, rule, decision, or bridge through Attacca "
                 "before acting when full current detail is required.")
-    return {"system_message": "Attacca background watcher · %d queued update(s)"
-                              % len(rows),
+    return {"system_message": "Attacca background watcher · %d delivered, %d queued"
+                              % (len(rows), captured["remaining"]),
             "context": context}
 
 
@@ -3359,6 +3402,13 @@ def _task_view(task):
         "lease_expired", "risk_level", "updated_at")}
 
 
+def _decision_view(decision):
+    """Keep durable decision meaning without injecting its full event history."""
+    return {key: decision.get(key) for key in (
+        "decision_id", "title", "status", "detail", "rationale",
+        "proposed_by", "resolved_by", "created_at", "resolved_at")}
+
+
 def _current_actor_record(snapshot):
     """Match the effective MCP identity to its post-registration agent row."""
     status = snapshot.get("status") or {}
@@ -3469,11 +3519,19 @@ def _compact_snapshot(snapshot):
     tasks = snapshot.get("tasks") or {}
     rules = snapshot.get("rules") or {}
 
-    def messages(rows, limit):
-        return [{"seq": row.get("seq"), "actor": row.get("actor"),
-                 "type": row.get("msg_type"), "body": _trim(row.get("body")),
+    def messages(rows, limit, full_body=False):
+        return [{"event_id": row.get("event_id"),
+                 "seq": row.get("seq"), "actor": row.get("actor"),
+                 "type": row.get("msg_type"),
+                 "body": (str(row.get("body") or "") if full_body else
+                          _trim(row.get("body"))),
                  "task_id": row.get("task_id"),
                  "mentions": row.get("mentions"),
+                 "reply_to": row.get("reply_to"),
+                 "addressed_to_you": row.get("addressed_to_you"),
+                 "broadcast_to_everyone": row.get(
+                     "broadcast_to_everyone"),
+                 "group_context": row.get("group_context"),
                  "origin_project": row.get("origin_project"),
                  "authority": row.get("authority"),
                  "mirrored_to": row.get("mirrored_to")}
@@ -3481,20 +3539,44 @@ def _compact_snapshot(snapshot):
 
     status = snapshot.get("status") or {}
     actor_record = _current_actor_record(snapshot) or {}
+    unread_rows = list(inbox.get("messages") or [])[-100:]
+    unread_keys = {_message_key(row) for row in unread_rows}
+    recent_rows = [row for row in (room.get("messages") or [])
+                   if _message_key(row) not in unread_keys][-50:]
+    unread_messages = messages(unread_rows, 100, full_body=True)
     return {
         "project": snapshot.get("project"),
         "checked_at": snapshot.get("checked_at"),
         "context_version": handoff.get("context_version"),
+        # Rules and Cloud Context stay ahead of verbose operational state so
+        # host-side context limits cannot silently drop the project's law and
+        # durable background after a long decision/task history.
+        "project_rules": rules.get("rules") or [],
+        "cloud_context": handoff.get("cloud_context"),
+        "room_protocol": (
+            "This is a group conversation. Read every unread_room message. "
+            "Mentions/replies assign the expected responder, not visibility; "
+            "chat/directive with neither is broadcast to everyone. Retain "
+            "relevant context even when no action is assigned."),
         "lead_director": handoff.get("lead_director"),
         "handoff": handoff.get("handoff"),
         "open_tasks": handoff.get("open_tasks"),
-        "decisions": handoff.get("decisions"),
-        "project_rules": rules.get("rules") or [],
-        "cloud_context": handoff.get("cloud_context"),
+        "decisions": [_decision_view(item) for item in
+                      (handoff.get("decisions") or [])[:100]
+                      if isinstance(item, dict)],
         "recent_activity": handoff.get("recent_activity"),
-        "inbox": messages(inbox.get("messages"), 20),
+        "unread_room": unread_messages,
+        # Keep a direct-attention projection for old clients and quick triage;
+        # it is a subset of unread_room, never the visibility boundary.
+        "inbox": [item for item in unread_messages
+                  if item.get("addressed_to_you") is not False],
         "unread_broadcasts": inbox.get("unread_broadcasts"),
-        "recent_room": messages(room.get("messages"), 20),
+        "unread_room_may_have_more": bool(inbox.get("may_have_more")),
+        "unread_room_next_action": (
+            "Call check_inbox again before other work; more unread group "
+            "messages remain behind this page."
+            if inbox.get("may_have_more") else None),
+        "recent_room": messages(recent_rows, 50),
         "tasks": [_task_view(task) for task in (tasks.get("tasks") or [])
                   if task.get("status") not in ("done", "cancelled")][:50],
         "actor": (status.get("you") or {}).get("actor_id"),
@@ -3517,9 +3599,9 @@ def _mcp_snapshot(status, plugin_root, config, mark_inbox_read=True):
         {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
          "params": {"name": "check_inbox",
                     "arguments": {"mark_read": bool(mark_inbox_read),
-                                  "limit": 50}}},
+                                  "limit": 100}}},
         {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
-         "params": {"name": "room_read", "arguments": {"limit": 30}}},
+         "params": {"name": "room_read", "arguments": {"limit": 50}}},
         {"jsonrpc": "2.0", "id": 6, "method": "tools/call",
          "params": {"name": "task_list", "arguments": {}}},
         {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
@@ -3780,6 +3862,8 @@ def _offline_session_payload(status, adapter, entry=None, failure=None,
                 "type": item.get("msg_type"),
                 "body": _trim(item.get("body"), 500),
                 "task_id": item.get("task_id"),
+                "mentions": item.get("mentions"),
+                "reply_to": item.get("reply_to"),
                 "origin_project": item.get("origin_project"),
                 "authority": item.get("authority")}
 
@@ -3817,6 +3901,14 @@ def _offline_session_payload(status, adapter, entry=None, failure=None,
             "warning": None,
         },
         "project_rules": rules,
+        # Cloud Context is part of the verified identity projection. Keep it
+        # ahead of operational lists so a host context cap cannot erase the
+        # project's durable background during an outage.
+        "cloud_context": snapshot.get("cloud_context"),
+        "room_protocol": (
+            "The room is a group conversation. Read every visible message; "
+            "mentions/replies assign attention, not visibility, and an "
+            "unaddressed chat/directive is broadcast to everyone."),
         "handoff": latest_handoff,
         "tasks": [_task_view(item) for item in
                   (snapshot.get("tasks") or [])[:100]
@@ -3825,7 +3917,7 @@ def _offline_session_payload(status, adapter, entry=None, failure=None,
                       (snapshot.get("decisions") or [])[:100]
                       if isinstance(item, dict)],
         "recent_room": [compact_room(item) for item in
-                        (snapshot.get("room_messages") or [])[-30:]
+                        (snapshot.get("room_messages") or [])[-100:]
                         if isinstance(item, dict)],
         "agents": [compact_agent(item) for item in
                    (snapshot.get("agents") or [])[:100]
@@ -4111,9 +4203,13 @@ rule_list, room_read, task_list, agent_list, and attacca_status
 through the configured MCP connection
 for this workspace. Use this state before working; do not rediscover the
 repository from scratch. Before writes, honor existing task claims and
-claim/create the relevant Attacca task. Treat addressed room messages as pending
-coordination. If any later Attacca response reports stale_context_warning,
-reload the handoff before further writes.
+claim/create the relevant Attacca task. The project room is a group conversation:
+read every message in unread_room and recent_room, including messages mentioning
+or replying to another participant. Mentions/replies identify the expected
+responder; they never limit visibility. A chat or directive with neither is sent
+to everyone. Consider relevant design and context changes even when no action is
+assigned. If any later Attacca response reports stale_context_warning, reload the
+handoff before further writes.
 
 %s""" % json.dumps(brief, indent=2, ensure_ascii=False)
             _rules_banner = _mandatory_rules_banner(
@@ -4225,33 +4321,44 @@ def _change_summary(status, previous, current, snapshot, interval):
                 _trim(item.get("title"), 70)) for item in rules[:5])
             or "none active"))
 
+    group_details = []
     inbox_keys = {_message_key(message) for message in inbox_messages}
-    for message in inbox_messages[-3:]:
+    for message in inbox_messages[-100:]:
         source = " from %s" % message["origin_project"] \
             if message.get("origin_project") else ""
         authority = " [%s]" % message["authority"] \
             if message.get("authority") else ""
-        details.append("Inbox%s%s · %s: %s" % (
+        if message.get("addressed_to_you"):
+            label = "Direct room message"
+        elif message.get("broadcast_to_everyone"):
+            label = "Everyone room broadcast"
+        else:
+            label = "Group room context"
+        group_details.append("%s%s%s · %s: %s" % (
+            label,
             source, authority, message.get("actor") or "unknown",
-            _trim(message.get("body"), 160)))
+            _trim(message.get("body"), 500)))
     old_room = set(previous.get("room_keys") or [])
     new_room = [message for message in
                 ((snapshot.get("room") or {}).get("messages") or [])
                 if _message_key(message) not in old_room
                 and _message_key(message) not in inbox_keys]
-    for message in new_room[-3:]:
+    # Backward compatibility: older servers put non-addressed room messages
+    # only in room_read. Surface every new visible one until the all-group
+    # inbox contract is available, then inbox_keys deduplicates this path.
+    for message in new_room[-100:]:
         source = " from %s" % message["origin_project"] \
             if message.get("origin_project") else ""
         target = " to %s" % ", ".join(message.get("mirrored_to") or []) \
             if message.get("mirrored_to") else ""
-        details.append("Room%s%s · %s: %s" % (
+        group_details.append("Group room context%s%s · %s: %s" % (
             source, target, message.get("actor") or "unknown",
-            _trim(message.get("body"), 160)))
+            _trim(message.get("body"), 500)))
 
     task_lines = _task_change_lines(previous.get("tasks"), current.get("tasks"))
     if task_lines:
         details.append("Tasks: " + "; ".join(task_lines[:4]))
-    if not details:
+    if not details and not group_details:
         old_events = (previous.get("counts") or {}).get("events") or 0
         new_events = (current.get("counts") or {}).get("events") or 0
         delta = max(0, new_events - old_events)
@@ -4259,7 +4366,10 @@ def _change_summary(status, previous, current, snapshot, interval):
             " (%d new ledger event%s)" % (delta, "" if delta == 1 else "s")
             if delta else ""))
 
-    details = details[:7]
+    # Room content comes first and is never collapsed to a count. Operational
+    # state remains compact behind it so an active hook cannot hide a group
+    # design/directive message merely because the task board also changed.
+    details = group_details + details[:7]
     lines = ["ATTACCA AUTOMATIC UPDATE · %s" % status["project_id"]]
     lines.extend("- " + detail for detail in details)
     lines.extend([
