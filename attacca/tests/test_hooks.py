@@ -722,9 +722,9 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             status = {"state_path": str(data / hook_module.STATE_NAME)}
             config = {"url": "http://server"}
             local_laws = {"version": c.MANAGED_BLOCK_VERSION,
-                          "sha256": "local-law"}
+                          "sha256": "a" * 64}
             server_laws = {"version": c.MANAGED_BLOCK_VERSION + 1,
-                           "sha256": "server-law-one"}
+                           "sha256": "b" * 64}
             with mock.patch.object(
                     hook_module, "_local_version", return_value=c.VERSION), \
                  mock.patch.object(
@@ -747,7 +747,7 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             # an earlier Skip/reminder cannot suppress its new fingerprint.
             hook_module.set_update_choice(
                 data, "http://server", c.VERSION, "skip")
-            server_laws["sha256"] = "server-law-two"
+            server_laws["sha256"] = "c" * 64
             with mock.patch.object(
                     hook_module, "_local_version", return_value=c.VERSION), \
                  mock.patch.object(
@@ -761,15 +761,37 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                     status, ROOT, config)
             self.assertIsNotNone(changed_again)
 
+    def test_same_managed_law_version_changed_hash_offers_update(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            status = {"state_path": str(
+                Path(tmp) / hook_module.STATE_NAME)}
+            config = {"url": "http://server"}
+            local_laws = {"version": c.MANAGED_BLOCK_VERSION,
+                          "sha256": "a" * 64}
+            server_laws = {"version": c.MANAGED_BLOCK_VERSION,
+                           "sha256": "b" * 64}
+            with mock.patch.object(
+                    hook_module, "_local_version", return_value=c.VERSION), \
+                 mock.patch.object(
+                    hook_module, "_local_managed_instructions",
+                    return_value=local_laws), \
+                 mock.patch.object(
+                    hook_module, "_server_release",
+                    return_value={"version": c.VERSION,
+                                  "managed_instructions": server_laws}):
+                offer = hook_module._update_offer(status, ROOT, config)
+            self.assertIsNotNone(offer)
+            self.assertIn("managed laws changed", offer["context"])
+
     def test_older_server_managed_laws_never_offer_a_downgrade(self):
         with tempfile.TemporaryDirectory() as tmp:
             data = Path(tmp)
             status = {"state_path": str(data / hook_module.STATE_NAME)}
             config = {"url": "http://server"}
             local_laws = {"version": c.MANAGED_BLOCK_VERSION,
-                          "sha256": "newer-local-law"}
+                          "sha256": "b" * 64}
             server_laws = {"version": c.MANAGED_BLOCK_VERSION - 1,
-                           "sha256": "older-server-law"}
+                           "sha256": "a" * 64}
             with mock.patch.object(
                     hook_module, "_local_version", return_value=c.VERSION), \
                  mock.patch.object(
@@ -782,6 +804,37 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                 self.assertIsNone(hook_module._update_offer(
                     status, ROOT, config))
             self.assertFalse(Path(status["state_path"]).exists())
+
+    def test_malformed_server_managed_law_metadata_is_advisory_only(self):
+        invalid = (
+            {"version": True, "sha256": "a" * 64},
+            {"version": 0, "sha256": "a" * 64},
+            {"version": -1, "sha256": "a" * 64},
+            {"version": c.MANAGED_BLOCK_VERSION, "sha256": {"bad": "hash"}},
+            {"version": c.MANAGED_BLOCK_VERSION, "sha256": 123},
+            {"version": c.MANAGED_BLOCK_VERSION, "sha256": " "},
+            {"version": c.MANAGED_BLOCK_VERSION, "sha256": "a" * 63},
+            {"version": c.MANAGED_BLOCK_VERSION, "sha256": "A" * 64},
+        )
+        for index, server_laws in enumerate(invalid):
+            with self.subTest(server_laws=server_laws), \
+                    tempfile.TemporaryDirectory() as tmp:
+                status = {"state_path": str(
+                    Path(tmp) / hook_module.STATE_NAME)}
+                config = {"url": "http://server-%d" % index}
+                with mock.patch.object(
+                        hook_module, "_local_version",
+                        return_value=c.VERSION), \
+                     mock.patch.object(
+                        hook_module, "_local_managed_instructions",
+                        return_value=None), \
+                     mock.patch.object(
+                        hook_module, "_server_release",
+                        return_value={"version": c.VERSION,
+                                      "managed_instructions": server_laws}):
+                    self.assertIsNone(hook_module._update_offer(
+                        status, ROOT, config))
+                self.assertFalse(Path(status["state_path"]).exists())
 
     def test_unlinked_project_offers_update_before_setup_and_then_honors_skip(self):
         with tempfile.TemporaryDirectory() as tmp:

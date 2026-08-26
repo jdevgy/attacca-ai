@@ -714,14 +714,23 @@ def _update_offer(status, plugin_root, config, setup_cwd=None,
         local_laws = _local_managed_instructions(plugin_root) or {}
         server_law_version = server_laws.get("version")
         local_law_version = local_laws.get("version")
+        server_law_sha = server_laws.get("sha256")
+        local_law_sha = local_laws.get("sha256")
+        server_laws_valid = (
+            type(server_law_version) is int and server_law_version >= 1 and
+            isinstance(server_law_sha, str) and
+            re.fullmatch(r"[0-9a-f]{64}", server_law_sha) is not None)
+        local_laws_valid = (
+            type(local_law_version) is int and local_law_version >= 1 and
+            isinstance(local_law_sha, str) and
+            re.fullmatch(r"[0-9a-f]{64}", local_law_sha) is not None)
         law_update = (
             available_key == installed_key and
-            isinstance(server_law_version, int) and
-            bool(server_laws.get("sha256")) and
-            (not isinstance(local_law_version, int) or
+            server_laws_valid and
+            (not local_laws_valid or
              server_law_version > local_law_version or
              (server_law_version == local_law_version and
-              server_laws.get("sha256") != local_laws.get("sha256"))))
+              server_law_sha != local_law_sha)))
         if not software_update and not law_update:
             return None
     except Exception:
