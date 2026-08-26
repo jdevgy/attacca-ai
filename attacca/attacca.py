@@ -16204,6 +16204,126 @@ def migration_directive(root_path=None):
     }
 
 
+def _md_handoff_content(row):
+    content = (row or {}).get("content")
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except (ValueError, TypeError):
+            content = {}
+    return content if isinstance(content, dict) else {}
+
+
+def render_state_markdown(projection):
+    """Render an Attacca projection (the durable synced state: handoff, rules,
+    cloud context, log, room, decisions, tasks) as a set of Markdown files.
+
+    Returns {filename: markdown_text}. These are DERIVED, read-only views of the
+    authoritative ledger/server — editing them does not sync back. Missing
+    sections render as empty, never an error."""
+    p = projection or {}
+    proj = p.get("project") or {}
+    name = proj.get("name") or proj.get("project_id") or "project"
+    out = {}
+
+    out["README.md"] = (
+        "# Attacca mirror — %s\n\n"
+        "Read-only Markdown views of this workspace's synced Attacca state, "
+        "refreshed whenever the local sync runs. The authoritative source is the "
+        "Attacca server / ledger and the local `snapshot.json`; editing these "
+        "files does not change project state.\n\n"
+        "- `HANDOFF.md` — current handoff\n- `CLOUD_CONTEXT.md` — project summary\n"
+        "- `RULES.md` — mandatory Project Rules\n- `TASKS.md` — task board\n"
+        "- `DECISIONS.md` — decision records\n- `ROOM.md` — recent room/inbox\n"
+        "- `LOG.md` — project event log\n" % name)
+
+    handoffs = p.get("handoffs") or []
+    content = _md_handoff_content(handoffs[-1] if handoffs else None)
+    lines = ["# Handoff — %s" % name, ""]
+    fields = ("objective", "what_changed", "active_work", "blockers", "risks",
+              "next_actions", "notes")
+    if any(content.get(f) for f in fields):
+        for f in fields:
+            v = content.get(f)
+            if v:
+                lines += ["## %s" % f.replace("_", " ").title(), "", str(v), ""]
+    else:
+        lines += ["_No handoff written yet._", ""]
+    out["HANDOFF.md"] = "\n".join(lines)
+
+    cc = p.get("cloud_context") or {}
+    cc_body = (cc.get("content") or "").strip()
+    out["CLOUD_CONTEXT.md"] = (cc_body + "\n") if cc_body else \
+        "# Cloud Context\n\n_No cloud context set._\n"
+
+    rules = p.get("rules") or []
+    rlines = ["# Project Rules — %s" % name, ""]
+    if rules:
+        for r in sorted(rules, key=lambda r: (r.get("priority", 100),
+                                              str(r.get("rule_id") or ""))):
+            state = "enabled" if r.get("enabled", True) else "disabled"
+            rlines += ["## %s · %s (priority %s · %s · %s)" % (
+                r.get("rule_id"), r.get("title"), r.get("priority"),
+                r.get("scope"), state), "", str(r.get("body") or ""), ""]
+    else:
+        rlines += ["_No rules._", ""]
+    out["RULES.md"] = "\n".join(rlines)
+
+    tasks = p.get("tasks") or []
+    tlines = ["# Tasks — %s" % name, "",
+              "| Task | Status | Claimed by | Title |", "|---|---|---|---|"]
+    for t in tasks:
+        tlines.append("| %s | %s | %s | %s |" % (
+            t.get("task_id"), t.get("status"), t.get("claimed_by") or "-",
+            str(t.get("title") or "").replace("|", "\\|")))
+    out["TASKS.md"] = "\n".join(tlines) + "\n"
+
+    decisions = p.get("decisions") or []
+    dlines = ["# Decisions — %s" % name, ""]
+    if decisions:
+        for d in decisions:
+            dlines += ["## %s · %s [%s]" % (
+                d.get("decision_id"), d.get("title"), d.get("status")), ""]
+            if d.get("detail"):
+                dlines += [str(d.get("detail")), ""]
+            if d.get("rationale"):
+                dlines += ["_Rationale:_ %s" % d.get("rationale"), ""]
+    else:
+        dlines += ["_No decisions._", ""]
+    out["DECISIONS.md"] = "\n".join(dlines)
+
+    room = p.get("room_messages") or []
+    mlines = ["# Room / Inbox — %s" % name, ""]
+    for m in room[-200:]:
+        mlines.append("- **%s** · %s · _%s_: %s" % (
+            m.get("actor"), m.get("msg_type") or "chat",
+            m.get("at") or m.get("created_at") or "",
+            str(m.get("body") or "").replace("\n", " ")))
+    if not room:
+        mlines.append("_No messages._")
+    out["ROOM.md"] = "\n".join(mlines) + "\n"
+
+    log = p.get("full_log") or []
+    out["LOG.md"] = "# Project Log — %s\n\n```\n%s\n```\n" % (
+        name, "\n".join(str(x) for x in log) if log else "(empty)")
+    return out
+
+
+def write_state_markdown(out_dir, projection):
+    """Write render_state_markdown() output into ``out_dir`` (created if
+    absent). Returns the list of written file paths. Atomic per file."""
+    directory = Path(out_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    written = []
+    for filename, text in render_state_markdown(projection).items():
+        target = directory / filename
+        tmp = directory / (filename + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(str(tmp), str(target))
+        written.append(str(target))
+    return written
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="attacca.py",

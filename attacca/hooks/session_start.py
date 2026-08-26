@@ -2545,6 +2545,27 @@ def _watcher_queue_sync_result(key, entry, result, adapter_status, now,
     return queued
 
 
+def _watcher_write_markdown_mirror(entry, adapter):
+    """Best-effort: render the synced durable state (handoff, cloud context,
+    rules, tasks, decisions, room, log) to Markdown files under
+    <checkout>/.attacca/mirror/ so the AI can read it directly. A convenience
+    view only; it never raises and never blocks sync."""
+    try:
+        root = entry.get("root") if isinstance(entry, dict) else None
+        getter = getattr(adapter, "local_projection", None)
+        if not root or not callable(getter):
+            return
+        projection = getter()
+        if not isinstance(projection, dict):
+            return
+        runtime = _load_attacca_runtime(entry.get("plugin_root"))
+        writer = getattr(runtime, "write_state_markdown", None)
+        if callable(writer):
+            writer(str(Path(root) / ".attacca" / "mirror"), projection)
+    except Exception:
+        pass
+
+
 def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
                   force=False, offline_adapter=None, offline_factory=None,
                   remote_adapter=None, remote_factory=None):
@@ -2700,6 +2721,7 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
                 "retry_in_seconds": current.get("offline_retry_seconds"),
                 "pending_sync": bool(adapter_status.get("pending_sync")),
             }
+        _watcher_write_markdown_mirror(entry, adapter)
         try:
             sync_notice_queued = _watcher_queue_sync_result(
                 key, entry, sync_result, adapter_status, now,
