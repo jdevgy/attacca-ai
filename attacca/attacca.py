@@ -16101,7 +16101,23 @@ def _managed_instruction_sync(project_id, root_path, db_path, files=None,
             entry["resolved_file"] = str(target)
         results.append(entry)
         processed[target_key] = entry
+    # Universal (R-2): keep the Cloud Context block in the same files in sync
+    # with the managed block for EVERY project — create it on setup, refresh it
+    # in place on later runs. Best-effort: never break the managed-block write.
+    cloud_context_files = []
+    if db_path:
+        try:
+            _cc_conn = connect(db_path)
+            try:
+                cloud_context_files = refresh_cloud_context_block(
+                    _cc_conn, project_id, root_path, files=filenames,
+                    create=not managed_only).get("files", [])
+            finally:
+                _cc_conn.close()
+        except Exception:
+            cloud_context_files = []
     return {
+        "cloud_context_files": cloud_context_files,
         "ok": not any(item["status"] in (
             "malformed", "unsafe_symlink", "unmanaged", "future",
             "write_error")
