@@ -7,6 +7,7 @@ import hashlib
 import tempfile
 import unittest
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 from unittest import mock
 import sys
 
@@ -187,7 +188,7 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
     def watcher_state(self):
         return json.loads(hook._watcher_state_path().read_text())
 
-    def test_watcher_token_is_exactly_scoped_by_base_project_and_actor(self):
+    def test_watcher_client_key_and_identity_headers_are_exactly_scoped(self):
         credentials = Path.home() / ".attacca" / "credentials.json"
         credentials.parent.mkdir(parents=True)
         server_key = "https://attacca.example/tenant-a"
@@ -195,10 +196,12 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
             "version": 1,
             "servers": {
                 server_key: {
+                    # Deliberately retain every retired credential shape here
+                    # to prove D-17 never falls back to one of them.
                     "api_token": "human-bootstrap-must-not-leak",
                     "tokens": {"codex": "legacy-runtime-must-not-leak"},
                     "terminal_credential": {
-                        "token": "shared-terminal-token",
+                        "token": "legacy-terminal-must-not-leak",
                         "token_kind": "terminal",
                         "token_id": "terminal-test-id",
                         "device_id": "machine-device",
@@ -225,14 +228,32 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
                             },
                         },
                     },
+                    "client_api_keys": {
+                        "codex-install-a": {
+                            "token": "atkey_tenant_a_install_a",
+                            "token_kind": "client",
+                            "token_id": "key-tenant-a-install-a",
+                            "client_instance": "codex-install-a",
+                            "username": "jack",
+                            "project_memberships": ["shared", "other"],
+                            "scope_mode": "selected_workspaces",
+                            "label": "Codex office install",
+                            "device_id": "machine-device",
+                        },
+                    },
                 },
                 "https://attacca.example/tenant-b": {
-                    "agent_tokens": {
-                        "shared": {
-                            "shared.director.codex": {
-                                "token": "wrong-base-token",
-                                "runtime": "codex",
-                            },
+                    "client_api_keys": {
+                        "codex-install-a": {
+                            "token": "atkey_tenant_b_install_a",
+                            "token_kind": "client",
+                            "token_id": "key-tenant-b-install-a",
+                            "client_instance": "codex-install-a",
+                            "username": "jack",
+                            "project_memberships": ["other"],
+                            "scope_mode": "selected_workspaces",
+                            "label": "Codex office install",
+                            "device_id": "machine-device",
                         },
                     },
                 },
@@ -245,6 +266,7 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
             "project_id": "shared",
             "canonical_actor_id": "shared.director.codex",
             "device_id": "machine-device",
+            "client_instance": "codex-install-a",
         }
         other = dict(base, project_id="other",
                      canonical_actor_id="other.director.codex")
@@ -254,16 +276,42 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
                 "ATTACCA_PROJECT": "",
                 "ATTACCA_ACTOR": "codex"}, clear=False):
             self.assertEqual(
-                hook._watcher_api_token(base), "shared-terminal-token")
+                hook._watcher_api_token(base), "atkey_tenant_a_install_a")
             self.assertEqual(
-                hook._watcher_api_token(other), "shared-terminal-token")
-            with self.assertRaises(hook.HostedAuthenticationRequired):
-                hook._watcher_api_token(dict(
-                    base, canonical_actor_id="shared.director.claude"))
+                hook._watcher_api_token(other), "atkey_tenant_a_install_a")
+            # D-17 keys authenticate the installed client/human account, not
+            # one AI model. Exact actor authority remains a request header
+            # checked by the hosted server.
+            self.assertEqual(hook._watcher_api_token(dict(
+                base, canonical_actor_id="shared.director.claude")),
+                "atkey_tenant_a_install_a")
+            claude_headers = hook._watcher_request_headers(dict(
+                base, canonical_actor_id="shared.director.claude"))
+            self.assertEqual(claude_headers["Authorization"],
+                             "Bearer atkey_tenant_a_install_a")
+            self.assertEqual(claude_headers["X-Attacca-Actor"],
+                             "shared.director.claude")
             self.assertIsNone(hook._watcher_api_token(dict(
-                base, server_url="https://attacca.example/tenant-b/" ,
-                project_id="other",
-                canonical_actor_id="other.director.codex")))
+                base, project_id="not-a-membership")))
+            self.assertIsNone(hook._watcher_api_token(dict(
+                base, client_instance="different-install")))
+            tenant_b = dict(
+                other, server_url="https://attacca.example/tenant-b/")
+            self.assertEqual(hook._watcher_api_token(tenant_b),
+                             "atkey_tenant_b_install_a")
+
+            headers = hook._watcher_request_headers(base)
+            self.assertEqual(headers["Authorization"],
+                             "Bearer atkey_tenant_a_install_a")
+            self.assertEqual(headers["X-Attacca-Project"], "shared")
+            self.assertEqual(headers["X-Attacca-Actor"],
+                             "shared.director.codex")
+            self.assertEqual(headers["X-Attacca-Client-Instance"],
+                             "codex-install-a")
+            self.assertEqual(headers["X-Attacca-Device-ID"],
+                             "machine-device")
+            self.assertEqual(headers["X-Attacca-Device"],
+                             "machine-device")
         self.assertNotIn("token", json.dumps(self.watcher_state()).lower())
 
     def verified_status(self, **updates):
@@ -447,7 +495,7 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
         self.assertIn("cm_conflict_0001", context)
         self.assertIn("work may continue", output["systemMessage"])
 
-    def test_revoked_token_blocks_valid_old_mirror_at_session_start(self):
+    def test_revoked_client_key_blocks_valid_old_mirror_at_session_start(self):
         adapter = FakeOfflineAdapter(self.verified_status(), self.snapshot())
         with mock.patch.object(
                 hook, "_plugin_and_config",
@@ -467,7 +515,7 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
              mock.patch.object(
                  hook, "_mcp_snapshot",
                  side_effect=hook.HostedAuthenticationRequired(
-                     "revoked project-bound token", http_status=401)):
+                     "revoked client-install key", http_status=401)):
             output = hook._active_output(
                 self.status, offline_adapter=adapter)
         context = output["hookSpecificOutput"]["additionalContext"]
@@ -524,12 +572,12 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
         self.assertNotIn("CONTINUE WORK", serialized)
         self.assertNotIn("stale outage continuity", serialized)
 
-    def test_watcher_revoked_token_queues_auth_notice_not_offline_continuity(self):
+    def test_watcher_revoked_client_key_queues_auth_notice_not_offline_continuity(self):
         adapter = FakeOfflineAdapter(self.verified_status(), self.snapshot())
         with mock.patch.object(
                 adapter, "synchronize",
                 side_effect=client.SyncAuthenticationError(
-                    "revoked project-bound token")), \
+                    "revoked client-install key", http_status=401)), \
              mock.patch.object(hook, "_settings_interval", return_value=60):
             result = hook._watcher_tick(
                 self.key, now=0, force=True, offline_adapter=adapter,
@@ -556,8 +604,9 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
         adapter = FakeOfflineAdapter(self.verified_status(), self.snapshot())
         with mock.patch.object(
                 adapter, "synchronize",
-                side_effect=client.SyncIdentityChangedError(
-                    "authenticated actor or role changed")), \
+                side_effect=client.SyncAuthenticationError(
+                    "host rejected the actor after its role changed",
+                    http_status=403)), \
              mock.patch.object(hook, "_settings_interval", return_value=60):
             result = hook._watcher_tick(
                 self.key, now=0, force=True, offline_adapter=adapter,
@@ -577,7 +626,8 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
         adapter = FakeOfflineAdapter(self.verified_status(), self.snapshot())
         with mock.patch.object(
                 adapter, "synchronize",
-                side_effect=client.SyncAuthenticationError("token revoked")), \
+                side_effect=client.SyncAuthenticationError(
+                    "client-install key revoked", http_status=401)), \
              mock.patch.object(hook, "_settings_interval", return_value=60):
             revoked = hook._watcher_tick(
                 self.key, now=0, force=True, offline_adapter=adapter,
@@ -660,7 +710,8 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
         entry = self.watcher_state()["subscriptions"][self.key]
         hook._watcher_queue_auth_required(
             self.key, entry,
-            hook.HostedAuthenticationRequired("old token revoked", 401), 0)
+            hook.HostedAuthenticationRequired(
+                "old client-install key revoked", 401), 0)
         with mock.patch.object(hook, "_settings_interval", return_value=60):
             result = hook._watcher_tick(
                 self.key, now=60, force=True, offline_adapter=adapter,
@@ -679,7 +730,8 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
         entry = self.watcher_state()["subscriptions"][self.key]
         hook._watcher_queue_auth_required(
             self.key, entry,
-            hook.HostedAuthenticationRequired("token revoked", http_status=401),
+            hook.HostedAuthenticationRequired(
+                "client-install key revoked", http_status=401),
             0)
         with mock.patch.object(
                 hook, "_plugin_and_config",
@@ -705,14 +757,18 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
         self.assertTrue(self.watcher_state()["subscriptions"][self.key][
             "auth_required"])
 
-    def test_adapter_build_auth_error_sets_latch_before_polling(self):
-        def rejected_factory(_entry, _wake):
-            raise client.SyncIdentityChangedError("cached role was revoked")
+    def test_remote_adapter_build_hosted_403_sets_latch_before_polling(self):
+        adapter = FakeOfflineAdapter(self.verified_status(), self.snapshot())
+
+        def rejected_factory(_entry):
+            raise hook.HostedAuthenticationRequired(
+                "host rejected the cached role", http_status=403)
 
         with mock.patch.object(hook, "_settings_interval", return_value=60):
             result = hook._watcher_tick(
                 self.key, now=0, force=True,
-                offline_factory=rejected_factory, notifier=lambda *_: None)
+                offline_adapter=adapter, remote_factory=rejected_factory,
+                notifier=lambda *_: None)
         self.assertTrue(result["authentication_required"])
         self.assertFalse(result["offline"])
         entry = self.watcher_state()["subscriptions"][self.key]
@@ -920,7 +976,7 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
         self.assertIsNone(hook._watcher_build_offline_adapter(entry))
         self.assertIsNone(hook._watcher_build_remote_adapter(entry))
 
-    def test_authenticated_snapshot_bootstraps_real_global_mirror_without_token(self):
+    def test_client_key_snapshot_bootstraps_real_global_mirror_without_leaking_secret(self):
         def remove_scope(state):
             entry = state["subscriptions"][self.key]
             entry.pop("sync_scope", None)
@@ -943,16 +999,31 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
                     protocol.canonical_json_bytes(expected))
 
         with mock.patch.object(hook, "_watcher_api_token",
-                               return_value="super-secret-token"):
+                               return_value="atkey_snapshot_secret"):
             result = hook._watcher_activate_identity_sync(
                 self.status, self.config, transport=Transport(),
                 runtime="codex")
         self.assertTrue(result["active"])
         self.assertEqual(captured[0]["method"], "GET")
-        self.assertTrue(captured[0]["url"].endswith(
-            "/v1/projects/shared/sync/snapshot"))
+        snapshot_url = urlsplit(captured[0]["url"])
+        self.assertEqual(snapshot_url.scheme, "http")
+        self.assertEqual(snapshot_url.netloc, "attacca.invalid:4173")
+        self.assertEqual(snapshot_url.path,
+                         "/v1/projects/shared/sync/snapshot")
+        self.assertEqual(
+            parse_qs(snapshot_url.query),
+            {key: [value] for key, value in
+             protocol.projection_capabilities_query().items()})
         self.assertEqual(captured[0]["headers"]["Authorization"],
-                         "Bearer super-secret-token")
+                         "Bearer atkey_snapshot_secret")
+        self.assertEqual(captured[0]["headers"]["X-Attacca-Project"],
+                         "shared")
+        self.assertEqual(captured[0]["headers"]["X-Attacca-Actor"],
+                         self.scope["actor_id"])
+        self.assertEqual(captured[0]["headers"][
+            "X-Attacca-Client-Instance"],
+            self.watcher_state()["subscriptions"][self.key][
+                "client_instance"])
         self.assertEqual(captured[0]["headers"]["X-Attacca-Device-ID"],
                          "office-device")
         state = self.watcher_state()
@@ -962,7 +1033,7 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
         self.assertEqual(entry["offline_pending_count"], 0)
         self.assertEqual(entry["offline_conflict_count"], 0)
         self.assertEqual(entry["offline_convergence_awaiting_count"], 0)
-        self.assertNotIn("super-secret-token", json.dumps(state))
+        self.assertNotIn("atkey_snapshot_secret", json.dumps(state))
         local = hook._watcher_build_offline_adapter(entry)
         self.assertEqual(local.local_snapshot(), expected)
         with mock.patch.object(
@@ -973,7 +1044,7 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
         files = [path for path in (self.root / "watcher").rglob("*")
                  if path.is_file()]
         self.assertTrue(files)
-        self.assertNotIn("super-secret-token", "".join(
+        self.assertNotIn("atkey_snapshot_secret", "".join(
             path.read_text(errors="ignore") for path in files))
 
     def test_no_token_snapshot_requires_fresh_active_compatibility_status(self):
@@ -986,6 +1057,8 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
         _, _, packaged_client = hook._watcher_sync_modules()
         expected = self.snapshot()
         captured = []
+        client_instance = self.watcher_state()["subscriptions"][self.key][
+            "client_instance"]
 
         class Transport:
             def request(inner, method, url, *, headers, body, timeout,
@@ -1001,16 +1074,22 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
                     200, {"content-type": "application/json"},
                     protocol.canonical_json_bytes(value))
 
-        with mock.patch.object(hook, "_watcher_api_token", return_value=None), \
-             mock.patch.object(hook, "_client_instance_id",
-                               return_value="codex-install-compat"):
+        with mock.patch.object(hook, "_watcher_api_token", return_value=None):
             result = hook._watcher_activate_identity_sync(
                 self.status, self.config, transport=Transport(),
                 runtime="codex")
         self.assertTrue(result["active"], result)
         self.assertEqual(len(captured), 2)
-        self.assertTrue(captured[0][0].endswith("/v1/auth/status"))
-        self.assertTrue(captured[1][0].endswith("/sync/snapshot"))
+        self.assertEqual(urlsplit(captured[0][0]).path, "/v1/auth/status")
+        snapshot_url = urlsplit(captured[1][0])
+        self.assertEqual(snapshot_url.scheme, "http")
+        self.assertEqual(snapshot_url.netloc, "attacca.invalid:4173")
+        self.assertEqual(snapshot_url.path,
+                         "/v1/projects/shared/sync/snapshot")
+        self.assertEqual(
+            parse_qs(snapshot_url.query),
+            {key: [value] for key, value in
+             protocol.projection_capabilities_query().items()})
         for _, headers in captured:
             self.assertNotIn("Authorization", headers)
             self.assertEqual(headers["X-Attacca-Project"], "shared")
@@ -1019,13 +1098,14 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
             self.assertEqual(headers["X-Attacca-Device-ID"],
                              "office-device")
             self.assertEqual(headers["X-Attacca-Client-Instance"],
-                             "codex-install-compat")
+                             client_instance)
 
     def test_authenticated_snapshot_repair_clears_revocation_latch(self):
         entry = self.watcher_state()["subscriptions"][self.key]
         hook._watcher_queue_auth_required(
             self.key, entry,
-            hook.HostedAuthenticationRequired("old token revoked", 401), 0)
+            hook.HostedAuthenticationRequired(
+                "old client-install key revoked", 401), 0)
         _, _, packaged_client = hook._watcher_sync_modules()
         expected = self.snapshot()
 
@@ -1037,7 +1117,7 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
                     protocol.canonical_json_bytes(expected))
 
         with mock.patch.object(hook, "_watcher_api_token",
-                               return_value="replacement-token"):
+                               return_value="atkey_replacement"):
             result = hook._watcher_activate_identity_sync(
                 self.status, self.config, transport=Transport(),
                 runtime="codex")
