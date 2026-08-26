@@ -180,32 +180,8 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
         self.assertTrue(active.kwargs["open_browser"])
         self.assertFalse(idle.kwargs["open_browser"])
 
-    def test_optional_compatibility_migration_never_auto_opens_browser(self):
-        """Healthy projects stay uninterrupted until enrollment is required."""
-        captured = []
-
-        class TerminalModule:
-            @staticmethod
-            def terminal_credential_status(*_args, **_kwargs):
-                return {
-                    "status": "migration_required",
-                    "legacy_actor_credentials": True,
-                }
-
-            @staticmethod
-            def safe_recovery_result(_server, operation):
-                return operation()
-
-            @staticmethod
-            def advance_device_flow(_server, **kwargs):
-                captured.append(kwargs)
-                return {
-                    "status": "pending",
-                    "verification_uri": "https://attacca.test/app",
-                    "user_code": "ABCD-1234",
-                    "browser_opened": False,
-                }
-
+    def test_healthy_lifecycle_never_starts_optional_terminal_enrollment(self):
+        """Healthy hooks do not even create an optional enrollment flow."""
         status = {"project_id": "shared"}
         config = {"url": "https://attacca.test", "actor": "codex"}
         entry = {
@@ -213,17 +189,55 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             "runtime": "codex",
         }
         with mock.patch.object(
-                hook_module, "_terminal_flow_module",
-                return_value=TerminalModule()), \
-             mock.patch.object(hook_module, "_local_device_id",
-                               return_value="dev_test"), \
-             mock.patch.object(hook_module, "_client_instance_id",
-                               return_value="client_codex_test"):
+                hook_module, "_terminal_flow_progress") as progress, \
+             mock.patch.object(
+                 hook_module, "_terminal_flow_notice") as visible_notice:
             for event_name in ("SessionStart", "UserPromptSubmit", "Stop"):
                 self.assertIsNone(hook_module._terminal_migration_notice(
                     status, config, event_name, entry))
-        self.assertEqual(len(captured), 3)
-        self.assertTrue(all(not call["open_browser"] for call in captured))
+        progress.assert_not_called()
+        visible_notice.assert_not_called()
+
+    def test_healthy_stop_creates_no_terminal_flow_or_server_enrollment(self):
+        """A full compatibility lifecycle stays out of authentication state."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            checkout = root / "repo"
+            data = root / "plugin-data"
+            link_dir = checkout / ".attacca"
+            home.mkdir()
+            link_dir.mkdir(parents=True)
+            (link_dir / "project.json").write_text(json.dumps({
+                "schema_version": 1, "project_id": "shared"}))
+            db = root / "hook.db"
+            conn = c.connect(db)
+            c.project_init(conn, "setup", "human", path=str(checkout),
+                           project_id="shared")
+            self._register_actor(conn, "shared", "codex", "worker")
+            conn.close()
+            server = c.AttaccaServer(("127.0.0.1", 0), db)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                url = "http://127.0.0.1:%d" % server.server_address[1]
+                startup = self._hook(checkout, data, home, url=url)
+                stopped = self._hook(
+                    checkout, data, home, url=url, event="Stop")
+                combined = startup.stdout + stopped.stdout
+                self.assertNotIn(
+                    "ATTACCA SECURE TERMINAL AUTHORIZATION", combined)
+                self.assertFalse(
+                    (home / ".attacca" / "terminal-flow.json").exists())
+                conn = c.connect(db)
+                enrollments = conn.execute(
+                    "SELECT COUNT(*) FROM auth_device_enrollments").fetchone()[0]
+                conn.close()
+                self.assertEqual(enrollments, 0)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
 
     def test_hook_manifest_registers_all_active_update_boundaries(self):
         manifest = json.loads((ROOT / "hooks" / "hooks.json").read_text())

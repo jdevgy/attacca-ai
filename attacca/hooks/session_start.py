@@ -1542,36 +1542,15 @@ def _terminal_flow_notice(status, config, event_name, entry=None,
 
 
 def _terminal_migration_notice(status, config, event_name, entry=None):
-    """Offer one shared terminal credential while legacy actor keys still work."""
-    try:
-        module = _terminal_flow_module()
-        binding = _terminal_requested_bindings(status, entry)
-        exact = binding[0] if len(binding) == 1 else {}
-        credential = module.terminal_credential_status(
-            config["url"], device_id=_local_device_id(),
-            project_id=exact.get("project_id"), actor_id=exact.get("actor_id"),
-            runtime=exact.get("runtime"))
-        if credential.get("status") == "ready":
-            return None
-        # Compatibility migration is optional until the owner explicitly
-        # activates or requests it.  Lifecycle events may prepare/poll the
-        # nonblocking flow, but must not steal focus by opening a browser for
-        # otherwise healthy running projects. Required-auth recovery and the
-        # native setup flow call ``_terminal_flow_notice`` directly with
-        # ``open_browser=True``.
-        progress = _terminal_flow_progress(
-            status, config, entry, open_browser=False)
-        if progress.get("status") in {"pending", "slow_down"} \
-                and not progress.get("browser_opened"):
-            return None
-        return _terminal_flow_notice(
-            status, config, event_name, entry, result=progress,
-            migration=bool(credential.get("legacy_actor_credentials")))["notice"]
-    except Exception:
-        # Authentication failure handling below still emits a safe /app URL.
-        # Healthy legacy clients must not lose their authoritative brief merely
-        # because an optional migration helper is unavailable.
-        return None
+    """Never initiate authorization from a healthy lifecycle boundary.
+
+    Required-auth recovery calls :func:`_terminal_flow_notice` directly, and
+    native setup has its own explicit enrollment path. Starting or polling a
+    device flow here would mutate authentication state merely because a normal
+    SessionStart/UserPromptSubmit/Stop hook ran while compatibility auth was
+    healthy and optional.
+    """
+    return None
 
 
 def _watcher_sync_client_id(entry):
