@@ -734,7 +734,8 @@ class SyncServerEngine:
                 raise
             return self._existing_outcome(existing, scope, mutation)
 
-    def push(self, authenticated_scope, envelope):
+    def push(self, authenticated_scope, envelope, *,
+             projection_capabilities=None):
         """Apply one bounded FIFO batch with durable per-mutation receipts."""
         scope = self._trusted_scope(authenticated_scope)
         self._require_authorized(scope, "sync.push")
@@ -750,7 +751,8 @@ class SyncServerEngine:
         with self._lock:
             with self._transaction():
                 fingerprint, _, _ = self._project_view(
-                    scope, "policy", None, self._head(scope), [])
+                    scope, "policy", None, self._head(scope), [],
+                    projection_capabilities=projection_capabilities)
                 known = self._known_receipts(scope, device_id, client_id)
             request = protocol.validate_push_request(
                 bounded, expected_scope=scope,
@@ -788,7 +790,8 @@ class SyncServerEngine:
             with self._transaction():
                 final_head = self._head(scope)
                 final_fingerprint, _, _ = self._project_view(
-                    scope, "policy", None, final_head, [])
+                    scope, "policy", None, final_head, [],
+                    projection_capabilities=projection_capabilities)
             return protocol.make_push_result(
                 scope, final_fingerprint, results, final_head)
 

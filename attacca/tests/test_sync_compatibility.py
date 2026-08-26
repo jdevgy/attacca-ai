@@ -220,6 +220,51 @@ class ClientNegotiationTests(unittest.TestCase):
                 RecordingTransport(changed), legacy,
                 first["visibility_fingerprint"]).fetch_snapshot()
 
+    def test_only_hosted_401_or_403_sets_authentication_http_status(self):
+        legacy = protocol.legacy_projection_capabilities()
+        rejected = RecordingTransport({"error": "revoked"}, status=403)
+        with self.assertRaises(
+                client_module.SyncAuthenticationError) as hosted:
+            self.client(rejected, legacy, None).fetch_snapshot()
+        self.assertEqual(hosted.exception.http_status, 403)
+
+        local = client_module.AuthenticatedSyncHttpClient(
+            "https://example.test", "agentg", self.scope, None,
+            "client_home", "device_home", lambda: None,
+            transport=RecordingTransport({}),
+            projection_capabilities=legacy)
+        with self.assertRaises(
+                client_module.SyncAuthenticationError) as missing:
+            local.fetch_snapshot()
+        self.assertIsNone(missing.exception.http_status)
+
+    def test_push_advertises_the_same_projection_capabilities(self):
+        current = protocol.current_projection_capabilities()
+        snapshot = empty_snapshot(
+            self.scope, current, cloud=True, dispositions=True)
+        mutation = protocol.make_client_mutation(
+            self.scope, "cm_push_caps_0001", "client_home", "device_home",
+            1, "room.send", {"body": "capability-bound push"},
+            snapshot["cursor"])
+        applied = protocol.applied_result(
+            self.scope, mutation, {
+                "canonical_event_id": "evt_push_caps_0001",
+                "canonical_event_seq": 1,
+            }, snapshot["cursor"])
+        response = protocol.make_push_result(
+            self.scope, snapshot["visibility_fingerprint"], [applied],
+            snapshot["cursor"])
+        transport = RecordingTransport(response)
+        checked = self.client(
+            transport, current,
+            snapshot["visibility_fingerprint"]).push(
+                mutations=[mutation], known_receipts=[])
+        self.assertEqual(checked["results"][0]["status"], "applied")
+        query = parse_qs(urlsplit(transport.calls[0]["url"]).query)
+        self.assertEqual(query["projection_schema_version"], ["2"])
+        self.assertIn(
+            "message_dispositions", query["projection_resources"][0])
+
 
 class CapabilityRemote(FakeRemote):
     def __init__(self):

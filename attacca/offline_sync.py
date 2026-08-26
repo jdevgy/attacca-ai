@@ -1573,8 +1573,17 @@ class OfflineProjectSync:
         if not self.has_mirror():
             if not allow_initialize:
                 raise OfflineMirrorError("no verified local mirror")
-            snapshot = self._remote_snapshot(remote)
-            self.install_snapshot(snapshot)
+            # A freshly negotiated projection can legitimately select a
+            # capability-bound visibility fingerprint different from the
+            # legacy pin supplied by an older watcher subscription.  With no
+            # mirror there is no cached authority to relabel: validate the
+            # stable authenticated principal, then install the server-selected
+            # scope/visibility as an explicit initial reset.
+            snapshot = self._remote_snapshot(
+                remote, allow_scope_change=True)
+            self.install_snapshot(
+                snapshot, reset=True,
+                reset_reason="initial projection capability binding")
             binder = getattr(remote, "bind_verified_identity", None)
             if callable(binder):
                 binder(self.scope, self.visibility_fingerprint)

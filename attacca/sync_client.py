@@ -39,6 +39,10 @@ class SyncClientError(RuntimeError):
 class SyncAuthenticationError(SyncClientError):
     """The current request has no usable token or was rejected by auth."""
 
+    def __init__(self, message, *, http_status=None):
+        super().__init__(message)
+        self.http_status = http_status
+
 
 class SyncTransportError(ConnectionError):
     """The hosted endpoint could not be reached or completed."""
@@ -230,6 +234,11 @@ class AuthenticatedSyncHttpClient:
             headers=self._identity_headers(), body=None,
             timeout=self.timeout_seconds,
             max_response_bytes=MAX_ERROR_BODY_BYTES)
+        if isinstance(response, JsonHttpResponse) \
+                and response.status in {401, 403}:
+            raise SyncAuthenticationError(
+                "Attacca rejected the current terminal credential",
+                http_status=response.status)
         if not isinstance(response, JsonHttpResponse) \
                 or response.status != 200 \
                 or not isinstance(response.headers, dict) \
@@ -288,7 +297,8 @@ class AuthenticatedSyncHttpClient:
             self._compatibility_optional_auth = False
             self._compatibility_probe_allowed = False
             raise SyncAuthenticationError(
-                "Attacca rejected the current terminal credential or AI scope")
+                "Attacca rejected the current terminal credential or AI scope",
+                http_status=response.status)
         if not 200 <= response.status < 300:
             protocol_code = None
             try:
@@ -420,7 +430,10 @@ class AuthenticatedSyncHttpClient:
             raise SyncClientError(
                 "queued mutation batch is invalid: %s" % error) from error
         value = self._request(
-            "POST", "/push", envelope=request,
+            "POST", "/push",
+            query=protocol.projection_capabilities_query(
+                self.projection_capabilities),
+            envelope=request,
             max_response_bytes=protocol.MAX_PUSH_BYTES * 2)
         try:
             return protocol.validate_push_result(
