@@ -11666,6 +11666,13 @@ def _r_migration_directive(h, m, q):
     h._reply_json(200, migration_directive(root))
 
 
+def _r_managed_law(h, m, q):
+    pid = q.get("project")
+    db = getattr(h.server, "db_path", None)
+    h._reply_json(200, managed_law_payload(pid, db),
+                  {"Cache-Control": "no-store"})
+
+
 def _r_poll_status(h, m, q):
     actor, atype = h._actor()
     actor = q.get("actor") or actor
@@ -11736,6 +11743,7 @@ ROUTES = [
     (*_route_def("GET", "/plugin\\.git/(.+)"), _r_plugin_git),
     (*_route_def("GET", "/healthz"), _r_healthz),
     (*_route_def("GET", "/v1/auth/status"), _r_auth_status),
+    (*_route_def("GET", "/v1/managed-law"), _r_managed_law),
     (*_route_def("GET", "/v1/migration-directive"), _r_migration_directive),
     (*_route_def("POST", "/v1/auth/bootstrap"), _r_auth_bootstrap),
     (*_route_def("POST", "/v1/auth/login"), _r_auth_login),
@@ -16472,6 +16480,24 @@ def poll_status(conn, project_id, actor_id=None, actor_type="agent",
             "context_version": project["context_version"],
             "update": update, "mail": mail,
             "cursor": {"event_seq": (head["s"] if head else 0) or 0}}
+
+
+def managed_law_payload(project_id=None, db_path=None):
+    """Serve the current managed-law block CONTENT so a client can apply it
+    without a plugin/binary reinstall. Law is instruction text, not executable
+    code; the server is authoritative for it. Version advances are monotonic on
+    the client (never a downgrade)."""
+    pid = project_id or _MANAGED_TEMPLATE_PROJECT
+    block = managed_instruction_block(pid, db_path)
+    meta = _metadata_for_managed_block(block)
+    template = managed_instruction_block(_MANAGED_TEMPLATE_PROJECT, None)
+    return {
+        "version": MANAGED_BLOCK_VERSION,
+        "sha256": meta.get("sha256"),
+        "law_sha256": sha256_hex(template),
+        "server_software_version": VERSION,
+        "block": block,
+    }
 
 
 def build_parser():
