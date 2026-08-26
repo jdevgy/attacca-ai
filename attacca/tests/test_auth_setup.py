@@ -1,5 +1,12 @@
-"""Hosted setup authentication and machine-credential isolation tests."""
+"""Hosted setup authentication and client-install credential isolation tests.
 
+Every HTTP server binds to loopback port 0 and every credential/database path
+lives in a TemporaryDirectory. Nothing in this module discovers or contacts
+an installed/live Attacca server.
+"""
+
+import http.client
+import http.cookies
 import importlib.util
 import json
 import os
@@ -7,9 +14,10 @@ import stat
 import tempfile
 import threading
 import unittest
-import urllib.parse
 from pathlib import Path
 from unittest import mock
+
+from attacca import terminal_flow
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -19,311 +27,348 @@ c = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(c)
 
 
-class CredentialIsolationTestCase(unittest.TestCase):
+class ClientCredentialIsolationTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.credentials = self.root / "credentials.json"
-        self.identity = self.root / "identity.json"
-        self.patches = [
-            mock.patch.object(c, "CREDENTIALS_FILE", self.credentials),
-            mock.patch.object(c, "IDENTITY_FILE", self.identity),
-            mock.patch.dict(os.environ, {c.ENV_API_TOKEN: ""}, clear=False),
-        ]
-        for patcher in self.patches:
-            patcher.start()
-        os.environ.pop(c.ENV_API_TOKEN, None)
+        self.instances = self.root / "client-instances"
 
     def tearDown(self):
-        c._remote_setup_auth.context = None
-        for patcher in reversed(self.patches):
-            patcher.stop()
         self.tmp.cleanup()
 
-    def test_full_url_project_actor_scope_and_same_runtime_do_not_collide(self):
-        server = "https://attacca.example/tenant-a"
-        first = "atc_first-secret"
-        second = "atc_second-secret"
-        returned = c.save_api_token(
-            server, first, runtime="codex", project_id="alpha",
-            actor_id="alpha.director.codex")
-        c.save_api_token(
-            server, second, runtime="codex", project_id="beta",
-            actor_id="beta.worker.codex")
-        self.assertEqual(returned, str(self.credentials))
+    @staticmethod
+    def credential(token, instance, projects=None, username="alice"):
+        return {
+            "token": token,
+            "token_kind": "client",
+            "token_id": "key_" + instance,
+            "client_instance": instance,
+            "username": username,
+            "project_memberships": list(projects or []),
+            "scope_mode": ("selected_workspaces" if projects
+                           else "account_memberships"),
+        }
+
+    def test_full_server_url_and_client_install_are_independent_boundaries(self):
+        tenant_a = "https://attacca.example/tenant-a"
+        tenant_b = "https://attacca.example/tenant-b"
+        home = "client-home"
+        office = "client-office"
+        home_a = "atkey_key_home-a.home-a-secret"
+        office_a = "atkey_key_office-a.office-a-secret"
+        home_b = "atkey_key_home-b.home-b-secret"
+
+        terminal_flow.save_client_api_key(
+            tenant_a, self.credential(home_a, home, ["alpha"]),
+            client_instance=home, credentials_path=self.credentials)
+        terminal_flow.save_client_api_key(
+            tenant_a, self.credential(office_a, office, ["alpha", "beta"]),
+            client_instance=office, credentials_path=self.credentials)
+        terminal_flow.save_client_api_key(
+            tenant_b, self.credential(home_b, home, ["alpha"]),
+            client_instance=home, credentials_path=self.credentials)
+
         self.assertEqual(
             stat.S_IMODE(self.credentials.stat().st_mode), 0o600)
-        self.assertEqual(c.load_api_token(
-            server, runtime="codex", project_id="alpha",
-            actor_id="alpha.director.codex"), first)
-        self.assertEqual(c.load_api_token(
-            server, runtime="codex", project_id="beta",
-            actor_id="beta.worker.codex"), second)
-        # A short runtime is usable only inside an already selected project.
-        self.assertEqual(c.load_api_token(
-            server, runtime="codex", project_id="alpha",
-            actor_id="codex"), first)
-        self.assertIsNone(c.load_api_token(
-            server, runtime="codex", actor_id="codex"))
-        self.assertIsNone(c.load_api_token(
-            server, runtime="codex", project_id="missing",
-            actor_id="missing.director.codex"))
+        self.assertEqual(terminal_flow.load_client_api_key(
+            tenant_a, client_instance=home, project_id="alpha",
+            credentials_path=self.credentials), home_a)
+        self.assertEqual(terminal_flow.load_client_api_key(
+            tenant_a, client_instance=office, project_id="beta",
+            credentials_path=self.credentials), office_a)
+        self.assertEqual(terminal_flow.load_client_api_key(
+            tenant_b, client_instance=home, project_id="alpha",
+            credentials_path=self.credentials), home_b)
+        self.assertIsNone(terminal_flow.load_client_api_key(
+            tenant_a, client_instance=home, project_id="beta",
+            credentials_path=self.credentials))
 
-        # A full path is part of the trust boundary.
-        c.save_api_token(
-            "https://attacca.example/tenant-b", "atc_tenant-b",
-            runtime="codex", project_id="alpha",
-            actor_id="alpha.director.codex")
-        self.assertEqual(c.load_api_token(
-            "https://attacca.example/tenant-b", runtime="codex",
-            project_id="alpha", actor_id="alpha.director.codex"),
-            "atc_tenant-b")
-        self.assertEqual(c.load_api_token(
-            server, runtime="codex", project_id="alpha",
-            actor_id="alpha.director.codex"), first)
+        # Exact actors are request selectors, never key-store dimensions.
+        headers = terminal_flow.client_request_headers(
+            tenant_a, client_instance=home, project_id="alpha",
+            actor_id="alpha.director.claude",
+            credentials_path=self.credentials)
+        self.assertEqual(headers["X-Attacca-Actor"],
+                         "alpha.director.claude")
+        self.assertEqual(headers["X-Attacca-Client-Instance"], home)
+        self.assertEqual(headers["Authorization"], "Bearer " + home_a)
 
-        # Human bootstrap credentials are opt-in and never a linked AI
-        # fallback.
-        c.save_api_token(server, "atc_human")
-        self.assertIsNone(c.load_api_token(
-            server, runtime="claude", project_id="alpha",
-            actor_id="alpha.director.claude"))
-        self.assertEqual(c.load_api_token(server, allow_human=True),
-                         "atc_human")
+        serialized = json.loads(self.credentials.read_text())
+        record = serialized["servers"][
+            terminal_flow.canonical_server_url(tenant_a)]
+        self.assertNotIn("actor_bindings", record)
+        self.assertNotIn("runtime", record["client_api_keys"][home])
 
-    def test_legacy_runtime_credentials_are_read_only_when_unambiguous(self):
-        key = c._credential_server_key("http://legacy.example:4173")
+    def test_stable_instance_ids_are_private_and_runtime_install_specific(self):
+        codex_path = self.instances / "codex.json"
+        claude_path = self.instances / "claude.json"
+        codex_first = terminal_flow.load_client_instance_id(
+            codex_path, runtime="codex")
+        codex_second = terminal_flow.load_client_instance_id(
+            codex_path, runtime="codex")
+        claude = terminal_flow.load_client_instance_id(
+            claude_path, runtime="claude")
+        self.assertEqual(codex_first, codex_second)
+        self.assertNotEqual(codex_first, claude)
+        self.assertTrue(codex_first.startswith("client_"))
+        self.assertEqual(stat.S_IMODE(codex_path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(claude_path.stat().st_mode), 0o600)
+
+    def test_retired_credentials_are_detected_but_never_loaded_as_client_keys(self):
+        server = terminal_flow.canonical_server_url(
+            "http://legacy.example:4173")
         self.credentials.write_text(json.dumps({
             "version": 1,
-            "servers": {key: {"tokens": {"codex": "atc_legacy"}}},
+            "servers": {server: {
+                "terminal_credential": {"token": "atd_retired.secret"},
+                "agent_tokens": {"alpha": {
+                    "alpha.director.codex": {"token": "ats_retired"},
+                }},
+            }},
         }))
         os.chmod(self.credentials, 0o600)
-        self.assertEqual(c.load_api_token(
-            key, runtime="codex"), "atc_legacy")
-        self.assertIsNone(c.load_api_token(
-            key, runtime="codex", project_id="alpha",
-            actor_id="alpha.director.codex"))
-        self.credentials.write_text(json.dumps({
-            "version": 1,
-            "servers": {key: {"tokens": {
-                "codex": "atc_codex", "claude": "atc_claude"}}},
-        }))
-        self.assertIsNone(c.load_api_token(key, runtime="codex"))
-        with self.assertRaisesRegex(
-                c.AttaccaError, "runtime-only credentials are legacy read-only"):
-            c.save_api_token(key, "atc_new-legacy", runtime="codex")
+        status = terminal_flow.client_api_key_status(
+            server, client_instance="client-new",
+            credentials_path=self.credentials)
+        self.assertEqual(status["status"], "authorization_required")
+        self.assertTrue(status["legacy_credential_present"])
+        self.assertIsNone(terminal_flow.load_client_api_key(
+            server, client_instance="client-new",
+            credentials_path=self.credentials))
 
 
-class SetupSessionLifecycleTestCase(unittest.TestCase):
+class SetupClientAuthorizationTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.db = self.root / "auth-setup.db"
+        self.db = self.root / "setup-auth.db"
         self.credentials = self.root / "credentials.json"
         self.identity = self.root / "identity.json"
+        self.client_instance = "client-setup-test"
+        self.device_id = "device-setup-test"
+
         conn = c.connect(self.db)
         try:
             c.auth_create_user(
                 conn, "alice", "correct-horse", "Alice", is_admin=True,
                 bootstrap=True)
-            c.set_current_owner("legacy-owner")
+            user = conn.execute(
+                "SELECT * FROM auth_users WHERE username='alice'").fetchone()
+            principal = c._auth_principal(
+                conn, user, "session", session_hash="fixture")
+            c.set_current_owner("alice")
             c.project_init(
-                conn, "seed", "human", path=self.root / "checkout",
+                conn, "web.alice", "human", path=self.root / "checkout",
                 project_id="alpha", name="Alpha")
-            c.agent_register(
-                conn, "alpha", "seed", "human",
-                agent_id="alpha.director.codex", role="director",
-                runtime="codex", display_name="Alpha Codex")
+            c.auth_grant_project_membership(
+                conn, principal, "alpha", granted_by="alice")
+            for actor, runtime in (
+                    ("alpha.director.codex", "codex"),
+                    ("alpha.director.claude", "claude")):
+                c.agent_register(
+                    conn, "alpha", "web.alice", "human", agent_id=actor,
+                    role="director", runtime=runtime,
+                    registration_username="alice")
         finally:
             c.set_current_owner(None)
             conn.close()
-        self.server = c.AttaccaServer(("127.0.0.1", 0), self.db, auth=True)
+
+        self.server = c.AttaccaServer(
+            ("127.0.0.1", 0), self.db, auth=True, auth_mode="auto")
         self.thread = threading.Thread(
             target=self.server.serve_forever, daemon=True)
         self.thread.start()
         host, port = self.server.server_address
         self.url = "http://%s:%d" % (host, port)
-        self.patches = [
+        self.patchers = [
             mock.patch.object(c, "CREDENTIALS_FILE", self.credentials),
             mock.patch.object(c, "IDENTITY_FILE", self.identity),
+            mock.patch.object(c, "find_project_link", return_value=None),
+            mock.patch.object(c, "load_client_instance_id",
+                              return_value=self.client_instance),
+            mock.patch.object(c, "load_device_id",
+                              return_value=self.device_id),
         ]
-        for patcher in self.patches:
+        for patcher in self.patchers:
             patcher.start()
+        self.token = self._create_client_key()
+        self._activate()
 
     def tearDown(self):
         c._remote_setup_auth.context = None
-        for patcher in reversed(self.patches):
+        for patcher in reversed(self.patchers):
             patcher.stop()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=3)
+        self.assertFalse(self.thread.is_alive())
         self.tmp.cleanup()
 
-    def _force_enforced_temp_server(self):
+    def _request(self, method, path, body=None, headers=None):
+        connection = http.client.HTTPConnection(
+            self.server.server_address[0], self.server.server_address[1],
+            timeout=5)
+        payload = json.dumps(body).encode() if body is not None else None
+        merged = {"Accept": "application/json", **(headers or {})}
+        if payload is not None:
+            merged["Content-Type"] = "application/json"
+        connection.request(method, path, body=payload, headers=merged)
+        response = connection.getresponse()
+        raw = response.read()
+        result = {"status": response.status, "headers": response.headers,
+                  "body": json.loads(raw) if raw else {}}
+        connection.close()
+        return result
+
+    @staticmethod
+    def _session_headers(response):
+        cookies = {}
+        for line in response["headers"].get_all("Set-Cookie") or []:
+            parsed = http.cookies.SimpleCookie()
+            parsed.load(line)
+            cookies.update({name: value.value
+                            for name, value in parsed.items()})
+        return {
+            "Cookie": "; ".join("%s=%s" % item for item in cookies.items()),
+            "X-Attacca-CSRF": cookies["attacca_csrf"],
+        }
+
+    def _create_client_key(self):
+        login = self._request("POST", "/v1/auth/login", {
+            "username": "alice", "password": "correct-horse"})
+        self.assertEqual(login["status"], 200, login["body"])
+        self.browser = self._session_headers(login)
+        created = self._request("POST", "/v1/auth/client-keys", {
+            "label": "Setup test client",
+            "client_instance": self.client_instance,
+            "device_id": self.device_id,
+            "project_memberships": ["alpha"],
+        }, self.browser)
+        self.assertEqual(created["status"], 201, created["body"])
+        self.token_id = created["body"]["record"]["token_id"]
+        return created["body"]["token"]
+
+    def _activate(self):
+        activated = self._request("POST", "/v1/auth/activation", {
+            "enabled": True, "confirmed": True,
+        }, self.browser)
+        self.assertEqual(activated["status"], 200, activated["body"])
+
+    def test_environment_key_hot_loads_without_rewriting_actor_or_storage(self):
         conn = c.connect(self.db)
         try:
-            c.server_settings_store(conn, {
-                "auth.activation_requested": True,
-                "auth.activated": True,
-                "auth.activated_by": "test-temp-only",
-            })
+            before = [tuple(row) for row in conn.execute(
+                "SELECT * FROM agents ORDER BY agent_id")]
         finally:
             conn.close()
 
-    def _approve_zero_binding_flow(self):
-        """Start in one process, approve in the browser, finish in another."""
-        self._force_enforced_temp_server()
-        with self.assertRaisesRegex(
-                c.AuthenticationError, "terminal_enrollment_pending"):
-            c.ensure_remote_setup_auth(self.url, "codex", interactive=False)
-        state_path = self.credentials.with_name("terminal-flow.json")
-        state = json.loads(state_path.read_text())
-        flow = state["flows"][c.configured_server_url(self.url)]
+        with mock.patch.dict(os.environ, {
+                c.ENV_API_TOKEN: self.token,
+                c.ENV_CLIENT_INSTANCE: self.client_instance,
+        }, clear=False):
+            first = c.ensure_remote_setup_auth(
+                self.url, "alpha.director.codex", interactive=False)
+            self.assertTrue(first["authenticated"])
+            self.assertEqual(first["token_kind"], "client")
+            self.assertEqual(first["credential_source"], "environment")
+            self.assertFalse(self.credentials.exists())
 
-        # The browser/account session approves the device but is closed before
-        # any setup process resumes; no cookie crosses the process boundary.
-        c.remote_setup_login(self.url, "alice", "correct-horse")
-        approved = c.remote_json(
-            self.url, "POST",
-            "/v1/auth/terminal-enrollments/%s/approve" %
-            urllib.parse.quote(flow["user_code"], safe=""),
-            {"project_memberships": [], "actor_bindings": []})
-        self.assertEqual(approved["status"], "approved")
-        c.close_remote_setup_session(self.url)
-        self.assertIsNone(c._remote_setup_session(self.url))
+            verified = c.provision_setup_agent_token(
+                self.url, "alpha", "alpha.director.codex")
+            self.assertEqual(verified["credential_kind"], "client")
+            self.assertEqual(verified["status"], "ready")
+            self.assertEqual(verified["credential_source"], "active_process")
 
-        # Simulate a fresh CLI/runtime process. It polls, verifies, and stores
-        # the browser-approved zero-binding terminal at mode 0600.
-        c._remote_setup_auth.context = None
-        first_resume = c.ensure_remote_setup_auth(
-            self.url, "codex", interactive=False)
-        self.assertTrue(first_resume["provisional_human"])
-        self.assertEqual(first_resume["bindings"], [])
-        self.assertEqual(stat.S_IMODE(self.credentials.stat().st_mode), 0o600)
-
-        # A second process has no browser state but resumes from the private
-        # device credential and verifies it against the enforced server.
-        c._remote_setup_auth.context = None
-        second_resume = c.ensure_remote_setup_auth(
-            self.url, "claude", interactive=False)
-        self.assertTrue(second_resume["provisional_human"])
-        self.assertEqual(second_resume["token_id"], first_resume["token_id"])
-        return second_resume
-
-    def test_provisional_terminal_cross_process_setup_then_exact_self_bind(self):
-        provisional = self._approve_zero_binding_flow()
-        visible = c.remote_json(
-            self.url, "GET", "/v1/projects", actor="codex",
-            actor_type="agent")
-        self.assertIn("alpha", {item["project_id"]
-                                for item in visible["projects"]})
-        with self.assertRaises(c.AttaccaError):
-            c.remote_json(
-                self.url, "POST", "/v1/projects/alpha/room",
-                {"body": "provisional terminals are setup-only"},
-                actor="codex", actor_type="agent")
-        with self.assertRaises(c.AttaccaError):
-            c.remote_json(
-                self.url, "PUT", "/v1/settings", {"verbose": True},
-                actor="codex", actor_type="agent")
-
-        created = c.remote_json(
-            self.url, "POST", "/v1/projects",
-            {"project_id": "delta", "name": "Delta"},
-            actor="codex", actor_type="agent")
-        self.assertEqual(created["project_id"], "delta")
-        actor_id = "delta.director.codex-exact"
-        registered = c.remote_json(
-            self.url, "POST", "/v1/projects/delta/agents",
-            {"agent_id": actor_id, "display_name": "Delta Codex",
-             "role": "director", "runtime": "codex"},
-            actor=actor_id, actor_type="agent")
-        self.assertEqual(registered["agent_id"], actor_id)
-
-        # Yet another process promotes the same credential through the narrow,
-        # audited self-binding endpoint. No actor token is minted.
-        c._remote_setup_auth.context = None
-        resumed = c.ensure_remote_setup_auth(
-            self.url, actor_id, interactive=False)
-        self.assertTrue(resumed["provisional_human"])
-        bound = c.provision_setup_agent_token(self.url, "delta", actor_id)
-        self.assertEqual(bound["status"], "bound")
-        self.assertEqual(bound["binding_count"], 1)
-        self.assertIsNone(c._remote_setup_session(self.url))
-
-        token = c.load_api_token(
-            self.url, runtime="codex", project_id="delta",
-            actor_id=actor_id)
-        self.assertTrue(token.startswith("atd_"))
-        status = c.remote_json(
-            self.url, "GET", "/v1/auth/status", actor=actor_id,
-            actor_type="agent", bearer_token=token, project_id="delta")
-        self.assertIn(actor_id, {
-            item["actor_id"] for item in status["principal"]["bindings"]})
-        self.assertEqual(status["principal"]["token_id"],
-                         provisional["token_id"])
-        with self.assertRaises(c.AttaccaError):
-            c.remote_json(
-                self.url, "PUT", "/v1/settings", {"verbose": True},
-                actor=actor_id, actor_type="agent",
-                bearer_token=token, project_id="delta")
+            # The same key selects another exact actor owned by the same human.
+            c._remote_setup_auth.context = None
+            second = c.ensure_remote_setup_auth(
+                self.url, "alpha.director.claude", interactive=False)
+            self.assertTrue(second["authenticated"])
+            selected = c.remote_json(
+                self.url, "GET", "/v1/projects/alpha/status",
+                actor="alpha.director.claude", actor_type="agent",
+                project_id="alpha")
+            self.assertEqual(selected["project"], "alpha")
 
         conn = c.connect(self.db)
         try:
-            kinds = [row["token_kind"] for row in conn.execute(
-                "SELECT token_kind FROM auth_tokens ORDER BY created_at")]
-            self.assertEqual(kinds, ["terminal"])
-            exact = conn.execute(
-                "SELECT * FROM agents WHERE project_id='delta' AND agent_id=?",
-                (actor_id,)).fetchone()
-            self.assertIsNotNone(exact)
-            self.assertEqual(exact["owner"], "alice")
-            event = conn.execute(
-                "SELECT * FROM events WHERE project_id='delta'"
-                " AND event_type='auth.terminal_binding_added'"
-                " ORDER BY seq DESC LIMIT 1").fetchone()
-            self.assertIsNotNone(event)
-            self.assertEqual(event["owner"], "alice")
-            self.assertNotIn(token, "\n".join(conn.iterdump()))
-        finally:
-            conn.close()
-
-    def test_failed_provisional_binding_mints_no_actor_credential(self):
-        self._approve_zero_binding_flow()
-        with self.assertRaises(c.AuthenticationError):
-            c.provision_setup_agent_token(
-                self.url, "alpha", "alpha.worker.does-not-exist")
-        self.assertIsNone(c._remote_setup_session(self.url))
-        conn = c.connect(self.db)
-        try:
-            rows = conn.execute(
-                "SELECT token_kind FROM auth_tokens").fetchall()
-            self.assertEqual([row["token_kind"] for row in rows],
-                             ["terminal"])
+            after = [tuple(row) for row in conn.execute(
+                "SELECT * FROM agents ORDER BY agent_id")]
+            self.assertEqual(after, before)
             self.assertEqual(conn.execute(
                 "SELECT COUNT(*) AS n FROM auth_token_actor_bindings"
-            ).fetchone()["n"], 0)
+                " WHERE token_id=?", (self.token_id,)).fetchone()["n"], 0)
         finally:
             conn.close()
 
-    def test_setup_parser_never_accepts_plaintext_token_in_argv(self):
+    def test_private_key_survives_fresh_process_and_hot_loads_without_browser(self):
+        saved = terminal_flow.save_client_api_key(
+            self.url, {
+                "token": self.token,
+                "token_id": self.token_id,
+                "client_instance": self.client_instance,
+                "username": "alice",
+                "project_memberships": ["alpha"],
+                "device_id": self.device_id,
+            }, client_instance=self.client_instance,
+            credentials_path=self.credentials)
+        self.assertTrue(saved["authorized"])
+        self.assertEqual(stat.S_IMODE(self.credentials.stat().st_mode), 0o600)
+
+        c._remote_setup_auth.context = None
+        runtime_flow = c._terminal_flow_runtime()
+        with mock.patch.dict(os.environ, {c.ENV_API_TOKEN: ""}, clear=False), \
+                mock.patch.object(runtime_flow, "authorize_client",
+                                  side_effect=AssertionError(
+                                      "stored key must not reopen browser")):
+            os.environ.pop(c.ENV_API_TOKEN, None)
+            result = c.ensure_remote_setup_auth(
+                self.url, "alpha.director.codex", interactive=False)
+        self.assertTrue(result["authenticated"])
+        self.assertEqual(result["kind"], "client_api_key")
+        self.assertEqual(result["credentials_file"], str(self.credentials))
+
+    def test_missing_key_requests_integrated_browser_hidden_tty_authorization(self):
+        self.credentials.unlink(missing_ok=True)
+        c._remote_setup_auth.context = None
+        required = {
+            "status": "authorization_required", "authorized": False,
+            "authorization_url": self.url + "/app#settings",
+            "client_instance": self.client_instance, "hot_reload": True,
+        }
+        runtime_flow = c._terminal_flow_runtime()
+        with mock.patch.dict(os.environ, {c.ENV_API_TOKEN: ""}, clear=False), \
+                mock.patch.object(
+                    runtime_flow, "authorize_client", return_value=required
+                ) as authorize, \
+                mock.patch.object(
+                    c.getpass, "getpass",
+                    side_effect=AssertionError(
+                        "setup must not ask for an account password")):
+            os.environ.pop(c.ENV_API_TOKEN, None)
+            with self.assertRaisesRegex(
+                    c.AuthenticationError, "client_authorization_required"):
+                c.ensure_remote_setup_auth(
+                    self.url, "alpha.director.codex", interactive=True)
+        authorize.assert_called_once()
+        kwargs = authorize.call_args.kwargs
+        self.assertTrue(kwargs["open_browser"])
+        self.assertTrue(kwargs["prompt"])
+        self.assertEqual(kwargs["client_instance"], self.client_instance)
+
+    def test_setup_parser_has_no_plaintext_secret_argument(self):
         parser = c.build_parser()
         setup_parser = parser._subparsers._group_actions[0].choices["setup"]
-        setup = next(action for action in setup_parser._actions
-                     if action.dest == "paste_token")
-        self.assertEqual(setup.nargs, 0)
-        help_text = setup_parser.format_help()
+        help_text = setup_parser.format_help().lower()
         self.assertNotIn("--api-token", help_text)
-        self.assertIn("--paste-token", help_text)
-        self._force_enforced_temp_server()
-        with mock.patch.object(
-                c.getpass, "getpass",
-                side_effect=AssertionError("device flow must not ask password")):
-            with self.assertRaisesRegex(
-                    c.AuthenticationError, "terminal_enrollment_pending"):
-                c.ensure_remote_setup_auth(
-                    self.url, "codex", interactive=False,
-                    login_username="ignored-legacy-name")
+        self.assertNotIn("--password", help_text)
+        self.assertNotIn("--paste-token", help_text)
+        paste = next(action for action in setup_parser._actions
+                     if action.dest == "paste_token")
+        self.assertEqual(paste.nargs, 0)
+        parsed = parser.parse_args(["setup", "--paste-token"])
+        self.assertIs(parsed.paste_token, True)
 
 
 if __name__ == "__main__":
