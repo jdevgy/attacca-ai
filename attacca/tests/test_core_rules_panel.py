@@ -39,7 +39,7 @@ class CoreRulesPanelTests(unittest.TestCase):
         self.assertEqual(self.panel.count('id="nav-rules"'), 1)
         self.assertRegex(
             self.panel,
-            r'const VIEWS = \[[^\]]*"room", "rules", "network"',
+            r'const VIEWS = \[[^\]]*"room", "rules", "context", "network"',
         )
         self.assertIn('rules: renderRules', self.panel)
         self.assertIn('location.hash.slice(1)', self.panel)

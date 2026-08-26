@@ -494,6 +494,7 @@
         <button type="button" data-view="tasks"><span class="nav-icon">✓</span>Tasks</button>
         <button type="button" data-view="room"><span class="nav-icon">◌</span>Room / Inbox <span id="nav-unread" class="badge" hidden></span></button>
         <button type="button" data-view="rules"><span class="nav-icon">§</span>Core Rules <span id="nav-rules" class="badge">0</span></button>
+        <button type="button" data-view="context"><span class="nav-icon">❑</span>Cloud Context</button>
         <button type="button" data-view="network"><span class="nav-icon">⇄</span>AI Network</button>
         <button type="button" data-view="decisions"><span class="nav-icon">⌘</span>Decisions</button>
         <button type="button" data-view="handoff"><span class="nav-icon">↗</span>Handoff</button>
@@ -531,7 +532,7 @@
     (() => {
       "use strict";
 
-      const VIEWS = ["overview", "workspaces", "tasks", "room", "rules", "network", "decisions", "handoff", "activity", "settings"];
+      const VIEWS = ["overview", "workspaces", "tasks", "room", "rules", "context", "network", "decisions", "handoff", "activity", "settings"];
       const HANDOFF_FIELDS = ["objective", "what_changed", "active_work", "blockers", "risks", "next_actions", "notes"];
       const BRIDGE_PARTICIPATION = [
         ["all", "All roles"],
@@ -1471,6 +1472,7 @@
             inbox: pathFor("/inbox?mark_read=0&limit=100"),
             room: pathFor(`/room?limit=${ROOM_HISTORY_LIMIT}`),
             decisions: pathFor("/decisions"),
+            cloudContext: pathFor("/cloud-context"),
             events: pathFor("/events?after=0&limit=1"),
             agents: pathFor("/agents"),
             log: pathFor("/log?limit=80"),
@@ -1665,6 +1667,7 @@
           tasks: renderTasks,
           room: renderRoom,
           rules: renderRules,
+          context: renderCloudContext,
           network: renderNetwork,
           decisions: renderDecisions,
           handoff: renderHandoff,
@@ -1969,6 +1972,23 @@
           <aside class="stack"><div class="card"><div class="card-head"><h2>Search project memory</h2>${state.searchResults ? `<span class="badge accepted">${h(state.searchResults.total_hits)} hits</span>` : ""}</div><div class="card-body"><form data-form="search-project"><div class="field"><label for="project-memory-search">Query</label><input id="project-memory-search" type="search" name="query" required value="${h(state.searchQuery)}" placeholder="decision, filename, message…"></div><div class="form-actions"><button class="button primary small" type="submit">Search everything</button></div></form>${renderSearchResults(state.searchResults)}</div></div>
           <div class="card"><div class="card-head"><h2>Ledger integrity</h2></div><div class="card-body">${verify ? `<div class="notice ${verify.ok ? "ok" : "error"}"><span>${verify.ok ? "✓" : "!"}</span><div><strong>${verify.ok ? "Hash chain verified" : "Verification failed"}</strong><br>${h(verify.events)} events checked${verify.problems?.length ? `<br>${h(verify.problems.join(" · "))}` : ""}</div></div>` : `<div class="muted">Verification unavailable.</div>`}<div class="form-actions"><button class="button small" data-action="verify-ledger">Run again</button></div></div></div>
           <div class="card"><div class="card-head"><h2>Append custom event</h2></div><div class="card-body"><form data-form="append-event"><div class="field"><label for="event-type">Event type</label><input id="event-type" name="event_type" required placeholder="prototype.note"></div><div class="field section-gap"><label for="event-payload">Payload JSON object</label><textarea id="event-payload" class="mono" name="payload" required placeholder='{"note":"Panel reviewed"}'>{}</textarea></div><div class="field section-gap"><label for="event-task">Task ID <span class="faint">optional</span></label><input id="event-task" name="task_id" placeholder="T-13"></div><div class="form-actions"><button class="button primary" type="submit">Append event</button></div></form></div></div></aside></div>`;
+      }
+
+      function renderCloudContext() {
+        const cc = state.data.cloudContext?.cloud_context || { content: "", version: 0, updated_by: null, updated_at: null };
+        const canManage = canManageProjectRules();
+        return pageHead(
+          "Shared project context",
+          "Cloud Context",
+          "A hosted AGENTS.md / CLAUDE.md for this workspace \u2014 injected into every AI session brief. Editable by humans and Directors.",
+          `<button class="button" data-view="rules">Open Core Rules</button>`
+        ) +
+          `<div class="notice"><span>!</span><div><strong>This document is read by every AI on every turn.</strong><br>It is pinned into each session brief alongside the mandatory Project Rules. Keep it short and durable \u2014 deploy targets, invariants, do-not-touch areas. Only humans and registered Directors can edit it.</div></div>` +
+          (state.errors.cloudContext ? errorNotice(state.errors.cloudContext) : "") +
+          `<section class="card section-gap"><div class="card-head"><div><h2>Workspace cloud context</h2><span class="faint small">version ${h(cc.version)}${cc.updated_at ? ` \u00b7 updated ${h(fmtTime(cc.updated_at))}` : ""}${cc.updated_by ? ` \u00b7 by ${h(actorDisplay(cc.updated_by))}` : ""}</span></div>${canManage ? `<span class="badge accepted">management enabled</span>` : `<span class="badge blocked">read only</span>`}</div><div class="card-body">
+            ${canManage ? "" : `<div class="notice error"><span>i</span><div><strong>Human or registered Director management only.</strong><br>${h(attributionText(state.prefs.actor, state.prefs.actorType, state.prefs.owner))} may read the cloud context but cannot edit it.</div></div>`}
+            <form data-form="save-cloud-context"><input type="hidden" name="expected_version" value="${h(cc.version)}"><div class="field wide"><label for="cloud-context-body">Context document</label><textarea id="cloud-context-body" name="content" rows="18" ${canManage ? "" : "disabled"} placeholder="# Project context every AI should read each turn">${h(cc.content || "")}</textarea></div>${canManage ? `<div class="form-actions"><button class="button primary" type="submit">Save cloud context</button></div>` : ""}</form>
+          </div></section>`;
       }
 
       function renderRules() {
@@ -2758,6 +2778,9 @@
           }
           if (kind === "update-rule") {
             await mutate(`${form.dataset.rule} updated`, () => api(pathFor(`/rules/${encodeURIComponent(form.dataset.rule)}`), { method: "PUT", body: { title: values.title, body: values.body, scope: values.scope, priority: Number(values.priority), expected_version: Number(values.expected_version) } }));
+          }
+          if (kind === "save-cloud-context") {
+            await mutate("Cloud context saved", () => api(pathFor("/cloud-context"), { method: "PUT", body: { content: values.content || "", expected_version: Number(values.expected_version) } }));
           }
           if (kind === "update-handoff") {
             const body = { expected_context_version: state.data.handoff?.context_version };

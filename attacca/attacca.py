@@ -42,6 +42,7 @@ import random
 import re
 import secrets
 import signal
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -13016,6 +13017,71 @@ def script_path():
     return str(Path(__file__).resolve())
 
 
+WATCHER_CRON_MARKER = "# attacca-watcher"
+
+
+def ensure_watcher_cron(root_path, url=None, actor=None, runtime=None,
+                        python_exe=None, crontab_bin=None):
+    """Install an idempotent per-minute crontab entry that keeps the Attacca
+    background watcher alive even when no coding client is open.
+
+    The lifecycle hooks already spawn a per-minute daemon while a client is
+    running; this cron is the reliability layer the project requires so
+    shared-state polling continues independently of any editor session. It
+    is idempotent: it refreshes (never duplicates) the entry for this exact
+    checkout root, and it fails soft where cron is unavailable so the
+    lifecycle daemon simply remains the only polling path."""
+    hook = Path(script_path()).resolve().parent / "hooks" / "session_start.py"
+    if not hook.is_file():
+        return {"ok": False, "status": "unavailable",
+                "error": "background watcher hook is missing: %s" % hook}
+    crontab_bin = crontab_bin or shutil.which("crontab")
+    if not crontab_bin:
+        return {"ok": False, "status": "unavailable",
+                "error": "crontab is not available on this machine; the "
+                         "lifecycle daemon remains the polling path"}
+    python_exe = python_exe or sys.executable or "python3"
+    root = str(Path(root_path).resolve())
+    marker = "%s:%s" % (WATCHER_CRON_MARKER, root)
+    parts = [shlex.quote(python_exe), shlex.quote(str(hook)),
+             "--watcher-ensure", "--cwd", shlex.quote(root)]
+    runtime = str(runtime or "").strip().lower()
+    if runtime:
+        parts.extend(["--runtime", shlex.quote(runtime)])
+    env_prefix = ""
+    if url:
+        env_prefix += "ATTACCA_URL=%s " % shlex.quote(
+            configured_server_url(url))
+    if actor:
+        env_prefix += "%s=%s " % (ENV_ACTOR, shlex.quote(str(actor)))
+    line = "* * * * * %s%s >/dev/null 2>&1  %s" % (
+        env_prefix, " ".join(parts), marker)
+    try:
+        listing = subprocess.run([crontab_bin, "-l"], capture_output=True,
+                                 text=True)
+    except Exception as err:
+        return {"ok": False, "status": "error", "error": str(err)}
+    current = listing.stdout if listing.returncode == 0 else ""
+    lines = current.splitlines()
+    marker_lines = [ln for ln in lines if marker in ln]
+    if marker_lines == [line]:
+        return {"ok": True, "status": "already", "line": line}
+    kept = [ln for ln in lines if marker not in ln]
+    kept.append(line)
+    new_crontab = "\n".join(kept).rstrip("\n") + "\n"
+    try:
+        proc = subprocess.run([crontab_bin, "-"], input=new_crontab,
+                              text=True, capture_output=True)
+    except Exception as err:
+        return {"ok": False, "status": "error", "error": str(err)}
+    if proc.returncode != 0:
+        return {"ok": False, "status": "error",
+                "error": (proc.stderr or "").strip() or
+                "crontab install failed"}
+    return {"ok": True, "status": "refreshed" if marker_lines else "installed",
+            "line": line}
+
+
 def watcher_command(action, root_path=None, url=None, actor=None,
                     runtime=None, timeout=10):
     """Control the machine-global idle watcher through the bundled hook."""
@@ -17107,6 +17173,19 @@ def cli_main(argv=None):
                         "watcher did not start"
             except Exception as err:
                 watcher_error = str(err)
+        cron_result = None
+        cron_error = None
+        if info["mode"] == "server":
+            cron_actor = (network_result or {}).get("actor") or actor
+            cron_runtime = normalize_agent_runtime(actor=cron_actor)
+            try:
+                cron_result = ensure_watcher_cron(
+                    info["root_path"], url=setup_url, actor=cron_actor,
+                    runtime=cron_runtime)
+                if not cron_result.get("ok"):
+                    cron_error = cron_result.get("error")
+            except Exception as err:
+                cron_error = str(err)
         script = script_path()
         inside = "  (this folder is inside it — use --here to make ./ its own project)" \
             if info["cwd_inside_root"] else ""
@@ -17164,6 +17243,17 @@ def cli_main(argv=None):
         elif watcher_error:
             print("! autonomous watcher could not start: %s" % watcher_error,
                   file=sys.stderr)
+        if cron_result and cron_result.get("ok"):
+            _cron_word = {"installed": "installed", "refreshed": "refreshed",
+                          "already": "already installed"}.get(
+                cron_result.get("status"), cron_result.get("status"))
+            print("✔ per-minute update cron: %s (pings Attacca for updates "
+                  "every minute even while no client is open)" % _cron_word)
+        elif cron_error:
+            print("· per-minute update cron not installed: %s" % cron_error,
+                  file=sys.stderr)
+            print("  the lifecycle watcher daemon still polls every minute "
+                  "while a client is open.", file=sys.stderr)
         lifecycle_hook = Path(script_path()).resolve().parent / "hooks" / "hooks.json"
         if lifecycle_hook.is_file():
             print("✔ lifecycle continuity hooks: %s" % lifecycle_hook)
