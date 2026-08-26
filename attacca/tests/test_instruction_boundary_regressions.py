@@ -87,7 +87,8 @@ class InstructionBoundaryRegressionTest(unittest.TestCase):
                 generated = (root / filename).read_text()
                 generated_block, outside = managed_and_outside(generated)
                 self.assertEqual(generated_block, block)
-                self.assertEqual(outside, "\n")
+                self.assertTrue(c.cloud_context_block_present(outside))
+                self.assertIn("_No cloud context set yet._", outside)
                 self.assertNotIn("Dynamic worker rule", generated)
                 self.assertNotIn(dynamic_body, generated)
                 for local_text in LOCAL_ONLY_TEXT:

@@ -64,7 +64,7 @@ try:
 except ImportError:  # pragma: no cover - Windows keeps thread serialization
     fcntl = None
 
-VERSION = "0.4.5"
+VERSION = "0.4.6"
 MCP_SUPPORTED_PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18")
 MCP_DEFAULT_PROTOCOL = "2025-06-18"
 DEFAULT_UPDATE_INTERVAL_SECONDS = 60
@@ -883,6 +883,8 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_proj_seq  ON events (project_id, seq);
 CREATE INDEX IF NOT EXISTS idx_events_proj_type ON events (project_id, event_type, seq);
+CREATE INDEX IF NOT EXISTS idx_events_type_time_project
+    ON events (event_type, created_at, project_id);
 CREATE TABLE IF NOT EXISTS tasks (
   project_id     TEXT NOT NULL,
   task_id        TEXT NOT NULL,
@@ -3390,24 +3392,55 @@ def _event_visible_to_actor(conn, project_id, row, actor_id=None,
     if row["event_type"] != "room.message" or actor_id is None:
         return True
     return _bridge_message_visible(
-        conn, project_id, json.loads(row["payload"] or "{}"),
+        conn, project_id, _room_policy_payload(conn, project_id, row),
         actor_id, actor_type)
+
+
+def _event_visibility_flags(conn, project_id, rows, actor_id=None,
+                            actor_type="agent"):
+    """Batch bridge-policy checks for one ordered event page."""
+    rows = list(rows or [])
+    if actor_id is None:
+        return [True] * len(rows)
+    room_rows = [row for row in rows
+                 if row["event_type"] == "room.message"]
+    room_payloads = _room_policy_payloads(conn, project_id, room_rows)
+    visible_by_id = {
+        row["event_id"]: _bridge_message_visible(
+            conn, project_id, payload, actor_id, actor_type)
+        for row, payload in zip(room_rows, room_payloads)}
+    return [visible_by_id.get(row["event_id"], True) for row in rows]
 
 
 def _significant_events(conn, project_id, after_seq=0, limit=100,
                         actor_id=None, actor_type="agent"):
-    rows = conn.execute(
-        "SELECT * FROM events WHERE project_id=? AND seq>? ORDER BY seq DESC",
-        (project_id, after_seq))
     out = []
-    for row in rows:
-        if not _event_visible_to_actor(
-                conn, project_id, row, actor_id, actor_type):
-            continue
-        line = render_log_line(row)
-        if line:
-            out.append(line)
-        if len(out) >= max(1, min(int(limit or 100), 1000)):
+    target = max(1, min(int(limit or 100), 1000))
+    batch_size = max(100, min(1000, target * 2))
+    before_seq = None
+    while len(out) < target:
+        sql = ("SELECT * FROM events WHERE project_id=? AND seq>?" +
+               (" AND seq<?" if before_seq is not None else "") +
+               " ORDER BY seq DESC LIMIT ?")
+        params = [project_id, after_seq]
+        if before_seq is not None:
+            params.append(before_seq)
+        params.append(batch_size)
+        rows = conn.execute(sql, params).fetchall()
+        if not rows:
+            break
+        flags = _event_visibility_flags(
+            conn, project_id, rows, actor_id, actor_type)
+        for row, visible in zip(rows, flags):
+            if not visible:
+                continue
+            line = render_log_line(row)
+            if line:
+                out.append(line)
+            if len(out) >= target:
+                break
+        before_seq = rows[-1]["seq"]
+        if len(rows) < batch_size:
             break
     out.reverse()
     return out
@@ -3585,7 +3618,10 @@ def room_send(conn, project_id, actor_id, actor_type, body, msg_type="chat",
         raise AttaccaError(
             "room_send: msg_type must be one of %s" % ", ".join(MSG_TYPES))
     mentions = _require_str_list("mentions", mentions)
-    payload = {"msg_type": msg_type, "body": str(body)}
+    # Persist an explicit empty destination list for new local-only rows.
+    # Absence of this key is reserved for the historic source-side bridge
+    # schema and is what activates counterpart inference on read.
+    payload = {"msg_type": msg_type, "body": str(body), "mirrored_to": []}
     if mentions:
         payload["mentions"] = mentions
     if reply_to:
@@ -3683,6 +3719,15 @@ def room_send(conn, project_id, actor_id, actor_type, body, msg_type="chat",
     return result
 
 
+def _actor_alias_ids(conn, project_id, actor_id):
+    if not actor_id:
+        return set()
+    rows = conn.execute(
+        "SELECT legacy_actor_id FROM actor_aliases WHERE project_id=?"
+        " AND canonical_actor_id=?", (project_id, actor_id)).fetchall()
+    return {actor_id} | {row["legacy_actor_id"] for row in rows}
+
+
 def room_read(conn, project_id, since_seq=None, limit=30, actor_id=None,
               actor_type="agent"):
     get_project(conn, project_id)
@@ -3710,10 +3755,17 @@ def room_read(conn, project_id, since_seq=None, limit=30, actor_id=None,
         next_since = int(since_seq)
     else:
         next_since = 0
-    messages = [_room_message_dict(row) for row in rows]
-    _infer_legacy_room_mirrors(conn, project_id, messages)
     visible_messages = []
-    for message in messages:
+    actor_ids = _actor_alias_ids(conn, project_id, actor_id)
+    policy_payloads = _room_policy_payloads(conn, project_id, rows)
+    for row, payload in zip(rows, policy_payloads):
+        # Preserve the immutable payload's key-presence distinction here.
+        # New local-only rows explicitly store ``mirrored_to: []``; only old
+        # rows with no such key may use counterpart inference. Normalizing all
+        # rows first loses that distinction and can misclassify a new local
+        # message as bridged when it happens to share a body/signature with a
+        # nearby outgoing message.
+        message = _room_message_dict(row, payload)
         if not _bridge_message_visible(
                 conn, project_id, message, actor_id, actor_type):
             continue
@@ -3732,35 +3784,49 @@ def room_read(conn, project_id, since_seq=None, limit=30, actor_id=None,
         message["actor"] = attribution["actor_id"]
         message["identity"] = attribution["identity"]
         message["attribution"] = attribution
+        message.update(_inbox_message_attention(conn, actor_ids, message))
         visible_messages.append(message)
     if since_seq is None:
-        may_have_more = len(visible_messages) > limit
+        older_messages_available = len(visible_messages) > limit
         visible_messages = visible_messages[-limit:]
+        # This is a latest-page snapshot, not the first page of a forward
+        # cursor walk. Do not claim that next_since_seq can recover older rows.
+        may_have_more = False
     else:
+        older_messages_available = False
         may_have_more = len(rows) == limit
     return {"project": project_id, "messages": visible_messages,
             "next_since_seq": next_since,
             "may_have_more": may_have_more,
-            "hint": ("more messages are waiting — poll again with "
+            "older_messages_available": older_messages_available,
+            "hint": (("latest page shown; call room_read with since_seq=0 "
+                      "to page chronologically from the beginning")
+                     if older_messages_available else
+                     ("more messages are waiting — poll again with "
                      "since_seq=next_since_seq now" if may_have_more else
                      "poll again with since_seq=next_since_seq to read only "
-                     "new messages")}
+                     "new messages"))}
 
 
 # --- inbox -----------------------------------------------------------------
 
 def _room_message_dict(row, payload=None):
     payload = payload if payload is not None else json.loads(row["payload"])
-    return {"event_id": row["event_id"], "seq": row["seq"],
-            "at": row["created_at"], "actor": row["actor_id"],
-            "actor_type": row["actor_type"],
-            "owner": row["owner"] if "owner" in row.keys() else None,
-            "msg_type": payload.get("msg_type"),
-            "body": payload.get("body"), "mentions": payload.get("mentions"),
-            "task_id": row["task_id"], "reply_to": payload.get("reply_to"),
-            "origin_project": payload.get("origin_project"),
-            "authority": payload.get("authority"),
-            "mirrored_to": payload.get("mirrored_to") or []}
+    result = {"event_id": row["event_id"], "seq": row["seq"],
+              "at": row["created_at"], "actor": row["actor_id"],
+              "actor_type": row["actor_type"],
+              "owner": row["owner"] if "owner" in row.keys() else None,
+              "msg_type": payload.get("msg_type"),
+              "body": payload.get("body"),
+              "mentions": payload.get("mentions"),
+              "task_id": row["task_id"],
+              "reply_to": payload.get("reply_to"),
+              "origin_project": payload.get("origin_project"),
+              "authority": payload.get("authority"),
+              "mirrored_to": payload.get("mirrored_to") or []}
+    if payload.get("mirrored_to_inferred"):
+        result["mirrored_to_inferred"] = True
+    return result
 
 
 def _inbox_message_attention(conn, actor_ids, payload):
@@ -3841,23 +3907,29 @@ def _infer_legacy_room_mirrors(conn, project_id, messages):
         time_params = [lower, upper]
 
     counterparts = {}
-    for bridge in _bridge_rows(conn, project_id):
-        other = bridge["with"]
-        rows = conn.execute(
-            "SELECT * FROM events WHERE project_id=?"
-            " AND event_type='room.message'" + time_clause,
-            [other] + time_params).fetchall()
-        for row in rows:
-            try:
-                payload = json.loads(row["payload"])
-            except (TypeError, ValueError):
-                continue
-            if payload.get("origin_project") != project_id:
-                continue
-            target = _room_message_dict(row, payload)
-            counterparts.setdefault(
-                _room_message_signature(target), []).append(
-                    (other, _room_message_time(target.get("at"))))
+    # Routing history outlives the current bridge relationship.  Searching
+    # only active bridge rows declassified a legacy source event as local as
+    # soon as its bridge was removed.  The mirrored counterpart is durable
+    # ledger evidence: it names ``origin_project`` and its own destination
+    # project, so use that evidence even after relationship removal.  Current
+    # participation lookup then fails closed for AIs when no bridge remains;
+    # human owners retain their explicit inspection authority.
+    rows = conn.execute(
+        "SELECT * FROM events WHERE project_id<>?"
+        " AND event_type='room.message'" + time_clause,
+        [project_id] + time_params).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, ValueError):
+            continue
+        if payload.get("origin_project") != project_id:
+            continue
+        other = row["project_id"]
+        target = _room_message_dict(row, payload)
+        counterparts.setdefault(
+            _room_message_signature(target), []).append(
+                (other, _room_message_time(target.get("at"))))
 
     for message in unresolved:
         source_time = _room_message_time(message.get("at"))
@@ -3874,6 +3946,53 @@ def _infer_legacy_room_mirrors(conn, project_id, messages):
             message["mirrored_to_inferred"] = True
 
 
+def _room_policy_payload(conn, project_id, row, payload=None):
+    """Return room routing metadata with legacy destinations reconstructed.
+
+    Old source-side bridge rows did not persist ``mirrored_to``.  Visibility
+    must not depend on which read surface happens to inspect such a row, so
+    every policy path reconstructs that destination before applying bridge
+    participation.  The immutable stored payload is never rewritten.
+    """
+    return _room_policy_payloads(
+        conn, project_id, [row],
+        payloads=[payload] if payload is not None else None)[0]
+
+
+def _room_policy_payloads(conn, project_id, rows, payloads=None):
+    """Batch routing reconstruction while preserving payload key presence."""
+    rows = list(rows or [])
+    if payloads is not None and len(payloads) != len(rows):
+        raise ValueError("room payload batch length differs from rows")
+    enriched_rows = []
+    unresolved = []
+    unresolved_indexes = []
+    for index, row in enumerate(rows):
+        payload = payloads[index] if payloads is not None else None
+        if payload is None:
+            raw = row["payload"] if "payload" in row.keys() else None
+            if isinstance(raw, dict):
+                payload = raw
+            else:
+                payload = json.loads(raw or "{}")
+        enriched = dict(payload or {})
+        enriched_rows.append(enriched)
+        # New senders persist the key even for local-only traffic. Only its
+        # absence identifies legacy source-side schema needing recovery.
+        if not enriched.get("origin_project") \
+                and "mirrored_to" not in enriched:
+            unresolved.append(_room_message_dict(row, enriched))
+            unresolved_indexes.append(index)
+    if unresolved:
+        _infer_legacy_room_mirrors(conn, project_id, unresolved)
+        for index, message in zip(unresolved_indexes, unresolved):
+            if message.get("mirrored_to"):
+                enriched_rows[index]["mirrored_to"] = list(
+                    message["mirrored_to"])
+                enriched_rows[index]["mirrored_to_inferred"] = True
+    return enriched_rows
+
+
 def inbox_read(conn, project_id, actor_id, mark_read=True, limit=50,
                actor_type="agent"):
     """Return every unread group-room message visible to this participant.
@@ -3885,47 +4004,75 @@ def inbox_read(conn, project_id, actor_id, mark_read=True, limit=50,
     """
     get_project(conn, project_id)
     limit = max(1, min(int(limit or 50), 500))
-    alias_rows = conn.execute(
-        "SELECT legacy_actor_id FROM actor_aliases WHERE project_id=?"
-        " AND canonical_actor_id=?", (project_id, actor_id)).fetchall()
-    actor_ids = {actor_id} | {row["legacy_actor_id"] for row in alias_rows}
+    actor_ids = _actor_alias_ids(conn, project_id, actor_id)
     row = conn.execute(
         "SELECT last_read_seq FROM inbox_cursors WHERE project_id=? AND actor_id=?",
         (project_id, actor_id)).fetchone()
     cursor = row["last_read_seq"] if row else 0
-    rows = conn.execute(
-        "SELECT * FROM events WHERE project_id=? AND seq>?"
-        " AND event_type='room.message' ORDER BY seq ASC LIMIT ?",
-        (project_id, cursor, limit + 1)).fetchall()
-    may_have_more = len(rows) > limit
-    rows = rows[:limit]
     messages = []
     counts = {"addressed": 0, "direct": 0, "everyone": 0,
               "group_context": 0}
-    for r in rows:
-        if r["actor_id"] in actor_ids:
-            continue  # your own messages are not inbox items
-        payload = json.loads(r["payload"])
-        if not _bridge_message_visible(
-                conn, project_id, payload, actor_id, actor_type):
-            continue
-        attention = _inbox_message_attention(conn, actor_ids, payload)
-        message = _room_message_dict(r, payload)
-        message.update(attention)
-        identity_project = message.get("origin_project") or project_id
-        attribution = immutable_event_attribution(
-            conn, identity_project, message["actor"],
-            message["actor_type"], message.get("owner"))
-        message["ledger_actor"] = message["actor"]
-        message["actor"] = attribution["actor_id"]
-        message["identity"] = attribution["identity"]
-        message["attribution"] = attribution
-        messages.append(message)
-        counts["addressed"] += int(attention["addressed_to_you"])
-        counts["direct"] += int(attention["directed_to_you"])
-        counts["everyone"] += int(attention["broadcast_to_everyone"])
-        counts["group_context"] += int(attention["group_context"])
-    new_cursor = rows[-1]["seq"] if rows else cursor
+    # Scan raw ledger pages until either one complete *visible* inbox page plus
+    # a look-ahead row is found or history is exhausted. A raw SQL LIMIT made
+    # self/bridge-hidden rows saturate non-mutating peeks, so poll_status and
+    # get_handoff could report no mail even though a visible message sat just
+    # behind them. Cursor advancement still stops at the last returned visible
+    # row when another visible row remains, so nothing can be skipped.
+    scan_cursor = cursor
+    batch_size = max(100, min(1000, limit * 2))
+    while len(messages) <= limit:
+        rows = conn.execute(
+            "SELECT * FROM events WHERE project_id=? AND seq>?"
+            " AND event_type='room.message' ORDER BY seq ASC LIMIT ?",
+            (project_id, scan_cursor, batch_size)).fetchall()
+        if not rows:
+            break
+        stop_after_page = False
+        candidate_rows = [r for r in rows if r["actor_id"] not in actor_ids]
+        policy_payloads = _room_policy_payloads(
+            conn, project_id, candidate_rows)
+        payload_by_event = {
+            r["event_id"]: payload
+            for r, payload in zip(candidate_rows, policy_payloads)}
+        for r in rows:
+            scan_cursor = r["seq"]
+            if r["actor_id"] in actor_ids:
+                continue  # your own messages are not inbox items
+            payload = payload_by_event[r["event_id"]]
+            if not _bridge_message_visible(
+                    conn, project_id, payload, actor_id, actor_type):
+                continue
+            attention = _inbox_message_attention(conn, actor_ids, payload)
+            message = _room_message_dict(r, payload)
+            message.update(attention)
+            if message.get("mirrored_to") and actor_id is not None:
+                message["mirrored_to"] = _visible_bridge_peers(
+                    conn, project_id, message, actor_id, actor_type)
+            identity_project = message.get("origin_project") or project_id
+            attribution = immutable_event_attribution(
+                conn, identity_project, message["actor"],
+                message["actor_type"], message.get("owner"))
+            message["ledger_actor"] = message["actor"]
+            message["actor"] = attribution["actor_id"]
+            message["identity"] = attribution["identity"]
+            message["attribution"] = attribution
+            messages.append(message)
+            if len(messages) > limit:
+                stop_after_page = True
+                break
+        if stop_after_page or len(rows) < batch_size:
+            break
+    may_have_more = len(messages) > limit
+    messages = messages[:limit]
+    if may_have_more and messages:
+        new_cursor = messages[-1]["seq"]
+    else:
+        new_cursor = scan_cursor
+    for message in messages:
+        counts["addressed"] += int(message["addressed_to_you"])
+        counts["direct"] += int(message["directed_to_you"])
+        counts["everyone"] += int(message["broadcast_to_everyone"])
+        counts["group_context"] += int(message["group_context"])
     if mark_read and new_cursor > cursor:
         with write_tx(conn):
             conn.execute(
@@ -6223,21 +6370,9 @@ def project_log(conn, project_id, limit=40, actor_id=None,
                 actor_type="agent"):
     get_project(conn, project_id)
     limit = max(1, min(int(limit or 40), 1000))
-    rows = conn.execute(
-        "SELECT * FROM events WHERE project_id=? ORDER BY seq DESC",
-        (project_id,))
-    lines = []
-    for row in rows:
-        if not _event_visible_to_actor(
-                conn, project_id, row, actor_id, actor_type):
-            continue
-        line = render_log_line(row)
-        if line:
-            lines.append(line)
-        if len(lines) >= limit:
-            break
-    lines.reverse()
-    return {"project": project_id, "log": lines}
+    return {"project": project_id, "log": _significant_events(
+        conn, project_id, after_seq=0, limit=limit,
+        actor_id=actor_id, actor_type=actor_type)}
 
 
 def project_status(conn, project_id, actor_id, actor_type, db_path):
@@ -6357,10 +6492,23 @@ def search_project(conn, project_id, query, limit=20, actor_id=None,
         ["payload", "actor_id", "event_type", "task_id"], terms)
     event_rows = conn.execute(
         "SELECT * FROM events WHERE project_id=? AND " + event_where +
-        " ORDER BY seq DESC", [project_id] + event_params)
+        " ORDER BY seq DESC", [project_id] + event_params).fetchall()
+    raw_payloads = {
+        row["event_id"]: json.loads(row["payload"] or "{}")
+        for row in event_rows}
+    room_rows = [row for row in event_rows
+                 if row["event_type"] == "room.message"]
+    room_payloads = _room_policy_payloads(
+        conn, project_id, room_rows,
+        payloads=[raw_payloads[row["event_id"]] for row in room_rows])
+    policy_payloads = {
+        row["event_id"]: payload
+        for row, payload in zip(room_rows, room_payloads)}
     events = []
     for row in event_rows:
-        payload = json.loads(row["payload"] or "{}")
+        payload = raw_payloads[row["event_id"]]
+        if row["event_type"] == "room.message":
+            payload = policy_payloads[row["event_id"]]
         if row["event_type"] == "room.message" and not \
                 _bridge_message_visible(
                     conn, project_id, payload, actor_id, actor_type):
@@ -6617,9 +6765,11 @@ MCP_TOOLS = [
     },
     {
         "name": "room_read",
-        "description": "Read Project Room messages. First call: omit since_seq to get the "
-                       "latest messages. Then poll with since_seq=next_since_seq from the "
-                       "previous response to receive only new messages (your inbox).",
+        "description": "Read the shared Project Room group conversation. Every "
+                       "participant allowed by the room/bridge policy can read every "
+                       "visible message; mentions and replies assign attention, not "
+                       "visibility. First call: omit since_seq for the latest messages. "
+                       "Then poll with since_seq=next_since_seq for only newer rows.",
         "inputSchema": {"type": "object", "properties": {
             "since_seq": _i("Only messages with ledger seq greater than this."),
             "limit": _i("Max messages (default 30)."),
@@ -6628,13 +6778,13 @@ MCP_TOOLS = [
     },
     {
         "name": "check_inbox",
-        "description": "YOUR personal inbox: room messages that mention you or "
-                       "reply to your messages, since your last check "
-                       "(persistent per-actor read cursor — works across "
-                       "sessions and tools). Marks them read by default; "
-                       "mark_read=false to peek. Also reports how many other "
-                       "unread room messages exist (read those with "
-                       "room_read). Check at session start and periodically.",
+        "description": "YOUR unread projection of the shared group room: every "
+                       "participation-visible non-self message since your persistent "
+                       "actor cursor, with attention metadata. Mentions/replies identify "
+                       "the expected responder; they never hide content from other "
+                       "participants. Chat/directive with no mention or reply is sent to "
+                       "everyone. Marks the scanned page read by default; "
+                       "mark_read=false peeks. Drain again when may_have_more is true.",
         "inputSchema": {"type": "object", "properties": {
             "mark_read": {"type": "boolean",
                           "description": "Advance your read cursor (default true)."},
@@ -7040,9 +7190,11 @@ board, mandatory role-scoped rules, decision records, handoff, and a human+AI pr
 workers across tools (Claude Code, Codex, GLM, humans).
 
 Session protocol:
-1. START: call get_handoff and rule_list, then check_inbox (messages addressed to YOU from
-   other AIs/humans — possibly from bridged projects). Do not rely on prior
-   chat memory or re-discover the repo from scratch.
+1. START: call get_handoff and rule_list, then check_inbox. Project rooms are
+   group conversations: read every participation-visible unread message, including
+   messages mentioning/replying to another participant. Mentions/replies assign
+   attention, not visibility; an untargeted chat/directive is sent to everyone.
+   Do not rely on prior chat memory or re-discover the repo from scratch.
 2. PROJECT RULES: everyone + your ACTUAL registered role are mandatory. Only
    humans and registered Directors may manage them.
 3. HISTORY-FIRST: when work depends on what/why/who happened earlier, call
@@ -7050,7 +7202,8 @@ Session protocol:
    and task_show around the hits before filesystem/Git archaeology.
 4. Claim a task (task_claim) before substantive work; create one if needed.
 5. Announce intent / coordinate via room_send; poll check_inbox / room_read
-   for replies. Messages tagged [MASTER-DIRECTIVE] come from a project whose
+   and consider all relevant group context even when no action is assigned.
+   Messages tagged [MASTER-DIRECTIVE] come from a project whose
    directors rule this one — treat them as binding; [SUGGESTION]/[ADVICE]
    are input, not orders.
 6. Record durable choices with decision_propose / decision_resolve.
@@ -7822,15 +7975,33 @@ def _api_events_sync(conn, project_id, after, limit, actor_id=None,
         "SELECT * FROM events WHERE project_id=? AND seq>? ORDER BY seq LIMIT ?",
         (project_id, int(after), limit)).fetchall()
     events = []
-    for row in rows:
+    raw_payloads = [json.loads(row["payload"]) for row in rows]
+    room_rows = [row for row in rows
+                 if row["event_type"] == "room.message"]
+    room_payloads = _room_policy_payloads(
+        conn, project_id, room_rows,
+        payloads=[payload for row, payload in zip(rows, raw_payloads)
+                  if row["event_type"] == "room.message"])
+    room_payload_iter = iter(room_payloads)
+    for row, raw_payload in zip(rows, raw_payloads):
         # The sync cursor follows the immutable raw sequence, while the
         # payload is actor-private.  Advancing past a hidden row prevents a
         # denied bridge message from permanently wedging an offline watcher.
-        if not _event_visible_to_actor(
-                conn, project_id, row, actor_id, actor_type):
-            continue
+        payload = raw_payload
+        if row["event_type"] == "room.message":
+            payload = next(room_payload_iter)
+            if actor_id is not None and not _bridge_message_visible(
+                    conn, project_id, payload, actor_id, actor_type):
+                continue
         event = dict(row)
-        event["payload"] = json.loads(event["payload"])
+        event["payload"] = payload
+        if event["event_type"] == "room.message":
+            event["payload"].update(_inbox_message_attention(
+                conn, _actor_alias_ids(conn, project_id, actor_id),
+                event["payload"]))
+            if event["payload"].get("mirrored_to") and actor_id is not None:
+                event["payload"]["mirrored_to"] = _visible_bridge_peers(
+                    conn, project_id, event["payload"], actor_id, actor_type)
         identity_project = event["payload"].get("origin_project") \
             if event["event_type"] == "room.message" else None
         attribution = immutable_event_attribution(
@@ -8308,13 +8479,19 @@ def _sync_scrub_secrets(value):
     return value
 
 
-def _sync_event_visible(conn, scope, event):
+def _sync_event_visible(conn, scope, event, room_payload=None):
     protocol, _ = _sync_runtime()
     policy_event = dict(event)
-    if isinstance(policy_event.get("payload"), dict):
+    if room_payload is not None:
+        policy_event["payload"] = canonical_json(room_payload)
+        if not _bridge_message_visible(
+                conn, scope["project_id"], room_payload,
+                scope["actor_id"], scope["actor_type"]):
+            return False
+    elif isinstance(policy_event.get("payload"), dict):
         policy_event["payload"] = policy_event.get("payload_json") \
             or canonical_json(policy_event["payload"])
-    if not _event_visible_to_actor(
+    if room_payload is None and not _event_visible_to_actor(
             conn, scope["project_id"], policy_event, scope["actor_id"],
             scope["actor_type"]):
         return False
@@ -8348,8 +8525,20 @@ def _sync_projection(conn, scope):
     snapshot = exporter.build_project_export(
         conn, scope["project_id"], log_renderer=render_log_line)
     events = snapshot["ledger"]["events"]
-    visible_events = [event for event in events
-                      if _sync_event_visible(conn, scope, event)]
+    room_events = [event for event in events
+                   if event.get("event_type") == "room.message"]
+    enriched_room_payloads = _room_policy_payloads(
+        conn, scope["project_id"], room_events,
+        payloads=[event.get("payload") or {} for event in room_events])
+    room_payload_by_id = {
+        event.get("event_id"): payload
+        for event, payload in zip(room_events, enriched_room_payloads)}
+    visible_events = [
+        event for event in events
+        if _sync_event_visible(
+            conn, scope, event,
+            room_payload=room_payload_by_id.get(event.get("event_id"))
+            if event.get("event_type") == "room.message" else None)]
     visible_seqs = {event["seq"] for event in visible_events}
 
     room_messages = []
@@ -8357,8 +8546,13 @@ def _sync_projection(conn, scope):
         if event.get("event_type") != "room.message" \
                 or event.get("seq") not in visible_seqs:
             continue
-        message = _room_message_dict(event, event.get("payload") or {})
+        payload = room_payload_by_id[event.get("event_id")]
+        message = _room_message_dict(event, payload)
         message["project_id"] = scope["project_id"]
+        if message.get("mirrored_to"):
+            message["mirrored_to"] = _visible_bridge_peers(
+                conn, scope["project_id"], message,
+                scope["actor_id"], scope["actor_type"])
         identity_project = message.get("origin_project") or scope["project_id"]
         attribution = immutable_event_attribution(
             conn, identity_project, message["actor"], message["actor_type"],
@@ -8416,9 +8610,20 @@ def _sync_visibility_projector(conn, scope, mode, from_cursor,
     if mode == "policy":
         return result
     result["projection"] = _sync_projection(conn, scope)
+    room_events = [event for event in events
+                   if event.get("event_type") == "room.message"]
+    room_payloads = _room_policy_payloads(
+        conn, scope["project_id"], room_events,
+        payloads=[event.get("payload") or {} for event in room_events])
+    room_payload_by_id = {
+        event.get("event_id"): payload
+        for event, payload in zip(room_events, room_payloads)}
     result["visible_event_seqs"] = [
         event["seq"] for event in events
-        if _sync_event_visible(conn, scope, event)]
+        if _sync_event_visible(
+            conn, scope, event,
+            room_payload=room_payload_by_id.get(event.get("event_id"))
+            if event.get("event_type") == "room.message" else None)]
     return result
 
 
@@ -9789,6 +9994,9 @@ class AttaccaHandler(BaseHTTPRequestHandler):
         if method == "GET" and path in (
                 "/healthz", "/v1/auth/status", "/v1/projects"):
             return
+        if method == "GET" and path == "/v1/managed-law" \
+                and principal.get("actor_type") == "agent":
+            return
         project_route = re.match(r"^/v1/projects/[^/]+(?:/|$)", path)
         if project_route:
             if path.endswith("/export"):
@@ -9817,6 +10025,10 @@ class AttaccaHandler(BaseHTTPRequestHandler):
         if method == "GET" and path in (
                 "/healthz", "/v1/auth/status", "/v1/auth/access",
                 "/v1/settings", "/v1/projects"):
+            return
+        if method == "GET" and path == "/v1/managed-law" \
+                and not provisional \
+                and principal.get("actor_type") == "agent":
             return
         if method == "POST" and path in (
                 "/v1/auth/device/start", "/v1/auth/device/poll"):
@@ -11720,7 +11932,17 @@ def _r_migration_directive(h, m, q):
 
 
 def _r_managed_law(h, m, q):
-    pid = q.get("project")
+    pid = str(q.get("project") or "").strip() or None
+    principal = getattr(h, "principal", None) or {}
+    bound_project = str(principal.get("project_id") or "").strip() or None
+    if bound_project:
+        if pid and pid != bound_project:
+            raise AuthorizationError(
+                "managed_law_scope_denied: credential is bound to workspace "
+                "'%s'" % bound_project)
+        pid = bound_project
+    if pid:
+        h._enforce_human_project_membership(pid)
     db = getattr(h.server, "db_path", None)
     h._reply_json(200, managed_law_payload(pid, db),
                   {"Cache-Control": "no-store"})
@@ -12358,6 +12580,11 @@ class OfflineProxySession:
         self.runtime = runtime
         self.device_id = device_id
         self.briefed_context = None
+        # Hosted cursors are immutable while offline.  This process-local
+        # cursor lets one active AI drain cached pages without either skipping
+        # rows or pretending the read was synchronized to the host. A restart
+        # safely replays the page until hosted reconciliation succeeds.
+        self.offline_inbox_cursors = {}
 
     @staticmethod
     def _res(msg_id, result):
@@ -12395,6 +12622,100 @@ class OfflineProxySession:
         project = projection.get("project") or {}
         events = _offline_proxy_visible_events(snapshot)
         self._project_args(args, scope)
+
+        # The verified projection is already participation-scoped.  Build the
+        # same actor-specific attention view used by hosted reads without
+        # turning mentions/replies into a second visibility filter.
+        aliases = {scope["actor_id"]}
+        aliases.update(
+            item.get("legacy_actor_id")
+            for item in projection.get("actor_aliases", [])
+            if item.get("canonical_actor_id") == scope["actor_id"]
+            and item.get("legacy_actor_id"))
+        cached_room = sorted(
+            list(projection.get("room_messages") or []),
+            key=lambda item: int(item.get("seq") or 0))
+        cached_room_by_id = {
+            item.get("event_id"): item for item in cached_room}
+
+        def classify_room(item):
+            message = dict(item)
+            mentions = set(message.get("mentions") or [])
+            mentioned = bool(aliases.intersection(mentions))
+            replied = bool(
+                message.get("reply_to") and
+                ((cached_room_by_id.get(message["reply_to"]) or {}).get(
+                    "actor") or
+                 (cached_room_by_id.get(message["reply_to"]) or {}).get(
+                    "actor_id")) in aliases)
+            broadcast = bool(
+                message.get("msg_type") in ("chat", "directive") and
+                not mentions and not message.get("reply_to"))
+            direct = mentioned or replied
+            addressed = direct or broadcast
+            message.update({
+                "mentioned_to_you": mentioned,
+                "reply_to_you": replied,
+                "directed_to_you": direct,
+                "broadcast_to_everyone": broadcast,
+                "addressed_to_you": addressed,
+                "group_context": not addressed,
+            })
+            return message
+
+        def cached_inbox(mark_read=True, limit=50):
+            limit = max(1, min(int(limit or 50), 500))
+            cursor_row = projection.get("inbox_cursor") or {}
+            hosted_cursor = int(cursor_row.get("last_read_seq") or 0)
+            cursor_key = (project_id, scope["actor_id"])
+            cursor = max(
+                hosted_cursor,
+                int(self.offline_inbox_cursors.get(cursor_key) or 0))
+            visible = []
+            remaining_rows = []
+            for item in cached_room:
+                seq = int(item.get("seq") or 0)
+                if seq <= cursor:
+                    continue
+                remaining_rows.append(item)
+                sender = item.get("actor") or item.get("actor_id")
+                if sender in aliases:
+                    continue
+                visible.append(classify_room(item))
+            page = visible[:limit]
+            scanned_through = int(page[-1].get("seq") or cursor) \
+                if page else max(
+                    [int(item.get("seq") or 0) for item in remaining_rows]
+                    or [cursor])
+            if mark_read and scanned_through > cursor:
+                self.offline_inbox_cursors[cursor_key] = scanned_through
+            addressed_count = sum(
+                bool(item.get("addressed_to_you")) for item in page)
+            direct_count = sum(
+                bool(item.get("directed_to_you")) for item in page)
+            everyone_count = sum(
+                bool(item.get("broadcast_to_everyone")) for item in page)
+            group_count = sum(
+                bool(item.get("group_context")) for item in page)
+            return {
+                "project": project_id, "actor": scope["actor_id"],
+                "messages": page, "messages_include_all_visible": True,
+                "unread_total": len(page),
+                "unread_addressed": addressed_count,
+                "unread_direct": direct_count,
+                "unread_everyone": everyone_count,
+                "unread_group_context": group_count,
+                "unread_broadcasts": group_count,
+                "may_have_more": len(visible) > len(page),
+                "read_cursor": scanned_through if mark_read else cursor,
+                "scanned_through_seq": scanned_through,
+                "hosted_read_cursor": hosted_cursor,
+                "offline_mark_read_deferred": bool(mark_read),
+                "hint": ("cached group inbox page; call check_inbox again "
+                         "while may_have_more is true. This process remembers "
+                         "the page locally, but the hosted cursor advances "
+                         "only after reconnect."),
+            }
         if name == "attacca_status":
             tasks = projection.get("tasks") or []
             decisions = projection.get("decisions") or []
@@ -12458,10 +12779,20 @@ class OfflineProxySession:
             context = project.get("context_version") or \
                 snapshot["cursor"]["context_version"]
             self.briefed_context = context
+            peek = cached_inbox(mark_read=False, limit=200)
             result = {
                 "project": project_id, "context_version": context,
                 "lead_director": project.get("lead_director"),
-                "your_inbox": None, "bridges": bridges,
+                "your_inbox": {
+                    "unread_total": peek["unread_total"],
+                    "unread_addressed_to_you": peek["unread_addressed"],
+                    "unread_everyone": peek["unread_everyone"],
+                    "unread_group_context": peek["unread_group_context"],
+                    "may_have_more": peek["may_have_more"],
+                    "messages_include_all_visible": True,
+                    "hint": ("read every message with check_inbox; mentions/"
+                             "replies assign attention, not visibility"),
+                }, "bridges": bridges,
                 "governance": ({"rules_over": rules_over,
                                 "follows": follows, "advised_by": advised,
                                 "hint": "cached verified bridge authority"}
@@ -12491,54 +12822,41 @@ class OfflineProxySession:
             }, adapter, proof)
         if name == "room_read":
             limit = max(1, min(int(args.get("limit") or 30), 500))
-            messages = list(projection.get("room_messages") or [])
             since = args.get("since_seq")
             if since is not None:
-                messages = [item for item in messages
-                            if int(item.get("seq") or 0) > int(since)][:limit]
+                eligible = [classify_room(item) for item in cached_room
+                            if int(item.get("seq") or 0) > int(since)]
+                page = eligible[:limit]
+                next_since = int(page[-1].get("seq") or since) \
+                    if page else int(since)
+                may_have_more = len(eligible) > len(page)
+                older_messages_available = False
             else:
-                messages = messages[-limit:]
+                older_messages_available = len(cached_room) > limit
+                may_have_more = False
+                page = [classify_room(item)
+                        for item in cached_room[-limit:]]
+                # Initial room reads return the latest visible page and then
+                # follow the mirror's raw event head for future polling.
+                next_since = int(snapshot["cursor"]["event_seq"] or 0)
             return _offline_proxy_mark({
-                "project": project_id, "messages": messages,
-                "next_since_seq": snapshot["cursor"]["event_seq"],
-                "may_have_more": False,
-                "hint": "cached through mirror cursor; poll hosted MCP after reconnect",
+                "project": project_id, "messages": page,
+                "next_since_seq": next_since,
+                "may_have_more": may_have_more,
+                "older_messages_available": older_messages_available,
+                "hint": (("latest cached page shown; call room_read with "
+                          "since_seq=0 to page chronologically from the "
+                          "beginning") if older_messages_available else
+                         ("more cached room messages remain — call room_read "
+                          "again with next_since_seq" if may_have_more else
+                          "cached through mirror cursor; poll hosted MCP after "
+                          "reconnect")),
             }, adapter, proof)
         if name == "check_inbox":
-            limit = max(1, min(int(args.get("limit") or 50), 500))
-            cursor_row = projection.get("inbox_cursor") or {}
-            cursor = int(cursor_row.get("last_read_seq") or 0)
-            aliases = {scope["actor_id"]}
-            aliases.update(item.get("legacy_actor_id")
-                           for item in projection.get("actor_aliases", [])
-                           if item.get("canonical_actor_id") == scope["actor_id"])
-            all_messages = projection.get("room_messages") or []
-            by_id = {item.get("event_id"): item for item in all_messages}
-            addressed, broadcasts = [], 0
-            for item in all_messages:
-                if int(item.get("seq") or 0) <= cursor \
-                        or item.get("actor") in aliases:
-                    continue
-                mentioned = bool(aliases.intersection(item.get("mentions") or []))
-                replied = bool(item.get("reply_to") and
-                               (by_id.get(item["reply_to"]) or {}).get("actor")
-                               in aliases)
-                structured_bridge = bool(
-                    item.get("origin_project") and
-                    item.get("msg_type") not in ("chat", "status"))
-                if mentioned or replied or structured_bridge:
-                    addressed.append(item)
-                else:
-                    broadcasts += 1
-            addressed = addressed[:limit]
-            return _offline_proxy_mark({
-                "project": project_id, "actor": scope["actor_id"],
-                "messages": addressed, "unread_broadcasts": broadcasts,
-                "may_have_more": len(addressed) >= limit,
-                "read_cursor": cursor,
-                "offline_mark_read_deferred": bool(args.get("mark_read", True)),
-                "hint": "cached inbox only; hosted read cursor advances after reconnect",
-            }, adapter, proof)
+            mark_read = bool(args.get("mark_read", True))
+            return _offline_proxy_mark(cached_inbox(
+                mark_read=mark_read, limit=args.get("limit") or 50),
+                adapter, proof)
         if name == "bridge_list":
             return _offline_proxy_mark({
                 "project": project_id,
@@ -15165,9 +15483,10 @@ def _remote_setup_network(url, project_id, workspaces, actor_id, actor_type):
     """Read-only governance context used by native setup pickers.
 
     A relationship prompt must show what already exists before asking the
-    user to change it. Addressed messages mirrored from another workspace are
-    included because they are often the clearest evidence that this checkout
-    is already part of an AI network.
+    user to change it. Every visible group-room message mirrored from another
+    workspace is included because shared context—not only mentions or
+    replies—is often the clearest evidence that this checkout is already part
+    of an AI network.
     """
     by_id = {p["project_id"]: p for p in workspaces}
     candidate = by_id.get(project_id) if project_id else None
@@ -15712,12 +16031,20 @@ def managed_instruction_block(project_id, db_path):
     lines.append("Directors in the same workspace have identical permissions; runtime and Lead")
     lines.append("Director status never bypass the role check.")
     lines.append("")
-    lines.append("1. **Session start**: use the injected `ATTACCA ACTIVE SESSION BRIEF`.")
-    lines.append("   If that brief is absent, immediately call `get_handoff`, then")
-    lines.append("   `check_inbox` and `room_read` yourself before any other work. Never")
-    lines.append("   choose, open, or ask about another Attacca database/store. Do not rely on")
-    lines.append("   prior chat memory or re-discover the repo from scratch. Inbox items tagged")
-    lines.append("   [MASTER-DIRECTIVE] come from a project that rules this one — binding;")
+    lines.append("1. **Session start and group-room reading**: use the injected")
+    lines.append("   `ATTACCA ACTIVE SESSION BRIEF`. If that brief is absent, immediately")
+    lines.append("   call `get_handoff`, then `check_inbox` and `room_read` before any other")
+    lines.append("   work. A Project Room or permitted bridged conversation is a GROUP CHAT:")
+    lines.append("   read every participation-visible unread message, including messages that")
+    lines.append("   mention or reply to somebody else. Mentions/replies identify the expected")
+    lines.append("   responder; they never restrict visibility. A chat or directive with no")
+    lines.append("   mentions and no reply target is sent to everyone. Consider relevant design,")
+    lines.append("   requirement, and project-context changes even when you are not assigned to")
+    lines.append("   act on them. Continue draining `check_inbox` while `may_have_more` is true.")
+    lines.append("   Never choose, open, or ask about another Attacca database/store. Do not")
+    lines.append("   rely on prior chat memory or re-discover the repo from scratch. Inbox items")
+    lines.append("   tagged [MASTER-DIRECTIVE] come from a project that rules this one —")
+    lines.append("   binding;")
     lines.append("   [SUGGESTION]/[ADVICE] are input, not orders.")
     lines.append("2. **Project Rules — binding dynamic instructions**: the mandatory")
     lines.append("   Project Rules for `everyone` plus your registered role are pinned as a")
@@ -15751,9 +16078,11 @@ def managed_instruction_block(project_id, db_path):
     lines.append("   implementation/research deliverable, check `task_list`; `task_claim` an")
     lines.append("   existing task or `task_create` then claim it. Declare `expected_scope` paths.")
     lines.append("   Heed scope-overlap warnings — coordinate in the room first.")
-    lines.append("5. **Room — ephemeral coordination**: announce intent, questions, directives,")
-    lines.append("   challenges, and short updates with `room_send`; use `since_seq` for replies.")
-    lines.append("   Room chat coordinates people but does not replace a task or decision.")
+    lines.append("5. **Room — ephemeral group coordination**: announce intent, questions,")
+    lines.append("   directives, challenges, and short updates with `room_send`; use `since_seq`")
+    lines.append("   for replies. Every participant reads the whole visible group conversation;")
+    lines.append("   addressing metadata assigns attention only. Room chat coordinates people")
+    lines.append("   but does not replace a task or decision.")
     lines.append("   Messages are local by default. Never mirror routine claims, status, audits,")
     lines.append("   task updates, or handoffs into another workspace. Cross-project delivery")
     lines.append("   requires an explicit `target_project` and the content must match that bridge's")
@@ -15970,13 +16299,27 @@ def _standard_claude_link_target(target, root):
 
 
 def _managed_instruction_sync(project_id, root_path, db_path, files=None,
-                              managed_only=False):
+                              managed_only=False, desired_block=None):
     if not root_path or not Path(root_path).is_dir():
         raise AttaccaError(
             "project root %s does not exist; re-run init in the project dir"
             % (root_path or "(unset)"))
-    block = managed_instruction_block(project_id, db_path)
-    desired_metadata = managed_instruction_metadata(project_id, db_path)
+    if desired_block is None:
+        block = managed_instruction_block(project_id, db_path)
+        desired_metadata = managed_instruction_metadata(project_id, db_path)
+    else:
+        block = str(desired_block)
+        desired_metadata = _metadata_for_managed_block(block)
+        if desired_metadata.get("project_id") != project_id:
+            raise AttaccaError(
+                "managed-law block belongs to project '%s', not '%s'" % (
+                    desired_metadata.get("project_id"), project_id))
+        if not desired_metadata.get("do_not_edit"):
+            raise AttaccaError(
+                "managed-law block lacks do_not_edit=true ownership marker")
+        if type(desired_metadata.get("version")) is not int or \
+                desired_metadata["version"] < 1:
+            raise AttaccaError("managed-law block version is invalid")
     results = []
     filenames = list(files or ["AGENTS.md", "CLAUDE.md"])
     root = Path(root_path).resolve()
@@ -16194,6 +16537,29 @@ def refresh_managed_instructions(project_id, root_path, db_path, files=None):
     """
     return _managed_instruction_sync(
         project_id, root_path, db_path, files=files, managed_only=True)
+
+
+def refresh_managed_instruction_block(project_id, root_path, block,
+                                      expected_sha256=None, files=None):
+    """Apply one server-supplied managed block without installing code.
+
+    The caller must first establish which server/workspace it trusts. This
+    adapter then validates exact bytes, project binding, ownership markers and
+    monotonic file versions before atomically replacing only an existing valid
+    managed region. It never creates a missing block or follows arbitrary
+    symlinks.
+    """
+    if not isinstance(block, str):
+        raise AttaccaError("server managed-law block must be text")
+    if expected_sha256 is not None:
+        expected = str(expected_sha256).strip().lower()
+        if re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+            raise AttaccaError("server managed-law sha256 is invalid")
+        if sha256_hex(block) != expected:
+            raise AttaccaError("server managed-law block failed sha256 validation")
+    return _managed_instruction_sync(
+        project_id, root_path, None, files=files, managed_only=True,
+        desired_block=block)
 
 
 def install_instructions(project_id, root_path, db_path, files=None):
@@ -16672,8 +17038,9 @@ def build_parser():
     pr = rsub.add_parser("tail", help="follow the room (poll loop)")
     pr.add_argument("--interval", type=float, default=2.0)
 
-    p = sub.add_parser("inbox", help="your inbox: messages mentioning or "
-                                     "replying to you (persistent read cursor)")
+    p = sub.add_parser(
+        "inbox", help="your unread group-room messages; mentions/replies "
+                      "assign attention only (persistent read cursor)")
     p.add_argument("-n", "--limit", type=int, default=50)
     p.add_argument("--keep-unread", action="store_true",
                    help="peek without advancing your read cursor")
@@ -16940,7 +17307,7 @@ def human_print(result, command=None):
         return
     if isinstance(result, dict) and "messages" in result:
         if not result["messages"] and "unread_broadcasts" in result:
-            print("inbox empty")
+            print("group inbox empty")
         for msg in result["messages"]:
             origin = (" via %s" % msg["origin_project"]) if msg.get("origin_project") else ""
             task = (" [%s]" % msg["task_id"]) if msg.get("task_id") else ""
@@ -16948,14 +17315,21 @@ def human_print(result, command=None):
             owner = (" (OWNER: %s)" % msg["owner"]) if msg.get("owner") else ""
             mentions = (" @" + ",@".join(str(m) for m in msg["mentions"])) \
                 if msg.get("mentions") else ""
-            print("#%-4d %s  %s%s%s (%s)%s%s%s: %s" % (
+            attention = (" [EVERYONE]" if msg.get("broadcast_to_everyone")
+                         else " [YOUR ATTENTION]" if msg.get("addressed_to_you")
+                         else " [GROUP CONTEXT]" if msg.get("group_context")
+                         else "")
+            print("#%-4d %s  %s%s%s (%s)%s%s%s%s: %s" % (
                 msg["seq"], msg["at"][:19].replace("T", " "), msg["actor"], owner,
-                origin, msg["msg_type"], auth, task, mentions, msg["body"]))
+                origin, msg["msg_type"], auth, task, mentions, attention,
+                msg["body"]))
         if "next_since_seq" in result:
             print("-- next_since_seq: %s" % result["next_since_seq"])
         if "unread_broadcasts" in result:
-            print("-- other unread room messages (not addressed to you): %d"
-                  % result["unread_broadcasts"])
+            total = result.get("unread_total", len(result["messages"]))
+            print("-- unread visible group messages: %d%s" % (
+                total, " (more pages remain)" if result.get("may_have_more")
+                else ""))
         return
     if isinstance(result, dict) and "query" in result and "events" in result:
         for hit in result["events"]:

@@ -24,8 +24,11 @@ humans at the same project, and they all share:
   Runtime remains visible for audit, but authorization depends only on the
   registered workspace role: Claude and Codex Directors are permission peers.
   Legacy owner-prefixed ids are aliased without rewriting hashed ledger history.
-- **Per-agent inboxes** — `check_inbox`: messages that mention/reply to you plus
-  structured inter-workspace coordination, with persistent read cursors
+- **Per-agent inbox cursors** — `check_inbox` delivers every visible non-self
+  room message, with a persistent cursor per canonical actor. Mentions and
+  replies assign attention/expected response without hiding shared context;
+  untargeted chat and directives are everyone-broadcasts. Bridge participation
+  and access policy are the cross-workspace visibility boundary.
 - **AI roles + Lead Director** — setup assigns Director, Advisor, or Worker;
   only Directors can update a governed workspace's shared handoff or issue a
   binding directive from a master workspace. Multiple Directors are allowed,
@@ -277,15 +280,25 @@ idle, deduplicates changes, and queues a concise local notification. The next
 supported lifecycle boundary injects that queue into the AI's context. The user
 never has to type “check messages,” and there is no second project database.
 
-Lifecycle startup compares the installed Attacca `VERSION` and managed-law
-fingerprint with the configured server's `/healthz`. When either bundle is
-newer or different, the AI asks once per reminder window with **Install now /
-Later / Skip this version**; it never executes downloaded code without the
-user's explicit choice. An unanswered offer is deduplicated, Later snoozes the
-exact bundle for 24 hours, and Skip suppresses only that exact
-version+managed-law fingerprint. Simultaneous clients atomically claim the
-offer so they cannot all ask at once. A successful install still requires a
-client restart so the new plugin code is actually loaded.
+Lifecycle startup compares the installed Attacca executable `VERSION` and the
+checkout's managed-law version/hash with the configured server. Only a newer
+**executable bundle** asks once per reminder window with **Install now / Later /
+Skip this version**; downloaded code is never installed without the user's
+explicit choice. An unanswered executable offer is deduplicated, Later snoozes
+that release for 24 hours, and Skip suppresses only that release. Simultaneous
+clients atomically claim the offer so they cannot all ask at once. A successful
+executable install may require a fresh client session to load the new code.
+
+Managed law is a separate, non-executable update path. The client fetches the
+server-authoritative project-bound block from `/v1/managed-law`, verifies its
+exact SHA-256, template hash, ownership markers, project ID, and monotonic
+version, then atomically refreshes existing valid `MANAGED_ATTACCA` blocks in
+`AGENTS.md` and `CLAUDE.md` without a binary reinstall or restart. It never
+downgrades a newer local law. A missing, malformed, project-mismatched, or
+hash-mismatched **server payload** is rejected. A valid Attacca-owned local
+block may be rebound after this checkout is verifiably relinked to another
+workspace; an unmanaged, malformed, or unsafe local target is left untouched
+and reported. Bytes outside the markers are preserved exactly.
 
 The universal installer downloads into same-filesystem staging, rejects
 missing/unsafe files or mismatched runtime/manifests, and only then swaps the
@@ -294,13 +307,15 @@ working plugin is retained or restored. The native Git marketplace cache is
 content-addressed by the served bundle, so a server upgrade cannot keep
 returning an older cached plugin.
 
-After the plugin is current, lifecycle startup automatically refreshes an
-existing `MANAGED_ATTACCA` block in `AGENTS.md` and a real `CLAUDE.md` (or its
-standard `CLAUDE.md -> AGENTS.md` link). The replacement is atomic and changes
-only the bytes between the managed markers; user-authored content outside them
-is preserved. Missing, malformed, hand-edited ownership, unsafe-symlink, or
-newer/future blocks are left untouched and reported for review. `/healthz`
-publishes the bundled managed-law version and hash for diagnostics.
+The managed-law refresh runs independently of executable update state. The
+server publishes the current version/hash through `/healthz` and the exact
+project-bound content through `/v1/managed-law`.
+
+Lifecycle briefs include the complete Cloud Context whenever it fits the
+client's configured hook-context budget. That budget is measured in UTF-8
+bytes, so unusually large Unicode-heavy context may be rendered as an explicit
+head/tail compacted view with `cloud_context_get` recovery instructions; the
+authoritative hosted content itself is never shortened or rewritten.
 
 ## How a tool connects (three shapes, one server)
 
@@ -391,12 +406,17 @@ Injected via the managed block and the MCP server's `instructions`:
 
 1. **Session start** — use the hook-injected brief, or call `get_handoff`,
    `check_inbox`, `room_read`, `task_list`, and `attacca_status` if absent.
+   Drain every `check_inbox` page while `may_have_more` is true before calling
+   the inbox current.
 2. **Tasks for owned, trackable work** — before editing, `task_claim` (or
    `task_create` then claim). Declare `expected_scope`; heed overlap warnings.
 3. **Room for ephemeral coordination** — questions, directives, challenges,
-   and short updates use `room_send` / `room_read since_seq=…`
-   (the cursor is lossless: a truncated batch sets `may_have_more` and the next poll
-   picks up exactly where the last one ended).
+   and short updates use `room_send` / `room_read since_seq=…`. Every permitted
+   participant reads every visible non-self message. Mentions/replies route
+   attention only; an untargeted chat/directive addresses everyone. Explicit
+   bridge participation/access, not mentions, sets the privacy boundary. The
+   cursor is lossless: a truncated batch sets `may_have_more` and the next poll
+   picks up exactly where the last one ended.
 4. **Decisions for durable choices** — architecture, API, data, security,
    workflow, or product choices use `decision_propose` / `decision_resolve`,
    not chat; routine implementation details do not need a decision record.
@@ -446,7 +466,7 @@ task report T-1 --summary TEXT [--evidence JSON] [--state review|done|blocked|qu
 task release T-1 [--reason TEXT] | task set-status T-1 STATUS [--reason TEXT]
 decision propose TITLE [--detail TEXT] [--rationale TEXT]
 decision resolve D-1 accepted|rejected|superseded | decision list
-inbox [-n N] [--keep-unread]                    addressed/structured messages, cursor persists
+inbox [-n N] [--keep-unread]                    visible non-self room messages, cursor persists
 lead [ACTOR_ID] [--clear]                       show or set the Lead Director
 bridge add OTHER [--boss P | --advisor P] | bridge remove OTHER | bridge list
 search QUERY [-n N] | overview                  explore everything stored

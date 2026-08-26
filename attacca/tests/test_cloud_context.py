@@ -138,7 +138,8 @@ class MandatoryRulesBannerTestCase(unittest.TestCase):
             {"rule_id": "R-1", "title": "Big", "body": "x" * 5000,
              "scope": "everyone", "priority": 1, "enabled": True}])
         self.assertLess(len(banner), 1200)
-        self.assertIn("...", banner)
+        self.assertIn(
+            "[TRUNCATED — STOP and call rule_list before acting]", banner)
 
 
 class CloudContextBriefWiringTestCase(unittest.TestCase):

@@ -9,8 +9,10 @@ Treat $ARGUMENTS as the intended message and optional routing hints:
 
 1. If it contains an `@name`, call `agent_list` and resolve that name to a
    registered actor. Use the actor's id in `mentions`, but show the user its
-   display name and runtime. If the name is missing or ambiguous, show a short
-   numbered list and ask which named recipient they mean.
+   display name and runtime. A mention assigns attention or an expected
+   responder; it does not make the shared room message private. If the name is
+   missing or ambiguous, show a short numbered list and ask which named
+   recipient they mean.
 2. If the user asks to send to another workspace, call `bridge_list` and
    `list_projects`. Offer only the current room and currently bridged
    workspaces, using workspace names and relationship labels. Map the chosen
@@ -22,12 +24,15 @@ Treat $ARGUMENTS as the intended message and optional routing hints:
    user is clearly instructing workers. Always pass `target_project`: use the
    current workspace id for the default local room, or the chosen connected
    workspace id. Keep `project` as the current workspace so both sides retain
-   a connected-room conversation without broadcasting to every bridge.
+   a connected-room conversation without broadcasting to every bridge. An
+   untargeted `chat` or `directive` is broadcast to everyone in the selected
+   room. Bridge participation and access policy define who may read a mirrored
+   copy; mentions never override that boundary.
 
-Confirm the delivered workspace, named recipients, and any bridged workspaces
-reported by `room_send`. Surface its warnings. A room message does not create
-a durable task or decision; offer the appropriate Attacca command if the user
-also wants one recorded.
+Confirm the delivered workspace, named attention recipients, and any bridged
+workspaces reported by `room_send`. Surface its warnings. A room message does
+not create a durable task or decision; offer the appropriate Attacca command
+if the user also wants one recorded.
 
 If Attacca reports that this checkout is not attached, invoke the native setup
 flow as the AI and continue its named choices; do not hand the human a command

@@ -388,6 +388,35 @@ class TerminalMigrationTestCase(unittest.TestCase):
             headers=wrong_actor)["status"], 403)
         self.assertEqual(self.actor_state(), before)
 
+    def test_managed_law_refresh_uses_bound_terminal_when_auth_is_enforced(self):
+        _flow, credential = self.issue_terminal()
+        conn = c.connect(self.db)
+        try:
+            c.server_settings_store(conn, {"auth.activated": True})
+        finally:
+            conn.close()
+
+        path = "/v1/managed-law?project=proj"
+        anonymous = self.request("GET", path)
+        self.assertEqual(anonymous["status"], 401, anonymous["body"])
+
+        headers = self.terminal_headers(
+            credential, "proj.director.codex-legacy")
+        headers["X-Attacca-Actor-Type"] = "agent"
+        headers["X-Attacca-Project"] = "proj"
+        authenticated = self.request("GET", path, headers=headers)
+        self.assertEqual(
+            authenticated["status"], 200, authenticated["body"])
+        self.assertEqual(
+            authenticated["body"]["version"], c.MANAGED_BLOCK_VERSION)
+        self.assertIn(
+            "project=proj", authenticated["body"]["block"].splitlines()[0])
+
+        other = self.request(
+            "GET", "/v1/managed-law?project=other", headers=headers)
+        self.assertEqual(other["status"], 403, other["body"])
+        self.assertIn("bound to workspace 'proj'", other["body"]["error"])
+
     def test_extension_supersedes_old_token_and_preserves_binding_union(self):
         _old_flow, old = self.issue_terminal()
         union = [

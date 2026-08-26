@@ -38,8 +38,8 @@ except ImportError:  # pragma: no cover - Windows fallback remains atomic replac
 STATE_NAME = "setup-prompts.json"
 WATCHER_STATE_NAME = "watcher-state.json"
 WATCHER_QUEUE_LIMIT = 200
-WATCHER_DELTA_CHUNK_SIZE = 25
-WATCHER_NOTICE_BATCH_SIZE = 5
+WATCHER_DELTA_CHUNK_SIZE = 10
+WATCHER_NOTICE_BATCH_SIZE = 2
 WATCHER_WAKE_SECONDS = 5
 WATCHER_EVENT_PAGE_SIZE = 200
 WATCHER_EVENT_MAX_PAGES = 20
@@ -50,6 +50,16 @@ UPDATE_CHOICES = {"install", "later", "skip"}
 AUXILIARY_HTTP_TIMEOUT_SECONDS = 1
 UPDATE_REMIND_AFTER_SECONDS = 24 * 60 * 60
 UPDATE_CHECK_INTERVAL_SECONDS = 5 * 60
+MANAGED_LAW_MAX_BYTES = 1024 * 1024
+HOOK_CONTEXT_MAX_BYTES = 262_144
+# Compatibility name retained for callers/tests; the host measures UTF-8
+# bytes (approximately four bytes per token), not Python code points.
+HOOK_CONTEXT_MAX_CHARACTERS = HOOK_CONTEXT_MAX_BYTES
+HOOK_NOTICE_RESERVE_BYTES = 24_000
+MANDATORY_RULES_BANNER_MAX_CHARACTERS = 24_000
+STARTUP_INBOX_PAGE_SIZE = 25
+STARTUP_UNREAD_BODY_LIMIT = 2_000
+WATCHER_ROOM_BODY_LIMIT = 600
 
 # A watcher process keeps executing the Python code which was imported when it
 # started even if install.sh later atomically replaces the stable plugin tree.
@@ -712,30 +722,7 @@ def _update_offer(status, plugin_root, config, setup_cwd=None,
         if not installed_key or not available_key:
             return None
         software_update = available_key > installed_key
-        server_laws = release.get("managed_instructions") or {}
-        local_laws = _local_managed_instructions(plugin_root) or {}
-        server_law_version = server_laws.get("version")
-        local_law_version = local_laws.get("version")
-        server_law_sha = server_laws.get("sha256")
-        local_law_sha = local_laws.get("sha256")
-        local_law_version_valid = (
-            type(local_law_version) is int and local_law_version >= 1)
-        local_law_sha_valid = (
-            isinstance(local_law_sha, str) and
-            re.fullmatch(r"[0-9a-f]{64}", local_law_sha) is not None)
-        server_laws_valid = (
-            type(server_law_version) is int and server_law_version >= 1 and
-            isinstance(server_law_sha, str) and
-            re.fullmatch(r"[0-9a-f]{64}", server_law_sha) is not None)
-        law_update = (
-            available_key == installed_key and
-            server_laws_valid and
-            local_law_version_valid and
-            (server_law_version > local_law_version or
-             (server_law_version == local_law_version and
-              (not local_law_sha_valid or
-               server_law_sha != local_law_sha))))
-        if not software_update and not law_update:
+        if not software_update:
             return None
     except Exception:
         # Version discovery is advisory. Never replace a successful MCP brief
@@ -745,10 +732,8 @@ def _update_offer(status, plugin_root, config, setup_cwd=None,
     server_url = _normalized_server_url(config["url"])
     # The atomic claim handles exact-version Skip, Later snoozing, unanswered
     # offers, and simultaneous lifecycle hooks without duplicate prompts.
-    fingerprint = "%s|%s|%s" % (
-        available, server_laws.get("version") or "",
-        server_laws.get("sha256") or "")
-    reason = "software_update" if software_update else "managed_law_update"
+    fingerprint = str(available)
+    reason = "software_update"
     if not _claim_update_offer(
             status["state_path"], server_url, available, installed,
             release_fingerprint=fingerprint, reason=reason):
@@ -782,11 +767,7 @@ def _update_offer(status, plugin_root, config, setup_cwd=None,
                "restart Kimi Code")
     availability = (
         "Attacca %s is available from %s; this client has %s." %
-        (available, server_url, installed)
-        if software_update else
-        "Attacca %s managed laws changed on %s; this client has the same "
-        "software version but a different managed-law bundle." %
-        (available, server_url))
+        (available, server_url, installed))
     context = """ATTACCA UPDATE CHOICE — ASK BEFORE INSTALLING
 %s
 Ask one concise question and show exactly these choices:
@@ -807,9 +788,8 @@ that brief in the newly restarted client; do not run old plugin code further."""
         availability, selection, install_record,
         install_command, restart, later_record, skip_record, available)
     return {
-        "system_message": "Attacca %s %s · choose Install now, Later, or Skip this version"
-                          % (available, "available" if software_update else
-                             "managed laws changed"),
+        "system_message": "Attacca %s available · choose Install now, Later, or Skip this version"
+                          % available,
         "context": context,
     }
 
@@ -834,15 +814,108 @@ def _managed_law_adapter(plugin_root, project_id, root_path, db_path=None):
     return refresh(project_id, root_path, db_path, files=None)
 
 
-def _refresh_managed_laws(status, plugin_root):
-    """Refresh only valid existing Attacca-owned instruction blocks."""
+def _server_managed_law(config, project_id, opener=None, entry=None):
+    """Fetch and fully validate one project-bound, non-executable law block."""
+    url = "%s/v1/managed-law?project=%s" % (
+        _normalized_server_url(config["url"]),
+        quote(str(project_id), safe=""))
+    headers = {"Accept": "application/json"}
+    if isinstance(entry, dict) and entry:
+        actor_id = str(entry.get("canonical_actor_id") or "").strip()
+        device_id = str(
+            entry.get("device_id") or _local_device_id()).strip()
+        if actor_id:
+            headers["X-Attacca-Actor"] = actor_id
+            headers["X-Attacca-Actor-Type"] = "agent"
+        headers["X-Attacca-Project"] = str(project_id)
+        if device_id:
+            headers["X-Attacca-Device-ID"] = device_id
+        headers["X-Attacca-Client-Instance"] = _client_instance_id()
+        if entry.get("owner"):
+            headers["X-Attacca-Owner"] = str(entry["owner"])
+        token = _watcher_api_token(entry)
+        if isinstance(token, str) and token.strip() \
+                and "\n" not in token and "\r" not in token:
+            headers["Authorization"] = "Bearer " + token.strip()
+    request = Request(url, headers=headers)
+    open_request = opener or urlopen
+    with open_request(
+            request, timeout=AUXILIARY_HTTP_TIMEOUT_SECONDS) as response:
+        raw = response.read(MANAGED_LAW_MAX_BYTES + 1)
+    if len(raw) > MANAGED_LAW_MAX_BYTES:
+        raise RuntimeError("managed-law response exceeded its size limit")
     try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError) as error:
+        raise RuntimeError("managed-law response is not valid UTF-8 JSON") from error
+    if not isinstance(payload, dict):
+        raise RuntimeError("managed-law response is not an object")
+    version = payload.get("version")
+    block = payload.get("block")
+    digest = payload.get("sha256")
+    law_digest = payload.get("law_sha256")
+    if type(version) is not int or version < 1:
+        raise RuntimeError("managed-law response has an invalid version")
+    if not isinstance(block, str) or not block:
+        raise RuntimeError("managed-law response has no block text")
+    if not isinstance(digest, str) or \
+            re.fullmatch(r"[0-9a-f]{64}", digest) is None or \
+            hashlib.sha256(block.encode("utf-8")).hexdigest() != digest:
+        raise RuntimeError("managed-law response failed exact sha256 validation")
+    if not isinstance(law_digest, str) or \
+            re.fullmatch(r"[0-9a-f]{64}", law_digest) is None:
+        raise RuntimeError("managed-law response has an invalid law sha256")
+    lines = block.splitlines()
+    header = lines[0] if lines else ""
+    match = re.fullmatch(
+        r"<!-- MANAGED_ATTACCA:BEGIN v=(\d+) project=([^\s>]+) "
+        r"do_not_edit=true -->", header)
+    if not match or int(match.group(1)) != version \
+            or match.group(2) != project_id \
+            or block.count("MANAGED_ATTACCA:BEGIN") != 1 \
+            or block.count("MANAGED_ATTACCA:END") != 1 \
+            or not block.endswith("<!-- MANAGED_ATTACCA:END -->"):
+        raise RuntimeError("managed-law block markers or project binding are invalid")
+    template = block.replace(
+        "project=%s" % project_id, "project=attacca-project", 1)
+    if hashlib.sha256(template.encode("utf-8")).hexdigest() != law_digest:
+        raise RuntimeError("managed-law template hash does not match the block")
+    return payload
+
+
+def _server_managed_law_adapter(plugin_root, project_id, root_path, law):
+    runtime = _load_attacca_runtime(plugin_root)
+    refresh = getattr(runtime, "refresh_managed_instruction_block", None)
+    if not callable(refresh):
+        raise RuntimeError(
+            "installed Attacca client cannot apply server-managed laws")
+    return refresh(
+        project_id, root_path, law["block"],
+        expected_sha256=law["sha256"], files=None)
+
+
+def _refresh_managed_laws(status, plugin_root, config=None, fetcher=None):
+    """Apply server-authoritative law text without reinstalling executable code."""
+    try:
+        if config is None:
+            _ignored_root, config = _plugin_and_config()
+        if fetcher is not None:
+            # Keep the narrow two-argument test/integration adapter contract.
+            law = fetcher(config, status["project_id"])
+        else:
+            # A successful MCP startup records the exact canonical actor into
+            # this subscription immediately before law refresh. Reload it so a
+            # first-run client does not reuse the pre-MCP anonymous entry.
+            _key, entry = _watcher_subscription_entry(status, config)
+            law = _server_managed_law(
+                config, status["project_id"], entry=entry)
         checkout_root = str(Path(status["link_path"]).parent.parent) \
             if status.get("link_path") else status["root"]
-        result = _managed_law_adapter(
-            plugin_root, status["project_id"], checkout_root,
-            os.environ.get("ATTACCA_DB")) or []
+        result = _server_managed_law_adapter(
+            plugin_root, status["project_id"], checkout_root, law) or []
     except Exception as err:
+        if getattr(err, "code", None) == 404:
+            return None  # older compatible server; executable update stays separate
         return {
             "system_message": "Attacca managed-law refresh could not run",
             "context": ("Attacca could not refresh its managed AGENTS.md/CLAUDE.md "
@@ -855,7 +928,7 @@ def _refresh_managed_laws(status, plugin_root):
                if item.get("changed") is True or
                str(item.get("action") or "").lower().startswith("updated")]
     problems = [item for item in results if item.get("status") in {
-        "malformed", "unsafe_symlink", "unmanaged", "future", "write_error"}]
+        "malformed", "unsafe_symlink", "unmanaged", "write_error"}]
     if not changed and not problems:
         return None
     files = ", ".join(dict.fromkeys(
@@ -896,21 +969,83 @@ def _append_notices(output, event_name, notices):
     return output
 
 
+def _insert_after_rules_banner(context, addition):
+    """Keep the mandatory banner literal-first while adding hook notices."""
+    context = str(context or "")
+    addition = str(addition or "")
+    if not context:
+        return addition
+    if not addition:
+        return context
+    banner_end = None
+    if context.startswith(
+            "===================== ATTACCA MANDATORY PROJECT RULES"):
+        footer = (
+            "==========================================================================")
+        found = context.find(footer)
+        if found >= 0:
+            banner_end = found + len(footer)
+    if banner_end is None:
+        return addition + "\n\n" + context
+    prefix = context[:banner_end]
+    suffix = context[banner_end:].lstrip("\n")
+    return prefix + "\n\n" + addition + (
+        "\n\n" + suffix if suffix else "")
+
+
 def _append_notice(output, notice):
     if not output or not notice:
         return output
-    if "message" in output and "hookSpecificOutput" not in output:
-        output["message"] = notice["context"] + "\n\n" + output["message"]
-        return output
+    if "message" in output:
+        hook_specific = output.get("hookSpecificOutput") or {}
+        if "hookSpecificOutput" not in output:
+            output["message"] = _bound_injected_context(
+                _insert_after_rules_banner(
+                    output["message"], notice["context"]),
+                reserve_notices=False)
+            return output
+        if hook_specific.get("permissionDecision") == "deny":
+            combined = _bound_injected_context(
+                _insert_after_rules_banner(
+                    output["message"], notice["context"]),
+                reserve_notices=False)
+            output["message"] = combined
+            hook_specific["permissionDecisionReason"] = combined
+            output["hookSpecificOutput"] = hook_specific
+            output["systemMessage"] = " ".join(filter(None, [
+                output.get("systemMessage"), notice["system_message"]]))
+            return output
     output["systemMessage"] = " ".join(filter(None, [
         output.get("systemMessage"), notice["system_message"]]))
     specific = output.get("hookSpecificOutput") or {}
     context = specific.get("additionalContext")
     if context:
-        specific["additionalContext"] = notice["context"] + "\n\n" + context
+        notice_context = str(notice.get("context") or "")
+        available = max(
+            0, HOOK_CONTEXT_MAX_BYTES -
+            len(context.encode("utf-8")) - 4)
+        if len(notice_context.encode("utf-8")) > available:
+            recovery = (
+                "[ATTACCA NOTICE COMPACTED TO FIT THE CLIENT CONTEXT LIMIT; "
+                "refresh Attacca for the complete queued/update detail]")
+            recovery_bytes = recovery.encode("utf-8")
+            if available <= len(recovery_bytes):
+                notice_context = recovery_bytes[:available].decode(
+                    "utf-8", errors="ignore")
+            else:
+                notice_context, _ = _head_tail_text(
+                    notice_context, available,
+                    "refresh Attacca for the complete queued/update detail")
+        if not notice_context:
+            return output
+        specific["additionalContext"] = _insert_after_rules_banner(
+            context, notice_context)
         output["hookSpecificOutput"] = specific
     elif output.get("decision") == "block":
-        output["reason"] = notice["context"] + "\n\n" + output.get("reason", "")
+        output["reason"] = _bound_injected_context(
+            _insert_after_rules_banner(
+                output.get("reason", ""), notice["context"]),
+            reserve_notices=False)
     return output
 
 
@@ -1005,6 +1140,7 @@ def _event_context_output(event_name, system_message, context):
     model. Claude marks its recursive event with ``stop_hook_active``; Kimi
     0.37.2 accepts the structured deny below and caps that continuation once.
     """
+    context = _bound_injected_context(context)
     if _runtime_name() == "kimi":
         if event_name == "Stop":
             return {
@@ -1042,7 +1178,8 @@ def _with_migration_notice(output, migration):
     specific = output.get("hookSpecificOutput") or {}
     context = specific.get("additionalContext")
     if context:
-        specific["additionalContext"] = notice + "\n\n" + context
+        specific["additionalContext"] = _insert_after_rules_banner(
+            context, notice)
         output["hookSpecificOutput"] = specific
     return output
 
@@ -2158,9 +2295,18 @@ def _watcher_event_line(event):
         authority = " [%s]" % payload["authority"] \
             if payload.get("authority") else ""
         msg_type = payload.get("msg_type") or "chat"
-        return "Room%s%s · %s · %s: %s" % (
-            source, authority, msg_type, actor,
-            _trim(payload.get("body"), 500))
+        attention = (
+            "everyone" if payload.get("broadcast_to_everyone") else
+            "your-attention" if payload.get("addressed_to_you") else
+            "group-context")
+        body = str(payload.get("body") or "")
+        excerpt, _ = _head_tail_text(
+            body, WATCHER_ROOM_BODY_LIMIT,
+            "call room_read with since_seq=%s for the complete message" %
+            max(0, int(event.get("seq") or 1) - 1))
+        return "Room #%s%s%s · %s · %s · %s: %s" % (
+            event.get("seq") or "?", source, authority, msg_type, attention,
+            actor, excerpt)
     if event_type.startswith("task.plan."):
         version = " v%s" % payload["plan_version"] \
             if payload.get("plan_version") is not None else ""
@@ -2880,28 +3026,43 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
             })
             chunk_after = through
         if len(pending) > WATCHER_QUEUE_LIMIT:
-            dropped = pending[:-WATCHER_QUEUE_LIMIT + 1]
-            retained = pending[-WATCHER_QUEUE_LIMIT + 1:]
-            pending[:] = [{
-                "fingerprint": "overflow:%s" % fingerprint,
-                "created_at": created_at,
-                "summary": (
-                    "ATTACCA UNREAD ROOM BACKLOG · %s\n"
-                    "- %d earlier queued event(s) exceeded the local desktop "
-                    "notice budget. The lifecycle snapshot is automatically "
-                    "loading their full content through check_inbox/room_read; "
-                    "the watcher did not advance the actor's inbox cursor."
-                    % (entry["project_id"], sum(
-                        int(item.get("event_count") or 0) for item in dropped))),
-                "kind": "project_delta_backlog",
-                "after": dropped[0].get("after") if dropped else cursor,
-                "through": dropped[-1].get("through") if dropped else cursor,
-                "event_count": sum(int(item.get("event_count") or 0)
-                                   for item in dropped),
-                "event_types": sorted({event_type for item in dropped
-                                       for event_type in
-                                       (item.get("event_types") or [])}),
-            }] + retained
+            # A room body may never be collapsed into a count after the event
+            # cursor advances. Bound only routine non-room notifications; if
+            # the excess is all group-room traffic, retain it durably and let
+            # lifecycle turns drain the FIFO in batches.
+            removable = max(0, len(pending) - WATCHER_QUEUE_LIMIT)
+            kept = []
+            coalesced = []
+            for item in pending:
+                contains_room = "room.message" in (
+                    item.get("event_types") or [])
+                if removable and not contains_room:
+                    coalesced.append(item)
+                    removable -= 1
+                else:
+                    kept.append(item)
+            if coalesced:
+                kept.insert(0, {
+                    "fingerprint": "operational-overflow:%s" % fingerprint,
+                    "created_at": created_at,
+                    "summary": (
+                        "ATTACCA OPERATIONAL BACKLOG · %s\n"
+                        "- %d non-room event(s) were compacted. No group-room "
+                        "message was dropped; refresh tasks/rules/decisions for "
+                        "full operational detail." % (
+                            entry["project_id"], sum(int(
+                                item.get("event_count") or 0)
+                                for item in coalesced))),
+                    "kind": "project_delta_backlog",
+                    "after": coalesced[0].get("after"),
+                    "through": coalesced[-1].get("through"),
+                    "event_count": sum(int(item.get("event_count") or 0)
+                                       for item in coalesced),
+                    "event_types": sorted({event_type for item in coalesced
+                                           for event_type in
+                                           (item.get("event_types") or [])}),
+                })
+            pending[:] = kept
         queued = True
 
     # Persistence happens before any optional desktop notification. A notifier
@@ -3396,17 +3557,181 @@ def _message_key(message):
         sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def _head_tail_text(value, limit, recovery):
+    """Bound hostile/verbose hosted text without hiding that it was cut.
+
+    Lifecycle context is finite.  Keeping both ends preserves headings and
+    recent appendices, while the explicit recovery instruction prevents a
+    compacted projection from masquerading as the complete durable record.
+    """
+    text = str(value or "")
+    limit = max(1, int(limit))
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text, False
+    marker = ("\n\n[ATTACCA COMPACTED TEXT OF %d UTF-8 BYTES TO FIT A %d "
+              "BYTE BRIEF LIMIT; %s]\n\n" %
+              (len(encoded), limit, recovery))
+    marker_bytes = marker.encode("utf-8")
+    if len(marker_bytes) >= limit:
+        return marker_bytes[:limit].decode("utf-8", errors="ignore"), True
+    payload = max(0, limit - len(marker_bytes))
+    head = (payload * 3) // 5
+    tail = payload - head
+    head_text = encoded[:head].decode("utf-8", errors="ignore") \
+        if head else ""
+    tail_text = encoded[-tail:].decode("utf-8", errors="ignore") \
+        if tail else ""
+    result = head_text + marker + tail_text
+    # UTF-8 boundary recovery can only reduce each slice, but keep this guard
+    # explicit so future marker edits cannot violate the client spill limit.
+    while len(result.encode("utf-8")) > limit and tail_text:
+        tail_text = tail_text[1:]
+        result = head_text + marker + tail_text
+    return result, True
+
+
+def _bound_injected_context(context, reserve_notices=True):
+    """Enforce the host budget while preserving a literal-first rules banner."""
+    context = str(context or "")
+    limit = HOOK_CONTEXT_MAX_BYTES - (
+        HOOK_NOTICE_RESERVE_BYTES if reserve_notices else 0)
+    if len(context.encode("utf-8")) <= limit:
+        return context
+    footer = (
+        "==========================================================================")
+    banner_end = context.find(footer) if context.startswith(
+        "===================== ATTACCA MANDATORY PROJECT RULES") else -1
+    if banner_end >= 0:
+        banner_end += len(footer)
+        prefix = context[:banner_end]
+        suffix = context[banner_end:].lstrip("\n")
+        available = max(
+            1, limit - len(prefix.encode("utf-8")) - 2)
+        compact, _ = _head_tail_text(
+            suffix, available,
+            "call the relevant Attacca read tools before relying on omitted "
+            "brief state")
+        return prefix + "\n\n" + compact
+    compact, _ = _head_tail_text(
+        context, limit,
+        "call the relevant Attacca read tools before relying on omitted "
+        "brief state")
+    return compact
+
+
+def _compact_cloud_context(value):
+    if not isinstance(value, dict):
+        return value
+    result = {key: value.get(key) for key in (
+        "version", "sha256", "updated_by", "updated_owner", "updated_at")
+              if key in value}
+    content, truncated = _head_tail_text(
+        value.get("content"), 100_000,
+        "call cloud_context_get before relying on the omitted section")
+    result["content"] = content
+    if truncated:
+        result["content_truncated"] = True
+    return result
+
+
+def _compact_handoff(value):
+    if not isinstance(value, dict):
+        return value
+    result = {}
+    for key, raw in value.items():
+        compact, truncated = _head_tail_text(
+            raw, 1_000,
+            "call get_handoff before relying on the omitted text")
+        result[key] = compact
+        if truncated:
+            result[key + "_truncated"] = True
+    return result
+
+
+def _compact_rule_view(rule):
+    result = {key: rule.get(key) for key in (
+        "project_id", "rule_id", "scope", "priority", "enabled", "version",
+        "created_by", "created_owner", "created_at",
+        "updated_by", "updated_owner", "updated_at") if key in rule}
+    title, title_truncated = _head_tail_text(
+        rule.get("title"), 180, "call rule_list for the complete title")
+    body, body_truncated = _head_tail_text(
+        rule.get("body"), 600,
+        "call rule_list before acting on this truncated binding rule")
+    result.update({"title": title, "body": body})
+    if title_truncated:
+        result["title_truncated"] = True
+    if body_truncated:
+        result["body_truncated"] = True
+    return result
+
+
+def _compact_rule_list(rules, max_characters=16_000):
+    """Keep a bounded rule projection and make every omission actionable."""
+    source = [rule for rule in (rules or []) if isinstance(rule, dict)]
+    result = []
+    for rule in source:
+        candidate = _compact_rule_view(rule)
+        projected = json.dumps(
+            result + [candidate], separators=(",", ":"), ensure_ascii=False)
+        if len(projected.encode("utf-8")) > max_characters:
+            break
+        result.append(candidate)
+    return result, max(0, len(source) - len(result))
+
+
+def _compact_activity(rows):
+    result = []
+    for row in list(rows or [])[-8:]:
+        if isinstance(row, dict):
+            item = {}
+            for key in ("event_id", "seq", "event_type", "actor", "at",
+                        "task_id", "summary"):
+                if key not in row:
+                    continue
+                value = row.get(key)
+                if isinstance(value, str):
+                    value, truncated = _head_tail_text(
+                        value, 300,
+                        "call search/get_project_log for the complete event")
+                    if truncated:
+                        item[key + "_truncated"] = True
+                item[key] = value
+            result.append(item)
+        else:
+            value, _ = _head_tail_text(
+                row, 300, "call get_project_log for the complete event")
+            result.append(value)
+    return result
+
+
 def _task_view(task):
-    return {key: task.get(key) for key in (
+    result = {key: task.get(key) for key in (
         "task_id", "title", "status", "claimed_by", "lease_until",
         "lease_expired", "risk_level", "updated_at")}
+    title, truncated = _head_tail_text(
+        result.get("title"), 180, "call task_show for the complete title")
+    result["title"] = title
+    if truncated:
+        result["title_truncated"] = True
+    return result
 
 
 def _decision_view(decision):
     """Keep durable decision meaning without injecting its full event history."""
-    return {key: decision.get(key) for key in (
+    result = {key: decision.get(key) for key in (
         "decision_id", "title", "status", "detail", "rationale",
         "proposed_by", "resolved_by", "created_at", "resolved_at")}
+    for key, limit in (("title", 180), ("detail", 350),
+                       ("rationale", 350)):
+        compact, truncated = _head_tail_text(
+            result.get(key), limit,
+            "call decision_list/search for the complete decision")
+        result[key] = compact
+        if truncated:
+            result[key + "_truncated"] = True
+    return result
 
 
 def _current_actor_record(snapshot):
@@ -3428,7 +3753,7 @@ def _needs_role_setup(snapshot):
     return role not in CONFIGURED_AI_ROLES
 
 
-def _mandatory_rules_banner(rules):
+def _mandatory_rules_banner(rules, pre_omitted=0):
     """Compact banner of the mandatory Project Rules, pinned near the very
     top of every injected turn so it survives host-side truncation of the
     larger state payload. Returns None when no rules apply."""
@@ -3444,14 +3769,32 @@ def _mandatory_rules_banner(rules):
         "section is ever missing from your context, call rule_list before acting.",
         "",
     ]
-    for r in applicable:
+    omitted = max(0, int(pre_omitted or 0))
+    for index, r in enumerate(applicable):
         body = " ".join(str(r.get("body") or "").split())
         if len(body) > 600:
-            body = body[:597] + "..."
-        lines.append("\u2022 [%s \u00b7 priority %s \u00b7 %s] %s" % (
+            marker = " [TRUNCATED — STOP and call rule_list before acting]"
+            body = body[:max(1, 600 - len(marker))] + marker
+        title = " ".join(str(r.get("title") or "").split())
+        if len(title) > 180:
+            marker = " [TRUNCATED — call rule_list]"
+            title = title[:max(1, 180 - len(marker))] + marker
+        rule_lines = ["\u2022 [%s \u00b7 priority %s \u00b7 %s] %s" % (
             r.get("rule_id"), r.get("priority"), r.get("scope"),
-            " ".join(str(r.get("title") or "").split())))
-        lines.append("    %s" % body)
+            title), "    %s" % body]
+        projected = "\n".join(lines + rule_lines + [
+            "=========================================================================="])
+        if len(projected.encode("utf-8")) > \
+                MANDATORY_RULES_BANNER_MAX_CHARACTERS:
+            omitted += len(applicable) - index
+            break
+        lines.extend(rule_lines)
+    if omitted:
+        lines.extend([
+            "\u2022 %d additional binding rule(s) did not fit this turn's banner."
+            % omitted,
+            "    STOP before other work and call rule_list; omitted rules remain binding.",
+        ])
     lines.append(
         "==========================================================================")
     return "\n".join(lines)
@@ -3464,6 +3807,8 @@ def _poll_view(snapshot):
     tasks = snapshot.get("tasks") or {}
     status = snapshot.get("status") or {}
     rules = snapshot.get("rules") or {}
+    compact_rules, omitted_rules = _compact_rule_list(
+        rules.get("rules") or [])
     return {
         # Exclude handoff.your_inbox and recent_activity: the startup poll marks
         # inbox rows read and registers its actor, so those transient values
@@ -3472,8 +3817,10 @@ def _poll_view(snapshot):
         "lead_director": handoff.get("lead_director"),
         "handoff": handoff.get("handoff"),
         "decisions": handoff.get("decisions") or [],
-        "project_rules": rules.get("rules") or [],
-        "cloud_context": handoff.get("cloud_context"),
+        "project_rules": compact_rules,
+        "project_rules_omitted_count": omitted_rules,
+        "cloud_context": _compact_cloud_context(
+            handoff.get("cloud_context")),
         "tasks": [_task_view(task) for task in (tasks.get("tasks") or [])],
         "room_keys": [_message_key(message)
                       for message in (room.get("messages") or [])],
@@ -3519,12 +3866,25 @@ def _compact_snapshot(snapshot):
     tasks = snapshot.get("tasks") or {}
     rules = snapshot.get("rules") or {}
 
-    def messages(rows, limit, full_body=False):
-        return [{"event_id": row.get("event_id"),
+    def messages(rows, limit, body_limit=180, newest=True):
+        rows = list(rows or [])
+        selected = rows[-limit:] if newest else rows[:limit]
+        result = []
+        for row in selected:
+            body = str(row.get("body") or "")
+            if body_limit is None:
+                rendered_body, body_truncated = body, False
+            else:
+                rendered_body, body_truncated = _head_tail_text(
+                    body, body_limit,
+                    "call room_read with since_seq=%s before relying on the "
+                    "omitted message text" % max(
+                        0, int(row.get("seq") or 1) - 1))
+            result.append({"event_id": row.get("event_id"),
                  "seq": row.get("seq"), "actor": row.get("actor"),
                  "type": row.get("msg_type"),
-                 "body": (str(row.get("body") or "") if full_body else
-                          _trim(row.get("body"))),
+                 "body": rendered_body,
+                 "body_truncated": body_truncated,
                  "task_id": row.get("task_id"),
                  "mentions": row.get("mentions"),
                  "reply_to": row.get("reply_to"),
@@ -3535,15 +3895,27 @@ def _compact_snapshot(snapshot):
                  "origin_project": row.get("origin_project"),
                  "authority": row.get("authority"),
                  "mirrored_to": row.get("mirrored_to")}
-                for row in (rows or [])[-limit:]]
+            )
+        return result
 
     status = snapshot.get("status") or {}
     actor_record = _current_actor_record(snapshot) or {}
-    unread_rows = list(inbox.get("messages") or [])[-100:]
+    # check_inbox is oldest-first. Never take a suffix of a page whose cursor
+    # has already advanced; doing so would silently discard earlier group chat.
+    all_unread_rows = list(inbox.get("messages") or [])
+    unread_rows = all_unread_rows[:STARTUP_INBOX_PAGE_SIZE]
     unread_keys = {_message_key(row) for row in unread_rows}
     recent_rows = [row for row in (room.get("messages") or [])
-                   if _message_key(row) not in unread_keys][-50:]
-    unread_messages = messages(unread_rows, 100, full_body=True)
+                   if _message_key(row) not in unread_keys]
+    unread_messages = messages(
+        unread_rows, max(1, len(unread_rows)),
+        body_limit=STARTUP_UNREAD_BODY_LIMIT, newest=False)
+    decision_rows = [item for item in (handoff.get("decisions") or [])
+                     if isinstance(item, dict)]
+    task_rows = [task for task in (tasks.get("tasks") or [])
+                 if task.get("status") not in ("done", "cancelled")]
+    compact_rules, omitted_rules = _compact_rule_list(
+        rules.get("rules") or [])
     return {
         "project": snapshot.get("project"),
         "checked_at": snapshot.get("checked_at"),
@@ -3551,34 +3923,51 @@ def _compact_snapshot(snapshot):
         # Rules and Cloud Context stay ahead of verbose operational state so
         # host-side context limits cannot silently drop the project's law and
         # durable background after a long decision/task history.
-        "project_rules": rules.get("rules") or [],
-        "cloud_context": handoff.get("cloud_context"),
+        "project_rules": compact_rules,
+        "project_rules_omitted_count": omitted_rules,
+        "project_rules_next_action": (
+            "STOP before other work and call rule_list; omitted rules remain "
+            "binding." if omitted_rules else None),
         "room_protocol": (
             "This is a group conversation. Read every unread_room message. "
             "Mentions/replies assign the expected responder, not visibility; "
             "chat/directive with neither is broadcast to everyone. Retain "
             "relevant context even when no action is assigned."),
-        "lead_director": handoff.get("lead_director"),
-        "handoff": handoff.get("handoff"),
-        "open_tasks": handoff.get("open_tasks"),
-        "decisions": [_decision_view(item) for item in
-                      (handoff.get("decisions") or [])[:100]
-                      if isinstance(item, dict)],
-        "recent_activity": handoff.get("recent_activity"),
+        "cloud_context": _compact_cloud_context(
+            handoff.get("cloud_context")),
         "unread_room": unread_messages,
-        # Keep a direct-attention projection for old clients and quick triage;
-        # it is a subset of unread_room, never the visibility boundary.
-        "inbox": [item for item in unread_messages
-                  if item.get("addressed_to_you") is not False],
-        "unread_broadcasts": inbox.get("unread_broadcasts"),
-        "unread_room_may_have_more": bool(inbox.get("may_have_more")),
+        "unread_room_counts": {
+            "total": inbox.get("unread_total", len(unread_messages)),
+            "addressed": inbox.get("unread_addressed"),
+            "direct": inbox.get("unread_direct"),
+            "everyone": inbox.get("unread_everyone"),
+            "group_context": inbox.get("unread_group_context"),
+        },
+        "unread_room_may_have_more": bool(
+            inbox.get("may_have_more") or
+            len(all_unread_rows) > len(unread_rows)),
         "unread_room_next_action": (
             "Call check_inbox again before other work; more unread group "
             "messages remain behind this page."
-            if inbox.get("may_have_more") else None),
-        "recent_room": messages(recent_rows, 50),
-        "tasks": [_task_view(task) for task in (tasks.get("tasks") or [])
-                  if task.get("status") not in ("done", "cancelled")][:50],
+            if (inbox.get("may_have_more") or
+                len(all_unread_rows) > len(unread_rows)) else None),
+        "lead_director": handoff.get("lead_director"),
+        "handoff": _compact_handoff(handoff.get("handoff")),
+        "decisions": [_decision_view(item) for item in decision_rows[:10]],
+        "decisions_total": len(decision_rows),
+        "decisions_truncated": len(decision_rows) > 10,
+        "decisions_next_action": (
+            "Call decision_list for the omitted durable decisions."
+            if len(decision_rows) > 10 else None),
+        "recent_activity": _compact_activity(
+            handoff.get("recent_activity")),
+        "recent_room": messages(recent_rows, 20, body_limit=180),
+        "tasks": [_task_view(task) for task in task_rows[:25]],
+        "tasks_total": len(task_rows),
+        "tasks_truncated": len(task_rows) > 25,
+        "tasks_next_action": (
+            "Call task_list for the omitted open tasks."
+            if len(task_rows) > 25 else None),
         "actor": (status.get("you") or {}).get("actor_id"),
         "actor_role": actor_record.get("role"),
         "counts": status.get("counts"),
@@ -3599,7 +3988,7 @@ def _mcp_snapshot(status, plugin_root, config, mark_inbox_read=True):
         {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
          "params": {"name": "check_inbox",
                     "arguments": {"mark_read": bool(mark_inbox_read),
-                                  "limit": 100}}},
+                                  "limit": STARTUP_INBOX_PAGE_SIZE}}},
         {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
          "params": {"name": "room_read", "arguments": {"limit": 50}}},
         {"jsonrpc": "2.0", "id": 6, "method": "tools/call",
@@ -3852,18 +4241,24 @@ def _offline_session_payload(status, adapter, entry=None, failure=None,
             "client_mutation_id", "operation", "client_sequence",
             "created_at", "sync_state")}
 
-    def compact_decision(item):
-        return {key: item.get(key) for key in (
-            "decision_id", "title", "status", "rationale", "resolved_at")}
-
     def compact_room(item):
-        return {"seq": item.get("seq"), "actor": (
+        body, truncated = _head_tail_text(
+            item.get("body"), STARTUP_UNREAD_BODY_LIMIT,
+            "call room_read with since_seq=%s before relying on the omitted "
+            "message text" % max(0, int(item.get("seq") or 1) - 1))
+        return {"event_id": item.get("event_id"),
+                "seq": item.get("seq"), "actor": (
                     item.get("actor") or item.get("actor_id")),
                 "type": item.get("msg_type"),
-                "body": _trim(item.get("body"), 500),
+                "body": body,
+                "body_truncated": truncated,
                 "task_id": item.get("task_id"),
                 "mentions": item.get("mentions"),
                 "reply_to": item.get("reply_to"),
+                "addressed_to_you": item.get("addressed_to_you"),
+                "broadcast_to_everyone": item.get(
+                    "broadcast_to_everyone"),
+                "group_context": item.get("group_context"),
                 "origin_project": item.get("origin_project"),
                 "authority": item.get("authority")}
 
@@ -3876,6 +4271,45 @@ def _offline_session_payload(status, adapter, entry=None, failure=None,
         return {key: item.get(key) for key in (
             "project_a", "project_b", "boss_project", "advisor_project",
             "relation", "access_a", "access_b")}
+
+    room_rows = [dict(item) for item in
+                 (snapshot.get("room_messages") or [])
+                 if isinstance(item, dict)]
+    aliases = {actor_id}
+    aliases.update(
+        item.get("legacy_actor_id") for item in
+        (snapshot.get("actor_aliases") or [])
+        if isinstance(item, dict) and
+        item.get("canonical_actor_id") == actor_id and
+        item.get("legacy_actor_id"))
+    by_id = {item.get("event_id"): item for item in room_rows}
+    inbox_cursor = int(
+        (snapshot.get("inbox_cursor") or {}).get("last_read_seq") or 0)
+    unread_rows = []
+    for item in room_rows:
+        sender = item.get("actor") or item.get("actor_id")
+        if int(item.get("seq") or 0) <= inbox_cursor or sender in aliases:
+            continue
+        mentions = set(item.get("mentions") or [])
+        mentioned = bool(aliases.intersection(mentions))
+        reply = by_id.get(item.get("reply_to")) or {}
+        replied = bool(item.get("reply_to") and
+                       (reply.get("actor") or reply.get("actor_id")) in aliases)
+        broadcast = bool(
+            item.get("msg_type") in ("chat", "directive") and
+            not mentions and not item.get("reply_to"))
+        addressed = mentioned or replied or broadcast
+        item.update({
+            "addressed_to_you": addressed,
+            "broadcast_to_everyone": broadcast,
+            "group_context": not addressed,
+        })
+        unread_rows.append(item)
+    unread_page = unread_rows[:STARTUP_INBOX_PAGE_SIZE]
+    unread_keys = {_message_key(item) for item in unread_page}
+    recent_rows = [item for item in room_rows
+                   if _message_key(item) not in unread_keys][-20:]
+    compact_rules, omitted_rules = _compact_rule_list(rules)
 
     cursor = proof["cursor"]
     verified_at = proof["mirror_verified_at"]
@@ -3900,25 +4334,44 @@ def _offline_session_payload(status, adapter, entry=None, failure=None,
             "authority_verified": identity_verified,
             "warning": None,
         },
-        "project_rules": rules,
+        "project_rules": compact_rules,
+        "project_rules_omitted_count": omitted_rules,
+        "project_rules_next_action": (
+            "STOP before other work and read cached rule_list; omitted rules "
+            "remain binding." if omitted_rules else None),
         # Cloud Context is part of the verified identity projection. Keep it
         # ahead of operational lists so a host context cap cannot erase the
         # project's durable background during an outage.
-        "cloud_context": snapshot.get("cloud_context"),
+        "cloud_context": _compact_cloud_context(
+            snapshot.get("cloud_context")),
         "room_protocol": (
             "The room is a group conversation. Read every visible message; "
             "mentions/replies assign attention, not visibility, and an "
             "unaddressed chat/directive is broadcast to everyone."),
-        "handoff": latest_handoff,
+        "unread_room": [compact_room(item) for item in unread_page],
+        "unread_room_counts": {
+            "total": len(unread_page),
+            "addressed": sum(bool(item.get("addressed_to_you"))
+                             for item in unread_page),
+            "everyone": sum(bool(item.get("broadcast_to_everyone"))
+                            for item in unread_page),
+            "group_context": sum(bool(item.get("group_context"))
+                                 for item in unread_page),
+        },
+        "unread_room_may_have_more": len(unread_rows) > len(unread_page),
+        "unread_room_next_action": (
+            "Call cached check_inbox again before other work; more unread "
+            "group messages remain behind this page."
+            if len(unread_rows) > len(unread_page) else None),
+        "offline_read_cursor_deferred": True,
+        "handoff": _compact_handoff(latest_handoff),
         "tasks": [_task_view(item) for item in
-                  (snapshot.get("tasks") or [])[:100]
+                  (snapshot.get("tasks") or [])[:50]
                   if isinstance(item, dict)],
-        "decisions": [compact_decision(item) for item in
-                      (snapshot.get("decisions") or [])[:100]
+        "decisions": [_decision_view(item) for item in
+                      (snapshot.get("decisions") or [])[:20]
                       if isinstance(item, dict)],
-        "recent_room": [compact_room(item) for item in
-                        (snapshot.get("room_messages") or [])[-100:]
-                        if isinstance(item, dict)],
+        "recent_room": [compact_room(item) for item in recent_rows],
         "agents": [compact_agent(item) for item in
                    (snapshot.get("agents") or [])[:100]
                    if isinstance(item, dict)],
@@ -3988,6 +4441,11 @@ def _offline_failure_output(status, config, event_name, err, adapter,
         "reconciliation confirms it. The machine-global watcher retries with "
         "backoff and injects accepted/conflict results.\n\n%s" %
         json.dumps(brief, indent=2, ensure_ascii=False))
+    rules_banner = _mandatory_rules_banner(
+        brief.get("project_rules"),
+        pre_omitted=brief.get("project_rules_omitted_count"))
+    if rules_banner:
+        context = rules_banner + "\n\n" + context
     return _event_context_output(
         event_name,
         "Attacca offline · %s · verified local mirror active; work may continue"
@@ -4132,6 +4590,10 @@ The authoritative startup snapshot has already been loaded:
 
 %s""" % (workspace_name, prior, setup_entry, default,
           json.dumps(brief, indent=2, ensure_ascii=False))
+    rules_banner = _mandatory_rules_banner(
+        (snapshot.get("rules") or {}).get("rules"))
+    if rules_banner:
+        context = rules_banner + "\n\n" + context
     return _event_context_output(
         "SessionStart",
         "Attacca linked · %s · first-run AI role setup required"
@@ -4222,13 +4684,15 @@ handoff before further writes.
                 % status["project_id"], context)
         # These are additive: neither version discovery nor managed-block
         # maintenance may prevent delivery of the authoritative shared state.
+        # Deliver the durable watcher FIFO first so lower-priority update and
+        # migration notices cannot consume its reserved context budget.
+        output = _append_notice(output, pending_notice)
         output = _append_notice(
-            output, _refresh_managed_laws(status, plugin_root))
+            output, _refresh_managed_laws(status, plugin_root, config=config))
         output = _append_notice(
             output, update_notice)
         output = _append_notice(output, watcher_notice)
         output = _append_notice(output, terminal_notice)
-        output = _append_notice(output, pending_notice)
         return output
     except StaleProjectLink as err:
         set_offered(status["root"], stale_project_id=status["project_id"])
@@ -4261,7 +4725,7 @@ handoff before further writes.
             if output is None:
                 output = _failure_output(status, config, "SessionStart", err)
             trailing_notices = (
-                update_notice, watcher_notice, terminal_notice, pending_notice)
+                pending_notice, update_notice, watcher_notice, terminal_notice)
         return _append_notices(
             output, "SessionStart",
             trailing_notices)
@@ -4328,16 +4792,21 @@ def _change_summary(status, previous, current, snapshot, interval):
             if message.get("origin_project") else ""
         authority = " [%s]" % message["authority"] \
             if message.get("authority") else ""
-        if message.get("addressed_to_you"):
-            label = "Direct room message"
-        elif message.get("broadcast_to_everyone"):
+        if message.get("broadcast_to_everyone"):
             label = "Everyone room broadcast"
+        elif message.get("directed_to_you"):
+            label = "Direct room message"
         else:
             label = "Group room context"
-        group_details.append("%s%s%s · %s: %s" % (
+        body = str(message.get("body") or "")
+        excerpt, _ = _head_tail_text(
+            body, WATCHER_ROOM_BODY_LIMIT,
+            "call room_read with since_seq=%s for the complete message" %
+            max(0, int(message.get("seq") or 1) - 1))
+        group_details.append("%s #%s%s%s · %s: %s" % (
             label,
-            source, authority, message.get("actor") or "unknown",
-            _trim(message.get("body"), 500)))
+            message.get("seq") or "?", source, authority,
+            message.get("actor") or "unknown", excerpt))
     old_room = set(previous.get("room_keys") or [])
     new_room = [message for message in
                 ((snapshot.get("room") or {}).get("messages") or [])
@@ -4351,9 +4820,14 @@ def _change_summary(status, previous, current, snapshot, interval):
             if message.get("origin_project") else ""
         target = " to %s" % ", ".join(message.get("mirrored_to") or []) \
             if message.get("mirrored_to") else ""
-        group_details.append("Group room context%s%s · %s: %s" % (
-            source, target, message.get("actor") or "unknown",
-            _trim(message.get("body"), 500)))
+        body = str(message.get("body") or "")
+        excerpt, _ = _head_tail_text(
+            body, WATCHER_ROOM_BODY_LIMIT,
+            "call room_read with since_seq=%s for the complete message" %
+            max(0, int(message.get("seq") or 1) - 1))
+        group_details.append("Group room context #%s%s%s · %s: %s" % (
+            message.get("seq") or "?", source, target,
+            message.get("actor") or "unknown", excerpt))
 
     task_lines = _task_change_lines(previous.get("tasks"), current.get("tasks"))
     if task_lines:
@@ -4443,11 +4917,13 @@ def _periodic_output(status, event_name, offline_adapter=None,
         # Project Rules must still be re-pinned at the start of every
         # response so they never fall out of a long conversation.
         banner_output = None
-        if event_name == "UserPromptSubmit":
+        if event_name == "UserPromptSubmit" or (
+                event_name == "Stop" and any(notices)):
             _identity, _entry = _poll_entry(status, config)
             _snap = (_entry or {}).get("snapshot") or {}
             _rules_banner = _mandatory_rules_banner(
-                _snap.get("project_rules"))
+                _snap.get("project_rules"),
+                pre_omitted=_snap.get("project_rules_omitted_count"))
             if _rules_banner:
                 banner_output = _event_context_output(
                     event_name,
@@ -4456,32 +4932,68 @@ def _periodic_output(status, event_name, offline_adapter=None,
         return _append_notices(banner_output, event_name, notices)
     interval = _settings_interval(config, entry=offline_entry)
     identity, entry = _poll_entry(status, config)
+    cached_rules_output = None
+    if event_name == "UserPromptSubmit" or (
+            event_name == "Stop" and any(notices)):
+        cached_poll = (entry or {}).get("snapshot") or {}
+        cached_banner = _mandatory_rules_banner(
+            cached_poll.get("project_rules"),
+            pre_omitted=cached_poll.get("project_rules_omitted_count"))
+        if cached_banner:
+            cached_rules_output = _event_context_output(
+                event_name, "Attacca · mandatory project rules pinned",
+                cached_banner)
     # Polling Off still allows Kimi's first native prompt to validate the link
     # and refresh managed laws once; subsequent prompts remain off.
     if interval == 0 and not (is_kimi_prompt and not entry):
-        return _append_notices(None, event_name, notices)
+        return _append_notices(cached_rules_output, event_name, notices)
     checked_at = time.time()
     last_poll_at = entry.get("last_poll_at")
     elapsed = checked_at - last_poll_at \
         if isinstance(last_poll_at, (int, float)) else None
     if elapsed is not None and 0 <= elapsed < interval:
-        return _append_notices(None, event_name, notices)
+        return _append_notices(cached_rules_output, event_name, notices)
     try:
         snapshot = _mcp_snapshot(status, plugin_root, config)
         _watcher_activate_after_mcp(status, config, snapshot)
         # Kimi has no command SessionStart hook. Refresh laws only after the
         # saved workspace has been validated by the successful MCP snapshot.
-        law_notice = _refresh_managed_laws(status, plugin_root) \
+        law_notice = _refresh_managed_laws(
+            status, plugin_root, config=config) \
             if is_kimi_prompt else None
         notices = (law_notice, update_notice, terminal_notice)
         current = _poll_view(snapshot)
         previous = entry.get("snapshot") if entry else None
         _record_poll(status, identity, interval, checked_at, current)
+        rules_output = None
+        if event_name == "UserPromptSubmit":
+            rules_banner = _mandatory_rules_banner(
+                (snapshot.get("rules") or {}).get("rules"))
+            if rules_banner:
+                rules_output = _event_context_output(
+                    event_name,
+                    "Attacca · mandatory project rules pinned",
+                    rules_banner)
         summary = _change_summary(status, previous, current, snapshot, interval)
+        if summary and event_name == "Stop" and not rules_output:
+            rules_banner = _mandatory_rules_banner(
+                (snapshot.get("rules") or {}).get("rules"))
+            if rules_banner:
+                rules_output = _event_context_output(
+                    event_name,
+                    "Attacca · mandatory project rules pinned",
+                    rules_banner)
         if not summary:
-            return _append_notices(None, event_name, notices)
-        output = _event_context_output(
-            event_name, "Attacca update · shared project state changed", summary)
+            return _append_notices(rules_output, event_name, notices)
+        if rules_output:
+            output = _append_notice(rules_output, {
+                "system_message": "Attacca update · shared project state changed",
+                "context": summary,
+            })
+        else:
+            output = _event_context_output(
+                event_name,
+                "Attacca update · shared project state changed", summary)
         return _append_notices(output, event_name, notices)
     except StaleProjectLink as err:
         set_offered(status["root"], stale_project_id=status["project_id"])

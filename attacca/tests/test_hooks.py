@@ -716,7 +716,7 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                     status, ROOT, config))
             self.assertFalse(Path(status["state_path"]).exists())
 
-    def test_equal_version_changed_managed_laws_offer_one_exact_bundle_update(self):
+    def test_equal_binary_version_law_change_never_offers_binary_reinstall(self):
         with tempfile.TemporaryDirectory() as tmp:
             data = Path(tmp)
             status = {"state_path": str(data / hook_module.STATE_NAME)}
@@ -734,19 +734,12 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                     hook_module, "_server_release",
                     return_value={"version": c.VERSION,
                                   "managed_instructions": server_laws}):
-                first = hook_module._update_offer(status, ROOT, config)
-                self.assertIn("managed laws changed", first["context"])
                 self.assertIsNone(hook_module._update_offer(
                     status, ROOT, config))
-            state = json.loads(Path(status["state_path"]).read_text())
-            entry = state["updates"]["http://server"][c.VERSION]
-            self.assertEqual(entry["reason"], "managed_law_update")
-            self.assertEqual(entry["offer_count"], 1)
+            self.assertFalse(Path(status["state_path"]).exists())
 
-            # Content at the same software version is a distinct exact bundle;
-            # an earlier Skip/reminder cannot suppress its new fingerprint.
-            hook_module.set_update_choice(
-                data, "http://server", c.VERSION, "skip")
+            # Hash-only law changes also use the server-law refresh path; they
+            # never create an executable install choice or restart request.
             server_laws["sha256"] = "c" * 64
             with mock.patch.object(
                     hook_module, "_local_version", return_value=c.VERSION), \
@@ -757,11 +750,11 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                     hook_module, "_server_release",
                     return_value={"version": c.VERSION,
                                   "managed_instructions": server_laws}):
-                changed_again = hook_module._update_offer(
-                    status, ROOT, config)
-            self.assertIsNotNone(changed_again)
+                self.assertIsNone(hook_module._update_offer(
+                    status, ROOT, config))
+            self.assertFalse(Path(status["state_path"]).exists())
 
-    def test_same_managed_law_version_changed_hash_offers_update(self):
+    def test_same_managed_law_version_changed_hash_never_offers_reinstall(self):
         with tempfile.TemporaryDirectory() as tmp:
             status = {"state_path": str(
                 Path(tmp) / hook_module.STATE_NAME)}
@@ -780,8 +773,8 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                     return_value={"version": c.VERSION,
                                   "managed_instructions": server_laws}):
                 offer = hook_module._update_offer(status, ROOT, config)
-            self.assertIsNotNone(offer)
-            self.assertIn("managed laws changed", offer["context"])
+            self.assertIsNone(offer)
+            self.assertFalse(Path(status["state_path"]).exists())
 
     def test_older_server_managed_laws_never_offer_a_downgrade(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -870,8 +863,8 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                         return_value={"version": c.VERSION,
                                       "managed_instructions": server_laws}):
                     offer = hook_module._update_offer(status, ROOT, config)
-                self.assertEqual(offer is not None, expected)
-                self.assertEqual(Path(status["state_path"]).exists(), expected)
+                self.assertIsNone(offer)
+                self.assertFalse(Path(status["state_path"]).exists())
 
     def test_unlinked_project_offers_update_before_setup_and_then_honors_skip(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1045,12 +1038,15 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                     {"file": str(checkout / "CLAUDE.md"), "changed": False,
                      "status": "unsafe_symlink", "action": "outside root"},
                 ]}
+            law = c.managed_law_payload("shared", None)
             with mock.patch.object(
-                    hook_module, "_managed_law_adapter",
+                    hook_module, "_server_managed_law_adapter",
                     return_value=result) as adapter:
-                notice = hook_module._refresh_managed_laws(status, ROOT)
+                notice = hook_module._refresh_managed_laws(
+                    status, ROOT, config={"url": "http://server"},
+                    fetcher=lambda config, project: law)
             adapter.assert_called_once_with(
-                ROOT, "shared", str(checkout), None)
+                ROOT, "shared", str(checkout), law)
             self.assertIn("AGENTS.md", notice["context"])
             self.assertIn("outside root", notice["context"])
             base = hook_module._event_context_output(
@@ -1085,13 +1081,16 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                 "project_id": "shared", "root": str(nested),
                 "link_path": str(link),
             }
-            notice = hook_module._refresh_managed_laws(status, ROOT)
+            notice = hook_module._refresh_managed_laws(
+                status, ROOT, config={"url": "http://server"},
+                fetcher=lambda config, project: c.managed_law_payload(
+                    project, None))
             self.assertIsNotNone(notice)
             self.assertEqual(agents.read_text(), before + desired + after)
             self.assertIn("AGENTS.md", notice["context"])
 
-    def test_managed_law_v9_auto_refreshes_to_v10_without_touching_user_bytes(self):
-        self.assertEqual(c.MANAGED_BLOCK_VERSION, 10)
+    def test_managed_law_v10_auto_refreshes_to_v11_without_touching_user_bytes(self):
+        self.assertEqual(c.MANAGED_BLOCK_VERSION, 11)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             checkout = root / "repo"
@@ -1102,8 +1101,8 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                 "schema_version": 1, "project_id": "shared"}))
             desired = c.managed_instruction_block("shared", None)
             previous = desired.replace(
-                "MANAGED_ATTACCA:BEGIN v=10",
-                "MANAGED_ATTACCA:BEGIN v=9", 1).replace(
+                "MANAGED_ATTACCA:BEGIN v=11",
+                "MANAGED_ATTACCA:BEGIN v=10", 1).replace(
                     "compact banner at the TOP of every turn",
                     "read the `project_rules` in the startup brief before",
                     1)
@@ -1114,7 +1113,10 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             status = {"project_id": "shared", "root": str(checkout),
                       "link_path": str(link)}
 
-            notice = hook_module._refresh_managed_laws(status, ROOT)
+            notice = hook_module._refresh_managed_laws(
+                status, ROOT, config={"url": "http://server"},
+                fetcher=lambda config, project: c.managed_law_payload(
+                    project, None))
 
             self.assertIsNotNone(notice)
             self.assertEqual(agents.read_text(), prefix + desired + suffix)

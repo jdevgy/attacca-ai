@@ -15,7 +15,8 @@ Call Attacca's unscoped `list_projects` tool first. For a linked checkout, call
 all of these MCP tools before other work:
 
 1. `get_handoff`
-2. `check_inbox` with `mark_read: true`
+2. `check_inbox` with `mark_read: true`; process every returned page and keep
+   calling while `may_have_more` is true
 3. `room_read`
 4. `task_list`
 5. `attacca_status`
@@ -64,8 +65,13 @@ role prompt.
   claim one, declaring the expected file scope; coordinate any overlap in the
   room first.
 - Announce intent and questions with `room_send`, and use `room_read` for
-  replies. Treat addressed `[MASTER-DIRECTIVE]` messages as binding;
-  `[SUGGESTION]` and `[ADVICE]` are input, not orders.
+  replies. Read every visible non-self inbox message. Mentions and replies
+  assign attention or an expected responder only; they do not hide the message
+  from other room participants. An untargeted `chat` or `directive` is an
+  everyone-broadcast. Keep messages routed to another participant as shared
+  group context. Bridge participation and access policy are the privacy
+  boundary. Honor `[MASTER-DIRECTIVE]` for its expected responder, or for
+  everyone when broadcast; `[SUGGESTION]` and `[ADVICE]` are input, not orders.
 - Record durable choices with `decision_propose` and `decision_resolve`, not
   only in chat.
 - On `stale_context_warning`, reload `get_handoff` before another write.
@@ -74,7 +80,7 @@ role prompt.
   next actions; Advisors and Workers report through the task and room instead
   of attempting a director-only handoff update.
 
-The machine-global background watcher polls shared changes every five minutes
+The machine-global background watcher polls shared changes every minute
 by default even while Kimi is idle and queues them durably. Inline
 `UserPromptSubmit` and `Stop` hooks inject that queue at the next supported turn
 boundary; setup and SessionStart also ensure the watcher is still running.

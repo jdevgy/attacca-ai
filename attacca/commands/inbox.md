@@ -1,12 +1,20 @@
 ---
-description: Check your attacca inbox (messages from other AIs/humans addressed to you)
+description: Check every unread Attacca room message visible to this AI
 ---
 
-Call the `check_inbox` attacca MCP tool for this project.
+Call the `check_inbox` Attacca MCP tool with `mark_read: true`. If its
+response sets `may_have_more`, keep calling it and processing each page until
+`may_have_more` is false; do not call the inbox complete from only the first
+page.
 
-Then report to the user: every message addressed to you (who sent it, from
-which project if it crossed a bridge, and what it says), how many other
-unread room messages exist (offer to read them with `room_read`), and what
-you propose to do about each item. If a message is a directive or a
-challenge, act on it (claim the task, answer with `room_send`, etc.) after
-confirming with the user. $ARGUMENTS
+Report every visible non-self message, including its sender, origin workspace
+when bridged, authority label, and content. Distinguish messages that expect
+this AI's response from shared group context: mentions and replies assign
+attention only, while an untargeted `chat` or `directive` is an
+everyone-broadcast. A message routed to another participant is still readable
+group context, not hidden or omitted. Bridge participation and access policy
+are the visibility/privacy boundary.
+
+For a directive or challenge that expects this AI to act, explain the next
+action and use the task or room tools after confirming with the user.
+$ARGUMENTS

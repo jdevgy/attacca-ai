@@ -119,8 +119,14 @@ class HttpTestCase(unittest.TestCase):
         self.assertIn("Inter-project", panel)
         self.assertIn("↔", panel)
         self.assertIn("swap-room-workspace", panel)
-        self.assertIn("This inbox belongs only to", panel)
-        self.assertIn("other actors have separate inboxes", panel)
+        self.assertIn(
+            "Every participation-visible non-self message appears here",
+            panel)
+        self.assertIn(
+            "mentions and replies only assign attention", panel)
+        self.assertIn("Mark group room read", panel)
+        self.assertNotIn("This inbox belongs only to", panel)
+        self.assertNotIn("other actors have separate inboxes", panel)
         self.assertIn("message.origin_project === activeBridge.with", panel)
         self.assertIn("includes(activeBridge.with)", panel)
         self.assertNotIn("All room activity", panel)
@@ -133,7 +139,9 @@ class HttpTestCase(unittest.TestCase):
         self.assertIn('[workspace, role, runtime].map(identityPart).join(" · ")',
                       panel)
         self.assertIn("Workspace · Role · Runtime", panel)
-        self.assertIn("Human actions identify the human once", panel)
+        self.assertIn(
+            "remain separate, exact identities; a terminal credential never "
+            "renames or impersonates them", panel)
         self.assertIn("Run by user", panel)
         self.assertNotIn('placeholder="analytics-admin.director.web"', panel)
         self.assertIn("Signed in: ${account.display_name || account.username}",
@@ -227,9 +235,11 @@ class HttpTestCase(unittest.TestCase):
         self.assertIn("const claimant = attribution.current_claimant ||", panel)
         self.assertIn("const claimantText = taskClaimantText(task);", panel)
         self.assertNotIn("Claimant AI", panel)
+        # D-18 renders each group message in the room feed and relationship
+        # evidence; the former separate per-actor inbox renderer was removed.
         self.assertGreaterEqual(panel.count(
             "attributionText(message.actor, message.actor_type, "
-            "message.owner, message.attribution)"), 3)
+            "message.owner, message.attribution)"), 2)
         self.assertIn(
             "attributionText(operational, event.actor_type, event.owner, "
             "event.attribution)", panel)
@@ -1751,15 +1761,16 @@ class ConnectProxyTestCase(unittest.TestCase):
         cls.tmp.cleanup()
 
     def _proxy(self, url=None, cwd=None):
+        fixture_url = url or self.server.base
         env = dict(os.environ)
         env.pop("CLAUDE_PROJECT_DIR", None)
         env.pop("ATTACCA_PROJECT", None)
         env["ATTACCA_DB"] = str(self.db)
-        env["ATTACCA_URL"] = url or self.server.base
+        env["ATTACCA_URL"] = fixture_url
         env["ATTACCA_ACTOR"] = "proxy_actor"
         env["ATTACCA_AUTOSTART"] = "0"
         return subprocess.Popen(
-            [sys.executable, SCRIPT, "connect"],
+            [sys.executable, SCRIPT, "connect", "--url", fixture_url],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, env=env,
             cwd=str(cwd or self.proj))
@@ -1950,7 +1961,8 @@ class TwoCodexCheckoutFlowTestCase(unittest.TestCase):
         env["ATTACCA_ACTOR"] = actor
         env["ATTACCA_AUTOSTART"] = "0"
         return subprocess.Popen(
-            [sys.executable, SCRIPT, "connect"], stdin=subprocess.PIPE,
+            [sys.executable, SCRIPT, "connect", "--url", server.base],
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             env=env, cwd=str(cwd))
 

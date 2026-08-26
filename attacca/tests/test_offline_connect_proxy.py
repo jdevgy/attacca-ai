@@ -439,6 +439,223 @@ class OfflineConnectProxyBlackBoxTests(unittest.TestCase):
             self.assertIn('"offline": true', serialized.lower(), name)
         self._stop_process(process)
 
+    def test_offline_room_and_inbox_pagination_attention_and_handoff_parity(
+            self):
+        target = "proj.director.codex"
+        other_target = "proj.worker.cline"
+        bodies = {
+            "anchor": "Offline reply anchor from this reader",
+            "everyone": "Offline everyone broadcast",
+            "mention": "Offline direct mention",
+            "reply": "Offline reply to this reader",
+            "other": "Offline group context for another reader",
+        }
+        conn = attacca.connect(self.fx.db)
+        try:
+            attacca.set_current_owner("owner1")
+            anchor = attacca.room_send(
+                conn, "proj", target, "agent", bodies["anchor"])
+            attacca.room_send(
+                conn, "proj", "web.owner1", "human", bodies["everyone"])
+            attacca.room_send(
+                conn, "proj", "web.owner1", "human", bodies["mention"],
+                mentions=[target])
+            attacca.room_send(
+                conn, "proj", "web.owner1", "human", bodies["reply"],
+                reply_to=anchor["event"]["event_id"])
+            attacca.room_send(
+                conn, "proj", "web.owner1", "human", bodies["other"],
+                mentions=[other_target])
+        finally:
+            conn.close()
+
+        status, snapshot, _ = self.fx.request(
+            "GET", "/v1/projects/proj/sync/snapshot",
+            token=self.fx.director_token, device="device_primary")
+        self.assertEqual(status, 200)
+        protocol.validate_snapshot(snapshot)
+        self.snapshot = snapshot
+        self.primary["engine"].install_snapshot(snapshot)
+        cached_room = sorted(
+            snapshot["projection"]["room_messages"],
+            key=lambda item: item["seq"])
+        expected_room_ids = [item["event_id"] for item in cached_room]
+
+        self._stop_hosted_server()
+        process = self._start_proxy()
+        self.assertIn("result", self._initialize(process))
+
+        latest = self._tool(
+            process, "room_read", {"limit": 2}, request_id=100)
+        self.assertEqual(
+            [item["event_id"] for item in latest["messages"]],
+            expected_room_ids[-2:])
+        self.assertTrue(latest["older_messages_available"])
+        self.assertFalse(latest["may_have_more"])
+        self.assertEqual(
+            latest["next_since_seq"], snapshot["cursor"]["event_seq"])
+        self.assertIn("since_seq=0", latest["hint"])
+
+        chronological = []
+        since_seq = 0
+        for page_number in range(1, len(cached_room) + 2):
+            page = self._tool(
+                process, "room_read",
+                {"since_seq": since_seq, "limit": 2},
+                request_id=100 + page_number)
+            page_messages = page["messages"]
+            page_sequences = [item["seq"] for item in page_messages]
+            self.assertEqual(page_sequences, sorted(page_sequences))
+            self.assertTrue(all(seq > since_seq for seq in page_sequences))
+            self.assertFalse(page["older_messages_available"])
+            chronological.extend(page_messages)
+            self.assertEqual(
+                page["next_since_seq"],
+                page_sequences[-1] if page_sequences else since_seq)
+            since_seq = page["next_since_seq"]
+            if not page["may_have_more"]:
+                break
+        else:
+            self.fail("offline room pagination did not converge")
+
+        self.assertEqual(
+            [item["event_id"] for item in chronological],
+            expected_room_ids)
+        self.assertEqual(
+            len(expected_room_ids), len(set(expected_room_ids)))
+        attention_fields = (
+            "mentioned_to_you", "reply_to_you", "directed_to_you",
+            "broadcast_to_everyone", "addressed_to_you", "group_context",
+        )
+        for message in chronological:
+            for field in attention_fields:
+                self.assertIsInstance(message[field], bool, (field, message))
+        by_body = {item["body"]: item for item in chronological}
+        self.assertEqual(
+            {field: by_body[bodies["everyone"]][field]
+             for field in attention_fields},
+            {
+                "mentioned_to_you": False,
+                "reply_to_you": False,
+                "directed_to_you": False,
+                "broadcast_to_everyone": True,
+                "addressed_to_you": True,
+                "group_context": False,
+            })
+        self.assertEqual(
+            {field: by_body[bodies["mention"]][field]
+             for field in attention_fields},
+            {
+                "mentioned_to_you": True,
+                "reply_to_you": False,
+                "directed_to_you": True,
+                "broadcast_to_everyone": False,
+                "addressed_to_you": True,
+                "group_context": False,
+            })
+        self.assertEqual(
+            {field: by_body[bodies["reply"]][field]
+             for field in attention_fields},
+            {
+                "mentioned_to_you": False,
+                "reply_to_you": True,
+                "directed_to_you": True,
+                "broadcast_to_everyone": False,
+                "addressed_to_you": True,
+                "group_context": False,
+            })
+        self.assertEqual(
+            {field: by_body[bodies["other"]][field]
+             for field in attention_fields},
+            {
+                "mentioned_to_you": False,
+                "reply_to_you": False,
+                "directed_to_you": False,
+                "broadcast_to_everyone": False,
+                "addressed_to_you": False,
+                "group_context": True,
+            })
+
+        hosted_cursor = int(
+            snapshot["projection"]["inbox_cursor"]["last_read_seq"])
+        expected_inbox_ids = [
+            item["event_id"] for item in cached_room
+            if item["seq"] > hosted_cursor and item["actor"] != target
+        ]
+        first_peek = self._tool(
+            process, "check_inbox", {"mark_read": False, "limit": 2},
+            request_id=200)
+        repeated_peek = self._tool(
+            process, "check_inbox", {"mark_read": False, "limit": 2},
+            request_id=201)
+        self.assertEqual(first_peek["messages"], repeated_peek["messages"])
+        self.assertEqual(first_peek["read_cursor"], hosted_cursor)
+        self.assertEqual(repeated_peek["read_cursor"], hosted_cursor)
+        self.assertEqual(
+            [item["event_id"] for item in first_peek["messages"]],
+            expected_inbox_ids[:2])
+
+        full_peek = self._tool(
+            process, "check_inbox", {"mark_read": False, "limit": 500},
+            request_id=202)
+        handoff = self._tool(
+            process, "get_handoff", request_id=203)
+        inbox_summary = handoff["your_inbox"]
+        self.assertEqual(
+            inbox_summary["unread_total"], full_peek["unread_total"])
+        self.assertEqual(
+            inbox_summary["unread_addressed_to_you"],
+            full_peek["unread_addressed"])
+        self.assertEqual(
+            inbox_summary["unread_everyone"],
+            full_peek["unread_everyone"])
+        self.assertEqual(
+            inbox_summary["unread_group_context"],
+            full_peek["unread_group_context"])
+        self.assertEqual(
+            inbox_summary["may_have_more"], full_peek["may_have_more"])
+        self.assertTrue(inbox_summary["messages_include_all_visible"])
+        after_handoff_peek = self._tool(
+            process, "check_inbox", {"mark_read": False, "limit": 2},
+            request_id=204)
+        self.assertEqual(
+            after_handoff_peek["messages"], first_peek["messages"])
+        self.assertEqual(after_handoff_peek["read_cursor"], hosted_cursor)
+
+        consumed = []
+        read_cursors = []
+        for page_number in range(1, len(expected_inbox_ids) + 2):
+            page = self._tool(
+                process, "check_inbox",
+                {"mark_read": True, "limit": 2},
+                request_id=204 + page_number)
+            consumed.extend(page["messages"])
+            read_cursors.append(page["read_cursor"])
+            self.assertEqual(page["hosted_read_cursor"], hosted_cursor)
+            if not page["may_have_more"]:
+                break
+        else:
+            self.fail("offline inbox pagination did not converge")
+        consumed_ids = [item["event_id"] for item in consumed]
+        self.assertEqual(consumed_ids, expected_inbox_ids)
+        self.assertEqual(len(consumed_ids), len(set(consumed_ids)))
+        self.assertEqual(read_cursors, sorted(set(read_cursors)))
+        for message in consumed:
+            for field in attention_fields:
+                self.assertIsInstance(message[field], bool, (field, message))
+
+        drained = self._tool(
+            process, "check_inbox", {"mark_read": True, "limit": 2},
+            request_id=300)
+        drained_peek = self._tool(
+            process, "check_inbox", {"mark_read": False, "limit": 2},
+            request_id=301)
+        self.assertEqual(drained["messages"], [])
+        self.assertFalse(drained["may_have_more"])
+        self.assertEqual(drained_peek["messages"], [])
+        self.assertEqual(drained_peek["read_cursor"], drained["read_cursor"])
+        self._stop_process(process)
+
     def test_allowlisted_mutations_queue_and_unsupported_tools_fail_closed(self):
         self._stop_hosted_server()
         process = self._start_proxy()

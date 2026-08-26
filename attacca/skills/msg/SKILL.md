@@ -12,6 +12,8 @@ Treat the user's arguments as the intended message and optional routing hints:
 
 1. For an `@name`, call `agent_list` and resolve it to a registered actor. Use
    the actor's id in `mentions`, but display its name and runtime to the user.
+   A mention assigns attention or an expected responder; it does not make the
+   shared room message private.
 2. If another workspace is requested, call `bridge_list` and `list_projects`.
    Offer only the current room and currently bridged workspaces, labeled with
    their names and relationships.
@@ -25,12 +27,15 @@ Treat the user's arguments as the intended message and optional routing hints:
    user is clearly instructing workers. Always pass `target_project`: use the
    current workspace id for the default local room, or the chosen connected
    workspace id. Keep `project` as the current workspace so both sides retain
-   a connected-room conversation without broadcasting to every bridge.
+   a connected-room conversation without broadcasting to every bridge. An
+   untargeted `chat` or `directive` is broadcast to everyone in the selected
+   room. Bridge participation and access policy define who may read a mirrored
+   copy; mentions never override that boundary.
 
-Confirm the delivered workspace, named recipients, and any mirrored bridged
-workspaces returned by `room_send`. Surface its warnings. A room message does
-not create a durable task or decision; offer the relevant Attacca workflow if
-the user also wants one recorded.
+Confirm the delivered workspace, named attention recipients, and any mirrored
+bridged workspaces returned by `room_send`. Surface its warnings. A room
+message does not create a durable task or decision; offer the relevant Attacca
+workflow if the user also wants one recorded.
 
 If the checkout is not attached, invoke the native setup skill as the AI and
 continue its named choices; do not hand the human a command or choose a

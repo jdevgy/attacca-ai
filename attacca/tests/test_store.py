@@ -512,8 +512,12 @@ class StoreTestCase(unittest.TestCase):
         c.room_send(self.conn, "p1", "carol", "agent", "random broadcast")
         inbox = c.inbox_read(self.conn, "p1", "bob")
         bodies = [m["body"] for m in inbox["messages"]]
-        self.assertEqual(bodies, ["hey bob", "answering you"])
-        self.assertEqual(inbox["unread_broadcasts"], 1)
+        self.assertEqual(
+            bodies, ["hey bob", "answering you", "random broadcast"])
+        self.assertEqual(inbox["unread_total"], 3)
+        self.assertEqual(inbox["unread_everyone"], 1)
+        self.assertTrue(inbox["messages"][-1]["broadcast_to_everyone"])
+        self.assertEqual(inbox["unread_broadcasts"], 0)
         # cursor persisted: second read is empty
         again = c.inbox_read(self.conn, "p1", "bob")
         self.assertEqual(again["messages"], [])
@@ -591,7 +595,7 @@ class StoreTestCase(unittest.TestCase):
                 self.conn, p2, "director", "agent", "cannot jump",
                 target_project=p3)
 
-    def test_interproject_system_is_inbox_but_chat_and_status_are_broadcasts(self):
+    def test_interproject_group_inbox_classifies_system_chat_and_status(self):
         p2 = self._second_project("inbox-target")
         c.bridge_add(self.conn, "p1", "admin", "human", p2)
         c.agent_register(
@@ -607,8 +611,11 @@ class StoreTestCase(unittest.TestCase):
         inbox = c.inbox_read(self.conn, p2, "p2.worker.codex",
                              mark_read=False)
         self.assertEqual([m["body"] for m in inbox["messages"]],
-                         ["schema changed"])
+                         ["schema changed", "hello", "green"])
         self.assertEqual(inbox["unread_broadcasts"], 2)
+        self.assertTrue(inbox["messages"][0]["group_context"])
+        self.assertTrue(inbox["messages"][1]["broadcast_to_everyone"])
+        self.assertTrue(inbox["messages"][2]["group_context"])
         structured = inbox["messages"][0]
         self.assertEqual(structured["actor"], "p1.director.claude")
         self.assertEqual(structured["ledger_actor"],

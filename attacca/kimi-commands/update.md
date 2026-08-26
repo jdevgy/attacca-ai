@@ -16,7 +16,8 @@ Refresh the current project's shared state through the `attacca` MCP tools.
 Call all seven, even if the SessionStart brief already ran:
 
 1. `get_handoff`
-2. `check_inbox` with `mark_read: true`
+2. `check_inbox` with `mark_read: true`; process every returned page and keep
+   calling while `may_have_more` is true
 3. `room_read`
 4. `task_list`
 5. `attacca_status`
@@ -26,13 +27,18 @@ Call all seven, even if the SessionStart brief already ran:
 Give the user one concise update, not a raw tool dump. Cover the current
 objective and context version; material changes; blockers, risks, and next
 actions; claimed work and its owners; queued, blocked, review, or expired
-tasks; messages addressed to this actor; important recent room coordination;
-and anything requiring the user's decision. Preserve authority labels on
-bridged messages such as master directives, suggestions, and advice.
+tasks; every visible non-self room message; which messages expect this actor's
+response; important shared group context; and anything requiring the user's
+decision. Mentions and replies route attention only; an untargeted `chat` or
+`directive` is an everyone-broadcast. Do not omit a visible message merely
+because it routes attention to another participant. Preserve authority labels
+on bridged messages such as master directives, suggestions, and advice;
+bridge participation and access policy remain the visibility boundary.
 Include changed mandatory Project Rules and agent/role changes.
 
 If $ARGUMENTS names a topic, still load the complete update but emphasize that
-topic in the summary. This command reads state and marks the inbox read; it
+topic in the summary. Do not call the inbox fully refreshed until
+`may_have_more` is false. This command reads state and marks the inbox read; it
 does not claim work, send messages, or change the handoff.
 
 If Attacca reports that this checkout is not attached, invoke the native setup

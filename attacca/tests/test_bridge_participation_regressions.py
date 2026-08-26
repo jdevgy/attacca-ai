@@ -485,12 +485,9 @@ class BridgeParticipationRegressionTest(unittest.TestCase):
         first_inbox = c.inbox_read(
             self.conn, "beta", beta["worker"], mark_read=True, limit=1,
             actor_type="agent")
-        self.assertEqual(first_inbox["messages"], [])
-        self.assertEqual(first_inbox["read_cursor"], hidden_seq)
-        second_inbox = c.inbox_read(
-            self.conn, "beta", beta["worker"], mark_read=True, limit=1,
-            actor_type="agent")
-        self.assertIn(visible_marker, json.dumps(second_inbox))
+        self.assertIn(visible_marker, json.dumps(first_inbox))
+        self.assertGreater(first_inbox["read_cursor"], hidden_seq)
+        self.assertFalse(first_inbox["may_have_more"])
 
     def test_initial_room_page_backfills_past_hidden_newer_rows(self):
         alpha = self.actors["alpha"]
@@ -511,6 +508,218 @@ class BridgeParticipationRegressionTest(unittest.TestCase):
             [message["body"] for message in first_page["messages"]],
             [visible_marker])
         self.assertNotIn(hidden_marker, json.dumps(first_page))
+
+    def test_new_local_marker_prevents_legacy_inference_collision(self):
+        alpha = self.actors["alpha"]
+        self._bridge("directors", "directors")
+        marker = "identicaltargetedandlocalprobe"
+
+        c.room_send(
+            self.conn, "alpha", alpha["director"], "agent", marker,
+            target_project="beta")
+        local = c.room_send(
+            self.conn, "alpha", alpha["director"], "agent", marker)
+        local_seq = local["event"]["seq"]
+
+        stored = self.conn.execute(
+            "SELECT seq,payload FROM events WHERE project_id='alpha'"
+            " AND event_type='room.message' ORDER BY seq").fetchall()
+        matching = [
+            (row["seq"], json.loads(row["payload"])) for row in stored
+            if json.loads(row["payload"]).get("body") == marker
+        ]
+        self.assertEqual(len(matching), 2)
+        self.assertEqual(matching[0][1]["mirrored_to"], ["beta"])
+        self.assertEqual(matching[1], (
+            local_seq,
+            {"body": marker, "mirrored_to": [], "msg_type": "chat"},
+        ))
+
+        room = c.room_read(
+            self.conn, "alpha", actor_id=alpha["worker"],
+            actor_type="agent")
+        inbox = c.inbox_read(
+            self.conn, "alpha", alpha["worker"], mark_read=False,
+            actor_type="agent")
+        for surface in (room["messages"], inbox["messages"]):
+            visible = [message for message in surface
+                       if message.get("body") == marker]
+            self.assertEqual([message["seq"] for message in visible],
+                             [local_seq])
+            self.assertEqual(visible[0]["mirrored_to"], [])
+            self.assertNotIn("mirrored_to_inferred", visible[0])
+
+    def test_removed_bridge_does_not_declassify_legacy_source_message(self):
+        alpha = self.actors["alpha"]
+        self._bridge("directors", "directors")
+        marker = "removedbridgelegacyprivacyprobe"
+        source_payload = {
+            "msg_type": "directive", "body": marker,
+            "mentions": [], "reply_to": None,
+        }
+        c.append_event(
+            self.conn, "alpha", alpha["director"], "agent",
+            "room.message", source_payload)
+        c.append_event(
+            self.conn, "beta", alpha["director"], "agent",
+            "room.message", dict(source_payload, origin_project="alpha"))
+
+        c.bridge_remove(
+            self.conn, "alpha", "operator", "human", "beta")
+        scope = {
+            "project_id": "alpha", "actor_id": alpha["worker"],
+            "actor_type": "agent", "role": "worker",
+            "principal_id": "owner",
+        }
+        search = c.search_project(
+            self.conn, "alpha", marker, limit=100,
+            actor_id=alpha["worker"], actor_type="agent")
+        self.assertEqual(search["events"], [])
+        self.assertEqual(search["total_hits"], 0)
+        surfaces = {
+            "room": c.room_read(
+                self.conn, "alpha", actor_id=alpha["worker"],
+                actor_type="agent"),
+            "inbox": c.inbox_read(
+                self.conn, "alpha", alpha["worker"], mark_read=False,
+                actor_type="agent"),
+            "handoff": c.get_handoff(
+                self.conn, "alpha", alpha["worker"], "agent"),
+            "project_log": c.project_log(
+                self.conn, "alpha", limit=100,
+                actor_id=alpha["worker"], actor_type="agent"),
+            "search_events": search["events"],
+            "events_api": c._api_events_sync(
+                self.conn, "alpha", after=0, limit=1000,
+                actor_id=alpha["worker"], actor_type="agent"),
+            "sync_projection": c._sync_projection(self.conn, scope),
+        }
+        for name, surface in surfaces.items():
+            with self.subTest(surface=name):
+                self.assertNotIn(marker, json.dumps(surface))
+
+    def test_multi_peer_legacy_routes_hide_denied_destination_metadata(self):
+        alpha = self.actors["alpha"]
+        gamma_root = Path(self.tmp.name) / "gamma"
+        gamma_root.mkdir()
+        c.project_init(
+            self.conn, "setup", "human", path=str(gamma_root),
+            project_id="gamma", name="Gamma")
+        c.agent_register(
+            self.conn, "gamma", "setup", "human",
+            agent_id="gamma.director.codex", role="director",
+            runtime="codex")
+
+        self._bridge("all", "all")
+        c.bridge_add(
+            self.conn, "alpha", "operator", "human", "gamma",
+            participation="directors", peer_participation="all")
+        marker = "multipeerlegacymetadataprobe"
+        source_payload = {
+            "msg_type": "directive", "body": marker,
+            "mentions": [], "reply_to": None,
+        }
+        c.append_event(
+            self.conn, "alpha", alpha["director"], "agent",
+            "room.message", source_payload)
+        for peer in ("beta", "gamma"):
+            c.append_event(
+                self.conn, peer, alpha["director"], "agent",
+                "room.message", dict(source_payload, origin_project="alpha"))
+
+        scope = {
+            "project_id": "alpha", "actor_id": alpha["worker"],
+            "actor_type": "agent", "role": "worker",
+            "principal_id": "owner",
+        }
+        room = c.room_read(
+            self.conn, "alpha", actor_id=alpha["worker"],
+            actor_type="agent")
+        inbox = c.inbox_read(
+            self.conn, "alpha", alpha["worker"], mark_read=False,
+            actor_type="agent")
+        events_api = c._api_events_sync(
+            self.conn, "alpha", after=0, limit=1000,
+            actor_id=alpha["worker"], actor_type="agent")
+        projection = c._sync_projection(self.conn, scope)
+        search = c.search_project(
+            self.conn, "alpha", marker, limit=100,
+            actor_id=alpha["worker"], actor_type="agent")
+
+        routed_views = {
+            "room": next(message for message in room["messages"]
+                         if message.get("body") == marker),
+            "inbox": next(message for message in inbox["messages"]
+                          if message.get("body") == marker),
+            "events_api": next(
+                event["payload"] for event in events_api["events"]
+                if event["event_type"] == "room.message"
+                and event["payload"].get("body") == marker),
+            "sync_projection": next(
+                message for message in projection["room_messages"]
+                if message.get("body") == marker),
+            "search": next(event for event in search["events"]
+                           if event.get("body") == marker),
+        }
+        for name, view in routed_views.items():
+            with self.subTest(surface=name):
+                self.assertEqual(view["mirrored_to"], ["beta"])
+                self.assertNotIn("gamma", json.dumps(view))
+
+    def test_legacy_route_inference_is_batched_across_core_surfaces(self):
+        alpha = self.actors["alpha"]
+        for index in range(50):
+            c.append_event(
+                self.conn, "alpha", alpha["director"], "agent",
+                "room.message",
+                {"msg_type": "directive",
+                 "body": "legacybatchprobe%02d" % index})
+
+        def counterpart_query_count(callback):
+            statements = []
+
+            def trace(statement):
+                compact = " ".join(statement.lower().split())
+                if compact.startswith(
+                        "select * from events where project_id<>'alpha' "
+                        "and event_type='room.message'"):
+                    statements.append(compact)
+
+            self.conn.set_trace_callback(trace)
+            try:
+                callback()
+            finally:
+                self.conn.set_trace_callback(None)
+            return len(statements)
+
+        scope = {
+            "project_id": "alpha", "actor_id": alpha["worker"],
+            "actor_type": "agent", "role": "worker",
+            "principal_id": "owner",
+        }
+        counts = {
+            "room": counterpart_query_count(lambda: c.room_read(
+                self.conn, "alpha", limit=100,
+                actor_id=alpha["worker"], actor_type="agent")),
+            "inbox": counterpart_query_count(lambda: c.inbox_read(
+                self.conn, "alpha", alpha["worker"], mark_read=False,
+                limit=100, actor_type="agent")),
+            "project_log": counterpart_query_count(lambda: c.project_log(
+                self.conn, "alpha", limit=100,
+                actor_id=alpha["worker"], actor_type="agent")),
+            "search": counterpart_query_count(lambda: c.search_project(
+                self.conn, "alpha", "legacy batch probe", limit=100,
+                actor_id=alpha["worker"], actor_type="agent")),
+            "sync_projection": counterpart_query_count(
+                lambda: c._sync_projection(self.conn, scope)),
+        }
+        self.assertEqual(counts, {
+            "room": 1,
+            "inbox": 1,
+            "project_log": 1,
+            "search": 1,
+            "sync_projection": 1,
+        })
 
     def test_rest_bridge_policies_are_actor_scoped_and_relationship_safe(self):
         alpha = self.actors["alpha"]
