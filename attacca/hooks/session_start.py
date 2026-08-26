@@ -282,7 +282,160 @@ def _state_path(value=None):
     return Path.home() / ".attacca" / "plugin-data" / "codex-attacca" / STATE_NAME
 
 
+class WatcherStateSecurityError(RuntimeError):
+    """The watcher cannot safely use its machine-local private state."""
+
+
+def _is_watcher_state_path(path):
+    return Path(path).name == WATCHER_STATE_NAME
+
+
+def _reject_watcher_symlink_components(path):
+    """Reject an existing symlink anywhere in a watcher storage path.
+
+    ``Path.resolve`` is deliberately forbidden here: resolving first would
+    erase the evidence that an attacker redirected the private watcher state.
+    Only the watcher directory itself is chmodded; existing ancestors are
+    inspected but never modified.
+    """
+    path = Path(path).expanduser().absolute()
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            mode = os.lstat(str(current)).st_mode
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as error:
+            raise WatcherStateSecurityError(
+                "cannot inspect watcher storage path %s: %s" %
+                (current, error)) from None
+        if stat.S_ISLNK(mode):
+            raise WatcherStateSecurityError(
+                "refusing symlink traversal in watcher storage: %s" %
+                current)
+
+
+def _ensure_private_watcher_directory(path):
+    """Create/repair exactly the watcher directory as mode 0700."""
+    path = Path(path).expanduser().absolute()
+    _reject_watcher_symlink_components(path)
+    try:
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as error:
+        raise WatcherStateSecurityError(
+            "cannot create watcher storage directory %s: %s" %
+            (path, error)) from None
+    _reject_watcher_symlink_components(path)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(str(path), flags)
+    except OSError as error:
+        raise WatcherStateSecurityError(
+            "watcher storage is not a safe directory %s: %s" %
+            (path, error)) from None
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise WatcherStateSecurityError(
+                "watcher storage is not a directory: %s" % path)
+        os.fchmod(descriptor, 0o700)
+    except OSError as error:
+        raise WatcherStateSecurityError(
+            "cannot make watcher storage private %s: %s" %
+            (path, error)) from None
+    finally:
+        os.close(descriptor)
+    return path
+
+
+def _open_private_watcher_file(path, flags, create=False):
+    """Open one private watcher file without following links.
+
+    Existing safe regular files are repaired to 0600 through the opened file
+    descriptor, avoiding a chmod-by-path race.  The post-open inode check also
+    rejects a concurrent path substitution before callers consume the file.
+    """
+    path = Path(path).expanduser().absolute()
+    _ensure_private_watcher_directory(path.parent)
+    _reject_watcher_symlink_components(path)
+    try:
+        existing = os.lstat(str(path))
+    except FileNotFoundError:
+        existing = None
+    except OSError as error:
+        raise WatcherStateSecurityError(
+            "cannot inspect watcher file %s: %s" % (path, error)) from None
+    if existing is not None and not stat.S_ISREG(existing.st_mode):
+        raise WatcherStateSecurityError(
+            "watcher path is not a regular file: %s" % path)
+    if existing is None and not create:
+        raise FileNotFoundError(str(path))
+    open_flags = flags | getattr(os, "O_CLOEXEC", 0) \
+        | getattr(os, "O_NOFOLLOW", 0)
+    if create:
+        open_flags |= os.O_CREAT
+    try:
+        descriptor = os.open(str(path), open_flags, 0o600)
+    except OSError as error:
+        raise WatcherStateSecurityError(
+            "cannot safely open watcher file %s: %s" %
+            (path, error)) from None
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise WatcherStateSecurityError(
+                "opened watcher path is not a regular file: %s" % path)
+        os.fchmod(descriptor, 0o600)
+        current = os.lstat(str(path))
+        if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode) \
+                or (current.st_dev, current.st_ino) != \
+                (opened.st_dev, opened.st_ino):
+            raise WatcherStateSecurityError(
+                "watcher path changed while it was opened: %s" % path)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _fsync_watcher_directory(path):
+    """Best-effort directory fsync after an atomic watcher-state replace."""
+    path = _ensure_private_watcher_directory(path)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(str(path), flags)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
 def _read_state(path):
+    path = Path(path)
+    if _is_watcher_state_path(path):
+        try:
+            descriptor = _open_private_watcher_file(path, os.O_RDONLY)
+        except FileNotFoundError:
+            _ensure_private_watcher_directory(path.parent)
+            return {}
+        try:
+            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+                descriptor = None
+                data = json.load(handle)
+            return data if isinstance(data, dict) else {}
+        except (OSError, UnicodeError, ValueError):
+            return {}
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
     try:
         data = json.loads(path.read_text())
         return data if isinstance(data, dict) else {}
@@ -291,6 +444,55 @@ def _read_state(path):
 
 
 def _write_state(path, state):
+    path = Path(path)
+    if _is_watcher_state_path(path):
+        directory = _ensure_private_watcher_directory(path.parent)
+        # Refuse a pre-existing link/non-file even though os.replace would not
+        # follow the final symlink. Failing closed makes corruption/tampering
+        # visible instead of silently deleting evidence.
+        _reject_watcher_symlink_components(path)
+        try:
+            target = os.lstat(str(path))
+        except FileNotFoundError:
+            target = None
+        if target is not None and not stat.S_ISREG(target.st_mode):
+            raise WatcherStateSecurityError(
+                "watcher state is not a regular file: %s" % path)
+        data = (json.dumps(state, indent=2, sort_keys=True) + "\n").encode(
+            "utf-8")
+        temporary = path.with_name(
+            ".%s.%d.%s.tmp" %
+            (path.name, os.getpid(), os.urandom(8).hex()))
+        descriptor = None
+        try:
+            descriptor = _open_private_watcher_file(
+                temporary, os.O_WRONLY | os.O_EXCL, create=True)
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = None
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            # Re-check the destination immediately before replacement. A race
+            # after this point can at worst have its link entry replaced; the
+            # referenced victim is never opened or modified.
+            _reject_watcher_symlink_components(path)
+            try:
+                current = os.lstat(str(path))
+            except FileNotFoundError:
+                current = None
+            if current is not None and not stat.S_ISREG(current.st_mode):
+                raise WatcherStateSecurityError(
+                    "watcher state changed to an unsafe target: %s" % path)
+            os.replace(str(temporary), str(path))
+            _fsync_watcher_directory(directory)
+            return
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            try:
+                os.unlink(str(temporary))
+            except FileNotFoundError:
+                pass
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(".%s.%d.tmp" % (path.name, os.getpid()))
     temporary.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
@@ -300,6 +502,22 @@ def _write_state(path, state):
 def _mutate_state(path, mutation):
     """Serialize read/modify/write across simultaneous lifecycle sessions."""
     path = Path(path)
+    if _is_watcher_state_path(path):
+        _ensure_private_watcher_directory(path.parent)
+        lock_path = path.with_name(".%s.lock" % path.name)
+        descriptor = _open_private_watcher_file(
+            lock_path, os.O_RDWR | os.O_APPEND, create=True)
+        with os.fdopen(descriptor, "a+", encoding="utf-8") as lock:
+            if fcntl is not None:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                state = _read_state(path)
+                mutation(state)
+                _write_state(path, state)
+                return state
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(".%s.lock" % path.name)
     with lock_path.open("a+") as lock:
@@ -3822,21 +4040,19 @@ def _watcher_mark_daemon(nonce, plugin_root, launch_identity=None, **updates):
 
 def _watcher_lock_available():
     """Probe the lifetime flock without changing daemon metadata."""
-    if fcntl is None:
-        return True
     path = _watcher_state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name("watcher.lock")
-    lock = lock_path.open("a+")
-    try:
+    descriptor = _open_private_watcher_file(
+        lock_path, os.O_RDWR | os.O_APPEND, create=True)
+    with os.fdopen(descriptor, "a+", encoding="utf-8") as lock:
+        if fcntl is None:
+            return True
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return False
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         return True
-    finally:
-        lock.close()
 
 
 def _watcher_daemon_loop(plugin_root, nonce, wait=None, clock=None,
@@ -3859,9 +4075,10 @@ def _watcher_daemon_loop(plugin_root, nonce, wait=None, clock=None,
                 previous_wake_handler = None
     clock = clock or time.time
     path = _watcher_state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name("watcher.lock")
-    lock = lock_path.open("a+")
+    lock_descriptor = _open_private_watcher_file(
+        lock_path, os.O_RDWR | os.O_APPEND, create=True)
+    lock = os.fdopen(lock_descriptor, "a+", encoding="utf-8")
     if fcntl is not None:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -4030,7 +4247,6 @@ def _ensure_registered_watcher(subscription_key, launch_root, plugin_root):
         }
     nonce = hashlib.sha256(os.urandom(32)).hexdigest()[:24]
     log_path = _watcher_state_path().with_name("watcher.log")
-    log_path.parent.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env.update({
         "ATTACCA_WATCHER_NONCE": nonce,
@@ -4074,7 +4290,9 @@ def _ensure_registered_watcher(subscription_key, launch_root, plugin_root):
         return {"ok": True, "already_starting": True,
                 "subscription_key": key}
     try:
-        with log_path.open("a", encoding="utf-8") as log:
+        log_descriptor = _open_private_watcher_file(
+            log_path, os.O_WRONLY | os.O_APPEND, create=True)
+        with os.fdopen(log_descriptor, "a", encoding="utf-8") as log:
             process = subprocess.Popen(
                 [sys.executable, str(hook_path), "--watcher-daemon",
                  "--watcher-nonce", nonce,
