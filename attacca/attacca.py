@@ -142,7 +142,7 @@ LOG_EXCLUDED_MSG_TYPES = {"chat", "status"}
 
 MANAGED_BEGIN = "<!-- MANAGED_ATTACCA:BEGIN"
 MANAGED_END = "<!-- MANAGED_ATTACCA:END -->"
-MANAGED_BLOCK_VERSION = 9
+MANAGED_BLOCK_VERSION = 10
 _MANAGED_TEMPLATE_PROJECT = "attacca-project"
 _MANAGED_BEGIN_LINE = re.compile(
     r"(?m)^<!-- MANAGED_ATTACCA:BEGIN\b[^\r\n]*-->[ \t]*\r?$")
@@ -15659,6 +15659,12 @@ def managed_instruction_block(project_id, db_path):
     lines.append("   sync it down into that local file so the checkout keeps the best context —")
     lines.append("   never modifying this managed block, which Attacca maintains and syncs")
     lines.append("   separately.")
+    lines.append("   **On first setup, de-duplicate the local AGENTS.md/CLAUDE.md**: remove or")
+    lines.append("   consolidate any project context now provided by this managed block or by")
+    lines.append("   Cloud Context so the two do not overlap — keep only genuinely local")
+    lines.append("   instructions, and migrate durable project context into Cloud Context")
+    lines.append("   (see the project-migration directive) rather than leaving a duplicate copy")
+    lines.append("   in the file.")
     lines.append("3. **History first**: when work depends on what happened, why, or who did it,")
     lines.append("   call `search` with relevant terms before filesystem or Git archaeology.")
     lines.append("   Follow with `get_project_log`, `task_show`, or the matching durable record.")
