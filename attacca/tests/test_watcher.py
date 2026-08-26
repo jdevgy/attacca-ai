@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import shutil
+import sys
 import tempfile
 import threading
 import unittest
@@ -328,6 +329,55 @@ class AutonomousWatcherTestCase(unittest.TestCase):
                 new_protocol.validate_identity_projection(
                     {"cloud_context": {}}, scope, partial=True),
                 {"cloud_context": {}})
+
+            # Repeated emergency in-place repairs remain strictly bounded in a
+            # daemon that cannot restart immediately. Namespace eviction is
+            # safe because any live adapter already owns direct module/class
+            # references rather than depending on sys.modules lookups.
+            protocol_base = (ROOT / "sync_protocol.py").read_bytes()
+            terminal_path = runtime_root / "terminal_flow.py"
+            terminal_base = (ROOT / "terminal_flow.py").read_bytes()
+            generations = max(
+                watch._RUNTIME_SOURCE_CACHE_LIMIT,
+                watch._RUNTIME_MODULE_CACHE_LIMIT) + 5
+            for generation in range(generations):
+                protocol_path.write_bytes(
+                    protocol_base +
+                    ("\n# bounded sync generation %04d\n" % generation
+                     ).encode("ascii"))
+                terminal_path.write_bytes(
+                    terminal_base +
+                    ("\n# bounded auth generation %04d\n" % generation
+                     ).encode("ascii"))
+                os.utime(protocol_path,
+                         ns=(fixed_mtime_ns, fixed_mtime_ns))
+                os.utime(terminal_path,
+                         ns=(fixed_mtime_ns, fixed_mtime_ns))
+                with mock.patch.object(
+                        watch, "_stable_plugin_root",
+                        return_value=runtime_root):
+                    watch._watcher_sync_modules()
+                    watch._terminal_flow_module()
+
+            self.assertLessEqual(
+                len(watch._RUNTIME_SOURCE_CACHE),
+                watch._RUNTIME_SOURCE_CACHE_LIMIT)
+            self.assertLessEqual(
+                len(watch._SYNC_MODULE_CACHE),
+                watch._RUNTIME_MODULE_CACHE_LIMIT)
+            self.assertLessEqual(
+                len(watch._TERMINAL_MODULE_CACHE),
+                watch._RUNTIME_MODULE_CACHE_LIMIT)
+            sync_names = [
+                name for name in sys.modules
+                if name.startswith("_attacca_hook_sync_")]
+            terminal_names = [
+                name for name in sys.modules
+                if name.startswith("_attacca_hook_terminal_")]
+            self.assertLessEqual(
+                len(sync_names), watch._RUNTIME_MODULE_CACHE_LIMIT * 5)
+            self.assertLessEqual(
+                len(terminal_names), watch._RUNTIME_MODULE_CACHE_LIMIT)
 
     def test_upgrade_rebind_makes_backed_off_subscription_due_now(self):
         link = self.checkout / ".attacca" / "project.json"

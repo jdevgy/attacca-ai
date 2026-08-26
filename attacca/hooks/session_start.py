@@ -105,6 +105,7 @@ _SYNC_MODULE_CACHE = {}
 _TERMINAL_MODULE_CACHE = {}
 _RUNTIME_SOURCE_CACHE = {}
 _RUNTIME_SOURCE_CACHE_LIMIT = 32
+_RUNTIME_MODULE_CACHE_LIMIT = 8
 
 
 def _runtime_name():
@@ -1345,6 +1346,9 @@ def _runtime_module_snapshot(root, relative_files):
         cached = _RUNTIME_SOURCE_CACHE.get(source_key)
         if cached is not None:
             if before == _runtime_file_signatures(root, relative_files):
+                # Refresh insertion order so bounded eviction is LRU-like.
+                _RUNTIME_SOURCE_CACHE.pop(source_key, None)
+                _RUNTIME_SOURCE_CACHE[source_key] = cached
                 return cached
             continue
         sources = {
@@ -1387,6 +1391,25 @@ def _exec_runtime_module(qualified, path, source, package):
     return module
 
 
+def _runtime_namespace(prefix, key):
+    digest = hashlib.sha256(
+        json.dumps(key, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return "%s%s" % (prefix, digest)
+
+
+def _evict_sync_runtime(key):
+    package_name = _runtime_namespace("_attacca_hook_sync_", key)
+    for suffix in ("", ".sync_protocol", ".terminal_flow",
+                   ".offline_sync", ".sync_client"):
+        sys.modules.pop(package_name + suffix, None)
+
+
+def _evict_terminal_runtime(key):
+    qualified = _runtime_namespace("_attacca_hook_terminal_", key)
+    sys.modules.pop(qualified, None)
+
+
 def _watcher_sync_modules():
     """Load schema-v1 clients only from this stable lifecycle image."""
     root = _plugin_root().resolve()
@@ -1395,10 +1418,10 @@ def _watcher_sync_modules():
     relative_files = tuple(name + ".py" for name in load_order)
     key, sources = _runtime_module_snapshot(root, relative_files)
     if key in _SYNC_MODULE_CACHE:
-        return _SYNC_MODULE_CACHE[key]
-    package_name = "_attacca_hook_sync_%s" % hashlib.sha256(
-        json.dumps(key, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()[:16]
+        cached = _SYNC_MODULE_CACHE.pop(key)
+        _SYNC_MODULE_CACHE[key] = cached
+        return cached
+    package_name = _runtime_namespace("_attacca_hook_sync_", key)
     package = sys.modules.get(package_name)
     if package is None:
         package = types.ModuleType(package_name)
@@ -1407,17 +1430,26 @@ def _watcher_sync_modules():
         sys.modules[package_name] = package
 
     loaded = {}
-    for name in load_order:
-        qualified = "%s.%s" % (package_name, name)
-        module = sys.modules.get(qualified)
-        if module is None:
-            relative = name + ".py"
-            module = _exec_runtime_module(
-                qualified, root / relative, sources[relative], package_name)
-        loaded[name] = module
+    try:
+        for name in load_order:
+            qualified = "%s.%s" % (package_name, name)
+            module = sys.modules.get(qualified)
+            if module is None:
+                relative = name + ".py"
+                module = _exec_runtime_module(
+                    qualified, root / relative, sources[relative],
+                    package_name)
+            loaded[name] = module
+    except Exception:
+        _evict_sync_runtime(key)
+        raise
     result = (loaded["sync_protocol"], loaded["offline_sync"],
               loaded["sync_client"])
     _SYNC_MODULE_CACHE[key] = result
+    while len(_SYNC_MODULE_CACHE) > _RUNTIME_MODULE_CACHE_LIMIT:
+        oldest = next(iter(_SYNC_MODULE_CACHE))
+        _SYNC_MODULE_CACHE.pop(oldest, None)
+        _evict_sync_runtime(oldest)
     return result
 
 
@@ -1426,16 +1458,20 @@ def _terminal_flow_module():
     root = _plugin_root().resolve()
     key, sources = _runtime_module_snapshot(root, ("terminal_flow.py",))
     if key in _TERMINAL_MODULE_CACHE:
-        return _TERMINAL_MODULE_CACHE[key]
+        cached = _TERMINAL_MODULE_CACHE.pop(key)
+        _TERMINAL_MODULE_CACHE[key] = cached
+        return cached
     path = root / "terminal_flow.py"
-    qualified = "_attacca_hook_terminal_%s" % hashlib.sha256(
-        json.dumps(key, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()[:16]
+    qualified = _runtime_namespace("_attacca_hook_terminal_", key)
     module = sys.modules.get(qualified)
     if module is None:
         module = _exec_runtime_module(
             qualified, path, sources["terminal_flow.py"], "")
     _TERMINAL_MODULE_CACHE[key] = module
+    while len(_TERMINAL_MODULE_CACHE) > _RUNTIME_MODULE_CACHE_LIMIT:
+        oldest = next(iter(_TERMINAL_MODULE_CACHE))
+        _TERMINAL_MODULE_CACHE.pop(oldest, None)
+        _evict_terminal_runtime(oldest)
     return module
 
 
