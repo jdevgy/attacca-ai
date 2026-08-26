@@ -11394,6 +11394,11 @@ def _r_handoff_get(h, m, q):
         h._conn(), m.group(1), actor_id=actor, actor_type=atype))
 
 
+def _r_handoff_history(h, m, q):
+    limit = q.get("limit") or 20
+    h._reply_json(200, handoff_history(h._conn(), m.group(1), limit=limit))
+
+
 def _r_inbox_get(h, m, q):
     actor, atype = h._actor()
     mark_read = str(q.get("mark_read", "1")).lower() not in (
@@ -11803,6 +11808,7 @@ ROUTES = [
     (*_route_def("DELETE", "/v1/projects/%s/bridges/%s" % (_PID, _PID)),
      _r_bridges_remove),
     (*_route_def("GET", "/v1/projects/%s/handoff" % _PID), _r_handoff_get),
+    (*_route_def("GET", "/v1/projects/%s/handoff/history" % _PID), _r_handoff_history),
     (*_route_def("POST", "/v1/projects/%s/handoff" % _PID), _r_handoff_set),
     (*_route_def("PUT", "/v1/projects/%s/handoff" % _PID), _r_handoff_set),
     (*_route_def("GET", "/v1/projects/%s/log" % _PID), _r_log),
