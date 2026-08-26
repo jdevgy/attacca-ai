@@ -314,10 +314,25 @@ class HookBriefContextBudgetTestCase(unittest.TestCase):
         self.assertLessEqual(
             len(banner.encode("utf-8")),
             hook.MANDATORY_RULES_BANNER_MAX_CHARACTERS)
-        self.assertIn("[TRUNCATED — STOP and call rule_list before acting]",
-                      banner)
-        self.assertRegex(banner, r"\d+ additional binding rule\(s\)")
-        self.assertIn("STOP before other work and call rule_list", banner)
+        self.assertNotIn("TRUNCATED", banner)
+        omitted_line = next(
+            line for line in banner.splitlines()
+            if line.startswith("• Omitted binding rule_ids:"))
+        omitted_ids = {
+            value.strip() for value in omitted_line.split(":", 1)[1].split(",")
+        }
+        rendered_ids = set(re.findall(r"^• \[(R-\d{3}) ·", banner,
+                                       flags=re.MULTILINE))
+        expected_ids = {"R-%03d" % index for index in range(100)}
+        self.assertEqual(rendered_ids | omitted_ids, expected_ids)
+        self.assertFalse(rendered_ids & omitted_ids)
+        for rule_id in rendered_ids:
+            index = int(rule_id.split("-")[1])
+            self.assertIn(
+                "RULE-%03d-BODY %s" % (index, "r" * 1_000), banner)
+        self.assertIn(
+            "STOP before other work and call rule_list for those exact "
+            "rule_ids", banner)
 
         snapshot = self._snapshot("cached cloud", rules=rules)
         cached_poll = hook._poll_view(snapshot)
@@ -358,9 +373,12 @@ class HookBriefContextBudgetTestCase(unittest.TestCase):
             context = output["reason"] if event_name == "Stop" else \
                 output["hookSpecificOutput"]["additionalContext"]
             self.assertTrue(context.startswith(RULES_BANNER_PREFIX))
+            self.assertIn("Omitted binding rule_ids:", context)
+            for rule_id in (cached_poll["project_rules_omitted_ids"] or []):
+                self.assertIn(rule_id, context)
             self.assertIn(
-                "%d additional binding rule(s)" % omitted, context)
-            self.assertIn("STOP before other work and call rule_list", context)
+                "STOP before other work and call rule_list for those exact "
+                "rule_ids", context)
             self.assertIn("CACHED-NOTICE-MUST-SURVIVE", context)
 
 
@@ -397,9 +415,276 @@ class WatcherNoLossDeliveryTestCase(unittest.TestCase):
     def state(self):
         return json.loads(hook._watcher_state_path().read_text())
 
-    def test_unicode_room_bodies_survive_ten_by_two_notice_batches_fifo(self):
+    def test_inbox_page_is_staged_before_ack_and_retries_failed_ack(self):
+        key = hook._register_watcher_subscription(
+            self.status, ROOT, self.config, runtime="codex", now=0)
+        message = {
+            "event_id": "mail-41", "seq": 41,
+            "actor": "peer.director.claude", "msg_type": "directive",
+            "body": "AUTOMATIC-MAIL-MUST-BE-SEEN",
+            "mentions": ["shared.director.codex"],
+            "directed_to_you": True, "addressed_to_you": True,
+            "broadcast_to_everyone": False, "group_context": False,
+            "origin_project": "peer",
+        }
+        peek = {"messages": [message], "read_cursor": 0,
+                "may_have_more": False}
+
+        with mock.patch.object(
+                hook, "_watcher_inbox_page",
+                side_effect=[peek, RuntimeError("ack offline")]):
+            with self.assertRaisesRegex(RuntimeError, "ack offline"):
+                hook._watcher_refresh_inbox_attention(
+                    self.status, self.config)
+
+        staged = self.state()["subscriptions"][key]["attention"]
+        self.assertEqual(len(staged), 1)
+        self.assertFalse(staged[0]["acknowledged"])
+        first = hook._watcher_attention_notice(self.status, self.config)
+        second = hook._watcher_attention_notice(self.status, self.config)
+        self.assertIn("AUTOMATIC-MAIL-MUST-BE-SEEN", first["context"])
+        self.assertIn("AUTOMATIC-MAIL-MUST-BE-SEEN", second["context"])
+
+        with mock.patch.object(
+                hook, "_watcher_inbox_page",
+                side_effect=[peek, dict(peek, read_cursor=41)]):
+            refreshed = hook._watcher_refresh_inbox_attention(
+                self.status, self.config)
+        self.assertTrue(refreshed["ok"])
+        acknowledged = self.state()["subscriptions"][key]["attention"]
+        self.assertTrue(acknowledged[0]["acknowledged"])
+        # It was already rendered while the hosted acknowledgement was
+        # unavailable. Once that acknowledgement succeeds, both delivery and
+        # hosted read are proven and the next boundary may remove it.
+        self.assertIsNone(
+            hook._watcher_attention_notice(self.status, self.config))
+
+    def test_entity_revisions_coalesce_but_room_messages_never_do(self):
+        key = hook._register_watcher_subscription(
+            self.status, ROOT, self.config, runtime="codex", now=0)
+        with mock.patch.object(hook, "_settings_interval", return_value=60):
+            hook._watcher_tick(
+                key, now=0, force=True,
+                delta_loader=lambda after: delta(next_after=0),
+                notifier=lambda *_: None)
+            hook._watcher_tick(
+                key, now=60, force=True,
+                delta_loader=lambda after: delta([
+                    event(1, "ROOM-ONE"),
+                    {
+                        "event_id": "rule-v3", "seq": 2,
+                        "event_type": "rule.updated",
+                        "actor_id": "shared.director.claude",
+                        "operational_actor_id": "shared.director.claude",
+                        "payload": {"rule_id": "R-X", "version": 3,
+                                    "enabled": True, "title": "OLD-RULE"},
+                    },
+                    {
+                        "event_id": "task-old", "seq": 3,
+                        "event_type": "task.status_changed",
+                        "actor_id": "shared.director.claude",
+                        "operational_actor_id": "shared.director.claude",
+                        "task_id": "T-X",
+                        "payload": {"to": "claimed", "title": "OLD-TASK"},
+                    },
+                ], next_after=3), notifier=lambda *_: None)
+            hook._watcher_tick(
+                key, now=120, force=True,
+                delta_loader=lambda after: delta([
+                    event(4, "ROOM-TWO"),
+                    {
+                        "event_id": "rule-v5", "seq": 5,
+                        "event_type": "rule.updated",
+                        "actor_id": "shared.director.claude",
+                        "operational_actor_id": "shared.director.claude",
+                        "payload": {"rule_id": "R-X", "version": 5,
+                                    "enabled": False, "title": "NEW-RULE"},
+                    },
+                    {
+                        "event_id": "task-new", "seq": 6,
+                        "event_type": "task.status_changed",
+                        "actor_id": "shared.director.claude",
+                        "operational_actor_id": "shared.director.claude",
+                        "task_id": "T-X",
+                        "payload": {"to": "done", "title": "NEW-TASK"},
+                    },
+                ], next_after=6), notifier=lambda *_: None)
+
+        state = self.state()["subscriptions"][key]
+        self.assertEqual([row["seq"] for row in state["attention"]], [1, 4])
+        entities = {row["entity_key"]: row for row in state["pending"]
+                    if row.get("kind") == "project_entity_delta"}
+        self.assertEqual(set(entities), {"rule:R-X", "task:T-X"})
+        self.assertIn("NEW-RULE", entities["rule:R-X"]["summary"])
+        self.assertIn("CURRENTLY DISABLED", entities["rule:R-X"]["summary"])
+        self.assertNotIn("OLD-RULE", entities["rule:R-X"]["summary"])
+        self.assertIn("NEW-TASK", entities["task:T-X"]["summary"])
+        self.assertNotIn("OLD-TASK", entities["task:T-X"]["summary"])
+
+    def test_pending_disposition_survives_read_cursor_until_host_clears_it(self):
+        key = hook._register_watcher_subscription(
+            self.status, ROOT, self.config, runtime="codex", now=0)
+        assignment = {
+            "event_id": "assign-72", "seq": 72,
+            "actor": "shared.director.claude", "msg_type": "directive",
+            "body": "ASSIGNMENT-MUST-STAY-PINNED",
+            "mentions": ["shared.director.codex"],
+            "directed_to_you": True, "addressed_to_you": True,
+            "broadcast_to_everyone": False, "group_context": False,
+            "requires_disposition": True, "disposition": None,
+        }
+        current = {
+            "messages": [], "read_cursor": 72, "may_have_more": False,
+            "pending_dispositions": [assignment],
+            "pending_disposition_total": 1,
+            "pending_disposition_may_have_more": False,
+        }
+        with mock.patch.object(
+                hook, "_watcher_inbox_page",
+                side_effect=[current, current]):
+            hook._watcher_refresh_inbox_attention(self.status, self.config)
+
+        state = self.state()["subscriptions"][key]
+        self.assertEqual(state["attention"], [])
+        self.assertEqual(state["pending_disposition_total"], 1)
+        for _ in range(2):
+            notice = hook._watcher_attention_notice(
+                self.status, self.config)
+            self.assertIn("PENDING DISPOSITIONS (1)", notice["context"])
+            self.assertIn("ASSIGNMENT-MUST-STAY-PINNED", notice["context"])
+            self.assertIn("Event assign-72", notice["context"])
+            self.assertIn("message_dispose", notice["context"])
+
+        cleared = dict(
+            current, pending_dispositions=[], pending_disposition_total=0)
+        with mock.patch.object(
+                hook, "_watcher_inbox_page",
+                side_effect=[cleared, cleared]):
+            hook._watcher_refresh_inbox_attention(self.status, self.config)
+        self.assertIsNone(
+            hook._watcher_attention_notice(self.status, self.config))
+
+    def test_idle_daemon_tick_checks_inbox_without_a_client_turn(self):
+        key = hook._register_watcher_subscription(
+            self.status, ROOT, self.config, runtime="codex", now=0)
+        with mock.patch.object(
+                hook, "_settings_interval", return_value=60), \
+             mock.patch.object(
+                hook, "_watcher_refresh_inbox_entry",
+                return_value={"ok": True, "staged": 1}) as refresh, \
+             mock.patch.object(
+                hook, "_watcher_event_delta",
+                return_value=delta(next_after=0)):
+            result = hook._watcher_tick(
+                key, now=60, force=True,
+                offline_factory=lambda *_: None,
+                notifier=lambda *_: None)
+        self.assertTrue(result["inbox_checked"])
+        self.assertEqual(result["inbox_staged"], 1)
+        refresh.assert_called_once()
+        self.assertEqual(refresh.call_args.args[0], key)
+        self.assertEqual(refresh.call_args.args[1]["client_instance"],
+                         self.state()["subscriptions"][key][
+                             "client_instance"])
+
+    def test_only_proven_host_401_or_403_latches_auth(self):
+        class HostedStatusError(RuntimeError):
+            def __init__(self, status):
+                super().__init__("host response")
+                self.http_status = status
+
+        class IdentitySchemaError(RuntimeError):
+            pass
+
+        self.assertTrue(hook._authentication_required_error(
+            HostedStatusError(401)))
+        self.assertTrue(hook._authentication_required_error(
+            HostedStatusError(403)))
+        self.assertFalse(hook._authentication_required_error(
+            HostedStatusError(409)))
+        self.assertFalse(hook._authentication_required_error(
+            hook.HostedAuthenticationRequired("local key is missing")))
+        self.assertFalse(hook._authentication_required_error(
+            IdentitySchemaError("visibility changed")))
+
+    def test_unread_mail_is_top_pinned_for_every_supported_turn_shape(self):
+        rule = {
+            "rule_id": "R-TOP", "title": "Rules remain first",
+            "body": "RULE-BODY", "scope": "everyone", "priority": 1,
+            "enabled": True,
+        }
+        cached_poll = {
+            "project_rules": [rule], "project_rules_omitted_count": 0,
+            "project_rules_omitted_ids": [],
+        }
+        for runtime in ("codex", "claude", "kimi"):
+            for event_name in ("UserPromptSubmit", "Stop"):
+                with self.subTest(runtime=runtime, event=event_name), \
+                     mock.patch.dict(os.environ, {
+                         "ATTACCA_RUNTIME": runtime,
+                     }, clear=False):
+                    key = hook._register_watcher_subscription(
+                        self.status, ROOT, self.config, runtime=runtime, now=0)
+                    hook._watcher_stage_attention(key, [{
+                        "event_id": "top-%s-%s" % (runtime, event_name),
+                        "seq": 100 + len(runtime) + len(event_name),
+                        "actor": "peer.director.claude",
+                        "msg_type": "directive",
+                        "body": "TOP-MAIL-%s-%s" % (runtime, event_name),
+                        "directed_to_you": True,
+                        "addressed_to_you": True,
+                        "broadcast_to_everyone": False,
+                        "group_context": False,
+                        "origin_project": "peer",
+                    }], acknowledged=True)
+                    with mock.patch.object(
+                            hook, "_plugin_and_config",
+                            return_value=(ROOT, self.config)), \
+                         mock.patch.object(
+                            hook, "_ensure_background_watcher",
+                            return_value={"ok": True,
+                                          "already_running": True}), \
+                         mock.patch.object(
+                            hook, "_watcher_refresh_inbox_attention",
+                            return_value={"ok": True}), \
+                         mock.patch.object(
+                            hook, "_watcher_pending_notice",
+                            return_value=None), \
+                         mock.patch.object(
+                            hook, "_terminal_migration_notice",
+                            return_value=None), \
+                         mock.patch.object(
+                            hook, "_update_offer", return_value=None), \
+                         mock.patch.object(
+                            hook, "_settings_interval", return_value=60), \
+                         mock.patch.object(
+                            hook, "_poll_entry",
+                            return_value=({"key": "actor"},
+                                          {"snapshot": cached_poll,
+                                           "last_poll_at": hook.time.time()})):
+                        output = hook._periodic_output(
+                            self.status, event_name,
+                            offline_adapter=object())
+                if runtime == "kimi":
+                    context = output["message"]
+                elif event_name == "Stop":
+                    context = output["reason"]
+                else:
+                    context = output[
+                        "hookSpecificOutput"]["additionalContext"]
+                self.assertTrue(context.startswith(RULES_BANNER_PREFIX))
+                footer_at = context.index(
+                    "==========================================================================")
+                mail_at = context.index(
+                    "ATTACCA PENDING ASSIGNMENTS + UNREAD GROUP MAIL")
+                self.assertGreater(mail_at, footer_at)
+                self.assertIn(
+                    "TOP-MAIL-%s-%s" % (runtime, event_name), context)
+                self.assertIn("no user needs to type", context)
+
+    def test_unicode_room_bodies_survive_attention_pages_fifo(self):
         self.assertEqual(hook.WATCHER_DELTA_CHUNK_SIZE, 10)
-        self.assertEqual(hook.WATCHER_NOTICE_BATCH_SIZE, 2)
+        self.assertEqual(hook.WATCHER_ATTENTION_PAGE_SIZE, 25)
         key = hook._register_watcher_subscription(
             self.status, ROOT, self.config, runtime="codex", now=0)
         rows = [event(index, "WATCH-ROOM-%03d-🌍" % index)
@@ -418,38 +703,51 @@ class WatcherNoLossDeliveryTestCase(unittest.TestCase):
         self.assertTrue(baseline["cursor_initialized"])
         self.assertTrue(queued["queued"])
         self.assertEqual(queued["event_cursor"], 151)
-        pending = self.state()["subscriptions"][key]["pending"]
-        expected_chunks = (
-            len(rows) + hook.WATCHER_DELTA_CHUNK_SIZE - 1
-        ) // hook.WATCHER_DELTA_CHUNK_SIZE
-        self.assertEqual(len(pending), expected_chunks)
-        self.assertTrue(all(row["kind"] == "project_delta"
-                            for row in pending))
-        self.assertTrue(all(row["event_types"] == ["room.message"]
-                            for row in pending))
-        self.assertEqual([row["after"] for row in pending],
-                         list(range(0, 151, 10)))
-        self.assertEqual([row["through"] for row in pending],
-                         list(range(10, 151, 10)) + [151])
+        state = self.state()["subscriptions"][key]
+        self.assertEqual(state["pending"], [])
+        self.assertEqual(len(state["attention"]), len(rows))
+        self.assertEqual([row["seq"] for row in state["attention"]],
+                         list(range(1, 152)))
+
+        # Persistent FIFO bodies are exact even when rendering later uses a
+        # bounded head/tail view.
+        long_body = "LONG-START-" + ("🌍" * 2_000) + "-LONG-END"
+        hook._watcher_stage_attention(key, [{
+            "event_id": "long-room", "seq": 152,
+            "actor": "shared.director.claude", "msg_type": "chat",
+            "body": long_body, "group_context": True,
+        }])
+        state = self.state()["subscriptions"][key]
+        self.assertEqual(state["attention"][-1]["body"], long_body)
+        # Keep this independent recovery row out of the 151-row drain below.
+        def remove_long(value):
+            value["subscriptions"][key]["attention"] = [
+                row for row in value["subscriptions"][key]["attention"]
+                if row.get("event_id") != "long-room"]
+
+        hook._mutate_state(hook._watcher_state_path(), remove_long)
+
+        # The raw event watcher never pretends delivery is a hosted read.
+        # Simulate the automatic /inbox acknowledgement that follows durable
+        # staging, then drain compact top-of-turn pages.
+        hook._watcher_ack_attention_through(key, 151)
 
         notices = []
-        remaining_count = expected_chunks
+        remaining_count = len(rows)
         while remaining_count:
-            notice = hook._watcher_pending_notice(self.status, self.config)
+            notice = hook._watcher_attention_notice(self.status, self.config)
             notices.append(notice)
             delivered_count = min(
-                hook.WATCHER_NOTICE_BATCH_SIZE, remaining_count)
+                hook.WATCHER_ATTENTION_PAGE_SIZE, remaining_count)
             remaining_count -= delivered_count
             self.assertIn(
-                "%d delivered, %d queued" % (
+                "%d unread shown, %d queued" % (
                     delivered_count, remaining_count),
                 notice["system_message"])
-            self.assertEqual(
-                len(self.state()["subscriptions"][key]["pending"]),
-                remaining_count)
-        self.assertEqual(self.state()["subscriptions"][key]["pending"], [])
-        self.assertIsNone(hook._watcher_pending_notice(
+        self.assertIsNone(hook._watcher_attention_notice(
             self.status, self.config))
+        self.assertEqual(
+            self.state()["subscriptions"][key]["attention"], [])
 
         all_context = "\n".join(notice["context"] for notice in notices)
         delivered = re.findall(

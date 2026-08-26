@@ -104,8 +104,8 @@ class AutonomousWatcherTestCase(unittest.TestCase):
         self.assertEqual(watch._watcher_state_path(),
                          self.root / "watcher" / "watcher-state.json")
 
-    def test_authenticated_exact_token_honors_custom_interval_and_off(self):
-        """Protected Settings uses the shared exact terminal credential."""
+    def test_authenticated_client_key_honors_custom_interval_and_off(self):
+        """Protected Settings uses the shared install-scoped client key."""
         db = self.root / "authenticated-settings.db"
         actor_id = "shared.director.codex"
         conn = core.connect(db)
@@ -113,9 +113,14 @@ class AutonomousWatcherTestCase(unittest.TestCase):
             core.project_init(
                 conn, "setup", "human", path=self.checkout,
                 project_id="shared", name="Shared")
-            core.agent_register(
-                conn, "shared", actor_id, "agent", agent_id=actor_id,
-                role="director", runtime="codex")
+            core.set_current_owner("alice")
+            try:
+                core.agent_register(
+                    conn, "shared", actor_id, "agent", agent_id=actor_id,
+                    role="director", runtime="codex",
+                    registration_username="alice")
+            finally:
+                core.set_current_owner(None)
             core.auth_create_user(
                 conn, "alice", "correct-horse", is_admin=True,
                 bootstrap=True)
@@ -123,26 +128,24 @@ class AutonomousWatcherTestCase(unittest.TestCase):
                 "SELECT * FROM auth_users WHERE username='alice'").fetchone()
             principal = core._auth_principal(
                 conn, user, "session", actor_type="human")
-            flow = core.auth_device_start(
-                conn, "http://127.0.0.1", "office-device",
-                "Attacca terminal · device office-device",
-                requested_bindings=[{
-                    "project_id": "shared", "actor_id": actor_id,
-                }], client_instance="watcher-test-client")
-            core.auth_device_approve(
-                conn, flow["user_code"], principal, ["shared"], [{
-                    "project_id": "shared", "actor_id": actor_id,
-                }])
-            credential = core.auth_device_poll(
-                conn, flow["device_code"], "office-device",
-                client_instance="watcher-test-client")["credential"]
+            conn.execute(
+                "INSERT OR IGNORE INTO auth_project_memberships"
+                " (user_id,project_id,granted_at,granted_by)"
+                " VALUES (?,?,?,?)",
+                (user["user_id"], "shared", core.now_iso(), "alice"))
+            terminal = watch._terminal_flow_module()
+            client_instance = terminal.load_client_instance_id(
+                runtime="codex")
+            credential = core.auth_client_key_create(
+                conn, principal, "Watcher test client", client_instance,
+                memberships=["shared"], device_id="office-device")
             core.server_settings_store(conn, {
                 "auth.activation_requested": True,
                 "auth.activated": True,
             })
             token_kinds = [row["token_kind"] for row in conn.execute(
                 "SELECT token_kind FROM auth_tokens ORDER BY token_id")]
-            self.assertEqual(token_kinds, ["terminal"])
+            self.assertEqual(token_kinds, ["client"])
         finally:
             conn.close()
 
@@ -169,14 +172,14 @@ class AutonomousWatcherTestCase(unittest.TestCase):
             }}},
         }))
         credential_path.chmod(0o600)
-        terminal = watch._terminal_flow_module()
         terminal.save_terminal_credential(
             url, credential, device_id="office-device",
-            credentials_path=credential_path)
+            credentials_path=credential_path,
+            client_instance_id=client_instance, runtime="codex")
 
         try:
             # Recovery preserves old records for rollback but must select the
-            # runtime-independent terminal principal for every protected call.
+            # install-scoped client principal for every protected call.
             self.assertEqual(watch._watcher_api_token(entry),
                              credential["token"])
             self.assertNotEqual(watch._watcher_api_token(entry), poison_legacy)
@@ -458,7 +461,7 @@ class AutonomousWatcherTestCase(unittest.TestCase):
         self.assertTrue(first["cursor_initialized"])
         self.assertTrue(second["queued"])
         self.assertFalse(duplicate["queued"])
-        self.assertEqual(len(self.state()["subscriptions"][key]["pending"]), 1)
+        self.assertEqual(len(self.state()["subscriptions"][key]["pending"]), 2)
         notice = watch._watcher_pending_notice(self.status, self.config)
         self.assertIn("Build on v2", notice["context"])
         self.assertIn("client was idle", notice["context"])
@@ -507,9 +510,11 @@ class AutonomousWatcherTestCase(unittest.TestCase):
         self.assertTrue(result["cursor_initialized"])
         self.assertTrue(result["queued"])
         self.assertEqual(result["relevant_count"], 1)
-        summary = self.state()["subscriptions"][key]["pending"][0]["summary"]
-        self.assertIn("raced startup", summary)
-        self.assertNotIn("already in brief", summary)
+        entry = self.state()["subscriptions"][key]
+        self.assertEqual(entry["pending"], [])
+        self.assertEqual(len(entry["attention"]), 1)
+        self.assertIn("raced startup", entry["attention"][0]["body"])
+        self.assertNotIn("already in brief", entry["attention"][0]["body"])
 
     def test_all_relevant_event_families_are_durable_and_concise(self):
         key = self.register()
@@ -549,16 +554,20 @@ class AutonomousWatcherTestCase(unittest.TestCase):
         self.assertEqual(result["relevant_count"], 7)
         entry = self.state()["subscriptions"][key]
         self.assertEqual(entry["event_cursor"], 8)
-        self.assertEqual(len(entry["pending"]), 1)
-        pending = entry["pending"][0]
-        self.assertEqual(pending["kind"], "project_delta")
-        self.assertEqual(pending["event_count"], 7)
-        self.assertNotIn("agent.registered", pending["event_types"])
-        summary = pending["summary"]
-        for expected in ("Ship the fix", "Task T-27", "Task plan T-35",
-                         "Project Rule R-4", "Decision D-8", "Handoff",
-                         "Bridge upstream"):
+        self.assertEqual(len(entry["attention"]), 1)
+        self.assertEqual(entry["attention"][0]["body"], "Ship the fix")
+        self.assertEqual(len(entry["pending"]), 6)
+        self.assertTrue(all(row["kind"] == "project_entity_delta"
+                            for row in entry["pending"]))
+        self.assertNotIn(
+            "agent.registered",
+            {event_type for row in entry["pending"]
+             for event_type in row["event_types"]})
+        summary = "\n".join(row["summary"] for row in entry["pending"])
+        for expected in ("Task T-27", "Task plan T-35", "Project Rule R-4",
+                         "Decision D-8", "Handoff", "Bridge upstream"):
             self.assertIn(expected, summary)
+        self.assertNotIn("Ship the fix", summary)
         self.assertNotIn("agent.registered", summary)
 
     def test_raw_event_feed_paginates_with_cursor_identity_and_token(self):
@@ -579,11 +588,13 @@ class AutonomousWatcherTestCase(unittest.TestCase):
             "project_id": "shared/space", "runtime": "codex",
             "actor": "shared.director.codex", "owner": "jack",
             "device_id": "office-device",
+            "client_instance": "stored-kimi-install-9",
         }
         with mock.patch.object(watch, "_watcher_api_token",
                                return_value="test-token"), \
              mock.patch.object(watch, "_client_instance_id",
-                               return_value="codex-install-2"):
+                               side_effect=AssertionError(
+                                   "must use subscription client_instance")):
             result = watch._watcher_event_delta(entry, 0, opener=opener)
         self.assertEqual(result["next_after"], 2)
         self.assertFalse(result["may_have_more"])
@@ -596,7 +607,7 @@ class AutonomousWatcherTestCase(unittest.TestCase):
         self.assertEqual(requests[0][0].get_header("X-attacca-actor"),
                          "shared.director.codex")
         self.assertEqual(requests[0][0].get_header(
-            "X-attacca-client-instance"), "codex-install-2")
+            "X-attacca-client-instance"), "stored-kimi-install-9")
         self.assertEqual(requests[0][1],
                          watch.AUXILIARY_HTTP_TIMEOUT_SECONDS)
 

@@ -26,7 +26,7 @@ import time
 import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 try:
@@ -40,6 +40,9 @@ WATCHER_STATE_NAME = "watcher-state.json"
 WATCHER_QUEUE_LIMIT = 200
 WATCHER_DELTA_CHUNK_SIZE = 10
 WATCHER_NOTICE_BATCH_SIZE = 2
+WATCHER_ATTENTION_PAGE_SIZE = 25
+WATCHER_INBOX_MAX_PAGES = 20
+WATCHER_INBOX_MAX_BYTES = 1024 * 1024
 WATCHER_WAKE_SECONDS = 5
 WATCHER_EVENT_PAGE_SIZE = 200
 WATCHER_EVENT_MAX_PAGES = 20
@@ -344,14 +347,14 @@ def _local_device_id():
             _trim(error, 160)) from None
 
 
-def _client_instance_id():
+def _client_instance_id(runtime=None):
     """Stable non-secret id for this installed coding-client integration."""
     explicit = str(os.environ.get("ATTACCA_CLIENT_INSTANCE") or "").strip()
     if explicit:
         return explicit
     try:
         return _terminal_flow_module().load_client_instance_id(
-            runtime=_runtime_name())
+            runtime=runtime or _runtime_name())
     except Exception as error:
         raise HostedAuthenticationRequired(
             "local client-instance identity requires repair: %s" %
@@ -830,7 +833,9 @@ def _server_managed_law(config, project_id, opener=None, entry=None):
         headers["X-Attacca-Project"] = str(project_id)
         if device_id:
             headers["X-Attacca-Device-ID"] = device_id
-        headers["X-Attacca-Client-Instance"] = _client_instance_id()
+        headers["X-Attacca-Client-Instance"] = (
+            entry.get("client_instance") or
+            _client_instance_id(entry.get("runtime")))
         if entry.get("owner"):
             headers["X-Attacca-Owner"] = str(entry["owner"])
         token = _watcher_api_token(entry)
@@ -1326,7 +1331,9 @@ def _settings_interval(config, entry=None):
                 headers["X-Attacca-Actor-Type"] = "agent"
             if project_id:
                 headers["X-Attacca-Project"] = project_id
-            headers["X-Attacca-Client-Instance"] = _client_instance_id()
+            headers["X-Attacca-Client-Instance"] = (
+                entry.get("client_instance") or
+                _client_instance_id(entry.get("runtime")))
         token = _watcher_api_token(entry) if entry else None
         if isinstance(token, str) and token.strip() \
                 and "\n" not in token and "\r" not in token:
@@ -1378,6 +1385,7 @@ def _register_watcher_subscription(status, plugin_root, config, runtime=None,
     """Register one checkout without storing credentials or project data."""
     now = time.time() if now is None else float(now)
     runtime = runtime or _runtime_name()
+    client_instance = _client_instance_id(runtime)
     key = _watcher_subscription_key(status, config, runtime=runtime)
     path = _watcher_state_path()
     identity = _runtime_actor(config, status["project_id"], runtime=runtime)
@@ -1395,6 +1403,7 @@ def _register_watcher_subscription(status, plugin_root, config, runtime=None,
             "actor": identity["actor"],
             "owner": config.get("owner") or None,
             "device_id": _local_device_id(),
+            "client_instance": client_instance,
             "root": str(Path(status["root"]).resolve()),
             "link_path": status.get("link_path"),
             "plugin_root": installed_plugin_root,
@@ -1409,6 +1418,16 @@ def _register_watcher_subscription(status, plugin_root, config, runtime=None,
         else:
             entry.setdefault("next_poll_at_epoch", now)
         entry.setdefault("pending", [])
+        # Room mail is kept separately from disposable operational summaries.
+        # A message leaves this durable FIFO only after the hosted inbox cursor
+        # has acknowledged it *and* a lifecycle hook has injected it into an AI
+        # turn.  Rendering is not allowed to masquerade as a successful read.
+        entry.setdefault("attention", [])
+        entry.setdefault("attention_ack_cursor", 0)
+        # Addressed work survives the unread cursor until an explicit
+        # message_dispose outcome removes it from the hosted pending set.
+        entry.setdefault("pending_dispositions", [])
+        entry.setdefault("pending_disposition_total", 0)
         entry.setdefault("cursor_registered_at_epoch", now)
         entry.setdefault("offline_failure_count", 0)
         if "event_cursor" not in entry:
@@ -1648,7 +1667,10 @@ def _terminal_flow_progress(status, config, entry=None, *, force_poll=False,
     module = _terminal_flow_module()
     bindings = _terminal_requested_bindings(status, entry)
     device_id = _local_device_id()
-    client_instance = _client_instance_id()
+    client_instance = (entry.get("client_instance") if isinstance(entry, dict)
+                       else None) or _client_instance_id(
+                           entry.get("runtime") if isinstance(entry, dict)
+                           else None)
     result = module.safe_recovery_result(
         config["url"],
         lambda: module.advance_device_flow(
@@ -1710,7 +1732,7 @@ def _terminal_migration_notice(status, config, event_name, entry=None):
 def _watcher_sync_client_id(entry):
     material = json.dumps([
         entry.get("key"), entry.get("runtime"), entry.get("actor"),
-        entry.get("device_id"),
+        entry.get("device_id"), entry.get("client_instance"),
     ], separators=(",", ":"), ensure_ascii=False)
     return "watcher_" + hashlib.sha256(
         material.encode("utf-8")).hexdigest()[:32]
@@ -1742,7 +1764,8 @@ def _watcher_default_offline_factory(entry, wake):
         _watcher_state_path().parent / "offline", entry["server_url"], scope,
         _watcher_sync_client_id(entry),
         entry.get("device_id") or _local_device_id(),
-        visibility_fingerprint=visibility, wake_callback=wake)
+        visibility_fingerprint=visibility, wake_callback=wake,
+        projection_capabilities=entry.get("sync_projection_capabilities"))
 
 
 def _watcher_default_remote_factory(entry):
@@ -1756,8 +1779,10 @@ def _watcher_default_remote_factory(entry):
         _watcher_sync_client_id(entry),
         entry.get("device_id") or _local_device_id(),
         lambda: _watcher_api_token(entry),
-        client_instance_id=_client_instance_id(),
-        compatibility_optional_auth=True)
+        client_instance_id=(entry.get("client_instance") or
+                            _client_instance_id(entry.get("runtime"))),
+        compatibility_optional_auth=True,
+        projection_capabilities=entry.get("sync_projection_capabilities"))
 
 
 def _watcher_build_offline_adapter(entry, factory=None):
@@ -1870,12 +1895,12 @@ def _desktop_notify(project_id, summary):
 
 
 def _watcher_api_token(entry):
-    """Load a device-bound terminal credential or legacy exact actor token.
+    """Load this installed client's account key without actor-token fallback.
 
-    The terminal credential is runtime-independent, but the lookup still
-    requires this subscription's exact canonical actor binding and machine
-    device. A runtime alone is never authorization. Legacy actor tokens remain
-    readable during migration; neither credential is copied into watcher state.
+    A D-17 client key authenticates one installed integration and its human
+    account.  The exact project and canonical AI actor remain independent
+    request headers; neither role nor runtime is encoded in the key.  Missing
+    keys return ``None`` so only a real hosted 401/403 can latch authority off.
     """
     if not isinstance(entry, dict):
         return None
@@ -1883,54 +1908,21 @@ def _watcher_api_token(entry):
     runtime = str(entry.get("runtime") or "").strip().lower()
     project_id = str(entry.get("project_id") or "").strip()
     actor_id = str(entry.get("canonical_actor_id") or "").strip()
-    if not server_url or not runtime or not project_id or not actor_id:
+    client_instance = str(
+        entry.get("client_instance") or _client_instance_id(runtime)).strip()
+    if not server_url or not runtime or not project_id or not actor_id \
+            or not client_instance:
         return None
     try:
         terminal = _terminal_flow_module()
-        device_id = entry.get("device_id") or _local_device_id()
-        status = terminal.terminal_credential_status(
-            server_url, device_id=device_id, project_id=project_id,
-            actor_id=actor_id, runtime=runtime)
-        state = str(status.get("status") or "invalid")
-        if status.get("credential_present") and state != "ready":
-            raise HostedAuthenticationRequired(
-                "local terminal credential requires enrollment repair "
-                "(%s)" % state)
-        token = terminal.load_terminal_credential(
-            server_url, device_id=device_id,
-            project_id=project_id, actor_id=actor_id, runtime=runtime)
-        if token:
-            return token
-        if state == "ready":
-            raise HostedAuthenticationRequired(
-                "local terminal credential could not be loaded safely")
-    except HostedAuthenticationRequired:
-        raise
+        token = terminal.load_client_api_key(
+            server_url, client_instance=client_instance, runtime=runtime,
+            project_id=project_id)
+        return token.strip() if isinstance(token, str) and token.strip() else None
     except Exception as error:
-        raise HostedAuthenticationRequired(
-            "local terminal credential state is invalid: %s" %
+        raise RuntimeError(
+            "local client API key state is invalid: %s" %
             _trim(error, 160)) from None
-    explicit = os.environ.get("ATTACCA_API_TOKEN")
-    explicit_project = str(os.environ.get("ATTACCA_PROJECT") or "").strip()
-    explicit_actor = str(os.environ.get("ATTACCA_ACTOR") or "").strip()
-    if explicit is not None and runtime == _runtime_name() \
-            and explicit_project == project_id \
-            and explicit_actor in {entry.get("actor"), actor_id}:
-        return explicit.strip() or None
-    try:
-        data = terminal.read_credentials_store()
-        server = terminal.server_record_for_url(data, server_url)
-        record = (((server.get("agent_tokens") or {}).get(project_id) or {})
-                  .get(actor_id))
-        if not isinstance(record, dict):
-            return None
-        recorded_runtime = str(record.get("runtime") or "").strip().lower()
-        token = record.get("token")
-        if recorded_runtime != runtime or not isinstance(token, str):
-            return None
-        return token.strip() or None
-    except Exception:
-        return None
 
 
 def _watcher_fetch_sync_snapshot(entry, transport=None):
@@ -1942,7 +1934,7 @@ def _watcher_fetch_sync_snapshot(entry, transport=None):
             "\n" in token or "\r" in token or
             len(token.encode("utf-8")) > client.MAX_TOKEN_BYTES):
         raise RuntimeError(
-            "no valid Attacca terminal credential is available for sync")
+            "no valid Attacca client API key is available for sync")
     request_transport = transport or client.UrllibJsonTransport()
     headers = {
         "Accept": "application/json",
@@ -1951,7 +1943,9 @@ def _watcher_fetch_sync_snapshot(entry, transport=None):
         "X-Attacca-Actor": entry.get("canonical_actor_id"),
         "X-Attacca-Actor-Type": "agent",
         "X-Attacca-Project": entry["project_id"],
-        "X-Attacca-Client-Instance": _client_instance_id(),
+        "X-Attacca-Client-Instance": (
+            entry.get("client_instance") or
+            _client_instance_id(entry.get("runtime"))),
     }
     if token:
         headers["Authorization"] = "Bearer " + token.strip()
@@ -1983,9 +1977,13 @@ def _watcher_fetch_sync_snapshot(entry, transport=None):
                 or auth_status.get("compatibility_active") is not True:
             raise HostedAuthenticationRequired(
                 "Attacca requires terminal enrollment for sync", http_status=401)
-    url = "%s/v1/projects/%s/sync/snapshot" % (
+    capabilities = protocol.validate_projection_capabilities(
+        entry.get("sync_projection_capabilities") or
+        protocol.current_projection_capabilities())
+    url = "%s/v1/projects/%s/sync/snapshot?%s" % (
         offline.normalize_server_url(entry["server_url"]),
-        quote(str(entry["project_id"]), safe=""))
+        quote(str(entry["project_id"]), safe=""),
+        urlencode(protocol.projection_capabilities_query(capabilities)))
     response = request_transport.request(
         "GET", url, headers=headers,
         body=None, timeout=AUXILIARY_HTTP_TIMEOUT_SECONDS,
@@ -2011,6 +2009,8 @@ def _watcher_fetch_sync_snapshot(entry, transport=None):
     try:
         value = json.loads(response.body.decode("utf-8"))
         snapshot = protocol.validate_snapshot(value)
+        protocol.validate_projection_for_capabilities(
+            snapshot["projection"], snapshot["scope"], capabilities)
     except Exception as error:
         raise RuntimeError(
             "sync snapshot failed schema-v1 validation: %s" % error) from error
@@ -2039,6 +2039,11 @@ def _watcher_install_sync_snapshot(key, entry, snapshot):
     checked = protocol.validate_snapshot(snapshot)
     scope = checked["scope"]
     visibility = checked["visibility_fingerprint"]
+    capabilities = protocol.validate_projection_capabilities(
+        entry.get("sync_projection_capabilities") or
+        protocol.current_projection_capabilities())
+    protocol.validate_projection_for_capabilities(
+        checked["projection"], scope, capabilities)
     if scope["project_id"] != entry.get("project_id") \
             or scope["actor_id"] != entry.get("canonical_actor_id") \
             or scope["role"] != entry.get("actor_role") \
@@ -2058,6 +2063,7 @@ def _watcher_install_sync_snapshot(key, entry, snapshot):
         previous_scope, _watcher_sync_client_id(entry),
         entry.get("device_id") or _local_device_id(),
         visibility_fingerprint=previous_visibility,
+        projection_capabilities=capabilities,
         wake_callback=lambda: _watcher_wake_subscription(
             key, "local_write"))
     reset = previous_scope != scope or previous_visibility != visibility
@@ -2082,6 +2088,7 @@ def _watcher_install_sync_snapshot(key, entry, snapshot):
             "sync_schema_version": protocol.SCHEMA_VERSION,
             "sync_scope": scope,
             "sync_visibility_fingerprint": visibility,
+            "sync_projection_capabilities": capabilities,
             "sync_activated_at": datetime.now(timezone.utc).isoformat(),
             "offline_mirror_cursor": proof["cursor"],
             "offline_mirror_verified_at": proof["mirror_verified_at"],
@@ -2183,6 +2190,62 @@ def _watcher_activate_identity_sync(status, config, transport=None,
             "cursor": proof["cursor"]}
 
 
+def _watcher_request_headers(entry):
+    """Build one authenticated, actor-scoped watcher request header set."""
+    token = _watcher_api_token(entry)
+    headers = {
+        "Accept": "application/json",
+        "X-Attacca-Actor": entry.get("canonical_actor_id") or
+                            entry.get("actor") or entry.get("runtime") or
+                            "watcher",
+        "X-Attacca-Actor-Type": "agent",
+        "X-Attacca-Project": entry["project_id"],
+        "X-Attacca-Device": entry.get("device_id") or _local_device_id(),
+        "X-Attacca-Device-ID": (
+            entry.get("device_id") or _local_device_id()),
+        "X-Attacca-Client-Instance": (
+            entry.get("client_instance") or
+            _client_instance_id(entry.get("runtime"))),
+    }
+    if entry.get("owner"):
+        headers["X-Attacca-Owner"] = entry["owner"]
+    if token:
+        headers["Authorization"] = "Bearer %s" % token
+    return headers
+
+
+def _watcher_inbox_page(entry, mark_read=False,
+                        limit=WATCHER_ATTENTION_PAGE_SIZE, opener=None):
+    """Fetch one actor-private group-inbox page.
+
+    The hook first peeks with ``mark_read=False`` and durably stages the exact
+    messages.  Only then does it make the acknowledging request.  This closes
+    the old crash gap where a remote read cursor could advance before the AI
+    ever received the message.
+    """
+    limit = max(1, min(int(limit or WATCHER_ATTENTION_PAGE_SIZE), 500))
+    url = "%s/v1/projects/%s/inbox?mark_read=%d&limit=%d" % (
+        entry["server_url"].rstrip("/"),
+        quote(str(entry["project_id"]), safe=""),
+        1 if mark_read else 0, limit)
+    request = Request(url, headers=_watcher_request_headers(entry))
+    with (opener or urlopen)(
+            request,
+            timeout=AUXILIARY_HTTP_TIMEOUT_SECONDS) as response:
+        raw = response.read(WATCHER_INBOX_MAX_BYTES + 1)
+    if len(raw) > WATCHER_INBOX_MAX_BYTES:
+        raise RuntimeError("inbox response exceeded its size limit")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError) as error:
+        raise RuntimeError("inbox response is not valid UTF-8 JSON") from error
+    messages = payload.get("messages") if isinstance(payload, dict) else None
+    if not isinstance(messages, list) or any(
+            not isinstance(message, dict) for message in messages):
+        raise RuntimeError("inbox response returned an invalid messages array")
+    return payload
+
+
 def _watcher_event_delta(entry, after, opener=None):
     """Fetch bounded raw-ledger pages after one durable event cursor.
 
@@ -2195,23 +2258,7 @@ def _watcher_event_delta(entry, after, opener=None):
     events = []
     may_have_more = False
     open_request = opener or urlopen
-    token = _watcher_api_token(entry)
-    headers = {
-        "Accept": "application/json",
-        "X-Attacca-Actor": entry.get("canonical_actor_id") or
-                            entry.get("actor") or entry.get("runtime") or
-                            "watcher",
-        "X-Attacca-Actor-Type": "agent",
-        "X-Attacca-Project": entry["project_id"],
-        "X-Attacca-Device": entry.get("device_id") or _local_device_id(),
-        "X-Attacca-Device-ID": (
-            entry.get("device_id") or _local_device_id()),
-        "X-Attacca-Client-Instance": _client_instance_id(),
-    }
-    if entry.get("owner"):
-        headers["X-Attacca-Owner"] = entry["owner"]
-    if token:
-        headers["Authorization"] = "Bearer %s" % token
+    headers = _watcher_request_headers(entry)
     for _ in range(WATCHER_EVENT_MAX_PAGES):
         url = "%s/v1/projects/%s/events?after=%d&limit=%d" % (
             entry["server_url"].rstrip("/"),
@@ -2280,6 +2327,388 @@ def _watcher_event_actor(event):
             "unknown")
 
 
+def _watcher_event_is_self(event, entry):
+    """Reject the subscription's own room writes from its unread FIFO."""
+    identity = event.get("identity") \
+        if isinstance(event.get("identity"), dict) else {}
+    attribution = event.get("attribution") \
+        if isinstance(event.get("attribution"), dict) else {}
+    candidates = {
+        str(value) for value in (
+            event.get("operational_actor_id"), event.get("actor_id"),
+            identity.get("actor_id"), attribution.get("actor_id"))
+        if value
+    }
+    own = {
+        str(value) for value in (
+            entry.get("canonical_actor_id"), entry.get("actor")) if value
+    }
+    return bool(candidates.intersection(own))
+
+
+def _watcher_attention_projection(value, entry):
+    """Return one bounded, actor-private room row for durable delivery."""
+    is_event = value.get("event_type") == "room.message"
+    payload = value.get("payload") if is_event else value
+    if not isinstance(payload, dict):
+        return None
+    if is_event and _watcher_event_is_self(value, entry):
+        return None
+    sender = (_watcher_event_actor(value) if is_event else
+              payload.get("actor") or payload.get("actor_id") or "unknown")
+    canonical = str(entry.get("canonical_actor_id") or "")
+    if not is_event and canonical and str(sender) == canonical:
+        return None
+    seq = value.get("seq") if is_event else payload.get("seq")
+    try:
+        numeric_seq = int(seq or 0)
+    except (TypeError, ValueError):
+        return None
+    # Persist the exact body. Rendering is bounded later; truncating the
+    # durable FIFO itself would make a transient watcher cache the only place
+    # where an unread room message was silently destroyed.
+    body = str(payload.get("body") or "")
+    directed = bool(payload.get("directed_to_you") or
+                    payload.get("addressed_to_you") and
+                    not payload.get("broadcast_to_everyone"))
+    everyone = bool(payload.get("broadcast_to_everyone"))
+    bridge = bool(payload.get("origin_project") or payload.get("authority"))
+    event_id = value.get("event_id") if is_event else payload.get("event_id")
+    return {
+        "event_id": event_id,
+        "message_key": ("event:%s" % event_id if event_id else
+                        json.dumps([numeric_seq, sender, body],
+                                   separators=(",", ":"),
+                                   ensure_ascii=False)),
+        "seq": numeric_seq,
+        "actor": sender,
+        "msg_type": payload.get("msg_type") or payload.get("type") or "chat",
+        "body": body,
+        "body_truncated": False,
+        "mentions": payload.get("mentions") or [],
+        "reply_to": payload.get("reply_to"),
+        "task_id": value.get("task_id") or payload.get("task_id"),
+        "origin_project": payload.get("origin_project"),
+        "authority": payload.get("authority"),
+        "directed_to_you": directed,
+        "broadcast_to_everyone": everyone,
+        "group_context": bool(payload.get("group_context")) or
+                         not (directed or everyone),
+        "priority_attention": bool(directed or everyone or bridge),
+    }
+
+
+def _watcher_merge_attention(entry, rows, acknowledged=False):
+    """Merge room rows into an unbounded lossless FIFO by immutable id."""
+    pending = entry.setdefault("attention", [])
+    by_key = {row.get("message_key"): row for row in pending
+              if isinstance(row, dict) and row.get("message_key")}
+    ack_cursor = max(0, int(entry.get("attention_ack_cursor") or 0))
+    added = 0
+    for row in rows:
+        projected = _watcher_attention_projection(row, entry)
+        if not projected:
+            continue
+        key = projected["message_key"]
+        existing = by_key.get(key)
+        acked = bool(acknowledged or projected["seq"] <= ack_cursor)
+        if existing:
+            existing.update({key: value for key, value in projected.items()
+                             if value is not None})
+            existing["acknowledged"] = bool(
+                existing.get("acknowledged") or acked)
+            continue
+        projected["acknowledged"] = acked
+        projected["staged_at"] = datetime.now(timezone.utc).isoformat()
+        pending.append(projected)
+        by_key[key] = projected
+        added += 1
+    pending.sort(key=lambda row: (
+        int(row.get("seq") or 0), str(row.get("message_key") or "")))
+    return added
+
+
+def _watcher_ack_attention_through(key, cursor):
+    """Record a hosted inbox cursor and mark already-staged rows acknowledged."""
+    try:
+        cursor = max(0, int(cursor or 0))
+    except (TypeError, ValueError):
+        return
+
+    def mutate(state):
+        entry = (state.get("subscriptions") or {}).get(key)
+        if not entry:
+            return
+        entry["attention_ack_cursor"] = max(
+            int(entry.get("attention_ack_cursor") or 0), cursor)
+        for row in entry.get("attention") or []:
+            if int(row.get("seq") or 0) <= cursor:
+                row["acknowledged"] = True
+
+    _mutate_state(_watcher_state_path(), mutate)
+
+
+def _watcher_stage_attention(key, rows, acknowledged=False):
+    captured = {"added": 0}
+
+    def mutate(state):
+        entry = (state.get("subscriptions") or {}).get(key)
+        if entry:
+            captured["added"] = _watcher_merge_attention(
+                entry, rows, acknowledged=acknowledged)
+
+    _mutate_state(_watcher_state_path(), mutate)
+    return captured["added"]
+
+
+def _watcher_replace_pending_dispositions(key, payload):
+    """Persist the server's actor-private unresolved assignment projection.
+
+    Unlike unread room rows, these records are a current set, not a FIFO. They
+    remain pinned after the read cursor advances and disappear only when the
+    server reports an explicit terminal disposition.
+    """
+    if not isinstance(payload, dict) or "pending_dispositions" not in payload:
+        return False
+    rows = payload.get("pending_dispositions")
+    if not isinstance(rows, list) or any(not isinstance(row, dict)
+                                         for row in rows):
+        raise RuntimeError(
+            "inbox response returned invalid pending_dispositions")
+    projected = []
+    for row in rows:
+        item = _watcher_attention_projection(row, {})
+        if not item:
+            continue
+        disposition = row.get("disposition")
+        item["disposition"] = disposition if isinstance(disposition, dict) \
+            else None
+        item["requires_disposition"] = True
+        projected.append(item)
+    try:
+        total = int(payload.get("pending_disposition_total", len(projected)))
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            "inbox response returned invalid pending_disposition_total")
+    if total < len(projected) or total < 0:
+        raise RuntimeError(
+            "inbox response returned inconsistent pending disposition count")
+
+    def mutate(state):
+        entry = (state.get("subscriptions") or {}).get(key)
+        if not entry:
+            return
+        entry["pending_dispositions"] = projected
+        entry["pending_disposition_total"] = total
+        entry["pending_disposition_may_have_more"] = bool(
+            payload.get("pending_disposition_may_have_more") or
+            total > len(projected))
+        entry["pending_dispositions_refreshed_at"] = datetime.now(
+            timezone.utc).isoformat()
+
+    _mutate_state(_watcher_state_path(), mutate)
+    return True
+
+
+def _watcher_refresh_inbox_attention(status, config, runtime=None,
+                                      opener=None):
+    """Automatically stage and acknowledge all bounded unread inbox pages.
+
+    Each page is peeked, fsynced into watcher state, and only then acknowledged
+    remotely. More than ``WATCHER_INBOX_MAX_PAGES`` remains unread on the host
+    for the next lifecycle boundary instead of being silently skipped.
+    """
+    key, entry = _watcher_subscription_entry(status, config, runtime=runtime)
+    if not entry or not entry.get("server_url") or not entry.get("project_id"):
+        return {"ok": False, "missing": True, "key": key}
+    return _watcher_refresh_inbox_entry(key, entry, opener=opener)
+
+
+def _watcher_refresh_inbox_entry(key, entry, opener=None):
+    """Refresh one already-resolved subscription (including idle daemon use)."""
+    pages = staged = 0
+    more = False
+    for _ in range(WATCHER_INBOX_MAX_PAGES):
+        peek = _watcher_inbox_page(
+            entry, mark_read=False, limit=WATCHER_ATTENTION_PAGE_SIZE,
+            opener=opener)
+        messages = peek.get("messages") or []
+        _watcher_replace_pending_dispositions(key, peek)
+        staged += _watcher_stage_attention(key, messages)
+        # The common idle case is deliberately one lightweight request. There
+        # is no hosted read cursor to advance when no visible unread row was
+        # returned; unresolved dispositions were still refreshed above.
+        if not messages and not peek.get("may_have_more"):
+            pages += 1
+            more = False
+            break
+        ack = _watcher_inbox_page(
+            entry, mark_read=True, limit=WATCHER_ATTENTION_PAGE_SIZE,
+            opener=opener)
+        _watcher_replace_pending_dispositions(key, ack)
+        try:
+            ack_cursor = int(ack.get("read_cursor") or 0)
+        except (TypeError, ValueError):
+            raise RuntimeError("inbox acknowledgement returned an invalid cursor")
+        last_message_seq = max(
+            [int(message.get("seq") or 0) for message in messages] or [0])
+        if ack_cursor < last_message_seq:
+            raise RuntimeError(
+                "inbox acknowledgement did not reach the durably staged page")
+        _watcher_ack_attention_through(key, ack_cursor)
+        pages += 1
+        more = bool(peek.get("may_have_more") or ack.get("may_have_more"))
+        if not more:
+            break
+    return {"ok": True, "key": key, "pages": pages, "staged": staged,
+            "may_have_more": more}
+
+
+def _watcher_attention_notice(status, config, runtime=None, consume=True):
+    """Pin unresolved assignments and staged unread mail at every boundary."""
+    key = _watcher_subscription_key(status, config, runtime=runtime)
+    captured = {"rows": [], "remaining": 0, "dispositions": [],
+                "disposition_total": 0, "disposition_more": False}
+
+    def mutate(state):
+        entry = (state.get("subscriptions") or {}).get(key)
+        if not entry:
+            return
+        # A row acknowledged by the hosted inbox and delivered on a previous
+        # lifecycle boundary is complete. Failed acknowledgements deliberately
+        # repeat, even if a prior hook rendered them.
+        pending = [row for row in (entry.get("attention") or [])
+                   if not (row.get("acknowledged") and
+                           row.get("delivered_at"))]
+        entry["attention"] = pending
+        captured["dispositions"] = list(
+            entry.get("pending_dispositions") or [])[
+                :WATCHER_ATTENTION_PAGE_SIZE]
+        captured["disposition_total"] = max(
+            len(captured["dispositions"]),
+            int(entry.get("pending_disposition_total") or 0))
+        captured["disposition_more"] = bool(
+            entry.get("pending_disposition_may_have_more") or
+            captured["disposition_total"] >
+            len(captured["dispositions"]))
+        disposition_keys = {
+            row.get("message_key") for row in captured["dispositions"]}
+        selected = pending[:WATCHER_ATTENTION_PAGE_SIZE]
+        captured["rows"] = [
+            row for row in selected
+            if row.get("message_key") not in disposition_keys]
+        captured["remaining"] = max(
+            0, len(pending) - len(selected))
+        if consume:
+            delivered_at = datetime.now(timezone.utc).isoformat()
+            for row in selected:
+                row["delivered_at"] = delivered_at
+
+    if consume:
+        _mutate_state(_watcher_state_path(), mutate)
+    else:
+        mutate(_read_state(_watcher_state_path()))
+    rows = captured["rows"]
+    dispositions = captured["dispositions"]
+    if not rows and not dispositions:
+        return None
+    lines = [
+        "ATTACCA PENDING ASSIGNMENTS + UNREAD GROUP MAIL · %s" %
+        status["project_id"],
+        "ATTACCA AUTOMATIC UPDATE · group-mail check completed",
+        "Automatically checked by Attacca. Read and disposition messages "
+        "marked YOUR ATTENTION, EVERYONE, or BRIDGE before yielding; no user "
+        "needs to type ‘check messages’.",
+    ]
+    if dispositions:
+        lines.append(
+            "PENDING DISPOSITIONS (%d): these stay pinned even after the read "
+            "cursor advances. Handle each assignment, then record its outcome "
+            "with message_dispose; rendering alone does not clear it." %
+            captured["disposition_total"])
+    for row in dispositions:
+        current = row.get("disposition") or {}
+        state = current.get("disposition") if isinstance(current, dict) \
+            else None
+        body, _ = _head_tail_text(
+            row.get("body") or "", WATCHER_ROOM_BODY_LIMIT,
+            "call room_read with since_seq=%s for the complete message" %
+            max(0, int(row.get("seq") or 0) - 1))
+        lines.append(
+            "- [DISPOSITION REQUIRED%s] Event %s · Room #%s · %s · %s: %s" % (
+                " · current=%s" % state if state else "",
+                row.get("event_id") or row.get("message_key") or "?",
+                row.get("seq") or "?", row.get("msg_type") or "directive",
+                row.get("actor") or "unknown", body))
+    if captured["disposition_more"]:
+        lines.append(
+            "- %d additional pending disposition(s) exist on the host; call "
+            "check_inbox for the complete current assignment set." % max(
+                0, captured["disposition_total"] - len(dispositions)))
+    for row in rows:
+        labels = []
+        if row.get("origin_project") or row.get("authority"):
+            labels.append("BRIDGE")
+        if row.get("directed_to_you"):
+            labels.append("YOUR ATTENTION")
+        elif row.get("broadcast_to_everyone"):
+            labels.append("EVERYONE")
+        else:
+            labels.append("GROUP CONTEXT")
+        source = " from %s" % row["origin_project"] \
+            if row.get("origin_project") else ""
+        authority = " [%s]" % row["authority"] \
+            if row.get("authority") else ""
+        body, _ = _head_tail_text(
+            row.get("body") or "", WATCHER_ROOM_BODY_LIMIT,
+            "call room_read with since_seq=%s for the complete message" %
+            max(0, int(row.get("seq") or 0) - 1))
+        lines.append("- [%s] Room #%s%s%s · %s · %s: %s" % (
+            "][".join(labels), row.get("seq") or "?", source, authority,
+            row.get("msg_type") or "chat", row.get("actor") or "unknown",
+            body))
+    if captured["remaining"]:
+        lines.append(
+            "- %d additional staged message(s) remain in lossless FIFO and "
+            "will be pinned on subsequent turn boundaries." %
+            captured["remaining"])
+    lines.append(
+        "These rows were durably staged before the hosted read cursor was "
+        "acknowledged. A failed acknowledgement keeps them pinned and retries "
+        "automatically.")
+    return {
+        "system_message": (
+            "Attacca assignments/mail · %d pending dispositions, %d unread "
+            "shown, %d queued" % (
+                captured["disposition_total"], len(rows),
+                captured["remaining"])),
+        "context": "\n".join(lines),
+    }
+
+
+def _watcher_entity_key(event):
+    """Stable coalescing key for supersedable operational ledger entities."""
+    event_type = str(event.get("event_type") or "")
+    payload = event.get("payload") \
+        if isinstance(event.get("payload"), dict) else {}
+    task_id = event.get("task_id") or payload.get("task_id")
+    if event_type.startswith("task.plan."):
+        return "task-plan:%s" % (task_id or "unknown")
+    if event_type.startswith("task."):
+        return "task:%s" % (task_id or "unknown")
+    if event_type.startswith("rule."):
+        return "rule:%s" % (payload.get("rule_id") or "unknown")
+    if event_type.startswith("decision."):
+        return "decision:%s" % (
+            payload.get("decision_id") or "unknown")
+    if event_type.startswith("handoff."):
+        return "handoff"
+    if event_type.startswith("bridge."):
+        return "bridge:%s" % (
+            payload.get("with") or payload.get("other_project") or "unknown")
+    return None
+
+
 def _watcher_event_line(event):
     """Render one coordination-relevant ledger event without a full read."""
     event_type = str(event.get("event_type") or "event")
@@ -2331,10 +2760,16 @@ def _watcher_event_line(event):
         rule_id = payload.get("rule_id") or "rule"
         version = " v%s" % payload["version"] \
             if payload.get("version") is not None else ""
+        if payload.get("enabled") is False or event_type.endswith(".disabled"):
+            state = " · CURRENTLY DISABLED"
+        elif payload.get("enabled") is True or event_type.endswith(".enabled"):
+            state = " · currently enabled"
+        else:
+            state = ""
         title = " — %s" % _trim(payload.get("title"), 140) \
             if payload.get("title") else ""
-        return "Project Rule %s%s %s · %s%s" % (
-            rule_id, version, verb, actor, title)
+        return "Project Rule %s%s %s%s · %s%s" % (
+            rule_id, version, verb, state, actor, title)
     if event_type.startswith("decision."):
         decision_id = payload.get("decision_id") or "decision"
         outcome = payload.get("resolution") or payload.get("status")
@@ -2834,18 +3269,6 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
                 offline_adapter=adapter)
             return {"ok": False, "due": True, "error": str(err),
                     "key": key}
-        sync_error = str(sync_result.get("error") or "").lower()
-        if sync_state == "conflict" and any(marker in sync_error for marker in (
-                "actor or role", "server/project/principal",
-                "identity changed", "visibility changed")):
-            auth_error = HostedAuthenticationRequired(
-                sync_result.get("error") or
-                "authenticated AI identity/authority changed",
-                http_status=403)
-            _watcher_queue_auth_required(key, entry, auth_error, now)
-            return {"ok": False, "due": True,
-                    "authentication_required": True, "offline": False,
-                    "error": str(auth_error), "key": key}
         if sync_state == "offline":
             error = sync_result.get("error") or adapter_status.get(
                 "last_error") or "hosted sync is unavailable"
@@ -2870,6 +3293,12 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
             }
         _watcher_write_markdown_mirror(entry, adapter)
         try:
+            # A successful capability negotiation can rebind visibility (and
+            # therefore the mirror key) without changing authority. Validate
+            # that exact pair before any result is queued or treated as a
+            # convergence proof.
+            entry, _rebind_proof, _rebind_snapshot, adapter_status = \
+                _watcher_accept_synced_identity(entry, adapter)
             sync_notice_queued = _watcher_queue_sync_result(
                 key, entry, sync_result, adapter_status, now,
                 offline_adapter=adapter,
@@ -2915,6 +3344,11 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
                     adapter_status),
                 "last_sync_at": datetime.now(timezone.utc).isoformat(),
                 "last_sync_result": sync_state,
+                "sync_scope": entry["sync_scope"],
+                "sync_visibility_fingerprint": entry[
+                    "sync_visibility_fingerprint"],
+                "sync_projection_capabilities": entry[
+                    "sync_projection_capabilities"],
             })
             if sync_state in ("online", "pending", "conflict"):
                 live.pop("auth_required", None)
@@ -2927,6 +3361,41 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
                         "connection_error"}]
 
         _mutate_state(_watcher_state_path(), persist_sync)
+    inbox_result = None
+    inbox_error = None
+    if delta_loader is None:
+        # The detached daemon, not only lifecycle hooks, performs the inbox
+        # read every configured minute. This is what makes new assignments
+        # visible while every coding client is otherwise idle.
+        try:
+            inbox_result = _watcher_refresh_inbox_entry(key, entry)
+
+            def clear_inbox_error(state_value):
+                live = (state_value.get("subscriptions") or {}).get(key)
+                if live:
+                    live.pop("last_inbox_error", None)
+                    live.pop("last_inbox_error_at", None)
+
+            _mutate_state(_watcher_state_path(), clear_inbox_error)
+        except Exception as err:
+            if _authentication_required_error(err):
+                _watcher_queue_auth_required(key, entry, err, now)
+                return {"ok": False, "due": True,
+                        "authentication_required": True, "offline": False,
+                        "error": str(err), "key": key}
+            inbox_error = _trim(err, 300)
+
+            def record_inbox_error(state_value):
+                live = (state_value.get("subscriptions") or {}).get(key)
+                if live:
+                    live["last_inbox_error"] = inbox_error
+                    live["last_inbox_error_at"] = datetime.now(
+                        timezone.utc).isoformat()
+
+            _mutate_state(_watcher_state_path(), record_inbox_error)
+            # Do not let one failed auxiliary inbox request suppress the raw
+            # event feed or verified offline synchronization. Hosted unread
+            # state is not acknowledged on failure and retries next minute.
     cursor = max(0, int(entry.get("event_cursor") or 0))
     initialized = bool(entry.get("event_cursor_initialized"))
     loader = delta_loader or (
@@ -2970,21 +3439,24 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
             and isinstance(registered_at, (int, float))
             and _watcher_event_epoch(event) >= registered_at]
     status = _watcher_subscription_status(entry)
-    summary_rows = []
-    for offset in range(0, len(relevant), WATCHER_DELTA_CHUNK_SIZE):
-        chunk = relevant[offset:offset + WATCHER_DELTA_CHUNK_SIZE]
-        summary = _watcher_delta_summary(status, chunk, interval)
-        if summary:
-            summary_rows.append({"events": chunk, "summary": summary})
+    room_events = [event for event in relevant
+                   if event.get("event_type") == "room.message"
+                   and not _watcher_event_is_self(event, entry)]
+    entity_events = [event for event in relevant
+                     if event.get("event_type") != "room.message"]
+    notification_summary = _watcher_delta_summary(
+        status, (room_events + entity_events)[-WATCHER_DELTA_CHUNK_SIZE:],
+        interval)
     fingerprint = hashlib.sha256(json.dumps([
         [event.get("seq"), event.get("event_id"), event.get("event_type")]
         for event in relevant
     ], sort_keys=True, separators=(",", ":"),
         ensure_ascii=False).encode("utf-8")).hexdigest()
     queued = False
+    attention_added = 0
 
     def persist(state_value):
-        nonlocal queued
+        nonlocal queued, attention_added
         live = (state_value.get("subscriptions") or {}).get(key)
         if not live:
             return
@@ -3002,41 +3474,71 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
         # Discard the legacy materialized view after the first successful
         # delta request. Only cursors and concise pending summaries persist.
         live.pop("snapshot", None)
-        if not summary_rows or \
-                live.get("last_queued_fingerprint") == fingerprint:
+        # Room traffic has its own durable FIFO and is never coalesced. This
+        # merge is in the same fsynced state transaction as the event cursor,
+        # so advancing the cursor cannot lose a message.
+        attention_added = _watcher_merge_attention(live, room_events)
+        inbox_cursor = delta.get("inbox_read_cursor")
+        if inbox_cursor is not None:
+            try:
+                inbox_cursor = max(0, int(inbox_cursor))
+            except (TypeError, ValueError):
+                inbox_cursor = None
+        if inbox_cursor is not None:
+            live["attention_ack_cursor"] = max(
+                int(live.get("attention_ack_cursor") or 0), inbox_cursor)
+            for row in live.get("attention") or []:
+                if int(row.get("seq") or 0) <= inbox_cursor:
+                    row["acknowledged"] = True
+
+        if live.get("last_queued_fingerprint") == fingerprint:
+            queued = bool(attention_added)
             return
         live["last_queued_fingerprint"] = fingerprint
         pending = live.setdefault("pending", [])
-        chunk_after = cursor
         created_at = datetime.now(timezone.utc).isoformat()
-        for index, row in enumerate(summary_rows):
-            chunk = row["events"]
-            through = (next_cursor if index == len(summary_rows) - 1 else
-                       int(chunk[-1].get("seq") or chunk_after))
+        for event in entity_events:
+            entity_key = _watcher_entity_key(event)
+            if not entity_key:
+                continue
+            # An older revision of the same task/rule/decision/handoff/bridge
+            # is unsafe to inject after a newer revision exists. Replace it in
+            # place with the latest observed ledger state instead of replaying
+            # historical instructions oldest-first.
+            pending[:] = [row for row in pending if not (
+                row.get("kind") == "project_entity_delta" and
+                row.get("entity_key") == entity_key)]
+            seq = int(event.get("seq") or 0)
+            line = _watcher_event_line(event)
             pending.append({
-                "fingerprint": "%s:%d" % (fingerprint, index),
+                "fingerprint": "%s:%s:%s" % (
+                    fingerprint, entity_key, seq),
                 "created_at": created_at,
-                "summary": row["summary"],
-                "kind": "project_delta",
-                "after": chunk_after,
-                "through": through,
-                "event_count": len(chunk),
-                "event_types": sorted({event.get("event_type")
-                                       for event in chunk}),
+                "summary": (
+                    "ATTACCA CURRENT ENTITY UPDATE · %s\n"
+                    "- %s\n"
+                    "This row supersedes older queued revisions for %s and "
+                    "reflects the newest watcher event through #%s. Refresh "
+                    "the entity before acting when complete current detail "
+                    "is required." % (
+                        entry["project_id"], line, entity_key, seq)),
+                "kind": "project_entity_delta",
+                "entity_key": entity_key,
+                "after": max(cursor, seq - 1),
+                "through": seq,
+                "event_count": 1,
+                "event_types": [event.get("event_type")],
             })
-            chunk_after = through
         if len(pending) > WATCHER_QUEUE_LIMIT:
-            # A room body may never be collapsed into a count after the event
-            # cursor advances. Bound only routine non-room notifications; if
-            # the excess is all group-room traffic, retain it durably and let
-            # lifecycle turns drain the FIFO in batches.
+            # Room bodies live in the separate lossless attention FIFO. This
+            # queue contains only re-fetchable operational state and may be
+            # compacted under an extreme number of distinct entities.
             removable = max(0, len(pending) - WATCHER_QUEUE_LIMIT)
             kept = []
             coalesced = []
             for item in pending:
-                contains_room = "room.message" in (
-                    item.get("event_types") or [])
-                if removable and not contains_room:
+                if removable and item.get("kind") in {
+                        "project_entity_delta", "project_delta"}:
                     coalesced.append(item)
                     removable -= 1
                 else:
@@ -3047,9 +3549,9 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
                     "created_at": created_at,
                     "summary": (
                         "ATTACCA OPERATIONAL BACKLOG · %s\n"
-                        "- %d non-room event(s) were compacted. No group-room "
-                        "message was dropped; refresh tasks/rules/decisions for "
-                        "full operational detail." % (
+                        "- %d supersedable entity update(s) were compacted. "
+                        "No group-room message was dropped; refresh tasks/"
+                        "rules/decisions/handoff for current detail." % (
                             entry["project_id"], sum(int(
                                 item.get("event_count") or 0)
                                 for item in coalesced))),
@@ -3063,15 +3565,15 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
                                            (item.get("event_types") or [])}),
                 })
             pending[:] = kept
-        queued = True
+        queued = bool(attention_added or entity_events)
 
     # Persistence happens before any optional desktop notification. A notifier
     # failure therefore cannot lose the update.
     _mutate_state(_watcher_state_path(), persist)
-    if queued:
+    if queued and notification_summary:
         try:
             (notifier or _desktop_notify)(
-                entry["project_id"], summary_rows[-1]["summary"])
+                entry["project_id"], notification_summary)
         except Exception:
             pass
     return {"ok": True, "due": True,
@@ -3082,6 +3584,10 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
             "write_woke": write_woke,
             "key": key, "interval_seconds": interval,
             "event_count": len(events), "relevant_count": len(relevant),
+            "attention_count": attention_added,
+            "inbox_checked": bool(inbox_result and inbox_result.get("ok")),
+            "inbox_staged": int((inbox_result or {}).get("staged") or 0),
+            "inbox_error": inbox_error,
             "event_cursor": next_cursor,
             "cursor_initialized": initialized or not may_have_more}
 
@@ -3112,15 +3618,32 @@ def _watcher_pending_notice(status, config, runtime=None, consume=True):
     rows = captured["rows"]
     if not rows:
         return None
-    context = "\n\n".join(row["summary"] for row in rows)
+    rendered = []
+    for row in rows:
+        summary = row["summary"]
+        if row.get("kind") == "project_delta":
+            # Pre-upgrade queues baked multiple historical entity revisions
+            # into one opaque string. They cannot be proven current. Preserve
+            # any legacy room excerpts for recovery, but explicitly prohibit
+            # acting on its task/rule/decision/handoff lines.
+            summary = (
+                "ATTACCA LEGACY QUEUED DELTA — ENTITY STATE NOT "
+                "REVALIDATED\n"
+                "Do not act on any task/rule/decision/handoff/bridge state "
+                "below until refreshing that entity. Room excerpts remain "
+                "message-recovery evidence.\n" + summary)
+        rendered.append(summary)
+    context = "\n\n".join(rendered)
     if captured["remaining"]:
         context += ("\n\n- %d queued update(s) remain and will be injected "
                     "oldest-first at subsequent lifecycle boundaries; none "
                     "were cleared or coalesced." % captured["remaining"])
     context += ("\n\nThe background watcher captured these ledger deltas while "
-                "the coding client was idle. Refresh the affected handoff, "
-                "room, task, plan, rule, decision, or bridge through Attacca "
-                "before acting when full current detail is required.")
+                "the coding client was idle. Supersedable entity rows were "
+                "collapsed to their newest observed revision; room mail uses "
+                "a separate lossless FIFO. Refresh the affected handoff, "
+                "task, plan, rule, decision, or bridge when full current "
+                "detail is required.")
     return {"system_message": "Attacca background watcher · %d delivered, %d queued"
                               % (len(rows), captured["remaining"]),
             "context": context}
@@ -3667,18 +4190,29 @@ def _compact_rule_view(rule):
     return result
 
 
-def _compact_rule_list(rules, max_characters=16_000):
-    """Keep a bounded rule projection and make every omission actionable."""
+def _compact_rule_projection(rules, max_characters=16_000):
+    """Keep a bounded rule projection plus the exact omitted rule ids."""
     source = [rule for rule in (rules or []) if isinstance(rule, dict)]
     result = []
-    for rule in source:
+    omitted_ids = []
+    for index, rule in enumerate(source):
         candidate = _compact_rule_view(rule)
         projected = json.dumps(
             result + [candidate], separators=(",", ":"), ensure_ascii=False)
         if len(projected.encode("utf-8")) > max_characters:
+            omitted_ids.extend(
+                str(item.get("rule_id") or "<missing-rule-id>")
+                for item in source[index:])
             break
         result.append(candidate)
-    return result, max(0, len(source) - len(result))
+    return result, omitted_ids
+
+
+def _compact_rule_list(rules, max_characters=16_000):
+    """Compatibility wrapper returning the historical omission count."""
+    result, omitted_ids = _compact_rule_projection(
+        rules, max_characters=max_characters)
+    return result, len(omitted_ids)
 
 
 def _compact_activity(rows):
@@ -3753,51 +4287,77 @@ def _needs_role_setup(snapshot):
     return role not in CONFIGURED_AI_ROLES
 
 
-def _mandatory_rules_banner(rules, pre_omitted=0):
-    """Compact banner of the mandatory Project Rules, pinned near the very
-    top of every injected turn so it survives host-side truncation of the
-    larger state payload. Returns None when no rules apply."""
+def _mandatory_rules_banner(rules, pre_omitted=0, pre_omitted_ids=None):
+    """Render only whole binding rules and name every omitted rule id."""
     applicable = [r for r in (rules or []) if r.get("enabled", True)]
-    if not applicable:
+    pre_ids = [str(value) for value in (pre_omitted_ids or []) if value]
+    missing_pre_ids = max(0, int(pre_omitted or 0) - len(pre_ids))
+    pre_ids.extend("<legacy-omitted-%d>" % (index + 1)
+                   for index in range(missing_pre_ids))
+    if not applicable and not pre_ids:
         return None
     applicable = sorted(
         applicable,
         key=lambda r: (r.get("priority", 100), str(r.get("rule_id") or "")))
-    lines = [
+    header = [
         "===================== ATTACCA MANDATORY PROJECT RULES ====================",
         "BINDING on EVERY response \u2014 do not bypass. Re-pinned every turn; if this",
         "section is ever missing from your context, call rule_list before acting.",
         "",
     ]
-    omitted = max(0, int(pre_omitted or 0))
-    for index, r in enumerate(applicable):
-        body = " ".join(str(r.get("body") or "").split())
-        if len(body) > 600:
-            marker = " [TRUNCATED — STOP and call rule_list before acting]"
-            body = body[:max(1, 600 - len(marker))] + marker
-        title = " ".join(str(r.get("title") or "").split())
-        if len(title) > 180:
-            marker = " [TRUNCATED — call rule_list]"
-            title = title[:max(1, 180 - len(marker))] + marker
+    footer = "=========================================================================="
+    included = []
+    omitted_ids = list(pre_ids)
+
+    def omission_lines(ids):
+        if not ids:
+            return []
+        return [
+            "\u2022 Omitted binding rule_ids: %s" % ", ".join(ids),
+            "    STOP before other work and call rule_list for those exact "
+            "rule_ids; every omitted rule remains binding.",
+        ]
+
+    def render(blocks, ids):
+        lines = list(header)
+        for block in blocks:
+            lines.extend(block)
+        lines.extend(omission_lines(ids))
+        lines.append(footer)
+        return "\n".join(lines)
+
+    for rule in applicable:
+        rule_id = str(rule.get("rule_id") or "<missing-rule-id>")
+        # Cached projections say explicitly when text was shortened. Never
+        # present that partial text as if it were a complete binding rule.
+        if rule.get("title_truncated") or rule.get("body_truncated"):
+            omitted_ids.append(rule_id)
+            continue
+        body = " ".join(str(rule.get("body") or "").split())
+        title = " ".join(str(rule.get("title") or "").split())
         rule_lines = ["\u2022 [%s \u00b7 priority %s \u00b7 %s] %s" % (
-            r.get("rule_id"), r.get("priority"), r.get("scope"),
-            title), "    %s" % body]
-        projected = "\n".join(lines + rule_lines + [
-            "=========================================================================="])
-        if len(projected.encode("utf-8")) > \
-                MANDATORY_RULES_BANNER_MAX_CHARACTERS:
-            omitted += len(applicable) - index
-            break
-        lines.extend(rule_lines)
-    if omitted:
-        lines.extend([
-            "\u2022 %d additional binding rule(s) did not fit this turn's banner."
-            % omitted,
-            "    STOP before other work and call rule_list; omitted rules remain binding.",
-        ])
-    lines.append(
-        "==========================================================================")
-    return "\n".join(lines)
+            rule_id, rule.get("priority"), rule.get("scope"), title),
+            "    %s" % body]
+        if len(render(included + [rule_lines], omitted_ids).encode(
+                "utf-8")) <= MANDATORY_RULES_BANNER_MAX_CHARACTERS:
+            included.append(rule_lines)
+        else:
+            omitted_ids.append(rule_id)
+
+    # Exact omitted IDs consume budget too. Remove complete trailing rules,
+    # never bytes from a rule, until the hard host cap is respected.
+    banner = render(included, omitted_ids)
+    while included and len(banner.encode("utf-8")) > \
+            MANDATORY_RULES_BANNER_MAX_CHARACTERS:
+        removed = included.pop()
+        match = re.match(r"^\u2022 \[([^ \u00b7]+)", removed[0])
+        omitted_ids.append(match.group(1) if match else "<missing-rule-id>")
+        banner = render(included, omitted_ids)
+    if len(banner.encode("utf-8")) > \
+            MANDATORY_RULES_BANNER_MAX_CHARACTERS:
+        raise RuntimeError(
+            "mandatory rule_id list exceeds the hook context budget")
+    return banner
 
 
 def _poll_view(snapshot):
@@ -3807,7 +4367,7 @@ def _poll_view(snapshot):
     tasks = snapshot.get("tasks") or {}
     status = snapshot.get("status") or {}
     rules = snapshot.get("rules") or {}
-    compact_rules, omitted_rules = _compact_rule_list(
+    compact_rules, omitted_rule_ids = _compact_rule_projection(
         rules.get("rules") or [])
     return {
         # Exclude handoff.your_inbox and recent_activity: the startup poll marks
@@ -3818,7 +4378,8 @@ def _poll_view(snapshot):
         "handoff": handoff.get("handoff"),
         "decisions": handoff.get("decisions") or [],
         "project_rules": compact_rules,
-        "project_rules_omitted_count": omitted_rules,
+        "project_rules_omitted_count": len(omitted_rule_ids),
+        "project_rules_omitted_ids": omitted_rule_ids,
         "cloud_context": _compact_cloud_context(
             handoff.get("cloud_context")),
         "tasks": [_task_view(task) for task in (tasks.get("tasks") or [])],
@@ -3914,7 +4475,7 @@ def _compact_snapshot(snapshot):
                      if isinstance(item, dict)]
     task_rows = [task for task in (tasks.get("tasks") or [])
                  if task.get("status") not in ("done", "cancelled")]
-    compact_rules, omitted_rules = _compact_rule_list(
+    compact_rules, omitted_rule_ids = _compact_rule_projection(
         rules.get("rules") or [])
     return {
         "project": snapshot.get("project"),
@@ -3924,10 +4485,11 @@ def _compact_snapshot(snapshot):
         # host-side context limits cannot silently drop the project's law and
         # durable background after a long decision/task history.
         "project_rules": compact_rules,
-        "project_rules_omitted_count": omitted_rules,
+        "project_rules_omitted_count": len(omitted_rule_ids),
+        "project_rules_omitted_ids": omitted_rule_ids,
         "project_rules_next_action": (
             "STOP before other work and call rule_list; omitted rules remain "
-            "binding." if omitted_rules else None),
+            "binding." if omitted_rule_ids else None),
         "room_protocol": (
             "This is a group conversation. Read every unread_room message. "
             "Mentions/replies assign the expected responder, not visibility; "
@@ -4033,9 +4595,7 @@ def _mcp_snapshot(status, plugin_root, config, mark_inbox_read=True):
                 if isinstance(data, dict) else None
             message = error.get("message") if isinstance(error, dict) \
                 else str(error)
-            if status_code in (401, 403) or (
-                    isinstance(data, dict) and
-                    data.get("category") == "authentication_required"):
+            if status_code in (401, 403):
                 raise HostedAuthenticationRequired(
                     message or "Attacca rejected this credential",
                     http_status=status_code)
@@ -4044,12 +4604,6 @@ def _mcp_snapshot(status, plugin_root, config, mark_inbox_read=True):
         if result.get("isError"):
             message = result.get("content", [{}])[0].get(
                 "text", "Attacca MCP tool failed")
-            lowered = str(message).lower()
-            if any(marker in lowered for marker in (
-                    "authentication", "api token", "not authorized",
-                    "authorization", "forbidden", "token's ai belongs",
-                    "token is bound")):
-                raise HostedAuthenticationRequired(message)
             raise RuntimeError(message)
         return json.loads(result["content"][0]["text"])
 
@@ -4123,6 +4677,72 @@ def _watcher_activate_after_mcp(status, config, snapshot, runtime=None):
                 "error": _trim(error, 240)}
 
 
+def _watcher_accept_synced_identity(entry, adapter):
+    """Validate and copy a capability/visibility rebind after hosted sync.
+
+    Projection capability negotiation legitimately changes the visibility
+    fingerprint and mirror path.  It must not look like principal drift.  The
+    new pair is accepted only when the proof and local snapshot agree, the
+    server/project/human principal are stable, and the exact MCP-verified
+    actor, role, and actor type are unchanged.
+    """
+    if adapter is None or not isinstance(entry, dict):
+        raise RuntimeError("offline sync adapter/subscription is unavailable")
+    protocol, offline, _ = _watcher_sync_modules()
+    previous = protocol.validate_scope(entry.get("sync_scope"))
+    proof_method = getattr(adapter, "convergence_proof", None)
+    snapshot_method = getattr(adapter, "local_snapshot", None)
+    if not callable(proof_method) or not callable(snapshot_method):
+        raise RuntimeError(
+            "offline adapter lacks proof or identity snapshot validation")
+    proof = offline.validate_convergence_proof(
+        proof_method(), expected_server_url=entry["server_url"],
+        expected_project=entry["project_id"], require_online=False)
+    scope = protocol.validate_scope(proof["scope"])
+    stable = ("server_id", "project_id", "principal_id")
+    if any(previous[name] != scope[name] for name in stable):
+        raise RuntimeError(
+            "synced mirror changed server, project, or human principal")
+    if scope["project_id"] != entry.get("project_id") \
+            or scope["actor_id"] != entry.get("canonical_actor_id") \
+            or scope["role"] != entry.get("actor_role") \
+            or scope["actor_type"] != "agent":
+        raise RuntimeError(
+            "synced mirror differs from the MCP-verified actor/role/type")
+    capabilities = protocol.validate_projection_capabilities(
+        proof["projection_capabilities"])
+    visibility = protocol.validate_visibility_fingerprint(
+        proof["visibility_fingerprint"])
+    snapshot = protocol.validate_snapshot(
+        snapshot_method(), expected_scope=scope,
+        expected_visibility=visibility)
+    protocol.validate_projection_for_capabilities(
+        snapshot["projection"], scope, capabilities)
+    digest = hashlib.sha256(
+        protocol.canonical_json_bytes(snapshot)).hexdigest()
+    if proof["snapshot_sha256"] != digest \
+            or proof["cursor"] != snapshot["cursor"]:
+        raise RuntimeError(
+            "synced capability proof does not describe the local snapshot")
+    status = _watcher_adapter_status(adapter)
+    if status.get("scope") not in (None, scope) \
+            or status.get("visibility_fingerprint") not in (None, visibility) \
+            or status.get("projection_capabilities") not in (
+                None, capabilities):
+        raise RuntimeError(
+            "synced adapter status differs from its capability proof")
+    status_proof = status.get("convergence_proof")
+    if status_proof is not None and status_proof != proof:
+        raise RuntimeError("adapter status and convergence proof disagree")
+    rebound = dict(entry)
+    rebound.update({
+        "sync_scope": scope,
+        "sync_visibility_fingerprint": visibility,
+        "sync_projection_capabilities": capabilities,
+    })
+    return rebound, proof, snapshot, status
+
+
 def _watcher_validated_convergence(entry, adapter, require_online=False):
     """Bind a core proof to the exact subscription and on-disk snapshot."""
     if adapter is None or not isinstance(entry, dict):
@@ -4132,6 +4752,9 @@ def _watcher_validated_convergence(entry, adapter, require_online=False):
     if identity is None:
         raise RuntimeError("subscription has no authenticated sync identity")
     scope, visibility = identity
+    capabilities = protocol.validate_projection_capabilities(
+        entry.get("sync_projection_capabilities") or
+        protocol.current_projection_capabilities())
     proof_method = getattr(adapter, "convergence_proof", None)
     snapshot_method = getattr(adapter, "local_snapshot", None)
     if not callable(proof_method) or not callable(snapshot_method):
@@ -4140,6 +4763,7 @@ def _watcher_validated_convergence(entry, adapter, require_online=False):
     proof = offline.validate_convergence_proof(
         proof_method(), expected_server_url=entry["server_url"],
         expected_project=entry["project_id"], expected_scope=scope,
+        expected_projection_capabilities=capabilities,
         require_online=require_online)
     if proof["visibility_fingerprint"] != visibility:
         raise RuntimeError(
@@ -4148,6 +4772,8 @@ def _watcher_validated_convergence(entry, adapter, require_online=False):
         snapshot = protocol.validate_snapshot(
             snapshot_method(), expected_scope=scope,
             expected_visibility=visibility)
+        protocol.validate_projection_for_capabilities(
+            snapshot["projection"], scope, capabilities)
     except Exception as error:
         raise RuntimeError(
             "offline identity snapshot failed protocol validation: %s" %
@@ -4164,7 +4790,9 @@ def _watcher_validated_convergence(entry, adapter, require_online=False):
         raise RuntimeError("adapter status and convergence proof disagree")
     if adapter_status.get("scope") not in (None, scope) \
             or adapter_status.get("visibility_fingerprint") not in (
-                None, visibility):
+                None, visibility) \
+            or adapter_status.get("projection_capabilities") not in (
+                None, capabilities):
         raise RuntimeError("adapter status identity differs from its proof")
     return proof, snapshot, adapter_status
 
@@ -4309,7 +4937,7 @@ def _offline_session_payload(status, adapter, entry=None, failure=None,
     unread_keys = {_message_key(item) for item in unread_page}
     recent_rows = [item for item in room_rows
                    if _message_key(item) not in unread_keys][-20:]
-    compact_rules, omitted_rules = _compact_rule_list(rules)
+    compact_rules, omitted_rule_ids = _compact_rule_projection(rules)
 
     cursor = proof["cursor"]
     verified_at = proof["mirror_verified_at"]
@@ -4335,10 +4963,11 @@ def _offline_session_payload(status, adapter, entry=None, failure=None,
             "warning": None,
         },
         "project_rules": compact_rules,
-        "project_rules_omitted_count": omitted_rules,
+        "project_rules_omitted_count": len(omitted_rule_ids),
+        "project_rules_omitted_ids": omitted_rule_ids,
         "project_rules_next_action": (
             "STOP before other work and read cached rule_list; omitted rules "
-            "remain binding." if omitted_rules else None),
+            "remain binding." if omitted_rule_ids else None),
         # Cloud Context is part of the verified identity projection. Keep it
         # ahead of operational lists so a host context cap cannot erase the
         # project's durable background during an outage.
@@ -4443,7 +5072,8 @@ def _offline_failure_output(status, config, event_name, err, adapter,
         json.dumps(brief, indent=2, ensure_ascii=False))
     rules_banner = _mandatory_rules_banner(
         brief.get("project_rules"),
-        pre_omitted=brief.get("project_rules_omitted_count"))
+        pre_omitted=brief.get("project_rules_omitted_count"),
+        pre_omitted_ids=brief.get("project_rules_omitted_ids"))
     if rules_banner:
         context = rules_banner + "\n\n" + context
     return _event_context_output(
@@ -4453,15 +5083,19 @@ def _offline_failure_output(status, config, event_name, err, adapter,
 
 
 def _authentication_required_error(error):
-    """Classify known hosted credential/scope rejection, never outages."""
-    if isinstance(error, HostedAuthenticationRequired):
-        return True
-    if error.__class__.__name__ in {
-            "SyncAuthenticationError", "SyncIdentityChangedError",
-            "OfflineIdentityChangedError"}:
-        return True
-    return getattr(error, "code", None) in (401, 403) \
-        or getattr(error, "status", None) in (401, 403)
+    """Latch authority off only for a proven hosted 401/403 response.
+
+    Local key-store/schema failures, visibility changes, and cached identity
+    validation errors are repairable sync failures, not proof that the host
+    revoked this account. Treating their class names or message text as auth
+    would incorrectly disable a still-valid verified offline mirror.
+    """
+    status = getattr(error, "http_status", None) \
+        or getattr(error, "code", None) or getattr(error, "status", None)
+    try:
+        return int(status) in (401, 403)
+    except (TypeError, ValueError):
+        return False
 
 
 def _authentication_required_output(status, config, event_name, error):
@@ -4636,6 +5270,19 @@ def _active_output(status, offline_adapter=None, offline_factory=None):
         }
     pending_notice = _watcher_pending_notice(status, config)
     offline_key, offline_entry = _watcher_subscription_entry(status, config)
+    inbox_check_notice = None
+    try:
+        _watcher_refresh_inbox_attention(status, config)
+    except Exception as err:
+        inbox_check_notice = {
+            "system_message": "Attacca automatic inbox check will retry",
+            "context": (
+                "ATTACCA AUTOMATIC INBOX CHECK FAILED: %s. Previously staged "
+                "mail remains pinned and the per-minute watcher will retry; "
+                "do not assume an empty inbox." % _trim(err, 240)),
+        }
+    attention_notice = _watcher_attention_notice(
+        status, config, consume=False)
     terminal_notice = _terminal_migration_notice(
         status, config, "SessionStart", offline_entry)
     if offline_adapter is None:
@@ -4693,13 +5340,20 @@ handoff before further writes.
             output, update_notice)
         output = _append_notice(output, watcher_notice)
         output = _append_notice(output, terminal_notice)
+        output = _append_notice(output, inbox_check_notice)
+        # Append last: _insert_after_rules_banner places the newest notice
+        # directly after the mandatory rules, making unread mail the first
+        # operational content at every supported turn boundary.
+        attention_notice = _watcher_attention_notice(status, config)
+        output = _append_notice(output, attention_notice)
         return output
     except StaleProjectLink as err:
         set_offered(status["root"], stale_project_id=status["project_id"])
         output = _hook_output(status, recovery_reason=str(err))
         return _append_notices(
             output, "SessionStart",
-            (update_notice, watcher_notice, terminal_notice, pending_notice))
+            (update_notice, watcher_notice, terminal_notice, pending_notice,
+             inbox_check_notice))
     except Exception as err:
         auth_blocked = _authentication_required_error(err) or bool(
             isinstance(offline_entry, dict) and
@@ -4719,13 +5373,15 @@ handoff before further writes.
             # after re-authentication will recover any durable project deltas.
             trailing_notices = (update_notice, watcher_notice)
         else:
+            attention_notice = _watcher_attention_notice(status, config)
             output = _offline_failure_output(
                 status, config, "SessionStart", err, offline_adapter,
                 entry=offline_entry)
             if output is None:
                 output = _failure_output(status, config, "SessionStart", err)
             trailing_notices = (
-                pending_notice, update_notice, watcher_notice, terminal_notice)
+                pending_notice, update_notice, watcher_notice, terminal_notice,
+                inbox_check_notice, attention_notice)
         return _append_notices(
             output, "SessionStart",
             trailing_notices)
@@ -4886,6 +5542,25 @@ def _periodic_output(status, event_name, offline_adapter=None,
         }
     pending_notice = _watcher_pending_notice(status, config)
     offline_key, offline_entry = _watcher_subscription_entry(status, config)
+    _early_identity, early_poll_entry = _poll_entry(status, config)
+    polling_disabled = bool(
+        (offline_entry or {}).get("interval_seconds") == 0 or
+        (early_poll_entry or {}).get("interval_seconds") == 0)
+    inbox_check_notice = None
+    if not polling_disabled:
+        try:
+            _watcher_refresh_inbox_attention(status, config)
+        except Exception as err:
+            inbox_check_notice = {
+                "system_message": "Attacca automatic inbox check will retry",
+                "context": (
+                    "ATTACCA AUTOMATIC INBOX CHECK FAILED: %s. Previously "
+                    "staged mail remains pinned and the per-minute watcher "
+                    "will retry; do not assume an empty inbox." %
+                    _trim(err, 240)),
+            }
+    attention_notice = _watcher_attention_notice(
+        status, config, consume=False)
     terminal_notice = _terminal_migration_notice(
         status, config, event_name, offline_entry)
     if offline_adapter is None:
@@ -4908,7 +5583,8 @@ def _periodic_output(status, event_name, offline_adapter=None,
     # prompt/stop hooks stay focused on shared-state changes.
     if not is_kimi_prompt:
         update_notice = None
-    notices = (pending_notice, watcher_notice, update_notice, terminal_notice)
+    notices = (pending_notice, watcher_notice, update_notice, terminal_notice,
+               inbox_check_notice, attention_notice)
     # A healthy daemon is the primary periodic path. Queued changes bypass the
     # old hook throttle and are delivered immediately; otherwise this boundary
     # stays quiet and leaves network polling to the autonomous watcher.
@@ -4923,12 +5599,15 @@ def _periodic_output(status, event_name, offline_adapter=None,
             _snap = (_entry or {}).get("snapshot") or {}
             _rules_banner = _mandatory_rules_banner(
                 _snap.get("project_rules"),
-                pre_omitted=_snap.get("project_rules_omitted_count"))
+                pre_omitted=_snap.get("project_rules_omitted_count"),
+                pre_omitted_ids=_snap.get("project_rules_omitted_ids"))
             if _rules_banner:
                 banner_output = _event_context_output(
                     event_name,
                     "Attacca \u00b7 mandatory project rules pinned",
                     _rules_banner)
+        notices = notices[:-1] + (
+            _watcher_attention_notice(status, config),)
         return _append_notices(banner_output, event_name, notices)
     interval = _settings_interval(config, entry=offline_entry)
     identity, entry = _poll_entry(status, config)
@@ -4938,7 +5617,8 @@ def _periodic_output(status, event_name, offline_adapter=None,
         cached_poll = (entry or {}).get("snapshot") or {}
         cached_banner = _mandatory_rules_banner(
             cached_poll.get("project_rules"),
-            pre_omitted=cached_poll.get("project_rules_omitted_count"))
+            pre_omitted=cached_poll.get("project_rules_omitted_count"),
+            pre_omitted_ids=cached_poll.get("project_rules_omitted_ids"))
         if cached_banner:
             cached_rules_output = _event_context_output(
                 event_name, "Attacca · mandatory project rules pinned",
@@ -4946,12 +5626,16 @@ def _periodic_output(status, event_name, offline_adapter=None,
     # Polling Off still allows Kimi's first native prompt to validate the link
     # and refresh managed laws once; subsequent prompts remain off.
     if interval == 0 and not (is_kimi_prompt and not entry):
+        notices = notices[:-1] + (
+            _watcher_attention_notice(status, config),)
         return _append_notices(cached_rules_output, event_name, notices)
     checked_at = time.time()
     last_poll_at = entry.get("last_poll_at")
     elapsed = checked_at - last_poll_at \
         if isinstance(last_poll_at, (int, float)) else None
     if elapsed is not None and 0 <= elapsed < interval:
+        notices = notices[:-1] + (
+            _watcher_attention_notice(status, config),)
         return _append_notices(cached_rules_output, event_name, notices)
     try:
         snapshot = _mcp_snapshot(status, plugin_root, config)
@@ -4961,7 +5645,9 @@ def _periodic_output(status, event_name, offline_adapter=None,
         law_notice = _refresh_managed_laws(
             status, plugin_root, config=config) \
             if is_kimi_prompt else None
-        notices = (law_notice, update_notice, terminal_notice)
+        notices = (law_notice, update_notice, terminal_notice,
+                   inbox_check_notice,
+                   _watcher_attention_notice(status, config))
         current = _poll_view(snapshot)
         previous = entry.get("snapshot") if entry else None
         _record_poll(status, identity, interval, checked_at, current)
@@ -4999,7 +5685,10 @@ def _periodic_output(status, event_name, offline_adapter=None,
         set_offered(status["root"], stale_project_id=status["project_id"])
         output = _hook_output(status, recovery_reason=str(err),
                               event_name=event_name)
-        return _append_notices(output, event_name, notices)
+        return _append_notices(
+            output, event_name,
+            tuple(notice for notice in notices
+                  if notice is not attention_notice))
     except Exception as err:
         _record_poll(status, identity, interval, checked_at,
                      entry.get("snapshot") if entry else {})
@@ -5019,6 +5708,8 @@ def _periodic_output(status, event_name, offline_adapter=None,
             # authority rejection. The reachable host has revoked cached use.
             notices = (watcher_notice, update_notice)
         else:
+            notices = notices[:-1] + (
+                _watcher_attention_notice(status, config),)
             output = _offline_failure_output(
                 status, config, event_name, err, offline_adapter,
                 entry=offline_entry)
