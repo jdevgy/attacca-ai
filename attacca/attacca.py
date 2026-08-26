@@ -14693,6 +14693,34 @@ def _exclusive_config_lock(path):
         lock.close()
 
 
+def _codex_config_lock_path(config_path):
+    """Return the one cooperative lock shared by every Codex TOML writer.
+
+    The lock is deliberately adjacent to ``config.toml`` rather than under
+    Attacca's machine state directory.  ``CODEX_HOME`` can point somewhere
+    outside ``HOME`` and setup/install repair paths do not otherwise touch the
+    machine server file, so using either of those locations would leave two
+    independent lock domains for the same TOML target.
+    """
+    target = Path(config_path)
+    return target.with_name(".%s.attacca.lock" % target.name)
+
+
+@contextlib.contextmanager
+def _exclusive_codex_config_lock(config_path):
+    """Serialize all Attacca read-normalize-write cycles for Codex TOML."""
+    lock_path = _codex_config_lock_path(config_path)
+    with _MACHINE_CONFIG_THREAD_LOCK, _exclusive_config_lock(lock_path):
+        # Lock files contain no data and must not become a source of machine
+        # information disclosure when the caller has a permissive umask.
+        try:
+            os.chmod(str(lock_path), 0o600)
+        except OSError as error:
+            raise AttaccaError(
+                "cannot make Codex config lock private: %s" % error)
+        yield
+
+
 def _snapshot_switch_paths(paths):
     snapshots = []
     for path in sorted({Path(value) for value in paths}, key=str):
@@ -15093,9 +15121,17 @@ def machine_server_set(server_url, home=None, validate=True, probe=None):
     machine_lock = config_path.with_name(".%s.lock" % config_path.name)
     watcher_path = _watcher_state_path_for_home(home)
     watcher_lock = watcher_path.with_name(".%s.lock" % watcher_path.name)
+    codex_target = effective_codex_root / "config.toml"
+    codex_lock = _codex_config_lock_path(codex_target)
 
     with _MACHINE_CONFIG_THREAD_LOCK, _exclusive_config_lock(machine_lock), \
-            _exclusive_config_lock(watcher_lock):
+            _exclusive_config_lock(watcher_lock), \
+            _exclusive_config_lock(codex_lock):
+        try:
+            os.chmod(str(codex_lock), 0o600)
+        except OSError as error:
+            raise AttaccaError(
+                "cannot make Codex config lock private: %s" % error)
         machine, _ = _read_machine_config(resolved_home)
         watcher_state = {}
         if watcher_path.exists() or watcher_path.is_symlink():
@@ -15127,7 +15163,6 @@ def machine_server_set(server_url, home=None, validate=True, probe=None):
         watcher_bytes = _json_switch_bytes(watcher_state) \
             if watcher_changed else None
 
-        codex_target = effective_codex_root / "config.toml"
         codex_backup = codex_target.with_name(
             codex_target.name + ".attacca-backup")
         codex_present = False
@@ -15186,9 +15221,9 @@ def machine_server_set(server_url, home=None, validate=True, probe=None):
         try:
             if codex_present:
                 before = codex_target.read_bytes()
-                configure_codex(
+                _configure_codex_locked(
                     None, server_url, DEFAULT_DB, stdio=False,
-                    home=home)
+                    home=home, target=codex_target)
                 codex_changed = codex_target.read_bytes() != before
             for item in prepared:
                 if item["changed"]:
@@ -16333,19 +16368,15 @@ def _codex_config_repair_module():
     return _CODEX_CONFIG_REPAIR_MODULE
 
 
-def configure_codex(project_id, url, db_path, stdio=False, home=None):
-    """Atomically replace every Attacca TOML table with one canonical entry.
-
-    Older installers stopped at the first descendant table, which could leave
-    ``[mcp_servers.attacca.env]`` beside the newer inline ``env`` key and make
-    Codex reject its entire config.  The standalone repair helper removes all
-    root/descendant copies, validates the result, and keeps a one-time backup.
-    """
+def _configure_codex_locked(project_id, url, db_path, stdio=False, home=None,
+                            target=None):
+    """Repair one Codex config while its adjacent lock is already held."""
     codex_dir = codex_config_dir(home)
-    codex_dir.mkdir(parents=True, exist_ok=True)
+    target = Path(target) if target is not None \
+        else codex_dir / "config.toml"
+    target.parent.mkdir(parents=True, exist_ok=True)
     block = codex_stdio_toml(project_id, db_path, home=home) if stdio \
         else codex_connect_toml(url, home=home)
-    target = codex_dir / "config.toml"
     repair = _codex_config_repair_module()
     try:
         result = repair.repair_codex_config(
@@ -16353,6 +16384,25 @@ def configure_codex(project_id, url, db_path, stdio=False, home=None):
     except repair.CodexConfigRepairError as error:
         raise AttaccaError("cannot safely repair %s: %s" % (target, error))
     return result["config"]
+
+
+def configure_codex(project_id, url, db_path, stdio=False, home=None):
+    """Atomically replace every Attacca TOML table with one canonical entry.
+
+    Older installers stopped at the first descendant table, which could leave
+    ``[mcp_servers.attacca.env]`` beside the newer inline ``env`` key and make
+    Codex reject its entire config.  The standalone repair helper removes all
+    root/descendant copies, validates the result, and keeps a one-time backup.
+    An adjacent lock covers the complete read-normalize-validate-write cycle so
+    installers, setup repairs, and server switches cannot race one another
+    even when ``CODEX_HOME`` is independent of the Attacca machine directory.
+    """
+    codex_dir = codex_config_dir(home)
+    target = codex_dir / "config.toml"
+    with _exclusive_codex_config_lock(target):
+        return _configure_codex_locked(
+            project_id, url, db_path, stdio=stdio, home=home,
+            target=target)
 
 
 def _merge_json_config(path, top_key, entry_name, value, backup=True):
