@@ -715,7 +715,10 @@ class BridgeParticipationRegressionTest(unittest.TestCase):
         }
         self.assertEqual(counts, {
             "room": 1,
-            "inbox": 1,
+            # Inbox performs one bounded batch for unread delivery and one
+            # independent bounded batch for cursor-independent pending work
+            # dispositions. Neither query scales with the message count.
+            "inbox": 2,
             "project_log": 1,
             "search": 1,
             "sync_projection": 1,

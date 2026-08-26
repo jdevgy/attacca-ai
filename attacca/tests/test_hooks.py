@@ -1089,8 +1089,8 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             self.assertEqual(agents.read_text(), before + desired + after)
             self.assertIn("AGENTS.md", notice["context"])
 
-    def test_managed_law_v10_auto_refreshes_to_v11_without_touching_user_bytes(self):
-        self.assertEqual(c.MANAGED_BLOCK_VERSION, 11)
+    def test_managed_law_v11_auto_refreshes_to_v12_without_touching_user_bytes(self):
+        self.assertEqual(c.MANAGED_BLOCK_VERSION, 12)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             checkout = root / "repo"
@@ -1101,11 +1101,10 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                 "schema_version": 1, "project_id": "shared"}))
             desired = c.managed_instruction_block("shared", None)
             previous = desired.replace(
-                "MANAGED_ATTACCA:BEGIN v=11",
-                "MANAGED_ATTACCA:BEGIN v=10", 1).replace(
-                    "compact banner at the TOP of every turn",
-                    "read the `project_rules` in the startup brief before",
-                    1)
+                "MANAGED_ATTACCA:BEGIN v=12",
+                "MANAGED_ATTACCA:BEGIN v=11", 1).replace(
+                    "Every directed assignment and broadcast directive must",
+                    "Directed assignments should", 1)
             prefix = "# Human instructions\n\nKeep before byte-for-byte.\n\n"
             suffix = "\n\n## Human tail\nKeep after byte-for-byte.\n"
             agents = checkout / "AGENTS.md"

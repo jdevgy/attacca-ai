@@ -136,10 +136,12 @@ process.stdout.write(JSON.stringify({parsed, error,
             self.assertIn(expression, renderer)
 
     def test_settings_explains_machine_local_server_switching(self):
-        self.assertIn("Connection changes are local to each terminal", self.panel)
-        self.assertIn("built-in connection settings", self.panel)
-        self.assertIn("never tells a human or AI to paste shell commands",
+        self.assertIn(
+            "Connection changes stay local to each client installation",
+            self.panel)
+        self.assertIn("active AI opens sign-in and secure key collection",
                       self.panel)
+        self.assertIn("never asks a human to run a shell command", self.panel)
         self.assertNotIn("attacca server set URL", self.panel)
 
 

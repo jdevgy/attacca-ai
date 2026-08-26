@@ -133,13 +133,15 @@ class MandatoryRulesBannerTestCase(unittest.TestCase):
                   "priority": i, "enabled": True} for i in range(4)]
         self.assertLess(len(hook._mandatory_rules_banner(rules)), 2048)
 
-    def test_long_body_is_trimmed(self):
+    def test_long_body_is_never_partially_rendered(self):
         banner = hook._mandatory_rules_banner([
             {"rule_id": "R-1", "title": "Big", "body": "x" * 5000,
              "scope": "everyone", "priority": 1, "enabled": True}])
-        self.assertLess(len(banner), 1200)
-        self.assertIn(
-            "[TRUNCATED — STOP and call rule_list before acting]", banner)
+        self.assertLessEqual(
+            len(banner.encode("utf-8")),
+            hook.MANDATORY_RULES_BANNER_MAX_CHARACTERS)
+        self.assertIn("x" * 5000, banner)
+        self.assertNotIn("TRUNCATED", banner)
 
 
 class CloudContextBriefWiringTestCase(unittest.TestCase):
