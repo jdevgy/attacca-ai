@@ -46,50 +46,38 @@ succeeds, call MCP `list_projects` and keep `you.actor_id` / `you.actor_type`
 internally as `CURRENT_AI_ACTOR` / `CURRENT_AI_TYPE`; pass them to every later
 CLI call so actions belong to this AI, not the shell user.
 
-If the server needs its first admin, the AI opens the displayed `/app` URL and
-asks the human only to create or authenticate the account there. On an enforced
-server with a brand-new/unlinked checkout, the AI starts the packaged
-`terminal_flow.py` browser/device flow with an explicit zero-binding request.
-The owner/admin approves it in the browser with empty memberships and actor
-bindings. The helper polls and stores that device credential as a provisional
-human setup principal; it cannot authorize AI/sync writes or select an actor.
+If the server needs its first owner, the AI opens the displayed `/app` URL and
+asks the human only to create or sign in to that account in the browser. If a
+401/403 says this installation needs a credential, the AI itself starts the
+packaged `terminal_flow.py authorize` flow in its active terminal. Never tell
+the human to run a command. The helper opens Attacca Settings with this exact
+non-secret `client_instance` already filled in. The signed-in human creates one
+API key for this client installation, optionally limits it to selected
+workspaces, and pastes it only into the helper's hidden foreground-terminal
+prompt. If no controlling terminal is available, leave the browser flow
+deferred and let the lifecycle hook retry; never collect the key in chat,
+ordinary stdin, argv, a URL, or logs.
 
-The 0600 credential—not a browser cookie—persists across the separate discovery
-and apply processes. Those processes may use it only as the authenticated human
-to list/create a workspace, establish membership, and register the explicitly
-confirmed actor and role. After that exact actor exists, the AI authenticates
-`POST /v1/auth/terminals/{token_id}/bindings` with the same device credential,
-adds `{project_id, actor_id}`, refreshes its saved no-secret metadata, and only
-then retries as that AI. A non-admin approval must select an existing membership.
-If provisional setup is abandoned, the owner can revoke it in Settings. A
-hidden existing-terminal-credential fallback is allowed only through a verified
-controlling TTY. Compatibility mode may do the initial setup anonymously, then
-initiate exact-binding enrollment at the end.
+The helper verifies that the value is an `atkey_` client key for this exact
+installation and atomically stores it in the private 0600 credentials file.
+The credential is human-owned and may be used by Claude, Codex, Kimi, or a
+generic MCP client only from that one installation. It is **not** bound to an
+AI model, runtime, actor, or role. Every project request still sends the exact
+`X-Attacca-Project` and canonical `X-Attacca-Actor`; the server independently
+checks the human's workspace access, that the registered actor belongs to that
+human, and the actor's registered role. Reuse the key only for sessions that
+resolve to the same `client_instance`; a distinct client installation or
+configuration root gets its own key even when it opens the same checkout or
+runs the same AI runtime. Never rewrite actor identity during auth repair.
 
-This is an internal tool action: never show the human a recovery shell command
-and never ask them to run setup again. Display only the server-verified login
-URL and short device code. Poll in bounded steps while lifecycle hooks and the
-watcher keep retrying; a headless browser failure remains deferred and
-nonblocking. On a 401/403, the AI itself initiates or resumes this browser/device
-recovery and retries only after verified hosted identity sync.
-
-Passwords, API tokens, and the high-entropy device code never enter chat, tool
-arguments, process arguments, or logs. Browser approval is the universal path
-for Codex, Claude, and Kimi. Claude's native choice UI may select non-secret
-options, but authentication still stays in the browser. A hidden paste fallback
-is allowed only when the helper proves it owns a real foreground controlling
-TTY; otherwise keep the browser flow. The helper atomically stores one 0600,
-device-bound terminal credential per full server URL. That credential belongs
-to the human/device and may select multiple server-approved existing AI actors;
-it never changes their ledger identity.
-
-After approval, retry MCP and watcher sync in the current host. Hot-reload the
-credential and clear the authentication latch only after a verified hosted
-identity sync; do not force a client restart. The native discovery and apply
-processes remain separate; only the privately stored provisional terminal
-credential crosses that boundary, so never claim a temporary login session
-carries between them. Do not repeat Steps 1-4 after an already completed setup; continue
-at verification and Step 5. Cached offline data is never authenticated recovery.
+The private key persists across the separate discovery and apply processes, so
+the AI can list or create an allowed workspace, register the explicitly chosen
+actor and role, and then retry as that actor. Browser cookies remain browser
+only. On success, hot-reload the credential in the current client, run a fresh
+hosted status/sync check, and clear the authentication latch; do not force a
+restart or ask the human to rerun setup. Cached offline data is never proof of
+authentication. Do not repeat Steps 1-4 after setup is already complete;
+continue at verification and Step 5.
 
 ## 1. Select the workspace
 

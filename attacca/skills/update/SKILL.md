@@ -5,15 +5,17 @@ description: Load a fresh, complete Attacca project update. Use when the user in
 
 # Attacca project update
 
-Before the seven reads, treat authentication, terminal-credential migration,
-or a hosted 401/403 for a linked checkout as an AI-owned recovery transition.
-Immediately advance the packaged browser/device enrollment flow for the exact
-saved project/actor binding with browser opening enabled,
-display only its verified login URL and short code, and poll in bounded steps.
-Never give the human a shell command or ask for a password/token in chat. A
-headless/no-TTY host remains deferred and nonblocking; lifecycle hooks and the
-watcher retry, hot-reload the one 0600 device credential, and clear the auth
-latch only after verified hosted sync. Do not force a client restart.
+Before the seven reads, treat a hosted 401/403 as an AI-owned authorization
+transition. The AI itself starts the packaged client-key authorization helper
+in its active terminal; never give the human a shell command. The helper opens
+Attacca Settings for this exact client installation and accepts an `atkey_`
+value only through a hidden foreground-terminal prompt—never chat, argv, a URL,
+logs, or ordinary stdin. It verifies and atomically stores the human-owned 0600
+key, then the watcher hot-reloads it and retries hosted sync without a client
+restart. The key authenticates the installation only; every request must still
+send the saved workspace and exact canonical actor so role and human
+attribution remain server-validated. A headless/no-TTY host stays deferred and
+nonblocking while lifecycle hooks retry.
 
 Refresh the current project's shared state through the `attacca` MCP tools.
 Call all seven, even if the SessionStart brief already ran:

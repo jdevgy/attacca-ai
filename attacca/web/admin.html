@@ -606,23 +606,24 @@
         catch (_) { return false; }
       }
 
-      // TESTABLE_ENROLLMENT_URL_HELPER:BEGIN
-      function consumeEnrollmentCodeFromLocation() {
-        let code = "";
+      // The terminal helper opens Settings with non-secret client-install
+      // hints in the fragment. No API key is ever accepted from a URL.
+      // TESTABLE_CLIENT_AUTHORIZATION_HINTS:BEGIN
+      function clientAuthorizationHintsFromLocation() {
         try {
-          const url = new URL(location.href);
-          const candidate = url.searchParams.get("user_code") || "";
-          if ((!url.hash || url.hash === "#settings") &&
-              /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/i.test(candidate)) code = candidate.toUpperCase();
-          if (url.searchParams.has("user_code")) {
-            url.searchParams.delete("user_code");
-            const query = url.searchParams.toString();
-            history.replaceState(null, "", `${url.pathname}${query ? `?${query}` : ""}${url.hash || "#settings"}`);
-          }
-        } catch (_) { /* malformed or unavailable URL state is ignored */ }
-        return code;
+          const raw = String(location.hash || "").replace(/^#/, "");
+          const [view, ...parts] = raw.split("&");
+          if (view !== "settings") return { clientInstance: "", clientLabel: "" };
+          const params = new URLSearchParams(parts.join("&"));
+          const clientInstance = params.get("client_instance") || "";
+          const clientLabel = params.get("client_label") || "";
+          return {
+            clientInstance: /^[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,119}$/.test(clientInstance) ? clientInstance : "",
+            clientLabel: clientLabel.slice(0, 120)
+          };
+        } catch (_) { return { clientInstance: "", clientLabel: "" }; }
       }
-      // TESTABLE_ENROLLMENT_URL_HELPER:END
+      // TESTABLE_CLIENT_AUTHORIZATION_HINTS:END
 
       // Invitation secrets stay in the URL fragment so they are never sent
       // to the HTTP server, access logs, or referrers. Consume and erase the
@@ -678,9 +679,7 @@
         auth: null,
         credentialAccess: null,
         oneTimeCredential: null,
-        activationArmedVersion: null,
-        targetedEnrollmentCode: consumeEnrollmentCodeFromLocation(),
-        targetedEnrollmentError: "",
+        clientAuthorization: clientAuthorizationHintsFromLocation(),
         pendingInvitationToken: consumeInvitationTokenFromLocation(),
         invitationAcceptanceError: "",
         authTokens: [],
@@ -720,30 +719,8 @@
       function emptyCredentialAccess() {
         return {
           supported: false,
-          capabilities: {
-            terminal_enrollment: false,
-            migration_scope: false,
-            activation: false,
-            service_keys: false,
-            invitations: false
-          },
-          compatibility: {
-            mode: "compatibility",
-            effective_authentication: "optional",
-            activation_requested: false,
-            activated: false,
-            ready: false,
-            readiness_version: null,
-            blockers: ["This server has not published terminal migration readiness."],
-            uncovered_projects: [],
-            uncovered_actors: [],
-            qa_evidence: { acceptance: { passed: false }, regression: { passed: false } }
-          },
-          terminals: [],
-          terminal_enrollments: [],
-          migration_targets: [],
-          service_keys: [],
-          invitations: []
+          capabilities: { client_keys: false, activation: false },
+          client_keys: []
         };
       }
       // TESTABLE_EMPTY_CREDENTIAL_ACCESS:END
@@ -988,72 +965,29 @@
       function normalizeCredentialAccess(payload) {
         const fallback = emptyCredentialAccess();
         const source = payload && typeof payload === "object" ? payload : {};
-        const compatibility = source.compatibility && typeof source.compatibility === "object"
-          ? source.compatibility : {};
-        const qa = compatibility.qa_evidence && typeof compatibility.qa_evidence === "object"
-          ? compatibility.qa_evidence : {};
         return {
-          supported: source.supported !== false && Boolean(source.compatibility),
+          supported: Array.isArray(source.client_keys),
           capabilities: {
             ...fallback.capabilities,
-            ...(source.capabilities && typeof source.capabilities === "object" ? source.capabilities : {})
+            client_keys: Array.isArray(source.client_keys),
+            activation: true
           },
-          compatibility: {
-            ...fallback.compatibility,
-            ...compatibility,
-            blockers: Array.isArray(compatibility.blockers) ? compatibility.blockers : fallback.compatibility.blockers,
-            uncovered_projects: Array.isArray(compatibility.uncovered_projects) ? compatibility.uncovered_projects : [],
-            uncovered_actors: Array.isArray(compatibility.uncovered_actors) ? compatibility.uncovered_actors : [],
-            qa_evidence: {
-              acceptance: qa.acceptance && typeof qa.acceptance === "object" ? qa.acceptance : { passed: false },
-              regression: qa.regression && typeof qa.regression === "object" ? qa.regression : { passed: false }
-            }
-          },
-          terminals: Array.isArray(source.terminals) ? source.terminals : [],
-          terminal_enrollments: Array.isArray(source.terminal_enrollments) ? source.terminal_enrollments : [],
-          migration_targets: Array.isArray(source.migration_targets) ? source.migration_targets
-            : Array.isArray(compatibility.migration_targets) ? compatibility.migration_targets : [],
-          service_keys: Array.isArray(source.service_keys) ? source.service_keys : [],
-          invitations: Array.isArray(source.invitations) ? source.invitations : []
+          client_keys: Array.isArray(source.client_keys) ? source.client_keys : []
         };
       }
 
       function activationEligibility(access, account) {
-        const compatibility = access?.compatibility || {};
-        const qa = compatibility.qa_evidence || {};
-        const acceptancePassed = qa.acceptance?.passed === true;
-        const regressionPassed = qa.regression?.passed === true;
-        const migrationReady = compatibility.ready === true;
         const isOwner = account?.is_owner === true;
         const activationSupported = access?.capabilities?.activation === true;
-        const modeAllowsActivation = compatibility.mode === "auto";
-        const alreadyActivated = compatibility.activated === true ||
-          compatibility.effective_authentication === "required";
+        const enabled = state.auth?.authentication_required === true ||
+          state.auth?.authentication_activated === true;
         const reasons = [];
-        if (!isOwner) reasons.push("Only the server owner can activate protected mode.");
-        if (!activationSupported) reasons.push("This server does not expose explicit protected-mode activation.");
-        if (!modeAllowsActivation) reasons.push("The server is explicitly pinned to compatibility mode.");
-        if (!migrationReady) reasons.push("Terminal migration readiness is incomplete.");
-        if (!acceptancePassed) reasons.push("Acceptance-criteria QA evidence has not passed.");
-        if (!regressionPassed) reasons.push("Independent regression QA evidence has not passed.");
-        if (alreadyActivated) reasons.push("Protected mode is already active.");
+        if (!isOwner) reasons.push("Only the server owner can change authentication enforcement.");
+        if (!activationSupported) reasons.push("This server does not expose the authentication toggle.");
         return {
-          allowed: isOwner && activationSupported && modeAllowsActivation && migrationReady && acceptancePassed && regressionPassed && !alreadyActivated,
-          acceptancePassed, regressionPassed, migrationReady, isOwner, activationSupported, modeAllowsActivation, alreadyActivated, reasons
+          allowed: isOwner && activationSupported,
+          isOwner, activationSupported, enabled, reasons
         };
-      }
-
-      function credentialBindings(record) {
-        const source = Array.isArray(record?.bindings) ? record.bindings
-          : Array.isArray(record?.actor_bindings) ? record.actor_bindings
-          : Array.isArray(record?.requested_bindings) ? record.requested_bindings
-          : Array.isArray(record?.allowed_actor_bindings) ? record.allowed_actor_bindings : [];
-        return source.flatMap(binding => {
-          if (typeof binding === "string") return [{ actor_id: binding, project_id: null }];
-          if (Array.isArray(binding?.actor_ids)) return binding.actor_ids.map(actorId => ({ actor_id: actorId, project_id: binding.project_id || null }));
-          return [{ actor_id: binding?.actor_id || "", project_id: binding?.project_id || null }];
-        })
-          .filter(binding => binding.actor_id);
       }
 
       function credentialMemberships(record) {
@@ -1061,49 +995,17 @@
         const explicit = (Array.isArray(memberships) ? memberships : [memberships])
           .map(item => typeof item === "string" ? item : item?.project_id)
           .filter(Boolean);
-        return [...new Set(explicit.length ? explicit : credentialBindings(record).map(binding => binding.project_id).filter(Boolean))];
-      }
-
-      function enrollmentCode(payload) {
-        const candidate = payload?.user_code || payload?.enrollment_code || "";
-        return typeof candidate === "string" ? candidate : "";
+        return [...new Set(explicit)];
       }
       // TESTABLE_CREDENTIAL_ACCESS_HELPERS:END
 
       async function loadCredentialAccess() {
         if (!state.auth?.authenticated) return emptyCredentialAccess();
         try {
-          return normalizeCredentialAccess(await api("/v1/auth/access"));
+          return normalizeCredentialAccess(await api("/v1/auth/client-keys"));
         } catch (error) {
           if (![404, 405].includes(error.status)) throw error;
-          const fallback = emptyCredentialAccess();
-          fallback.compatibility.mode = state.auth?.authentication_required ? "auto" : "compatibility";
-          fallback.compatibility.effective_authentication = state.auth?.authentication_required ? "required" : "optional";
-          fallback.compatibility.activated = Boolean(state.auth?.authentication_required);
-          return fallback;
-        }
-      }
-
-      async function mergeTargetedTerminalEnrollment(access) {
-        const code = state.targetedEnrollmentCode;
-        if (!code || !state.auth?.authenticated) return access;
-        try {
-          const enrollment = await api(`/v1/auth/terminal-enrollments/${encodeURIComponent(code)}`);
-          const returnedCode = enrollmentCode(enrollment).toUpperCase();
-          if (!returnedCode || returnedCode !== code) {
-            throw new Error("The server returned a different terminal enrollment code.");
-          }
-          state.targetedEnrollmentError = "";
-          const existing = Array.isArray(access?.terminal_enrollments)
-            ? access.terminal_enrollments : [];
-          return {
-            ...access,
-            terminal_enrollments: [enrollment, ...existing.filter(item =>
-              enrollmentCode(item).toUpperCase() !== returnedCode)]
-          };
-        } catch (error) {
-          state.targetedEnrollmentError = error.message || String(error);
-          return access;
+          return emptyCredentialAccess();
         }
       }
 
@@ -1137,7 +1039,6 @@
           state.errors = {};
           state.credentialAccess = null;
           state.oneTimeCredential = null;
-          state.activationArmedVersion = null;
           state.authTokens = [];
           try {
             const response = await fetch("/v1/auth/status", {
@@ -1260,7 +1161,7 @@
         const description = acceptingInvitation
           ? "Create your own human account from this one-time invitation. Its workspace and administrator scope cannot be widened here."
           : bootstrapRequired
-          ? "Create the human control account first. Compatibility mode remains unchanged until migration readiness, two QA passes, and a later explicit activation."
+          ? "Create the human control account first. Authentication enforcement remains off until the server owner enables it in Settings."
           : "Use your Attacca account to open the hosted control room.";
         const form = acceptingInvitation
           ? `<form data-form="accept-human-invitation"><div class="form-grid"><div class="field"><label for="invite-accept-display-name">Your name</label><input id="invite-accept-display-name" name="display_name" autocomplete="name" maxlength="120"></div><div class="field"><label for="invite-accept-username">Username</label><input id="invite-accept-username" name="username" autocomplete="username" minlength="2" maxlength="64" pattern="[a-z0-9][a-z0-9._-]+" required autofocus></div><div class="field wide"><label for="invite-accept-password">Create password</label><input id="invite-accept-password" name="password" type="password" autocomplete="new-password" minlength="8" required><span class="help">The invitation token remains only in this page's memory and is submitted once over the same-origin API.</span></div></div><div class="form-actions"><button class="button quiet" type="button" data-action="dismiss-invitation-acceptance">Cancel</button><button class="button primary" type="submit">Accept invitation and sign in</button></div></form>`
@@ -1270,7 +1171,7 @@
         const context = acceptingInvitation
           ? "Acceptance creates and signs in as a separate human account. It never reuses the inviter's identity or credential, and a consumed, expired, or revoked invitation cannot be replayed."
           : bootstrapRequired
-            ? "Creating the administrator does not activate protected mode. Existing terminals stay in compatibility mode until each human-owned terminal is migrated and activation is explicitly approved."
+            ? "Creating the administrator does not enable enforcement. The owner can first create client-install API keys, then use the explicit Settings toggle."
             : "Sign-in identifies the human operator. AI actor identities remain separate and are never replaced by this account.";
         content.innerHTML = `${pageHead("Hosted access", title, description)}<div class="grid two"><section class="card" style="grid-column:1/-1;max-width:760px"><div class="card-head"><h2>${h(title)}</h2><span class="badge ${bootstrapRequired || acceptingInvitation ? "pending" : "accepted"}">${acceptingInvitation ? "one-time invitation" : bootstrapRequired ? "first run" : "account sign-in"}</span></div><div class="card-body">${state.invitationAcceptanceError ? `<div class="notice error"><span>!</span><div><strong>Invitation could not be accepted.</strong><br>${h(state.invitationAcceptanceError)}</div></div>` : ""}${form}<div class="notice section-gap"><span>i</span><div>${context}</div></div></div></section></div>`;
         content.setAttribute("aria-busy", "false");
@@ -1318,8 +1219,7 @@
           state.health = health;
           state.serverSettings = settings;
           state.authTokens = tokens?.tokens || [];
-          state.credentialAccess = await mergeTargetedTerminalEnrollment(
-            credentialAccess || emptyCredentialAccess());
+          state.credentialAccess = credentialAccess || emptyCredentialAccess();
           projectsResult = projects;
         } catch (error) {
           // A protected request may have discovered an expired session and
@@ -1569,94 +1469,13 @@
 
       function applyCredentialCapabilityGates() {
         const capabilities = state.credentialAccess?.capabilities || {};
-        const serviceForm = $('form[data-form="create-service-key"]', content);
-        if (serviceForm) {
-          const actorField = $$(".field", serviceForm).find(field =>
-            field.querySelector("label")?.textContent?.includes("Exact allowed AI actors"));
-          const cluster = actorField?.querySelector(".cluster");
-          if (cluster) {
-            cluster.replaceChildren();
-            const directory = state.projects.flatMap(project =>
-              (state.workspaceAgents?.[project.project_id] || []).map(agent => ({ project_id: project.project_id, agent })));
-            if (!directory.length) {
-              const unavailable = document.createElement("span");
-              unavailable.className = "muted";
-              unavailable.textContent = "No registered actors are available in the selected workspace memberships.";
-              cluster.append(unavailable);
-            }
-            directory.forEach(({ project_id: projectId, agent }) => {
-              const label = document.createElement("label");
-              label.className = "chip";
-              const input = document.createElement("input");
-              input.type = "checkbox";
-              input.name = "actor_bindings";
-              input.value = JSON.stringify({ project_id: projectId, actor_id: agent.agent_id });
-              label.append(input, document.createTextNode(` ${projectId} · ${agent.agent_id}`));
-              cluster.append(label);
-            });
-          }
-        }
-        const gates = [
-          ['form[data-form="approve-terminal-enrollment"]', "terminal_enrollment", "Terminal approval is unavailable until terminal enrollment is enabled."],
-          ['form[data-form="save-migration-scope"]', "migration_scope", "Migration-scope editing is not enabled by this server."],
-          ['form[data-form="create-service-key"]', "service_keys", "Service-key enrollment is not enabled yet; no unusable key can be created from this panel."],
-          ['form[data-form="invite-human"]', "invitations", "Human invitations are not enabled yet. This panel will not create a credential that impersonates another person."]
-        ];
-        gates.forEach(([selector, capability, message]) => {
-          $$(selector, content).forEach(form => {
-            if (capabilities[capability] === true) return;
-            form.hidden = true;
-            const notice = document.createElement("div");
-            notice.className = "notice section-gap";
-            notice.dataset.capabilityNotice = capability;
-            const icon = document.createElement("span");
-            icon.textContent = "i";
-            const body = document.createElement("div");
-            const strong = document.createElement("strong");
-            strong.textContent = "Unavailable in this server build.";
-            body.append(strong, document.createElement("br"), document.createTextNode(message));
-            notice.append(icon, body);
-            form.before(notice);
-          });
+        if (capabilities.client_keys === true) return;
+        const form = $('form[data-form="create-client-key"]', content);
+        if (form) form.hidden = true;
+        $$('[data-action="revoke-client-key"]', content).forEach(button => {
+          button.disabled = true;
+          button.title = "Client API key management is unavailable in this server build.";
         });
-        if (capabilities.terminal_enrollment !== true) {
-          $$('[data-action="deny-terminal-enrollment"], [data-action="revoke-terminal"]', content)
-            .forEach(button => { button.disabled = true; button.title = "Terminal credential management is unavailable."; });
-        }
-        if (capabilities.service_keys !== true) {
-          $$('[data-action="revoke-service-key"]', content)
-            .forEach(button => { button.disabled = true; button.title = "Service-key management is unavailable."; });
-        }
-        if (capabilities.invitations !== true) {
-          $$('[data-action="revoke-invitation"]', content)
-            .forEach(button => { button.disabled = true; button.title = "Human invitation management is unavailable."; });
-        }
-        const targetCode = state.targetedEnrollmentCode;
-        if (targetCode) {
-          const matches = $$('[data-enrollment-code]', content)
-            .filter(panel => panel.dataset.enrollmentCode === targetCode);
-          if (matches.length === 1) {
-            const panel = matches[0];
-            panel?.classList.add("targeted");
-            if (panel) panel.dataset.targetedEnrollment = "true";
-            if (panel?.parentElement) panel.parentElement.prepend(panel);
-            const cluster = panel?.querySelector(".cluster");
-            if (cluster) {
-              const badge = document.createElement("span");
-              badge.className = "badge accepted";
-              badge.textContent = "opened from this terminal";
-              cluster.append(badge);
-            }
-          } else state.targetedEnrollmentCode = "";
-        }
-        const directoryErrors = Object.entries(state.workspaceAgentErrors || {});
-        if (directoryErrors.length) {
-          const terminalForm = $('form[data-form="approve-terminal-enrollment"]', content);
-          const notice = document.createElement("div");
-          notice.className = "notice error section-gap";
-          notice.textContent = `Actor inventory could not be loaded for: ${directoryErrors.map(([projectId]) => projectId).join(", ")}. Enrollment approval cannot silently bind actors from those workspaces.`;
-          terminalForm?.closest(".bridge-panel")?.before(notice);
-        }
       }
 
       function render({ force = false, feedTransition = null } = {}) {
@@ -2060,130 +1879,49 @@
           : `<span class="chip">no workspace membership</span>`;
       }
 
-      function renderCredentialBindings(record) {
-        const bindings = credentialBindings(record);
-        return bindings.length
-          ? bindings.map(binding => `<span class="chip" title="Exact AI actor binding">${h(binding.actor_id)}${binding.project_id ? ` · ${h(binding.project_id)}` : ""}</span>`).join("")
-          : `<span class="chip">no AI actor binding</span>`;
-      }
-
-      function renderTerminalRow(terminal, account) {
-        const status = credentialStatus(terminal);
-        const label = terminal.client_label || terminal.device_label || terminal.label || "Unnamed terminal";
-        return `<div class="list-row"><div><div class="cluster"><strong>${h(label)}</strong>${statusBadge(status)}</div><div class="list-meta"><span>Human owner: @${h(credentialOwner(terminal, account))}</span><span>Device ID: ${h(terminal.device_id || "not reported")}</span><span>Last use: ${h(fmtTime(terminal.last_used_at))}</span><span>${terminal.expires_at ? `Expires: ${h(fmtTime(terminal.expires_at))}` : "No expiry"}</span>${terminal.revoked_at ? `<span>Revoked: ${h(fmtTime(terminal.revoked_at))}</span>` : ""}</div><div class="cluster section-gap"><span class="faint small">Workspace membership</span>${renderCredentialMemberships(terminal)}</div><div class="cluster section-gap"><span class="faint small">Separate AI actors</span>${renderCredentialBindings(terminal)}</div></div>${status === "active" ? `<button class="button danger small" type="button" data-action="revoke-terminal" data-token="${h(terminal.token_id || terminal.terminal_id)}">Revoke terminal</button>` : ""}</div>`;
-      }
-
-      function renderServiceKeyRow(key, account) {
+      // D-17 client-install authorization is the sole Settings access surface.
+      function renderClientKeyRow(key, account) {
         const status = credentialStatus(key);
-        return `<div class="list-row"><div><div class="cluster"><strong>${h(key.label || "Unnamed service")}</strong>${statusBadge(status)}</div><div class="list-meta"><span>Owned by: @${h(credentialOwner(key, account))}</span><span>Prefix: ${h(key.token_prefix || "unavailable")}…</span><span>Last use: ${h(fmtTime(key.last_used_at))}</span><span>${key.expires_at ? `Expires: ${h(fmtTime(key.expires_at))}` : "No expiry"}</span></div><div class="cluster section-gap"><span class="faint small">Workspace scope</span>${renderCredentialMemberships(key)}</div><div class="cluster section-gap"><span class="faint small">Exact allowed AI actors</span>${renderCredentialBindings(key)}</div></div>${status === "active" ? `<button class="button danger small" type="button" data-action="revoke-service-key" data-key="${h(key.token_id)}">Revoke key</button>` : ""}</div>`;
+        const memberships = credentialMemberships(key);
+        const scope = memberships.length
+          ? memberships.map(projectId => `<span class="chip">${h(projectName(projectId))} · ${h(projectId)}</span>`).join("")
+          : `<span class="chip">all workspaces available to @${h(credentialOwner(key, account))}</span>`;
+        return `<div class="list-row"><div><div class="cluster"><strong>${h(key.label || "Attacca client")}</strong>${statusBadge(status)}</div><div class="list-meta"><span>Human owner: @${h(credentialOwner(key, account))}</span><span>Client installation: ${h(key.client_instance || "not recorded")}</span><span>Prefix: ${h(key.token_prefix || "atkey_")}…</span><span>Last use: ${h(fmtTime(key.last_used_at))}</span><span>${key.expires_at ? `Expires: ${h(fmtTime(key.expires_at))}` : "No expiry"}</span></div><div class="cluster section-gap"><span class="faint small">Workspace scope</span>${scope}</div><p class="muted small section-gap">This key authenticates the client installation only. AI actor, role, runtime, and Run by user attribution are resolved separately on every request.</p></div>${status === "active" ? `<button class="button danger small" type="button" data-action="revoke-client-key" data-key="${h(key.token_id)}">Revoke key</button>` : ""}</div>`;
       }
 
-      function renderInvitationRow(invitation) {
-        const status = invitation.revoked_at ? "revoked" : invitation.accepted_at ? "accepted" : invitation.expires_at && new Date(invitation.expires_at).valueOf() <= Date.now() ? "expired" : "pending";
-        return `<div class="list-row"><div><div class="cluster"><strong>${h(invitation.label || "Workspace invitation")}</strong>${statusBadge(status)}${invitation.is_admin ? `<span class="badge review">administrator</span>` : `<span class="badge">member</span>`}</div><div class="list-meta"><span>Invited by: @${h(invitation.invited_by || "not recorded")}</span><span>Prefix: ${h(invitation.token_prefix || "unavailable")}…</span><span>${invitation.expires_at ? `Expires: ${h(fmtTime(invitation.expires_at))}` : "No expiry"}</span>${invitation.accepted_at ? `<span>Accepted: ${h(fmtTime(invitation.accepted_at))}</span>` : ""}</div><div class="cluster section-gap"><span class="faint small">Workspace membership</span>${renderCredentialMemberships(invitation)}</div></div>${status === "pending" ? `<button class="button danger small" type="button" data-action="revoke-invitation" data-invitation="${h(invitation.invitation_id)}">Revoke invitation</button>` : ""}</div>`;
-      }
-
-      function renderPendingEnrollment(enrollment, agentDirectory) {
-        const code = enrollmentCode(enrollment);
-        const requestId = enrollment.enrollment_id || code;
-        const targeted = Boolean(code && state.targetedEnrollmentCode && code === state.targetedEnrollmentCode);
-        if (enrollment.status === "approved") {
-          return `<article class="bridge-panel ${targeted ? "targeted" : ""}" data-enrollment-code="${h(code)}"><div class="bridge-panel-head"><div><div class="cluster"><strong>${h(enrollment.client_label || enrollment.device_label || "New terminal")}</strong><span class="badge accepted">approved</span><span class="badge pending">waiting for terminal claim</span></div><div class="list-meta"><span>Device ID: ${h(enrollment.device_id || "not reported")}</span><span>Approved: ${h(fmtTime(enrollment.approved_at))}</span><span>Expires: ${h(fmtTime(enrollment.expires_at))}</span></div></div></div><div class="cluster section-gap"><span class="faint small">Requested exact AI actors</span>${renderCredentialBindings(enrollment)}</div><p class="muted small">The long-lived credential is available only to the initiating terminal's one-time device poll. It is never rendered in this browser.</p></article>`;
-        }
-        const requestedProjects = new Set(credentialMemberships(enrollment));
-        const requestedBindings = new Set(credentialBindings(enrollment).map(binding => `${binding.project_id || ""}\u0000${binding.actor_id}`));
-        return `<article class="bridge-panel ${targeted ? "targeted" : ""}" data-enrollment-code="${h(code)}"><div class="bridge-panel-head"><div><div class="cluster"><strong>${h(enrollment.client_label || enrollment.device_label || "New terminal")}</strong><span class="badge pending">pending approval</span></div><div class="list-meta"><span>Device ID: ${h(enrollment.device_id || "assigned after approval")}</span><span>Requested: ${h(fmtTime(enrollment.created_at || enrollment.requested_at))}</span><span>Expires: ${h(fmtTime(enrollment.expires_at))}</span></div></div>${state.auth?.user?.is_admin === true ? `<button class="button danger small" type="button" data-action="deny-terminal-enrollment" data-code="${h(code)}">Deny</button>` : ""}</div><form data-form="approve-terminal-enrollment" data-code="${h(code)}" data-enrollment="${h(requestId)}" class="section-gap"><div class="field"><label>Workspace memberships</label><div class="cluster">${state.projects.map(project => `<label class="chip"><input type="checkbox" name="project_memberships" value="${h(project.project_id)}" ${requestedProjects.has(project.project_id) ? "checked" : ""}> ${h(project.name)} · ${h(project.project_id)}</label>`).join("") || `<span class="muted">No workspaces are available.</span>`}</div><span class="help">Requested memberships are visible and preselected. The terminal can access only the memberships approved here.</span></div><div class="field section-gap"><label>Allowed AI actor bindings across selected workspaces</label><div class="cluster">${agentDirectory.map(({ project_id: projectId, agent }) => `<label class="chip"><input type="checkbox" name="actor_bindings" value="${h(JSON.stringify({ project_id: projectId, actor_id: agent.agent_id }))}" ${requestedBindings.has(`${projectId}\u0000${agent.agent_id}`) ? "checked" : ""}> ${h(projectId)} · ${h(agent.agent_id)}</label>`).join("") || `<span class="muted">No AI actors are registered in the available workspaces.</span>`}</div><span class="help">Requested bindings are visible and preselected. Every approved binding must belong to an approved workspace membership. These are exact, unchanged AI identities; the signed-in human remains the separate terminal owner.</span></div><div class="field section-gap"><label>Terminal expiry <span class="faint">optional</span></label><input name="expires_at" type="datetime-local"></div><div class="form-actions"><button class="button primary" type="submit" ${code ? "" : "disabled"}>Approve terminal enrollment</button></div></form></article>`;
-      }
-
-      function renderMigrationTarget(target, editable = true) {
-        const covered = Array.isArray(target.covered_by_terminal_ids) && target.covered_by_terminal_ids.length > 0;
-        const required = target.migration_required !== false;
-        const targetId = target.target_id || [target.project_id, target.actor_id, target.device_id].filter(Boolean).join(":");
-        const control = editable
-          ? `<div class="field" style="min-width:260px"><label class="chip"><input type="checkbox" name="required_clients" value="${h(targetId)}" data-project="${h(target.project_id || "")}" data-actor="${h(target.actor_id || "")}" data-device="${h(target.device_id || "")}" ${required ? "checked" : ""}> Required for activation</label><input name="exclusion_reason" data-exclusion-for="${h(targetId)}" value="${h(target.migration_exclusion_reason || "")}" placeholder="Reason required when excluded"></div>`
-          : `<div class="cluster">${statusBadge(required ? "required" : "excluded")}${!required && target.migration_exclusion_reason ? `<span class="muted small">${h(target.migration_exclusion_reason)}</span>` : ""}</div>`;
-        return `<div class="list-row" data-migration-target="${h(targetId)}"><div><div class="cluster"><strong>${h(target.client_label || target.device_id || "Legacy client")}</strong>${statusBadge(covered ? "covered" : required ? "pending" : "excluded")}</div><div class="list-meta"><span>Workspace: ${h(target.project_id || "unknown")}</span><span>Device: ${h(target.device_id || "unknown")}</span></div><div class="cluster section-gap"><span class="faint small">Exact AI actor</span><span class="chip">${h(target.actor_id || "unknown")}</span></div>${covered ? `<div class="list-meta"><span>Covered by terminal: ${h(target.covered_by_terminal_ids.join(", "))}</span></div>` : ""}</div>${control}</div>`;
-      }
-
-      function renderOneTimeServiceCredential() {
+      function renderOneTimeClientCredential() {
         const value = state.oneTimeCredential;
-        if (value?.kind !== "service" || !value.secret) return "";
-        return `<div class="notice ok"><span>✓</span><div><strong>Copy this service credential now</strong><br><code id="one-time-service-secret">${h(value.secret)}</code>${value.expires_at ? ` · expires ${h(fmtTime(value.expires_at))}` : ""}<div class="cluster section-gap"><button class="button primary small" type="button" data-action="copy-one-time-secret">Copy service credential</button><button class="button quiet small" type="button" data-action="dismiss-one-time-credential">Dismiss permanently</button></div><span class="help">This long-lived credential exists only in this page's memory. It is absent from later API responses, browser storage, and logs; dismissing or reloading cannot recover it.</span></div></div>`;
-      }
-
-      function renderOneTimeInvitation() {
-        const value = state.oneTimeCredential;
-        if (value?.kind !== "invitation" || !value.secret || !value.link) return "";
-        return `<div class="notice ok"><span>✓</span><div><strong>Share this one-time invitation securely</strong><br><span class="help">Acceptance link (the secret is in the fragment and is not sent in the initial HTTP request):</span><br><code id="one-time-invitation-link">${h(value.link)}</code><div class="section-gap"><span class="help">Token fallback:</span><br><code id="one-time-invitation-secret">${h(value.secret)}</code></div>${value.expires_at ? `<div class="list-meta"><span>Expires: ${h(fmtTime(value.expires_at))}</span></div>` : ""}<div class="cluster section-gap"><button class="button primary small" type="button" data-action="copy-one-time-link">Copy acceptance link</button><button class="button small" type="button" data-action="copy-one-time-secret">Copy token</button><button class="button quiet small" type="button" data-action="dismiss-one-time-credential">Dismiss permanently</button></div><span class="help">Neither value is stored by this panel. The invitation is consumed once; replay, expiry, and revocation are rejected.</span></div></div>`;
+        if (value?.kind !== "client" || !value.secret) return "";
+        return `<div class="notice ok"><span>✓</span><div><strong>Copy this client API key now</strong><br><code id="one-time-client-secret">${h(value.secret)}</code>${value.expires_at ? ` · expires ${h(fmtTime(value.expires_at))}` : ""}<div class="cluster section-gap"><button class="button primary small" type="button" data-action="copy-one-time-secret">Copy client key</button><button class="button quiet small" type="button" data-action="dismiss-one-time-credential">Dismiss permanently</button></div><span class="help">Paste it only into the hidden prompt already opened by the active Attacca AI. Never paste it into chat or an ordinary shell command. The plaintext is not returned by later API responses or stored in browser storage.</span></div></div>`;
       }
 
       function renderAuthenticatedSettings() {
         const settings = state.serverSettings || {};
         const account = state.auth?.user || {};
         const access = state.credentialAccess || emptyCredentialAccess();
-        const compatibility = access.compatibility;
         const eligibility = activationEligibility(access, account);
-        const armed = state.activationArmedVersion !== null &&
-          String(state.activationArmedVersion) === String(compatibility.readiness_version) &&
-          eligibility.allowed;
-        const agents = state.data.agents?.agents || [];
-        const workspaceAgentDirectory = state.projects.flatMap(project =>
-          (state.workspaceAgents?.[project.project_id] || []).map(agent => ({ project_id: project.project_id, agent })));
-        const protectedMode = eligibility.alreadyActivated;
-        const compatibilityActive = !protectedMode;
-        const qaAcceptance = compatibility.qa_evidence?.acceptance || {};
-        const qaRegression = compatibility.qa_evidence?.regression || {};
-        const blockers = [
-          ...(compatibility.blockers || []),
-          ...(compatibility.uncovered_projects || []).map(projectId => `Required workspace ${projectId} has no enrolled terminal coverage.`),
-          ...(compatibility.uncovered_actors || []).map(actorId => `Required AI actor ${actorId} has no enrolled terminal coverage.`),
-          ...eligibility.reasons.filter(reason => !reason.includes("already active"))
-        ];
-        const migrationTargets = access.migration_targets || [];
-        const terminalRows = access.terminals.length
-          ? access.terminals.map(terminal => renderTerminalRow(terminal, account)).join("")
-          : `<div class="muted">No enrolled terminals yet. Compatibility stays active and protected-mode activation stays locked.</div>`;
-        const pendingRows = access.terminal_enrollments.length
-          ? access.terminal_enrollments.map(enrollment => renderPendingEnrollment(enrollment, workspaceAgentDirectory)).join("")
-          : `<div class="muted">No terminal enrollment is waiting for approval.</div>`;
-        const serviceRows = access.service_keys.length
-          ? access.service_keys.map(key => renderServiceKeyRow(key, account)).join("")
-          : `<div class="muted">No service keys yet.</div>`;
-        const invitationRows = access.invitations.length
-          ? access.invitations.map(renderInvitationRow).join("")
-          : `<div class="muted">No human invitations yet.</div>`;
-        const legacyRows = state.authTokens.length
-          ? state.authTokens.map(token => `<div class="list-row"><div><div class="cluster"><strong>${h(token.label)}</strong><span class="badge pending">legacy credential</span></div><div class="list-meta"><span>Owner: @${h(account.username || "not recorded")}</span><span>${h(token.token_prefix || "unavailable")}…</span><span>${token.last_used_at ? `Last use: ${h(fmtTime(token.last_used_at))}` : "Never used"}</span></div><div class="cluster section-gap"><span class="faint small">Exact AI actor</span><span class="chip">${h(token.actor_id || "human API client")}</span>${token.project_id ? `<span class="chip">${h(token.project_id)}</span>` : ""}</div></div>${token.revoked_at ? statusBadge("revoked") : `<button class="button danger small" type="button" data-action="revoke-auth-token" data-token="${h(token.token_id)}">Revoke legacy key</button>`}</div>`).join("")
-          : `<div class="muted">No legacy actor keys remain.</div>`;
-        const serviceKeyControls = access.capabilities.service_keys === true
-          ? `<form data-form="create-service-key" class="section-gap"><div class="form-grid"><div class="field"><label for="service-label">Label</label><input id="service-label" name="label" maxlength="120" placeholder="Release automation" required></div><div class="field"><label for="service-expires">Expires <span class="faint">recommended</span></label><input id="service-expires" name="expires_at" type="datetime-local"></div><div class="field wide"><label>Workspace scope</label><div class="cluster">${state.projects.map(project => `<label class="chip"><input type="checkbox" name="project_memberships" value="${h(project.project_id)}"> ${h(project.name)} · ${h(project.project_id)}</label>`).join("")}</div></div><div class="field wide"><label>Exact allowed AI actors <span class="faint">optional</span></label><div class="cluster">${workspaceAgentDirectory.map(({ project_id: projectId, agent }) => `<label class="chip"><input type="checkbox" name="actor_bindings" value="${h(JSON.stringify({ project_id: projectId, actor_id: agent.agent_id }))}"> ${h(projectId)} · ${h(agent.agent_id)}</label>`).join("") || `<span class="muted">No registered actors are available in the selected workspace memberships.</span>`}</div></div></div><div class="form-actions"><button class="button primary" type="submit">Create service key</button></div></form>`
-          : `<div class="notice section-gap"><span>i</span><div><strong>Service-key enrollment is not enabled yet.</strong><br>No dead creation control is rendered. Existing service-key metadata remains visible, and exact actor bindings are unchanged.</div></div>`;
-        const invitationControls = access.capabilities.invitations !== true
-          ? `<div class="notice section-gap"><span>i</span><div><strong>Human invitations are not enabled yet.</strong><br>No dead invitation control is rendered, and this panel cannot create a credential that impersonates another person.</div></div>`
-          : account.is_admin !== true
-            ? `<div class="notice section-gap"><span>i</span><div><strong>Administrator access is required to create invitations.</strong><br>Your own human and terminal identities remain unchanged.</div></div>`
-            : `<form data-form="invite-human" class="section-gap"><div class="form-grid"><div class="field"><label for="invite-label">Invitation label</label><input id="invite-label" name="label" maxlength="120" placeholder="New teammate · Alpha" required></div><div class="field"><label for="invite-expires">Expires <span class="faint">48 hours by default</span></label><input id="invite-expires" name="expires_at" type="datetime-local"></div><div class="field wide"><label>Workspace membership</label><div class="cluster">${state.projects.map(project => `<label class="chip"><input type="checkbox" name="project_memberships" value="${h(project.project_id)}"> ${h(project.name)} · ${h(project.project_id)}</label>`).join("")}</div></div><div class="field wide"><label class="chip"><input type="checkbox" name="is_admin" ${account.is_owner === true ? "" : "disabled"}> Invite as server administrator</label><span class="help">${account.is_owner === true ? "Only the server owner may grant administrator scope." : "Only the server owner can grant administrator scope; this invitation will be a member."}</span></div></div><div class="form-actions"><button class="button primary" type="submit">Create one-time invitation</button></div></form>`;
-        const migrationScopeControls = migrationTargets.length
-          ? account.is_owner === true && access.capabilities.migration_scope === true
-            ? `<form data-form="save-migration-scope" class="section-gap"><div class="card-head" style="padding-left:0;padding-right:0"><div><h3>Active client migration scope</h3><span class="faint small">Only live compatibility clients and explicitly selected clients are targets. Historical actors are not added automatically.</span></div></div><div class="list">${migrationTargets.map(target => renderMigrationTarget(target, true)).join("")}</div><div class="form-actions"><button class="button" type="submit">Save required clients and exclusions</button></div></form>`
-            : `<div class="section-gap"><div class="card-head" style="padding-left:0;padding-right:0"><div><h3>Active client migration scope</h3><span class="faint small">Read only · ${account.is_owner === true ? "migration-scope editing is not enabled by this server" : "only the server owner can change activation scope"}.</span></div></div><div class="list">${migrationTargets.map(target => renderMigrationTarget(target, false)).join("")}</div></div>`
-          : `<div class="notice section-gap"><span>i</span><div><strong>No active migration targets are published.</strong><br>At least one live terminal enrollment and coverage for every required client are needed before readiness can pass.</div></div>`;
-        return pageHead("Account and access", "Settings", "Manage human-owned terminals, service automation, invitations, compatibility migration, and server behavior without changing AI identities.") +
-          `<div class="notice"><span>✓</span><div><strong>Signed in as ${h(account.display_name || account.username)}</strong><br>Human account: <code>web.${h(account.username)}</code> · <strong>Run by user: ${h(account.username)}</strong>. AI actors such as ${agents[0]?.agent_id ? `<code>${h(agents[0].agent_id)}</code>` : "registered workspace actors"} remain separate, exact identities; a terminal credential never renames or impersonates them. Browser identity headers cannot override either identity.</div></div>
+        const keys = access.client_keys || [];
+        const keyRows = keys.length
+          ? keys.map(key => renderClientKeyRow(key, account)).join("")
+          : `<div class="muted">No client API keys yet.</div>`;
+        const hint = state.clientAuthorization || {};
+        const clientInstance = hint.clientInstance || "";
+        const clientLabel = hint.clientLabel || "";
+        const activationText = eligibility.enabled
+          ? "Authentication is enforced. Browser sessions or a valid client-install API key are required."
+          : "Authentication enforcement is off. Create keys for active client installations before enabling it.";
+        const activationButton = eligibility.enabled
+          ? "Disable authentication enforcement"
+          : "Enable authentication enforcement";
+        return pageHead("Account and access", "Settings", "Manage browser sign-in, human-owned API keys for installed clients, and server behavior. AI identities remain separate.") +
+          `<div class="notice"><span>✓</span><div><strong>Signed in as ${h(account.display_name || account.username)}</strong><br>Human account: <code>web.${h(account.username)}</code> · <strong>Run by user: ${h(account.username)}</strong>. Canonical AI actors keep their own workspace, role, and runtime; a client key never renames, binds, or impersonates them.</div></div>
           <div class="grid two section-gap">
-            <section class="card"><div class="card-head"><h2>Human account</h2><span class="badge accepted">${account.is_owner ? "server owner" : account.is_admin ? "admin" : "user"}</span></div><div class="card-body"><div class="list"><div class="list-row"><span class="muted">Username</span><code>@${h(account.username)}</code></div><div class="list-row"><span class="muted">Display name</span><strong>${h(account.display_name || account.username)}</strong></div><div class="list-row"><span class="muted">Protected-mode authority</span><strong>${account.is_owner ? "Owner controls enabled" : "Read only · server owner required"}</strong></div></div><div class="form-actions"><button class="button danger" type="button" data-action="auth-logout">Sign out</button></div></div></section>
+            <section class="card"><div class="card-head"><h2>Human account</h2><span class="badge accepted">${account.is_owner ? "server owner" : account.is_admin ? "admin" : "user"}</span></div><div class="card-body"><div class="list"><div class="list-row"><span class="muted">Username</span><code>@${h(account.username)}</code></div><div class="list-row"><span class="muted">Display name</span><strong>${h(account.display_name || account.username)}</strong></div><div class="list-row"><span class="muted">Authentication authority</span><strong>${account.is_owner ? "Owner toggle available" : "Read only · server owner required"}</strong></div></div><div class="form-actions"><button class="button danger" type="button" data-action="auth-logout">Sign out</button></div></div></section>
+            <section class="card"><div class="card-head"><h2>Authentication enforcement</h2>${statusBadge(eligibility.enabled ? "enabled" : "off")}</div><div class="card-body"><p class="muted">${h(activationText)}</p>${eligibility.reasons.length ? `<div class="notice section-gap"><span>i</span><div>${h(eligibility.reasons.join(" "))}</div></div>` : ""}<div class="form-actions"><button class="button ${eligibility.enabled ? "danger" : "primary"}" type="button" data-action="toggle-authentication" ${eligibility.allowed ? "" : "disabled"} data-enabled="${eligibility.enabled ? "false" : "true"}">${h(activationButton)}</button></div></div></section>
+            <section class="card" style="grid-column:1/-1"><div class="card-head"><div><h2>Client API keys</h2><span class="faint small">one human-owned key per installed client</span></div><span class="badge">${h(keys.length)} key${keys.length === 1 ? "" : "s"}</span></div><div class="card-body">${renderOneTimeClientCredential()}<div class="notice"><span>i</span><div><strong>Client identity and AI identity are different.</strong><br>Create a key for a concrete Claude, Codex, Kimi, or generic MCP installation. The same installation may run different AI actors; every request still supplies the exact workspace and canonical actor for server-side membership, ownership, and role checks.</div></div>${access.supported ? `<form data-form="create-client-key" class="section-gap"><div class="form-grid"><div class="field"><label for="client-key-label">Client label</label><input id="client-key-label" name="label" maxlength="120" value="${h(clientLabel)}" placeholder="Office laptop · Codex" required></div><div class="field"><label for="client-instance">Client installation ID</label><input id="client-instance" name="client_instance" maxlength="120" pattern="[A-Za-z0-9][A-Za-z0-9._:/@+\\-]*" value="${h(clientInstance)}" placeholder="Filled automatically by the active AI" required><span class="help">Generated by that installation. It is non-secret and cannot select an actor.</span></div><div class="field"><label for="client-key-expires">Expires <span class="faint">optional</span></label><input id="client-key-expires" name="expires_at" type="datetime-local"></div><div class="field wide"><label>Workspace scope <span class="faint">optional</span></label><div class="cluster">${state.projects.map(project => `<label class="chip"><input type="checkbox" name="project_memberships" value="${h(project.project_id)}"> ${h(project.name)} · ${h(project.project_id)}</label>`).join("") || `<span class="muted">No workspaces are currently available.</span>`}</div><span class="help">Leave all unchecked to follow every workspace membership of this human account, including memberships added later.</span></div></div><div class="form-actions"><button class="button primary" type="submit">Create client API key</button></div></form>` : `<div class="notice error section-gap"><span>!</span><div><strong>Client API key management is unavailable.</strong><br>Upgrade the hosted Attacca service before enabling authentication.</div></div>`}<div class="list section-gap">${keyRows}</div></div></section>
             <section class="card"><div class="card-head"><h2>Browser refresh</h2></div><div class="card-body"><form data-form="save-panel-behavior"><div class="form-grid"><div class="field"><label for="settings-refresh">Refresh interval</label><input id="settings-refresh" name="refreshSeconds" type="number" min="5" max="300" value="${h(state.prefs.refreshSeconds)}"></div><div class="field"><label for="settings-auto">Live refresh</label><select id="settings-auto" name="autoRefresh"><option value="true" ${state.prefs.autoRefresh ? "selected" : ""}>On</option><option value="false" ${!state.prefs.autoRefresh ? "selected" : ""}>Off</option></select></div></div><div class="form-actions"><button class="button primary" type="submit">Save browser settings</button></div></form></div></section>
-            <section class="card" style="grid-column:1/-1"><div class="card-head"><div><h2>Authentication migration</h2><span class="faint small">explicit activation only</span></div><div class="cluster">${statusBadge(compatibilityActive ? "compatibility" : "protected")}${statusBadge(eligibility.migrationReady ? "ready" : "pending")}</div></div><div class="card-body">${!access.supported ? `<div class="notice error"><span>!</span><div><strong>Terminal migration inventory is unavailable.</strong><br>Activation is locked. Upgrade the hosted service through its normal operator workflow; this panel will never guess that migration is safe.</div></div>` : compatibilityActive ? `<div class="notice"><span>↔</span><div><strong>Compatibility mode is active.</strong><br>Existing clients may continue while human-owned terminals are enrolled. Creating the administrator did not activate protected mode.</div></div>` : `<div class="notice ok"><span>✓</span><div><strong>Protected mode is active.</strong><br>Terminal credentials and service keys are required according to the recorded migration scope.</div></div>`}
-              <div class="grid two section-gap"><div class="bridge-panel"><div class="cluster"><strong>Migration readiness</strong>${statusBadge(eligibility.migrationReady ? "passed" : "pending")}</div><div class="list-meta"><span>Readiness version: ${h(compatibility.readiness_version ?? "not published")}</span><span>${h(access.terminals.length)} enrolled terminal${access.terminals.length === 1 ? "" : "s"}</span></div></div><div class="bridge-panel"><div class="cluster"><strong>Two independent QA passes</strong>${statusBadge(eligibility.acceptancePassed && eligibility.regressionPassed ? "passed" : "pending")}</div><div class="list-meta"><span>Acceptance criteria: ${eligibility.acceptancePassed ? "passed" : "missing"}${qaAcceptance.suite ? ` · ${h(qaAcceptance.suite)}` : ""}${qaAcceptance.result ? ` · ${h(qaAcceptance.result)}` : ""}</span><span>Regression/integration: ${eligibility.regressionPassed ? "passed" : "missing"}${qaRegression.suite ? ` · ${h(qaRegression.suite)}` : ""}${qaRegression.result ? ` · ${h(qaRegression.result)}` : ""}</span></div></div></div>
-              ${migrationScopeControls}
-              ${blockers.length && !protectedMode ? `<div class="notice error section-gap"><span>!</span><div><strong>Activation remains locked.</strong><ul>${[...new Set(blockers)].map(item => `<li>${h(item)}</li>`).join("")}</ul></div></div>` : ""}
-              <div class="bridge-panel section-gap"><div class="bridge-panel-head"><div><strong>Two-stage owner activation</strong><div class="list-meta"><span>Stage 1 records a separate owner review. Stage 2 performs activation. Neither stage runs automatically.</span></div></div>${statusBadge(armed ? "armed" : protectedMode ? "active" : "not armed")}</div><div class="form-actions"><button class="button" type="button" data-action="arm-auth-activation" ${eligibility.allowed && !armed ? "" : "disabled"}>1. Review and arm activation</button><button class="button primary" type="button" data-action="activate-authentication" ${armed ? "" : "disabled"}>2. Activate protected mode</button></div></div></div></section>
-            <section class="card" style="grid-column:1/-1"><div class="card-head"><div><h2>Human-owned terminals</h2><span class="faint small">model-independent device identity</span></div><span class="badge">${h(access.terminals.length)} enrolled</span></div><div class="card-body">${state.targetedEnrollmentError ? `<div class="notice error"><span>!</span><div><strong>The linked terminal request could not be loaded.</strong><br>${h(state.targetedEnrollmentError)}</div></div>` : ""}<div class="notice"><span>↗</span><div><strong>The initiating terminal starts enrollment.</strong><br>Only that terminal holds its one-time device secret and exact device ID. Its browser approval link opens the matching request below; this panel never manufactures an unbound terminal credential.</div></div><div class="card-head section-gap" style="padding-left:0;padding-right:0"><h3>Pending terminal approvals</h3><span class="faint small">approve workspace membership and exact actors</span></div><div class="stack">${pendingRows}</div><div class="card-head section-gap" style="padding-left:0;padding-right:0"><h3>Enrolled terminals</h3><span class="faint small">human owner · device · scope · last use</span></div><div class="list">${terminalRows}</div></div></section>
-            <section class="card"><div class="card-head"><h2>Service keys</h2><span class="faint small">human-owned automation</span></div><div class="card-body">${renderOneTimeServiceCredential()}<div class="notice"><span>i</span><div>A service key belongs to the signed-in human or organization service account. Exact allowed AI actor bindings remain separate; the key does not turn one actor into another.</div></div>${serviceKeyControls}<div class="list section-gap">${serviceRows}</div></div></section>
-            <section class="card"><div class="card-head"><h2>Invite another human</h2><span class="faint small">no impersonation</span></div><div class="card-body">${renderOneTimeInvitation()}<div class="notice"><span>+</span><div>The invitee accepts once, creates their own human account, and then signs in through the ordinary session endpoint. This never creates a key that acts as the invitee.</div></div>${invitationControls}<div class="list section-gap">${invitationRows}</div></div></section>
-            <section class="card" style="grid-column:1/-1"><div class="card-head"><h2>Legacy actor keys pending migration</h2><span class="faint small">read-only metadata · no plaintext</span></div><div class="card-body"><div class="notice"><span>!</span><div>These keys predate human-owned terminal enrollment. They are shown only as prefixes and exact actor bindings. No raw key is rendered, and they do not satisfy terminal readiness unless the server records matching terminal coverage.</div></div><div class="list section-gap">${legacyRows}</div></div></section>
-            <section class="card"><div class="card-head"><h2>Server runtime</h2>${statusBadge(state.health?.ok ? "ok" : "error")}</div><div class="card-body"><form data-form="save-runtime"><div class="form-grid"><div class="field wide"><label for="runtime-default">Default workspace</label><select id="runtime-default" name="default_project"><option value="">No server default</option>${state.projects.map(project => `<option value="${h(project.project_id)}" ${settings.default_project === project.project_id ? "selected" : ""}>${h(project.name)} · ${h(project.project_id)}</option>`).join("")}</select></div><div class="field"><label for="runtime-update-interval">AI update checks</label><select id="runtime-update-interval" name="update_interval_seconds">${[[0,"Off"],[60,"Every minute (default)"],[300,"Every 5 minutes"],[600,"Every 10 minutes"],[1800,"Every 30 minutes"],[3600,"Every hour"]].map(([seconds,label]) => `<option value="${seconds}" ${Number(settings.update_interval_seconds) === seconds ? "selected" : ""}>${label}</option>`).join("")}</select></div><div class="field"><label for="runtime-verbose">Request logging</label><select id="runtime-verbose" name="verbose"><option value="false" ${!settings.verbose ? "selected" : ""}>Quiet</option><option value="true" ${settings.verbose ? "selected" : ""}>Verbose</option></select></div></div><div class="form-actions"><button class="button primary" type="submit">Save watcher settings</button></div></form><div class="notice section-gap"><span>↗</span><div><strong>Connection changes are local to each terminal.</strong><br>Use that terminal's built-in connection settings. This panel never tells a human or AI to paste shell commands.</div></div></div></section>
-            <section class="card"><div class="card-head"><h2>Download all workspace data</h2></div><div class="card-body"><p class="muted">Download a deterministic snapshot of the selected workspace, including the ledger and full logs. Each download is a private human backup, not the agent sync mirror. Authentication secrets are excluded; if preparation fails, no empty placeholder file is saved.</p><div class="form-actions" style="justify-content:flex-start"><button class="button primary" type="button" data-action="download-export" data-format="zip" ${state.projectId ? "" : "disabled"}>ZIP</button><button class="button" type="button" data-action="download-export" data-format="json" ${state.projectId ? "" : "disabled"}>Full JSON</button><button class="button" type="button" data-action="download-export" data-format="ledger.ndjson" ${state.projectId ? "" : "disabled"}>Ledger NDJSON</button><button class="button" data-action="download-export" data-format="full-log.txt" ${state.projectId ? "" : "disabled"}>Full log</button></div></div></section>
+            <section class="card"><div class="card-head"><h2>Server runtime</h2>${statusBadge(state.health?.ok ? "ok" : "error")}</div><div class="card-body"><form data-form="save-runtime"><div class="form-grid"><div class="field wide"><label for="runtime-default">Default workspace</label><select id="runtime-default" name="default_project"><option value="">No server default</option>${state.projects.map(project => `<option value="${h(project.project_id)}" ${settings.default_project === project.project_id ? "selected" : ""}>${h(project.name)} · ${h(project.project_id)}</option>`).join("")}</select></div><div class="field"><label for="runtime-update-interval">AI update checks</label><select id="runtime-update-interval" name="update_interval_seconds">${[[0,"Off"],[60,"Every minute (default)"],[300,"Every 5 minutes"],[600,"Every 10 minutes"],[1800,"Every 30 minutes"],[3600,"Every hour"]].map(([seconds,label]) => `<option value="${seconds}" ${Number(settings.update_interval_seconds) === seconds ? "selected" : ""}>${label}</option>`).join("")}</select></div><div class="field"><label for="runtime-verbose">Request logging</label><select id="runtime-verbose" name="verbose"><option value="false" ${!settings.verbose ? "selected" : ""}>Quiet</option><option value="true" ${settings.verbose ? "selected" : ""}>Verbose</option></select></div></div><div class="form-actions"><button class="button primary" type="submit">Save watcher settings</button></div></form><div class="notice section-gap"><span>↗</span><div><strong>Connection changes stay local to each client installation.</strong><br>The active AI opens sign-in and secure key collection itself; this panel never asks a human to run a shell command.</div></div></div></section>
+            <section class="card" style="grid-column:1/-1"><div class="card-head"><h2>Download all workspace data</h2></div><div class="card-body"><p class="muted">Download a deterministic snapshot of the selected workspace, including the ledger and full logs. Authentication secrets are excluded.</p><div class="form-actions" style="justify-content:flex-start"><button class="button primary" type="button" data-action="download-export" data-format="zip" ${state.projectId ? "" : "disabled"}>ZIP</button><button class="button" type="button" data-action="download-export" data-format="json" ${state.projectId ? "" : "disabled"}>Full JSON</button><button class="button" type="button" data-action="download-export" data-format="ledger.ndjson" ${state.projectId ? "" : "disabled"}>Ledger NDJSON</button><button class="button" data-action="download-export" data-format="full-log.txt" ${state.projectId ? "" : "disabled"}>Full log</button></div></div></section>
           </div>`;
       }
 
@@ -2250,7 +1988,6 @@
             state.auth = null;
             state.credentialAccess = null;
             state.oneTimeCredential = null;
-            state.activationArmedVersion = null;
             state.authTokens = [];
             state.projects = [];
             state.workspaceAgents = {};
@@ -2269,7 +2006,7 @@
           if (action === "copy-one-time-secret") {
             if (!state.oneTimeCredential?.secret) throw new Error("The one-time credential is no longer available.");
             await navigator.clipboard.writeText(state.oneTimeCredential.secret);
-            toast(state.oneTimeCredential.kind === "invitation" ? "Invitation token copied" : "Service credential copied");
+            toast(state.oneTimeCredential.kind === "client" ? "Client API key copied" : state.oneTimeCredential.kind === "invitation" ? "Invitation token copied" : "Credential copied");
           }
           if (action === "copy-one-time-link") {
             if (state.oneTimeCredential?.kind !== "invitation" || !state.oneTimeCredential.link) throw new Error("The one-time invitation link is no longer available.");
@@ -2285,69 +2022,26 @@
             state.invitationAcceptanceError = "";
             await bootstrap();
           }
-          if (action === "deny-terminal-enrollment") {
-            if (state.credentialAccess?.capabilities?.terminal_enrollment !== true) throw new Error("Terminal enrollment management is not enabled on this server.");
-            if (state.auth?.user?.is_admin !== true) throw new Error("Administrator access is required to deny another terminal request.");
-            if (!button.dataset.code) throw new Error("The pending enrollment has no approval code.");
-            if (!confirm("Deny this terminal enrollment? No long-lived credential will be issued.")) return;
-            await api(`/v1/auth/terminal-enrollments/${encodeURIComponent(button.dataset.code)}/deny`, { method: "POST", body: {} });
-            if (state.targetedEnrollmentCode === button.dataset.code) state.targetedEnrollmentCode = "";
+          if (action === "revoke-client-key") {
+            if (state.credentialAccess?.capabilities?.client_keys !== true) throw new Error("Client API key management is unavailable on this server.");
+            if (!button.dataset.key) throw new Error("The client API key has no identifier.");
+            if (!confirm("Revoke this client-install API key? That installation will need a new key; its AI actors and audit history are unchanged.")) return;
+            await api(`/v1/auth/client-keys/${encodeURIComponent(button.dataset.key)}`, { method: "DELETE", body: {} });
             state.credentialAccess = await loadCredentialAccess();
             render({ force: true });
-            toast("Terminal enrollment denied");
+            toast("Client API key revoked");
           }
-          if (action === "revoke-terminal") {
-            if (state.credentialAccess?.capabilities?.terminal_enrollment !== true) throw new Error("Terminal credential management is not enabled on this server.");
-            if (!confirm("Revoke this human-owned terminal credential? Its exact AI actor bindings are not changed.")) return;
-            await api(`/v1/auth/terminals/${encodeURIComponent(button.dataset.token)}`, { method: "DELETE", body: {} });
-            state.credentialAccess = await loadCredentialAccess();
-            state.activationArmedVersion = null;
-            render({ force: true });
-            toast("Terminal credential revoked");
-          }
-          if (action === "revoke-service-key") {
-            if (state.credentialAccess?.capabilities?.service_keys !== true) throw new Error("Service-key management is not enabled on this server.");
-            if (!confirm("Revoke this service key? Its recorded human owner and exact actor bindings remain in audit history.")) return;
-            await api(`/v1/auth/service-keys/${encodeURIComponent(button.dataset.key)}`, { method: "DELETE", body: {} });
-            state.credentialAccess = await loadCredentialAccess();
-            state.activationArmedVersion = null;
-            render({ force: true });
-            toast("Service key revoked");
-          }
-          if (action === "revoke-invitation") {
-            if (state.credentialAccess?.capabilities?.invitations !== true) throw new Error("Human invitations are not enabled on this server.");
-            if (state.auth?.user?.is_admin !== true) throw new Error("Administrator access is required to revoke an invitation.");
-            if (!button.dataset.invitation) throw new Error("The invitation has no identifier.");
-            if (!confirm("Revoke this unused invitation? Its one-time token will stop working.")) return;
-            await api(`/v1/auth/invitations/${encodeURIComponent(button.dataset.invitation)}`, { method: "DELETE", body: {} });
-            state.credentialAccess = await loadCredentialAccess();
-            render({ force: true });
-            toast("Invitation revoked");
-          }
-          if (action === "arm-auth-activation") {
-            const access = state.credentialAccess || emptyCredentialAccess();
-            const eligibility = activationEligibility(access, state.auth?.user || {});
-            if (!eligibility.allowed) throw new Error(eligibility.reasons[0] || "Activation readiness has not passed.");
-            const version = access.compatibility?.readiness_version;
-            if (version === null || version === undefined) throw new Error("Activation readiness has no immutable version.");
-            if (!confirm("Stage 1 of 2: confirm that the active-client migration scope, every exclusion reason, and both QA evidence passes have been reviewed. This only arms the current readiness version; it does not activate authentication.")) return;
-            state.activationArmedVersion = version;
-            render({ force: true });
-            toast("Current readiness version armed for explicit activation");
-          }
-          if (action === "activate-authentication") {
-            const access = state.credentialAccess || emptyCredentialAccess();
-            const eligibility = activationEligibility(access, state.auth?.user || {});
-            const version = access.compatibility?.readiness_version;
-            const armed = state.activationArmedVersion !== null && String(state.activationArmedVersion) === String(version);
-            if (!eligibility.allowed || !armed) throw new Error("Complete the separate owner review before activation.");
-            if (!confirm("Stage 2 of 2: activate protected mode now? This is the explicit activation action; it is never performed by readiness checks, enrollment, refresh, or AI activity.")) return;
-            await api("/v1/auth/activation", { method: "POST", body: { confirmed: true, expected_readiness_version: version } });
-            state.activationArmedVersion = null;
+          if (action === "toggle-authentication") {
+            const eligibility = activationEligibility(state.credentialAccess || emptyCredentialAccess(), state.auth?.user || {});
+            if (!eligibility.allowed) throw new Error(eligibility.reasons[0] || "Only the server owner can change authentication enforcement.");
+            const enabled = button.dataset.enabled === "true";
+            const verb = enabled ? "enable" : "disable";
+            if (!confirm(`${identityPart(verb)} authentication enforcement now? Existing client keys and AI identities are not changed.`)) return;
+            await api("/v1/auth/activation", { method: "POST", body: { enabled, confirmed: true } });
             state.auth = await api("/v1/auth/status");
             state.credentialAccess = await loadCredentialAccess();
             render({ force: true });
-            toast("Protected mode activated explicitly");
+            toast(`Authentication enforcement ${enabled ? "enabled" : "disabled"}`);
           }
           if (action === "select-project") await selectProject(button.dataset.project);
           if (action === "view-task-plan") await openTaskPlan(button.dataset.task);
@@ -2573,7 +2267,7 @@
             state.auth = await api("/v1/auth/bootstrap", { method: "POST", body: { username: values.username.trim(), display_name: values.display_name.trim(), password: values.password } });
             form.reset();
             await bootstrap();
-            toast("Administrator created; compatibility mode is unchanged");
+            toast("Administrator created; authentication enforcement remains off");
           }
           if (kind === "auth-login") {
             state.auth = await api("/v1/auth/login", { method: "POST", body: { username: values.username.trim(), password: values.password } });
@@ -2608,134 +2302,29 @@
               throw error;
             }
           }
-          if (kind === "approve-terminal-enrollment") {
-            if (state.credentialAccess?.capabilities?.terminal_enrollment !== true) throw new Error("Terminal enrollment approval is not enabled on this server.");
-            const code = form.dataset.code;
-            if (!code) throw new Error("The pending terminal enrollment has no approval code.");
-            const projectMemberships = formData.getAll("project_memberships").map(String);
-            if (!projectMemberships.length) throw new Error("Select at least one workspace membership for this terminal.");
-            const actorBindings = formData.getAll("actor_bindings").map(value => {
-              try { return JSON.parse(String(value)); }
-              catch (_) { throw new Error("An AI actor binding is malformed; refresh before approving."); }
-            });
-            const selectedMemberships = new Set(projectMemberships);
-            const knownBindings = new Set(Object.entries(state.workspaceAgents || {}).flatMap(([projectId, records]) =>
-              records.map(agent => `${projectId}\u0000${agent.agent_id}`)));
-            actorBindings.forEach(binding => {
-              if (!selectedMemberships.has(binding.project_id)) throw new Error(`AI actor ${binding.actor_id} belongs to ${binding.project_id}, which is not an approved terminal membership.`);
-              if (!knownBindings.has(`${binding.project_id}\u0000${binding.actor_id}`)) throw new Error(`AI actor ${binding.actor_id} is not registered in workspace ${binding.project_id}.`);
-            });
-            const body = { project_memberships: projectMemberships, actor_bindings: actorBindings };
-            if (values.expires_at) body.expires_at = new Date(values.expires_at).toISOString();
-            await api(`/v1/auth/terminal-enrollments/${encodeURIComponent(code)}/approve`, { method: "POST", body });
-            if (state.targetedEnrollmentCode === code) state.targetedEnrollmentCode = "";
-            state.activationArmedVersion = null;
-            state.credentialAccess = await loadCredentialAccess();
-            render({ force: true });
-            toast("Terminal enrollment approved; the credential is delivered only to that terminal");
-          }
-          if (kind === "save-migration-scope") {
-            if (state.credentialAccess?.capabilities?.migration_scope !== true) throw new Error("Migration-scope management is not enabled on this server.");
-            if (state.auth?.user?.is_owner !== true) throw new Error("Only the server owner may change migration scope.");
-            const requiredClients = [];
-            const exclusions = [];
-            $$('[data-migration-target]', form).forEach(row => {
-              const checkbox = $('[name="required_clients"]', row);
-              const reasonInput = $('[data-exclusion-for]', row);
-              const client = {
-                project_id: checkbox?.dataset.project || "",
-                actor_id: checkbox?.dataset.actor || "",
-                device_id: checkbox?.dataset.device || ""
-              };
-              if (!client.project_id || !client.actor_id || !client.device_id) throw new Error("A migration target is missing its exact workspace, actor, or device identity.");
-              if (checkbox.checked) requiredClients.push(client);
-              else {
-                const reason = reasonInput?.value?.trim() || "";
-                if (!reason) throw new Error(`Explain why excluded client ${client.device_id} is not required for activation.`);
-                exclusions.push({ ...client, reason });
-              }
-            });
-            await api("/v1/auth/migration-scope", { method: "POST", body: {
-              expected_readiness_version: state.credentialAccess?.compatibility?.readiness_version,
-              required_clients: requiredClients, exclusions
-            } });
-            state.activationArmedVersion = null;
-            state.credentialAccess = await loadCredentialAccess();
-            render({ force: true });
-            toast("Active-client migration scope saved with explicit exclusions");
-          }
-          if (kind === "create-service-key") {
-            if (state.credentialAccess?.capabilities?.service_keys !== true) throw new Error("Service-key enrollment is not enabled on this server.");
-            const projectMemberships = formData.getAll("project_memberships").map(String);
-            if (!projectMemberships.length) throw new Error("Select at least one workspace for the service key.");
-            const actorBindings = formData.getAll("actor_bindings").map(value => {
-              try { return JSON.parse(String(value)); }
-              catch (_) { throw new Error("An allowed AI actor binding is malformed; refresh and retry."); }
-            });
-            const selectedWorkspaces = new Set(projectMemberships);
-            const knownBindings = new Set(Object.entries(state.workspaceAgents || {}).flatMap(([projectId, records]) =>
-              records.map(agent => `${projectId}\u0000${agent.agent_id}`)));
-            actorBindings.forEach(binding => {
-              if (!selectedWorkspaces.has(binding.project_id)) throw new Error(`Allowed AI actor ${binding.actor_id} is outside the selected service-key workspace scope.`);
-              if (!knownBindings.has(`${binding.project_id}\u0000${binding.actor_id}`)) throw new Error(`Allowed AI actor ${binding.actor_id} is not registered in workspace ${binding.project_id}.`);
-            });
+          if (kind === "create-client-key") {
+            if (state.credentialAccess?.capabilities?.client_keys !== true) throw new Error("Client API key management is unavailable on this server.");
+            const clientInstance = String(values.client_instance || "").trim();
+            if (!/^[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,119}$/.test(clientInstance)) throw new Error("Enter the exact client installation ID supplied by the active AI (120 characters maximum).");
             const body = {
-              label: values.label.trim(),
-              project_memberships: projectMemberships, actor_bindings
+              label: String(values.label || "").trim(),
+              client_instance: clientInstance,
+              project_memberships: formData.getAll("project_memberships").map(String)
             };
             if (values.expires_at) body.expires_at = new Date(values.expires_at).toISOString();
-            const result = await api("/v1/auth/service-keys", { method: "POST", body });
-            if (typeof result.token !== "string" || !result.token.startsWith("atsvc_")) throw new Error("The server created a service key without returning its one-time credential.");
+            const result = await api("/v1/auth/client-keys", { method: "POST", body });
+            if (typeof result.token !== "string" || !result.token.startsWith("atkey_")) throw new Error("The server did not return a one-time client API key.");
+            if (!result.record || result.record.client_instance !== clientInstance) throw new Error("The server returned a key for a different client installation.");
             state.oneTimeCredential = {
-              kind: "service", secret: result.token,
-              label: result.record?.label || body.label,
-              expires_at: result.record?.expires_at || null
+              kind: "client", secret: result.token,
+              label: result.record.label || body.label,
+              client_instance: clientInstance,
+              expires_at: result.record.expires_at || null
             };
-            if (result.record && typeof result.record === "object") {
-              const access = state.credentialAccess || emptyCredentialAccess();
-              state.credentialAccess = {
-                ...access,
-                service_keys: [result.record, ...(access.service_keys || []).filter(
-                  record => record.token_id !== result.record.token_id)]
-              };
-            }
-            form.reset();
+            state.credentialAccess = await loadCredentialAccess();
+            state.clientAuthorization = { clientInstance: "", clientLabel: "" };
             render({ force: true });
-            toast("Service key created; copy the one-time credential now");
-          }
-          if (kind === "invite-human") {
-            if (state.credentialAccess?.capabilities?.invitations !== true) throw new Error("Human invitations are not enabled on this server.");
-            if (state.auth?.user?.is_admin !== true) throw new Error("Administrator access is required to create a human invitation.");
-            const projectMemberships = formData.getAll("project_memberships").map(String);
-            if (!projectMemberships.length) throw new Error("Select at least one workspace for the invited human.");
-            const isAdmin = formData.has("is_admin");
-            if (isAdmin && state.auth?.user?.is_owner !== true) throw new Error("Only the server owner may invite an administrator.");
-            const body = {
-              label: values.label.trim(),
-              project_memberships: projectMemberships,
-              is_admin: isAdmin
-            };
-            if (values.expires_at) body.expires_at = new Date(values.expires_at).toISOString();
-            const result = await api("/v1/auth/invitations", { method: "POST", body });
-            if (typeof result.invitation_token !== "string" || !result.invitation_token.startsWith("ati_")) throw new Error("The server created an invitation without returning its one-time token.");
-            const link = invitationAcceptanceLink(result.verification_uri, result.invitation_token);
-            if (!link) throw new Error("The invitation response could not be converted into a safe acceptance link.");
-            state.oneTimeCredential = {
-              kind: "invitation", secret: result.invitation_token, link,
-              label: result.record?.label || body.label,
-              expires_at: result.record?.expires_at || null
-            };
-            if (result.record && typeof result.record === "object") {
-              const access = state.credentialAccess || emptyCredentialAccess();
-              state.credentialAccess = {
-                ...access,
-                invitations: [result.record, ...(access.invitations || []).filter(
-                  record => record.invitation_id !== result.record.invitation_id)]
-              };
-            }
-            form.reset();
-            render({ force: true });
-            toast("Human invitation created; copy its one-time acceptance link now");
+            toast("Client API key created; copy it into the active AI's hidden prompt now");
           }
           if (kind === "save-panel-behavior") {
             state.prefs = { ...state.prefs, autoRefresh: values.autoRefresh === "true", refreshSeconds: Math.max(5, Math.min(300, Number(values.refreshSeconds) || 15)) };
@@ -2874,6 +2463,7 @@
       });
 
       window.addEventListener("hashchange", () => {
+        state.clientAuthorization = clientAuthorizationHintsFromLocation();
         const invitationToken = consumeInvitationTokenFromLocation();
         if (invitationToken) {
           state.pendingInvitationToken = invitationToken;

@@ -39,39 +39,29 @@ When that succeeds, call MCP `list_projects`; keep `you.actor_id` and
 pass both to later setup CLI calls. They identify the actual Claude/Kimi AI,
 not the shell account such as `vscode`.
 
-If the server needs its first admin, open the displayed `/app` URL and ask the
-human only to create or authenticate the account there. On an enforced server
-with a brand-new/unlinked checkout, start `terminal_flow.py` as an explicit
-zero-binding browser/device flow. The owner/admin approves empty memberships
-and bindings; Kimi polls and stores the resulting 0600 device credential as a
-provisional human setup principal. It cannot authorize AI/sync writes.
+If the server needs its first owner, open the displayed `/app` URL and ask the
+human only to create or sign in to that account in the browser. On a 401/403,
+Kimi itself starts the packaged `terminal_flow.py authorize` helper in the
+active terminal; never give the human a recovery command. The helper opens
+Attacca Settings with the exact non-secret client-install ID filled in. The
+signed-in human creates one `atkey_` API key for that installation, optionally
+limits its workspace memberships, and pastes it only into the helper's hidden
+foreground-terminal prompt. Never accept the key in chat, `$ARGUMENTS`, argv,
+a URL, logs, or ordinary stdin. With no controlling TTY, leave authorization
+deferred and nonblocking while the lifecycle hook retries.
 
-That private credential—not a browser cookie—persists across the separate
-discovery and apply processes. Use it only to list/create the workspace,
-establish membership, and register the explicitly confirmed actor/role. Then
-authenticate `POST /v1/auth/terminals/{token_id}/bindings` with the same device
-credential, add the exact `{project_id, actor_id}`, refresh saved metadata, and
-retry as the AI. Non-admin approval must select an existing membership. If
-abandoned, the owner can revoke the provisional credential in Settings.
-Compatibility mode may complete the initial actor setup anonymously and bind at
-the end. This is an internal Kimi/AI action: show only the verified login URL
-and short device code, never a shell command for the human.
+The helper verifies the key and atomically stores it in the private 0600
+credentials file. It belongs to the authenticated human and one client
+installation—not to Kimi, Claude, Codex, any actor, or any role. Every project
+request separately sends the exact workspace and canonical actor; the server
+checks membership, actor ownership, and the actor's registered role. The key
+persists across discovery and apply so Kimi can finish the explicitly confirmed
+workspace, actor, and role setup. Browser cookies never cross into the CLI.
 
-The browser/device approval path is universal. On a 401/403, Kimi itself starts
-or resumes that native flow and retries after verified hosted identity sync.
-Never request a password, API token,
-or high-entropy device code in chat, `$ARGUMENTS`, Bash arguments, or logs. A
-hidden paste fallback is allowed only when the helper proves a real foreground
-controlling TTY; otherwise keep the browser flow deferred and nonblocking. The
-helper stores one 0600 device-bound terminal credential per full server URL,
-independent of runtime, with only server-approved existing actor bindings.
-
-After exact binding, hot-reload and retry MCP/watcher sync in this client. Clear the
-authentication latch only after verified hosted identity sync and do not force
-a restart. Discovery and apply remain separate processes; only the private
-provisional terminal credential crosses them, so never claim a temporary login
-session carries between them. Continue at Step 5 rather than
-reapplying completed Steps 1-4. Cached offline data never authorizes recovery.
+After authorization, hot-reload and retry MCP/watcher sync in this same client.
+Clear the latch only after verified hosted sync; do not force a restart, alter
+the established actor identity, or repeat completed Steps 1-4. Cached offline
+data never authorizes recovery.
 
 ## 1. Select the workspace
 

@@ -92,8 +92,7 @@ database is installed inside a user's project.
 
 ```bash
 cd attacca && python3 attacca.py serve     # http://127.0.0.1:8722
-# request auth migration/readiness checks at launch: add --auth
-# enforcement still requires an explicit owner activation after coverage + QA
+# bootstrap the owner, create per-install client keys, and enable auth in /app Settings
 # remote prototype: --host 0.0.0.0 (put TLS in front of it)
 ```
 
@@ -205,62 +204,58 @@ no project side effects — what install.sh uses),
 
 ## Hosted authentication (prototype)
 
-The Control Panel at `/app` is the first-run entry point. Before it loads any
-workspace data, it calls the public authentication status endpoint and asks for
-the first admin account. Creating that account bootstraps ownership but does
-**not** activate enforcement or freeze existing clients. The server stays in a
-bounded compatibility state until the owner explicitly activates authentication
-after required terminal coverage and two recorded QA passes. `serve --auth`
-records launch-time activation intent and exposes readiness blockers; it does
-not bypass that migration gate or make a normal restart enforce immediately.
+The Control Panel at `/app` is the first-run entry point. Before it loads
+workspace data, it checks public authentication status and asks for the first
+owner account when needed. Bootstrap establishes that human account but does
+**not** enable enforcement. The owner enables or disables enforcement with the
+single explicit toggle in Settings; the toggle sends `{enabled, confirmed:true}`.
+There is no separate readiness workflow or automatic activation side effect.
 
-Browsers use an expiring `HttpOnly`, `SameSite=Strict` session cookie plus a
-separate CSRF token on every state-changing request. Sign out in Settings to
-revoke that session. Settings manages human-owned terminal enrollments and
-separately scoped automation/service credentials; creating new registered-AI
-actor tokens is disabled. For credentials that have a one-time copy step,
-Plaintext is shown exactly once and the server stores only a hash. Revoke a token
-there when a computer/client is retired. After explicit activation, a revoked,
-expired, wrong-device, wrong-workspace, or wrong-actor credential gets 401/403.
-Before activation, compatibility may treat an invalid legacy bearer as absent,
-but only the exact project/actor/device compatibility resolver can authorize a
-legacy sync; it never turns that bearer into a terminal principal.
+Attacca supports exactly two advertised authentication forms:
 
-For an authenticated server, the native setup/update skill or lifecycle hook
-starts a browser/device enrollment itself. The human receives only the verified
-Control Panel login URL and a short approval code—never a recovery command to
-run. Codex, Claude, and Kimi all use this browser path. The helper polls in
-bounded steps, so headless or temporarily inactive terminals remain deferred
-without blocking project work.
+- A browser uses an expiring `HttpOnly`, `SameSite=Strict` session cookie and a
+  separate CSRF token for every state-changing request. Signing out in Settings
+  revokes the session.
+- Each installed Attacca client keeps its own human-owned API key with prefix
+  `atkey_`. The key identifies that concrete installation through its required
+  stable `client_instance`; it does not identify or bind an AI model, runtime,
+  actor, role, or Git checkout.
 
-For an enforced brand-new checkout, the integrated helper first requests a
-zero-binding terminal enrollment. The owner/admin approves it in the browser;
-the client stores it as a provisional human setup principal with no AI/sync
-authority. This 0600 device credential—not the browser cookie—persists across
-separate discovery and apply processes, allowing protected workspace creation,
-membership, and confirmed actor registration. Setup then authenticates the
-terminal-binding endpoint with that same device credential, adds the exact
-existing `{project_id, actor_id}`, refreshes the saved record, and only then
-retries AI sync. It never mints a replacement actor token or claims a browser
-session crosses processes. Compatibility-unactivated servers may perform
-initial setup anonymously and add the exact terminal binding afterward.
+Settings creates, lists, and revokes client-install keys through
+`/v1/auth/client-keys`. Creation may restrict the key to selected workspace
+memberships; leaving the selection empty follows the authenticated human's
+current memberships. The plaintext key appears once, is kept only in page
+memory, and is never returned by list responses. Stored records contain only a
+hash, prefix, human owner, client installation, scope, timestamps, and status.
+Revoking one installation does not revoke another installation or rewrite any
+AI identity or audit history.
 
-The high-entropy device code becomes the terminal Bearer after approval; the
-server stores only its hash. Retrying a dropped approval response therefore
-recovers the same credential instead of losing it or minting a duplicate. The
-client verifies and atomically stores one terminal credential in
-`~/.attacca/credentials.json` with mode `0600`, scoped by the full server base
-URL (including any path) and the machine device. Its server-approved bindings
-may cover multiple existing workspace AI actors, while every write still sends
-the exact unchanged actor selector. Human/device ownership and ledger actor
-attribution remain separate.
+Every authenticated AI request still supplies the exact
+`X-Attacca-Project: <workspace>` and
+`X-Attacca-Actor: <workspace>.<role>.<runtime>` headers. The server validates
+the key's workspace scope, the human's workspace membership, and that the
+registered actor belongs to that authenticated human; authorization then comes
+from the actor's registered role. Ledger writes therefore record the canonical
+AI actor and `Run by user` separately. A Codex client key is not a Codex actor
+key: the same installed client can select any valid actor owned by that human.
 
-Passwords, API tokens, and device codes are never accepted in AI chat or as
-command arguments and are never printed. A hidden paste fallback exists only
-when the helper proves a real foreground controlling TTY; otherwise the browser
-form is mandatory. Watcher/MCP clients hot-reload the credential, retry in the
-current host, and clear an authentication latch only after verified hosted
-identity sync; a forced client restart is not the normal recovery path.
+When a protected server needs authorization, the native setup/update skill or
+lifecycle hook starts the packaged helper inside the active AI terminal. The
+helper generates or loads that installation's stable non-secret client ID and
+opens the browser directly on Settings with only the client ID and label in the
+URL fragment. The signed-in human creates the key there; if a manual transfer is
+needed, the helper accepts it only through a hidden foreground controlling-TTY
+prompt. The AI runs this flow itself: the product never tells the human to run a
+recovery shell command, and secrets are never accepted in chat, argv, stdin,
+URLs, logs, or browser storage.
+
+After verification, the helper atomically stores the key in the private
+`~/.attacca/credentials.json` registry with mode `0600`, scoped by the full
+server base URL and the stable client installation ID. Claude, Codex, Kimi, and
+generic MCP clients use the same client-key contract while retaining distinct
+client configuration roots and canonical AI actors. MCP, lifecycle hooks, and
+the watcher hot-reload a repaired key in the current host; authorization repair
+does not require an executable plugin reinstall or a client restart.
 
 The landing page, `/install.sh`, plugin zip/marketplace, health check, auth
 status, bootstrap, and login remain public so a new machine can install and
@@ -335,8 +330,9 @@ the normalized Git remote fingerprint lets setup suggest the same workspace
 for confirmation. The link contains no token, user identity, database path, or
 absolute directory.
 
-Each computer keeps a separate device outbox and the same principal-scoped
-verified mirror. During an outage, each can queue its own allowlisted mutations;
+Each computer keeps a separate installation-scoped outbox and a verified mirror
+scoped to its human-owned client key plus exact project and actor headers. During
+an outage, each can queue its own allowlisted mutations;
 the background watcher reconnects, pulls, replays immutable mutation IDs in
 order, and pulls again. Duplicate retries return the stored receipt, while real
 conflicts remain visible and block dependent work instead of being overwritten.
@@ -344,10 +340,9 @@ conflicts remain visible and block dependent work instead of being overwritten.
 Keep the server running across reboots with anything you like, e.g.
 `nohup python3 /abs/attacca.py serve >/tmp/attacca.log 2>&1 &` or a
 systemd user unit. It binds `127.0.0.1` by default; `--host 0.0.0.0` exposes an
-unencrypted HTTP listener. Bootstrap an account, complete terminal migration,
-record both QA passes, explicitly activate, and put TLS in front of it before
-using it outside a trusted development network. `--auth` requests readiness; it
-does not skip those gates.
+unencrypted HTTP listener. Bootstrap an account, create a separate key for every
+active client installation, explicitly enable enforcement in Settings, and put
+TLS in front of it before using it outside a trusted development network.
 
 ## REST API (server mode)
 
@@ -355,21 +350,9 @@ does not skip those gates.
 GET  /                         GET /app[/]                 GET /healthz
 GET  /v1/auth/status
 POST /v1/auth/bootstrap       POST /v1/auth/login         POST /v1/auth/logout
-GET  /v1/auth/access
-POST /v1/auth/device/start    POST /v1/auth/device/poll
-GET/POST /v1/auth/terminal-enrollments
-GET  /v1/auth/terminal-enrollments/{code}
-POST /v1/auth/terminal-enrollments/{code}/approve
-POST /v1/auth/terminal-enrollments/{code}/deny
-DELETE /v1/auth/terminals/{token_id}
-POST /v1/auth/terminals/{token_id}/bindings
-GET/POST /v1/auth/service-keys
-DELETE /v1/auth/service-keys/{token_id}
-GET/POST /v1/auth/invitations
-POST /v1/auth/invitations/accept
-DELETE /v1/auth/invitations/{invitation_id}
-POST /v1/auth/migration-scope POST /v1/auth/activation
-GET  /v1/auth/tokens          DELETE /v1/auth/tokens/{token_id}
+GET/POST /v1/auth/client-keys
+DELETE /v1/auth/client-keys/{token_id}
+POST /v1/auth/activation
 GET/PUT /v1/settings
 GET  /v1/projects                          POST /v1/projects
 GET  /v1/projects/{id}/status              GET  /v1/projects/{id}/inbox
@@ -473,9 +456,7 @@ search QUERY [-n N] | overview                  explore everything stored
 handoff history [-n N] | event show SEQ         version and event detail
 agent register [--id X] [--role R] [--runtime RT] | agent list
 event append --type note.x --payload '{"k":"v"}' | event tail | event verify
-serve [--host H] [--port P] [--verbose] [--auth]
-                                               host REST + MCP/HTTP; --auth
-                                               requests gated auth readiness
+serve [--host H] [--port P] [--verbose]        host REST + MCP/HTTP
 mcp                                            explicit stdio direct-DB mode (not hosted fallback)
 setup --discover | --attach ID | --create NAME  advanced/scripted workspace flags
 setup [--url U] [--stdio] [--no-instructions]  one-shot checkout setup
@@ -498,15 +479,16 @@ python3 attacca.py event verify  # hash-chain + sequence integrity of a real led
 ## Notes and limits (honest edges)
 
 - **Prototype authentication, not production identity infrastructure.** Account
-  sessions, CSRF, hash-only terminal/service credentials, project/actor binding, Director-only
-  handoff/directive rules, and stale versions are enforced. SSO/MFA, login rate
+  sessions, CSRF, hash-only per-install client keys, exact project/actor request
+  selection, human attribution, Director-only handoff/directive rules, and stale
+  versions are enforced. SSO/MFA, login rate
   limits, centralized key rotation, TLS termination, and hostile-host isolation
   remain later layers (blueprint §12.3, §28 "policy bypass").
 - **No encryption.** Everything is plaintext on your machine. The E2E key hierarchy
   (§17) is the next milestone and slots in at the sync boundary.
 - **Offline mode is identity-scoped, not a second database.** It activates only
   after an authenticated snapshot has bound server, project, human principal,
-  canonical AI actor/role, visibility policy and device. Bridge/agent/lead-policy
+  canonical AI actor/role, visibility policy and client installation. Bridge/agent/lead-policy
   changes and cross-project sends remain unavailable offline. A timeout after a
   mutation may be ambiguous, so `connect` refuses to queue that request; a proven
   connection refusal can be queued safely.

@@ -2,15 +2,17 @@
 description: Load a fresh full-project update from Attacca in Kimi Code (/attacca:update)
 ---
 
-Before the seven reads, treat authentication, terminal-credential migration,
-or a hosted 401/403 for a linked checkout as an AI-owned recovery transition.
-Immediately advance the packaged browser/device enrollment flow for the exact
-saved project/actor binding with browser opening enabled,
-show only the verified login URL and short code, and poll in bounded steps.
-Never give the human a shell command or request a password/token in chat or
-`$ARGUMENTS`. Headless/no-TTY recovery stays deferred and nonblocking; the
-watcher hot-reloads the private 0600 device credential and clears its latch
-only after verified hosted sync. Do not force a restart.
+Before the seven reads, treat a hosted 401/403 as an AI-owned authorization
+transition. Kimi itself starts the packaged client-key helper in its active
+terminal; never give the human a shell command. The helper opens Settings for
+this exact installation, accepts the `atkey_` value only through hidden
+foreground-terminal input, verifies it, stores it in the private 0600 file,
+and hot-reloads it before retrying hosted sync. Never collect a key in chat,
+argv, a URL, logs, ordinary stdin, or `$ARGUMENTS`. The human-owned key is not
+an actor or model credential: each project request still sends the exact
+workspace and canonical actor for server-side membership, ownership, and role
+validation. No TTY remains a deferred, nonblocking browser flow; never force a
+restart.
 
 Refresh the current project's shared state through the `attacca` MCP tools.
 Call all seven, even if the SessionStart brief already ran:
