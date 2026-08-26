@@ -360,7 +360,7 @@ class OfflineConnectProxyBlackBoxTests(unittest.TestCase):
             self.assertRegex(
                 lowered,
                 r"(authentication|credential|revoked|expired|"
-                r"terminal_enrollment_required)")
+                r"terminal_enrollment_required|client_authorization_required)")
             self.assertIn("cached mirror", lowered)
             self.assertIn("blocked", lowered)
             self.assertIn("/app", lowered)
@@ -846,7 +846,7 @@ class OfflineConnectProxyBlackBoxTests(unittest.TestCase):
         self.assertEqual(entry.get("offline_mode"), "auth_required")
         self.assertEqual(
             {item.get("kind") for item in entry.get("pending") or []},
-            {"terminal_enrollment_required"})
+            {"authentication_required"})
 
         self._stop_hosted_server()
         self._assert_latched_outage_blocks_cache_and_outbox()
