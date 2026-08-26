@@ -296,7 +296,9 @@ class TaskPlanModelTests(unittest.TestCase):
         self.assertFalse(shown["plan_required"])
         finished = c.task_report(
             self.conn, "plans", "plans.director.codex", "agent", optional,
-            "Done without formal approval", requested_state="done")
+            "Done without formal approval",
+            evidence=[{"kind": "test", "result": "pass"}],
+            requested_state="done")
         self.assertEqual(finished["status"], "done")
 
     def test_invalid_sections_and_review_transitions_fail_atomically(self):

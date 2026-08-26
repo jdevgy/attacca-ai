@@ -377,6 +377,18 @@ def build_project_export(conn, project_id, log_renderer=None):
             "ORDER BY agent_id, device_id",
             (project_id,),
         )
+        dispositions = _optional_rows(
+            conn, tables, "message_dispositions",
+            "SELECT * FROM message_dispositions WHERE project_id=? "
+            "ORDER BY actor_id, message_event_id",
+            (project_id,),
+        )
+        cloud_context_rows = _optional_rows(
+            conn, tables, "project_cloud_context",
+            "SELECT * FROM project_cloud_context WHERE project_id=?",
+            (project_id,),
+        )
+        cloud_context = cloud_context_rows[0] if cloud_context_rows else None
 
     full_log = _full_log(raw_events, log_renderer=log_renderer)
     room_messages = [
@@ -400,10 +412,13 @@ def build_project_export(conn, project_id, log_renderer=None):
         "bridges": len(bridges),
         "inbox_cursors": len(cursors),
         "agent_clients": len(clients),
+        "message_dispositions": len(dispositions),
+        "cloud_context": 1 if cloud_context is not None else 0,
     }
     snapshot_at = _snapshot_at([
         [project], raw_events, raw_tasks, raw_plans, raw_handoffs, decisions,
-        rules, agents, aliases, raw_bridges, cursors, clients,
+        rules, agents, aliases, raw_bridges, cursors, clients, dispositions,
+        cloud_context_rows,
     ])
     export_body = {
         "project": project,
@@ -419,6 +434,8 @@ def build_project_export(conn, project_id, log_renderer=None):
         "bridges": bridges,
         "inbox_cursors": cursors,
         "agent_clients": clients,
+        "message_dispositions": dispositions,
+        "cloud_context": cloud_context,
     }
     manifest = {
         "format": EXPORT_FORMAT,

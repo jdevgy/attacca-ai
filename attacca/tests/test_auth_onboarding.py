@@ -27,35 +27,40 @@ class AuthOnboardingTestCase(unittest.TestCase):
                 self.assertLess(preflight, first_mcp)
                 self.assertIn("public", source[:first_mcp].lower())
                 self.assertIn("terminal_flow.py", source)
-                self.assertIn("browser/device", source)
-                self.assertIn("zero-binding", source)
-                self.assertIn("provisional", source.lower())
-                self.assertIn("/v1/auth/terminals/{token_id}/bindings", source)
-                self.assertIn("not a browser cookie", source.lower())
+                self.assertTrue(
+                    "client_instance" in source or "client-install ID" in source)
+                self.assertIn("atkey_", source)
+                self.assertIn("Settings", source)
+                self.assertNotIn("browser/device", source)
+                self.assertNotIn("zero-binding", source)
+                self.assertNotIn("provisional human", source.lower())
+                self.assertNotIn("/v1/auth/terminals/", source)
+                self.assertIn("browser cookies", source.lower())
                 self.assertIn("exact", source.lower())
                 self.assertIn("actor", source.lower())
-                self.assertIn("revok", source.lower())
                 self.assertIn("controlling", source.lower())
-                self.assertIn("tty", source.lower())
+                self.assertTrue(
+                    "tty" in source.lower()
+                    or "foreground-terminal" in source.lower())
                 self.assertNotIn("setup --interactive", source)
                 self.assertNotIn("--paste-token", source)
                 self.assertIn("never", source.lower())
                 self.assertIn("401/403", source)
                 self.assertIn("cached offline", source.lower())
                 self.assertIn("hot-reload", source.lower())
-                self.assertIn("verified hosted", source.lower())
+                self.assertIn("hosted", source.lower())
 
     def test_skill_does_not_claim_cross_process_login_reuse(self):
         skill = SETUP_SKILL.read_text(encoding="utf-8")
         kimi = KIMI_SETUP.read_text(encoding="utf-8")
-        self.assertIn("processes remain separate", skill)
         normalized_skill = " ".join(skill.split())
         normalized_kimi = " ".join(kimi.split())
-        self.assertIn("never claim a temporary login session carries",
-                      normalized_skill)
-        self.assertIn("Discovery and apply remain separate processes", kimi)
-        self.assertIn("never claim a temporary login session carries",
-                      normalized_kimi)
+        self.assertIn(
+            "private key persists across the separate discovery and apply "
+            "processes", normalized_skill)
+        self.assertIn("Browser cookies remain browser only", normalized_skill)
+        self.assertIn("key persists across discovery and apply", normalized_kimi)
+        self.assertIn("Browser cookies never cross into the CLI", normalized_kimi)
         self.assertNotIn("Before running a shell command, call Attacca's unscoped",
                          skill)
         self.assertNotIn("Before running Bash, call Attacca's unscoped", kimi)
@@ -66,40 +71,35 @@ class AuthOnboardingTestCase(unittest.TestCase):
 
     def test_readme_documents_activation_tokens_and_honest_limits(self):
         source = README.read_text(encoding="utf-8")
+        normalized = " ".join(source.split())
         for phrase in (
                 "Hosted authentication (prototype)",
-                "serve --auth",
-                "first admin account",
+                "first owner account",
                 "HttpOnly",
                 "CSRF",
-                "Plaintext is shown exactly once",
+                "atkey_",
+                "client_instance",
+                "plaintext key appears once",
                 "~/.attacca/credentials.json",
                 "mode `0600`",
-                "browser/device enrollment",
-                "high-entropy device code",
-                "provisional human setup principal",
-                "terminal-binding endpoint",
-                "controlling TTY",
-                "Sign out",
-                "Revoke a token",
+                "hidden foreground controlling-TTY",
+                "Signing out",
+                "Settings creates, lists, and revokes client-install keys",
                 "remain public",
                 "does not terminate TLS"):
-            self.assertIn(phrase, source)
-        self.assertRegex(source, r"full\s+server base\s+URL\s+\(including "
-                         r"any path\) and the machine device")
+            self.assertIn(phrase, normalized)
+        self.assertIn("full server base URL", normalized)
+        self.assertIn("stable client installation ID", normalized)
         self.assertNotIn("attacca setup --interactive", source)
         self.assertNotIn("--paste-token", source)
         self.assertNotIn("Authentication, permissions, and hostile-client",
                          source)
         self.assertNotIn("**unauthenticated** server", source)
-        normalized = " ".join(source.split())
-        self.assertIn("does **not** activate enforcement", normalized)
-        self.assertIn("two recorded QA passes", normalized)
-        self.assertIn("creating new registered-AI actor tokens is disabled",
-                      normalized)
-        self.assertIn(
-            "compatibility may treat an invalid legacy bearer as absent",
-            normalized)
+        self.assertIn("does **not** enable enforcement", normalized)
+        self.assertIn("single explicit toggle", normalized)
+        self.assertIn("does not identify or bind an AI model", normalized)
+        self.assertIn("key's workspace scope", normalized)
+        self.assertIn("Run by user", normalized)
         for obsolete in (
                 "Creating that account immediately protects",
                 "`serve --auth` requires authentication immediately",

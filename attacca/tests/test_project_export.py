@@ -103,11 +103,17 @@ class ProjectExportTestCase(unittest.TestCase):
             self.conn, "p1", "worker", "agent",
             "chat body line one\nchat body line two", msg_type="chat",
             task_id=self.task_id, target_project="p1")
-        c.room_send(
+        directive = c.room_send(
             self.conn, "p1", "director", "agent",
             "Durable export directive", msg_type="directive",
             mentions=["worker"], task_id=self.task_id,
             target_project="p1")
+        c.message_dispose(
+            self.conn, "p1", "worker", "agent",
+            directive["event"]["event_id"], "acknowledged")
+        c.cloud_context_set(
+            self.conn, "p1", "director", "agent",
+            "# Durable cloud context\n\nExport this too.")
         c.bridge_add(
             self.conn, "p1", "owner", "human", "peer",
             participation="directors", peer_participation="selected_agents",
@@ -192,6 +198,12 @@ class ProjectExportTestCase(unittest.TestCase):
         self.assertEqual(first["inbox_cursors"][0]["last_read_seq"], latest(
             first["ledger"]["events"]))
         self.assertEqual(first["agent_clients"][0]["device_id"], "device-1")
+        self.assertEqual(
+            first["message_dispositions"][0]["disposition"],
+            "acknowledged")
+        self.assertEqual(first["cloud_context"]["version"], 1)
+        self.assertIn("Durable cloud context",
+                      first["cloud_context"]["content"])
         self.assertEqual(first["bridges"][0]["access_a"]["preset"],
                          "directors")
         self.assertIn("auth_tokens",

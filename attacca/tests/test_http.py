@@ -140,8 +140,8 @@ class HttpTestCase(unittest.TestCase):
                       panel)
         self.assertIn("Workspace · Role · Runtime", panel)
         self.assertIn(
-            "remain separate, exact identities; a terminal credential never "
-            "renames or impersonates them", panel)
+            "Canonical AI actors keep their own workspace, role, and runtime; "
+            "a client key never renames, binds, or impersonates them", panel)
         self.assertIn("Run by user", panel)
         self.assertNotIn('placeholder="analytics-admin.director.web"', panel)
         self.assertIn("Signed in: ${account.display_name || account.username}",
@@ -165,19 +165,18 @@ class HttpTestCase(unittest.TestCase):
         status, settings, _ = self.rest("GET", "/v1/settings")
         self.assertEqual(status, 200)
         self.assertFalse(settings["authentication"])
-        # Settings exposes the integrated device-flow contract, not shell or
-        # chat commands that a human is expected to run. The active AI invokes
-        # its native setup surface and the terminal/browser flow guides the
-        # human from there.
+        # Settings exposes the integrated per-install client-key contract, not
+        # shell or chat commands that a human is expected to run. The active AI
+        # invokes its native setup surface and the terminal/browser flow guides
+        # the human from there.
         self.assertNotIn("setup", settings)
         self.assertNotIn("terminal_setup", settings)
         self.assertEqual(
-            settings["terminal_authorization"][
-                "device_authorization_endpoint"],
-            "/v1/auth/device/start")
+            settings["client_authorization"]["api_keys_endpoint"],
+            "/v1/auth/client-keys")
         self.assertEqual(
-            settings["terminal_authorization"]["device_token_endpoint"],
-            "/v1/auth/device/poll")
+            settings["client_authorization"]["credential_model"],
+            "browser-session-or-client-api-key")
         self.assertEqual(settings["update_interval_seconds"], 60)
         self.assertEqual(
             settings["installer"],
@@ -2511,18 +2510,41 @@ class OneShotSetupTestCase(unittest.TestCase):
             checkout.mkdir()
             home.mkdir()
             c.connect(db).close()
+            bootstrap = c.connect(db)
+            try:
+                created = c.auth_create_user(
+                    bootstrap, "owner", "owner-pass-1234",
+                    display_name="Owner", is_admin=True, bootstrap=True)
+                user = bootstrap.execute(
+                    "SELECT * FROM auth_users WHERE user_id=?",
+                    (created["user"]["user_id"],)).fetchone()
+                principal = c._auth_principal(
+                    bootstrap, user, "session")
+                c.project_init(
+                    bootstrap, "owner", "human", path=str(checkout),
+                    project_id="current-app", name="Current App")
+                c.auth_grant_project_membership(
+                    bootstrap, principal, "current-app")
+                client_instance = "client_setup_attribution_test"
+                key = c.auth_client_key_create(
+                    bootstrap, principal, "Setup test", client_instance,
+                    memberships=[])["token"]
+            finally:
+                bootstrap.close()
             server = ServerFixture(db)
             env = dict(os.environ)
             env.update({"HOME": str(home), "USER": "vscode",
                         "ATTACCA_DB": str(root / "unused-client.db"),
-                        "ATTACCA_OWNER": ""})
+                        "ATTACCA_OWNER": "",
+                        "ATTACCA_API_TOKEN": key,
+                        "ATTACCA_CLIENT_INSTANCE": client_instance})
             try:
                 proc = subprocess.run(
                     [sys.executable, SCRIPT,
                      "--actor", "jack.codex_director",
                      "--actor-type", "agent", "setup",
                      "--url", server.base, "--no-server",
-                     "--create", "Current App", "--role", "director",
+                     "--attach", "current-app", "--role", "director",
                      "--lead", "current", "--skip-tools", "all",
                      "--no-instructions"],
                     cwd=str(checkout), env=env, text=True,

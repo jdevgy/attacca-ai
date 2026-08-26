@@ -766,13 +766,16 @@ def client_request_headers(server_url, *, token=None, client_instance=None,
 def verify_client_api_key(server_url, token, *, client_instance=None,
                           runtime=None, storage_path=None, project_id=None,
                           actor_id=None, device_id=None, transport=None,
-                          timeout=DEFAULT_TIMEOUT_SECONDS):
+                          timeout=DEFAULT_TIMEOUT_SECONDS,
+                          verify_registered_actor=True):
     """Verify a pasted key and return only safe metadata."""
     instance = _resolved_client_instance_id(
         client_instance, runtime=runtime, storage_path=storage_path)
     headers = client_request_headers(
         server_url, token=token, client_instance=instance,
-        project_id=project_id, actor_id=actor_id, device_id=device_id)
+        project_id=project_id if verify_registered_actor else None,
+        actor_id=actor_id if verify_registered_actor else None,
+        device_id=device_id)
     response = (transport or UrllibJsonTransport()).request(
         "GET", _endpoint(server_url, AUTH_STATUS_PATH), headers=headers,
         timeout=timeout)
@@ -923,7 +926,13 @@ def paste_client_api_key(server_url, *, client_instance=None, runtime=None,
         checked = verify_client_api_key(
             server_url, token, client_instance=instance,
             project_id=project_id, actor_id=actor_id, device_id=device_id,
-            transport=transport, timeout=timeout)
+            transport=transport, timeout=timeout,
+            # A fresh runtime in an already-linked checkout does not have an
+            # actor row yet. First verify the human-owned install key itself;
+            # the immediately following POST /agents proves membership and
+            # creates only that exact requested actor. Normal calls then use
+            # exact project+actor headers.
+            verify_registered_actor=False)
         return save_client_api_key(
             server_url, checked, client_instance=instance,
             credentials_path=credentials_path)

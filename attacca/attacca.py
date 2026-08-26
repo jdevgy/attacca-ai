@@ -85,6 +85,8 @@ SYNC_DEVICE_HEADER = "X-Attacca-Device-ID"
 CLIENT_INSTANCE_HEADER = "X-Attacca-Client-Instance"
 ENV_DEVICE = "ATTACCA_DEVICE_ID"
 ENV_CLIENT_INSTANCE = "ATTACCA_CLIENT_INSTANCE"
+_CLIENT_INSTALL_ID_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,239}$")
 
 
 def _migrate_legacy_state():
@@ -142,7 +144,7 @@ LOG_EXCLUDED_MSG_TYPES = {"chat", "status"}
 
 MANAGED_BEGIN = "<!-- MANAGED_ATTACCA:BEGIN"
 MANAGED_END = "<!-- MANAGED_ATTACCA:END -->"
-MANAGED_BLOCK_VERSION = 11
+MANAGED_BLOCK_VERSION = 12
 _MANAGED_TEMPLATE_PROJECT = "attacca-project"
 _MANAGED_BEGIN_LINE = re.compile(
     r"(?m)^<!-- MANAGED_ATTACCA:BEGIN\b[^\r\n]*-->[ \t]*\r?$")
@@ -316,18 +318,17 @@ def load_api_token(url, runtime=None, project_id=None, actor_id=None,
         runtime = normalize_agent_runtime(runtime, actor_id)
         project_id = str(project_id or "").strip() or None
         actor_id = str(actor_id or "").strip() or None
-        # One human-owned terminal credential may authorize several existing
-        # workspace actors.  It is intentionally independent of one runtime
-        # or actor, but is offered only when its saved binding can satisfy the
-        # requested project/runtime.  The server still performs the
-        # authoritative membership, actor-binding, expiry, revocation and
-        # device checks on every request.
-        terminal_token = terminal_flow.load_terminal_credential(
-            url, device_id=load_device_id(), project_id=project_id,
-            actor_id=actor_id, runtime=runtime,
+        # D-17: one human-owned key authenticates this installed client. The
+        # request's exact workspace/actor headers remain separate selectors.
+        client_token = terminal_flow.load_client_api_key(
+            url, client_instance=load_client_instance_id(runtime),
+            project_id=project_id, runtime=runtime,
             credentials_path=CREDENTIALS_FILE)
-        if terminal_token:
-            return terminal_token
+        if client_token:
+            return client_token
+        # Compatibility-only legacy lookup. Enforced servers reject every
+        # actor/terminal credential; this lets old installations reach the
+        # upgrade/login surface before the owner flips enforcement.
         by_project = server.get("agent_tokens") or {}
         candidates = []
         projects = [project_id] if project_id else list(by_project)
@@ -373,7 +374,7 @@ def load_api_token(url, runtime=None, project_id=None, actor_id=None,
 
 def require_usable_terminal_credential(url, runtime=None, project_id=None,
                                        actor_id=None):
-    """Fail before I/O when a present modern credential is known unusable.
+    """Fail before I/O when this client-install key is known unusable.
 
     A missing credential may still probe a server in pre-activation
     compatibility mode. A present expired/wrong-device/corrupt/unbound modern
@@ -382,18 +383,19 @@ def require_usable_terminal_credential(url, runtime=None, project_id=None,
     """
     try:
         terminal_flow = _terminal_flow_runtime()
-        status = terminal_flow.terminal_credential_status(
-            url, device_id=load_device_id(), project_id=project_id,
-            actor_id=actor_id, runtime=normalize_agent_runtime(
-                runtime, actor_id), credentials_path=CREDENTIALS_FILE)
+        normalized_runtime = normalize_agent_runtime(runtime, actor_id)
+        status = terminal_flow.client_api_key_status(
+            url, client_instance=load_client_instance_id(normalized_runtime),
+            project_id=project_id, runtime=normalized_runtime,
+            credentials_path=CREDENTIALS_FILE)
     except Exception as error:
         raise AuthenticationError(
-            "terminal_enrollment_required: local credential identity is "
+            "client_authorization_required: local client identity is "
             "invalid (%s)" % error) from None
     state = str(status.get("status") or "invalid")
-    if status.get("credential_present") and state != "ready":
+    if state not in ("ready", "authorization_required"):
         raise AuthenticationError(
-            "terminal_enrollment_required: local terminal credential is %s"
+            "client_authorization_required: local client API key is %s"
             % state)
     return status
 
@@ -883,6 +885,20 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_proj_seq  ON events (project_id, seq);
 CREATE INDEX IF NOT EXISTS idx_events_proj_type ON events (project_id, event_type, seq);
+CREATE TABLE IF NOT EXISTS message_dispositions (
+  project_id    TEXT NOT NULL,
+  actor_id      TEXT NOT NULL,
+  message_event_id TEXT NOT NULL,
+  disposition  TEXT NOT NULL,
+  note         TEXT,
+  task_id      TEXT,
+  updated_by   TEXT NOT NULL,
+  updated_owner TEXT,
+  updated_at   TEXT NOT NULL,
+  PRIMARY KEY (project_id, actor_id, message_event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_message_dispositions_actor
+  ON message_dispositions (project_id, actor_id, disposition, updated_at);
 CREATE INDEX IF NOT EXISTS idx_events_type_time_project
     ON events (event_type, created_at, project_id);
 CREATE TABLE IF NOT EXISTS tasks (
@@ -1028,6 +1044,15 @@ CREATE TABLE IF NOT EXISTS auth_users (
   created_at          TEXT NOT NULL,
   disabled_at         TEXT
 );
+CREATE TABLE IF NOT EXISTS auth_user_owner_aliases (
+  alias_key   TEXT PRIMARY KEY,
+  alias       TEXT NOT NULL,
+  user_id     TEXT NOT NULL,
+  created_at  TEXT NOT NULL,
+  created_by  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_auth_owner_aliases_user
+  ON auth_user_owner_aliases (user_id, alias_key);
 CREATE TABLE IF NOT EXISTS auth_tokens (
   token_id      TEXT PRIMARY KEY,
   user_id       TEXT NOT NULL,
@@ -1578,6 +1603,20 @@ def auth_visible_project_ids(conn, principal):
     if not principal:
         return None
     token_kind = principal.get("token_kind")
+    if token_kind == "client":
+        memberships = {row["project_id"] for row in conn.execute(
+            "SELECT project_id FROM auth_project_memberships"
+            " WHERE user_id=? AND revoked_at IS NULL",
+            (principal["user_id"],)).fetchall()}
+        explicit = set(auth_token_project_bindings(
+            conn, principal["token_id"]))
+        if explicit:
+            # A key's selected-workspace scope can only narrow the account's
+            # current memberships. Revoking a human membership must revoke
+            # every client install's access immediately; an old token binding
+            # is never an independent authority grant.
+            return explicit.intersection(memberships)
+        return memberships
     if token_kind == "terminal" and not principal.get("provisional_human"):
         return {item["project_id"] for item in auth_terminal_bindings(
             conn, principal["token_id"])}
@@ -1597,6 +1636,325 @@ def auth_visible_project_ids(conn, principal):
             " WHERE user_id=? AND revoked_at IS NULL",
             (principal["user_id"],)).fetchall()}
     return set()
+
+
+def _auth_owner_alias_key(value):
+    return str(value or "").strip().casefold()
+
+
+def _auth_owner_label_user_id(conn, owner_label):
+    """Resolve one owner label to exactly one human account, fail closed.
+
+    Usernames and legacy aliases share a single authorization namespace. Old
+    or externally modified databases can contain a collision, so resolution
+    deliberately returns no owner instead of allowing both accounts through.
+    """
+    key = _auth_owner_alias_key(owner_label)
+    if not key:
+        return None
+    owners = {
+        row["user_id"] for row in conn.execute(
+            "SELECT user_id FROM auth_users WHERE username=? COLLATE NOCASE",
+            (key,)).fetchall()
+    }
+    alias = conn.execute(
+        "SELECT user_id FROM auth_user_owner_aliases WHERE alias_key=?",
+        (key,)).fetchone()
+    if alias:
+        owners.add(alias["user_id"])
+    return next(iter(owners)) if len(owners) == 1 else None
+
+
+def auth_principal_owner_labels(conn, principal):
+    """Return exact historical actor-owner labels assigned to one account."""
+    if not principal or not principal.get("user_id"):
+        return set()
+    candidates = {_auth_owner_alias_key(principal.get("username"))}
+    candidates.update(
+        row["alias_key"] for row in conn.execute(
+            "SELECT alias_key FROM auth_user_owner_aliases WHERE user_id=?",
+            (principal["user_id"],)).fetchall())
+    candidates.discard("")
+    return {
+        label for label in candidates
+        if _auth_owner_label_user_id(conn, label) == principal["user_id"]
+    }
+
+
+def auth_principal_owns_label(conn, principal, owner_label):
+    return bool(principal and principal.get("user_id") and
+                _auth_owner_label_user_id(conn, owner_label) ==
+                principal["user_id"])
+
+
+def _auth_reject_username_alias_collision(conn, username):
+    """Keep newly created usernames out of another account's alias space."""
+    key = _auth_owner_alias_key(username)
+    alias = conn.execute(
+        "SELECT alias,user_id FROM auth_user_owner_aliases WHERE alias_key=?",
+        (key,)).fetchone()
+    if alias:
+        raise AttaccaError(
+            "Attacca username '%s' is reserved by legacy owner alias '%s'; "
+            "an owner must explicitly migrate that alias before creating "
+            "this account" % (username, alias["alias"]))
+
+
+def auth_claim_single_user_legacy_owner_aliases(conn, principal):
+    """Preserve legacy actor rows while attaching their labels to one owner.
+
+    Prototype databases often recorded a shell username, display name, or
+    placeholder in ``agents.owner`` before account authentication existed.
+    If and only if the server has one active human account, activation may
+    claim those exact labels for that immutable server owner. No actor row is
+    rewritten and every later mutation still records both actor and account.
+    """
+    if not principal or not principal.get("is_owner"):
+        raise AuthorizationError("server_owner_required: alias claim denied")
+    users = conn.execute(
+        "SELECT user_id FROM auth_users WHERE disabled_at IS NULL").fetchall()
+    if len(users) != 1 or users[0]["user_id"] != principal["user_id"]:
+        return []
+    aliases = sorted({
+        str(row["owner"] or "").strip()
+        for row in conn.execute(
+            "SELECT DISTINCT owner FROM agents WHERE owner IS NOT NULL")
+        if str(row["owner"] or "").strip()
+        and _auth_owner_alias_key(row["owner"]) !=
+        _auth_owner_alias_key(principal.get("username"))
+    }, key=str.casefold)
+    claimed = []
+    for alias in aliases:
+        key = _auth_owner_alias_key(alias)
+        username_owner = conn.execute(
+            "SELECT user_id FROM auth_users WHERE username=? COLLATE NOCASE",
+            (key,)).fetchone()
+        if username_owner and username_owner["user_id"] != \
+                principal["user_id"]:
+            # Usernames are authoritative labels. Never claim a disabled or
+            # active account's namespace as a compatibility alias.
+            continue
+        existing = conn.execute(
+            "SELECT user_id FROM auth_user_owner_aliases WHERE alias_key=?",
+            (key,)).fetchone()
+        if existing:
+            continue
+        conn.execute(
+            "INSERT INTO auth_user_owner_aliases"
+            " (alias_key,alias,user_id,created_at,created_by)"
+            " VALUES (?,?,?,?,?)",
+            (key, alias, principal["user_id"], now_iso(),
+             principal["username"]))
+        claimed.append(alias)
+    return claimed
+
+
+def auth_grant_single_user_legacy_project_memberships(conn, principal):
+    """Attach a prototype single-owner account to every existing workspace.
+
+    Pre-auth Attacca databases had projects and actors but no human membership
+    rows. During the one-account owner cutover, preserve those projects without
+    weakening the steady-state rule that every client key requires an active
+    account membership. Multi-account servers never receive this migration.
+    """
+    if not principal or not principal.get("is_owner"):
+        raise AuthorizationError(
+            "server_owner_required: legacy membership claim denied")
+    users = conn.execute(
+        "SELECT user_id FROM auth_users WHERE disabled_at IS NULL").fetchall()
+    if len(users) != 1 or users[0]["user_id"] != principal["user_id"]:
+        return []
+    existing = {row["project_id"] for row in conn.execute(
+        "SELECT project_id FROM auth_project_memberships"
+        " WHERE user_id=? AND revoked_at IS NULL",
+        (principal["user_id"],)).fetchall()}
+    nowi = now_iso()
+    granted = []
+    for row in conn.execute(
+            "SELECT project_id FROM projects ORDER BY project_id").fetchall():
+        project_id = row["project_id"]
+        if project_id in existing:
+            continue
+        conn.execute(
+            "INSERT INTO auth_project_memberships"
+            " (user_id,project_id,granted_at,granted_by,revoked_at)"
+            " VALUES (?,?,?,?,NULL)"
+            " ON CONFLICT(user_id,project_id) DO UPDATE SET"
+            " revoked_at=NULL,granted_at=excluded.granted_at,"
+            " granted_by=excluded.granted_by",
+            (principal["user_id"], project_id, nowi,
+             principal["username"]))
+        granted.append(project_id)
+    return granted
+
+
+def _auth_validate_client_projects(conn, principal, memberships):
+    """Validate the optional workspace scope for one client-install key.
+
+    An empty list deliberately means "all workspaces this human account may
+    access", including workspaces joined later.  This is still account scoped;
+    it never inherits server-admin authority and it never selects an AI actor.
+    """
+    if memberships is None:
+        memberships = []
+    if not isinstance(memberships, list):
+        raise AttaccaError("project_memberships must be an array")
+    projects = []
+    for value in memberships:
+        project_id = get_project(conn, str(value or "").strip())["project_id"]
+        if not auth_has_project_membership(conn, principal, project_id):
+            raise AuthorizationError(
+                "client_key_scope_denied: workspace membership is required")
+        if project_id not in projects:
+            projects.append(project_id)
+    return projects
+
+
+def auth_client_key_create(conn, principal, label, client_instance,
+                           memberships=None, expires_at=None,
+                           device_id=None):
+    """Create a human-owned credential for one installed Attacca client.
+
+    The credential authenticates the client installation only.  It contains
+    no runtime, model, role, or actor binding; those are resolved independently
+    from the exact registered actor sent on each project request.
+    """
+    label = str(label or "Attacca client").strip()
+    if not label or len(label) > 120:
+        raise AttaccaError("client key label must be 1-120 characters")
+    client_instance = str(client_instance or "").strip()
+    if not _CLIENT_INSTALL_ID_RE.fullmatch(client_instance) \
+            or len(client_instance) > 120:
+        raise AttaccaError(
+            "client_instance must be a safe 1-120 character installation ID")
+    device_id = str(device_id or "").strip() or None
+    if device_id and not _CLIENT_INSTALL_ID_RE.fullmatch(device_id):
+        raise AttaccaError(
+            "device_id must be a safe 1-240 character device ID")
+    projects = _auth_validate_client_projects(conn, principal, memberships)
+    expires_at = _auth_expiry(expires_at)
+    token_id = new_id("key")
+    raw = "atkey_%s.%s" % (token_id, secrets.token_urlsafe(32))
+    nowi = now_iso()
+    with write_tx(conn):
+        conn.execute(
+            "INSERT INTO auth_tokens"
+            " (token_id,user_id,label,token_prefix,token_hash,token_kind,"
+            " actor_id,actor_type,project_id,runtime,device_id,client_label,"
+            " client_instance,created_at,expires_at)"
+            " VALUES (?,?,?,?,?,'client',NULL,'client',NULL,'client',?,?,?,?,?)",
+            (token_id, principal["user_id"], label, raw[:22], sha256_hex(raw),
+             device_id, label, client_instance, nowi, expires_at))
+        for project_id in projects:
+            conn.execute(
+                "INSERT INTO auth_token_project_bindings"
+                " (token_id,project_id,created_at,revoked_at)"
+                " VALUES (?,?,?,NULL)", (token_id, project_id, nowi))
+    row = conn.execute(
+        "SELECT t.*,u.username FROM auth_tokens t JOIN auth_users u"
+        " ON u.user_id=t.user_id WHERE t.token_id=?", (token_id,)).fetchone()
+    return {
+        "ok": True,
+        "token": raw,
+        "record": auth_client_key_record(conn, row),
+        "warning": "API key plaintext is returned only in this response",
+    }
+
+
+def auth_client_key_record(conn, row):
+    return {
+        "token_id": row["token_id"],
+        "label": row["label"],
+        "token_prefix": row["token_prefix"],
+        "token_kind": "client",
+        "username": row["username"] if "username" in row.keys() else None,
+        "client_instance": row["client_instance"],
+        "device_id": row["device_id"],
+        "project_memberships": auth_token_project_bindings(
+            conn, row["token_id"]),
+        "scope_mode": ("selected_workspaces" if
+                       auth_token_project_bindings(conn, row["token_id"])
+                       else "account_memberships"),
+        "created_at": row["created_at"],
+        "last_used_at": row["last_used_at"],
+        "expires_at": row["expires_at"],
+        "revoked_at": row["revoked_at"],
+    }
+
+
+def auth_client_key_list(conn, principal):
+    if principal.get("is_admin"):
+        rows = conn.execute(
+            "SELECT t.*,u.username FROM auth_tokens t JOIN auth_users u"
+            " ON u.user_id=t.user_id WHERE t.token_kind='client'"
+            " ORDER BY t.created_at DESC").fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT t.*,u.username FROM auth_tokens t JOIN auth_users u"
+            " ON u.user_id=t.user_id WHERE t.token_kind='client'"
+            " AND t.user_id=? ORDER BY t.created_at DESC",
+            (principal["user_id"],)).fetchall()
+    return [auth_client_key_record(conn, row) for row in rows]
+
+
+def auth_client_key_revoke(conn, principal, token_id):
+    row = conn.execute(
+        "SELECT * FROM auth_tokens WHERE token_id=? AND token_kind='client'",
+        (token_id,)).fetchone()
+    if not row or (row["user_id"] != principal.get("user_id")
+                   and not principal.get("is_admin")):
+        raise AuthorizationError("client_key_not_owned")
+    nowi = now_iso()
+    with write_tx(conn):
+        conn.execute(
+            "UPDATE auth_tokens SET revoked_at=? WHERE token_id=?"
+            " AND revoked_at IS NULL", (nowi, token_id))
+        conn.execute(
+            "UPDATE auth_token_project_bindings SET revoked_at=?"
+            " WHERE token_id=? AND revoked_at IS NULL", (nowi, token_id))
+    return {"ok": True, "token_id": token_id, "revoked": True}
+
+
+def auth_client_project_access(conn, principal, project_id):
+    """Validate one client key's account/workspace scope."""
+    if principal.get("token_kind") != "client":
+        raise AuthorizationError("credential is not a client API key")
+    project_id = get_project(conn, project_id)["project_id"]
+    if not auth_has_project_membership(conn, principal, project_id):
+        raise AuthorizationError(
+            "client_key_scope_denied: account has no workspace membership")
+    explicit = auth_token_project_bindings(conn, principal["token_id"])
+    if explicit and project_id not in explicit:
+        raise AuthorizationError(
+            "client_key_scope_denied: workspace is outside key scope")
+    return project_id
+
+
+def auth_client_principal_scope(conn, principal, project_id, claimed_actor):
+    """Resolve a client key to one existing actor without binding the key."""
+    project_id = auth_client_project_access(conn, principal, project_id)
+    actor_id = str(claimed_actor or "").strip()
+    if not actor_id:
+        raise AuthorizationError(
+            "client_actor_required: send the exact canonical X-Attacca-Actor")
+    row = conn.execute(
+        "SELECT * FROM agents WHERE project_id=? AND agent_id=?",
+        (project_id, actor_id)).fetchone()
+    if not row:
+        raise AuthorizationError(
+            "client_actor_not_registered: '%s' is not registered in '%s'" %
+            (actor_id, project_id))
+    if not auth_principal_owns_label(conn, principal, row["owner"]):
+        raise AuthorizationError(
+            "client_actor_denied: actor belongs to Attacca user '%s'" %
+            (row["owner"] or "unassigned"))
+    return {
+        "project_id": project_id,
+        "actor_id": row["agent_id"],
+        "actor_type": "agent",
+        "runtime": normalize_agent_runtime(row["runtime"], row["agent_id"]),
+        "role": str(row["role"] or "unassigned").lower(),
+    }
 
 
 def authorize_authenticated_bridge_peer(conn, principal, project_id,
@@ -1626,6 +1984,29 @@ def authorize_authenticated_bridge_peer(conn, principal, project_id,
             (principal.get("username") or principal.get("user_id"), other))
 
     token_kind = principal.get("token_kind")
+    if actor_type == "agent" and token_kind == "client":
+        source = conn.execute(
+            "SELECT * FROM agents WHERE project_id=? AND agent_id=?",
+            (project_id, actor_id)).fetchone()
+        if not source or source["role"] != "director":
+            raise AuthorizationError(
+                "bridge_peer_actor_required: selected source actor is not a"
+                " registered Director")
+        auth_client_project_access(conn, principal, other)
+        runtime = normalize_agent_runtime(source["runtime"], source["agent_id"])
+        rows = conn.execute(
+            "SELECT * FROM agents WHERE project_id=? AND role='director'",
+            (other,)).fetchall()
+        peers = [row for row in rows
+            if auth_principal_owns_label(conn, principal, row["owner"])
+            if normalize_agent_runtime(row["runtime"], row["agent_id"])
+            == runtime]
+        if len(peers) != 1:
+            raise AuthorizationError(
+                "bridge_peer_actor_required: client owner needs one matching"
+                " Director runtime in workspace '%s'" % other)
+        _require_bridge_manager(conn, other, peers[0]["agent_id"], "agent")
+        return peers[0]["agent_id"]
     if actor_type != "agent" or token_kind not in ("terminal", "service"):
         raise AuthorizationError(
             "bridge_peer_actor_binding_required: this credential has no exact"
@@ -1870,6 +2251,7 @@ def auth_invitation_accept(conn, raw_token, username, password,
         if not current or current["revoked_at"] or current["accepted_at"] \
                 or current["expires_at"] <= nowi:
             raise AuthenticationError("invalid_invitation: already consumed")
+        _auth_reject_username_alias_collision(conn, username)
         try:
             conn.execute(
                 "INSERT INTO auth_users"
@@ -1972,70 +2354,27 @@ def _auth_target_coverage(conn, target):
 
 
 def auth_activation_readiness(conn, server=None, include_details=True):
+    """Return the simple D-17 enforcement state.
+
+    Creating/revoking client keys and flipping enforcement are deliberately
+    separate owner actions.  There is no device-code enrollment, actor-binding
+    migration inventory, source-hash latch, or test-result gate in the product
+    API.  Release QA remains a development responsibility, not a login mode.
+    """
     nowi = now_iso()
-    terminal_count = conn.execute(
-        "SELECT COUNT(DISTINCT t.token_id) AS n FROM auth_tokens t"
-        " JOIN auth_users u ON u.user_id=t.user_id"
-        " JOIN auth_token_actor_bindings b ON b.token_id=t.token_id"
-        " JOIN agents a ON a.project_id=b.project_id AND a.agent_id=b.actor_id"
-        " AND b.revoked_at IS NULL WHERE t.token_kind='terminal'"
+    bootstrapped = auth_is_enabled(conn)
+    client_count = conn.execute(
+        "SELECT COUNT(*) AS n FROM auth_tokens t JOIN auth_users u"
+        " ON u.user_id=t.user_id WHERE t.token_kind='client'"
         " AND t.revoked_at IS NULL"
         " AND (t.expires_at IS NULL OR t.expires_at>?)"
         " AND u.disabled_at IS NULL", (nowi,)).fetchone()["n"]
-    targets = []
-    uncovered = []
-    for row in conn.execute(
-            "SELECT * FROM auth_migration_targets ORDER BY selected_at,target_id"):
-        item = dict(row)
-        item["migration_required"] = bool(item["migration_required"])
-        item["migration_exclusion_reason"] = item.pop("exclusion_reason")
-        item["covered_by_terminal_ids"] = _auth_target_coverage(conn, item)
-        item["covered"] = bool(item["covered_by_terminal_ids"])
-        if item["migration_required"] and not item["covered"]:
-            uncovered.append(item)
-        targets.append(item)
-    bootstrapped = auth_is_enabled(conn)
-    disk_artifact_sha256 = auth_source_sha256()
-    launch_artifact_sha256 = getattr(
-        server, "auth_artifact_sha256_at_start", None) \
-        if server is not None else disk_artifact_sha256
-    artifact_unchanged = bool(
-        launch_artifact_sha256 and disk_artifact_sha256 and
-        hmac.compare_digest(launch_artifact_sha256,
-                            disk_artifact_sha256))
-    qa_evidence = auth_qa_evidence(
-        conn, expected_artifact_sha256=launch_artifact_sha256)
-    qa_ready = all(
-        bool(qa_evidence[name].get("passed"))
-        for name in ("acceptance", "regression"))
-    blockers = []
-    if not bootstrapped:
-        blockers.append("create the first administrator account")
-    if not terminal_count:
-        blockers.append("enroll at least one human-owned terminal device")
-    if uncovered:
-        blockers.append("enroll or explicitly exclude every selected client")
-    if not qa_ready:
-        blockers.append("both required QA passes must be recorded")
-    if not launch_artifact_sha256 or not disk_artifact_sha256:
-        blockers.append("authentication package artifact is incomplete")
-    elif not artifact_unchanged:
-        blockers.append(
-            "authentication package changed after this server process started")
+    blockers = [] if bootstrapped else [
+        "create the first administrator account"]
     state_material = {
         "bootstrapped": bootstrapped,
-        "terminal_count": terminal_count,
-        "targets": [{
-            "target_id": item["target_id"],
-            "required": item["migration_required"],
-            "reason": item["migration_exclusion_reason"],
-            "covered": item["covered"],
-            "tokens": item["covered_by_terminal_ids"],
-        } for item in targets],
-        "qa": qa_evidence,
-        "launch_artifact_sha256": launch_artifact_sha256,
-        "disk_artifact_sha256": disk_artifact_sha256,
-        "artifact_unchanged": artifact_unchanged,
+        "client_key_count": client_count,
+        "activated": bool(_auth_setting(conn, "auth.activated", False)),
     }
     readiness_version = sha256_hex(canonical_json(state_material))[:24]
     persisted_requested = bool(_auth_setting(
@@ -2056,17 +2395,20 @@ def auth_activation_readiness(conn, server=None, include_details=True):
         "ready": not blockers,
         "readiness_version": readiness_version,
         "blockers": blockers,
-        "terminal_count": terminal_count,
-        "selected_client_count": len(targets),
-        "uncovered_client_count": len(uncovered),
-        "qa_evidence": qa_evidence,
-        "launch_artifact_sha256": launch_artifact_sha256,
-        "disk_artifact_sha256": disk_artifact_sha256,
-        "artifact_unchanged": artifact_unchanged,
+        "client_key_count": client_count,
+        # Deprecated response keys stay zero-valued for one release so old
+        # panels fail harmlessly while the unsafe flows themselves disappear.
+        "terminal_count": 0,
+        "selected_client_count": 0,
+        "uncovered_client_count": 0,
+        "qa_evidence": None,
+        "launch_artifact_sha256": None,
+        "disk_artifact_sha256": None,
+        "artifact_unchanged": None,
     }
     if include_details:
-        result["migration_targets"] = targets
-        result["uncovered_clients"] = uncovered
+        result["migration_targets"] = []
+        result["uncovered_clients"] = []
     return result
 
 
@@ -2095,6 +2437,7 @@ def auth_create_user(conn, username, password, display_name=None,
         if bootstrap and count:
             raise AttaccaError("authentication is already bootstrapped")
         user_id = new_id("usr")
+        _auth_reject_username_alias_collision(conn, username)
         try:
             conn.execute(
                 "INSERT INTO auth_users (user_id, username, display_name,"
@@ -2301,10 +2644,11 @@ def auth_token_principal(conn, raw_token):
         expires_at=row["expires_at"],
         actor_id=row["actor_id"], actor_type=row["actor_type"],
         project_id=row["project_id"], runtime=row["runtime"])
-    if row["token_kind"] == "service":
-        # A human owns and is attributed on a service credential, but the
-        # bearer does not inherit that human's admin/owner override. Exact
-        # actor bindings below may grant only the registered actor's role.
+    if row["token_kind"] in ("client", "service"):
+        # A human owns and is attributed on a client/service credential, but
+        # a bearer never inherits account-admin/server-owner authority.  A
+        # client key receives only the separately registered actor's project
+        # role selected on the current request.
         principal["owner_is_admin"] = principal["is_admin"]
         principal["owner_is_owner"] = principal["is_owner"]
         principal["is_admin"] = False
@@ -2326,6 +2670,9 @@ def auth_token_list(conn, username):
                    "expires_at", "revoked_at")}
         if row["token_kind"] == "terminal":
             record["bindings"] = auth_terminal_bindings(conn, row["token_id"])
+        elif row["token_kind"] == "client":
+            record["project_memberships"] = auth_token_project_bindings(
+                conn, row["token_id"])
         records.append(record)
     return {"username": username, "tokens": records}
 
@@ -2871,6 +3218,7 @@ def auth_access_payload(conn, principal=None, server=None):
     terminals = []
     enrollments = []
     service_keys = []
+    client_keys = []
     invitations = []
     if principal:
         if principal.get("is_admin"):
@@ -2915,13 +3263,15 @@ def auth_access_payload(conn, principal=None, server=None):
                 (principal["user_id"],)).fetchall()
         service_keys = [auth_service_key_record(conn, row)
                         for row in service_rows]
+        client_keys = auth_client_key_list(conn, principal)
         if principal.get("is_admin"):
             invitations = [auth_invitation_record(row) for row in conn.execute(
                 "SELECT * FROM auth_invitations ORDER BY created_at DESC")]
     return {
         "capabilities": {
-            "terminal_enrollment": True,
-            "migration_scope": True,
+            "client_keys": True,
+            "terminal_enrollment": False,
+            "migration_scope": False,
             "activation": True,
             "service_keys": True,
             "invitations": True,
@@ -2929,6 +3279,7 @@ def auth_access_payload(conn, principal=None, server=None):
         "compatibility": readiness,
         "terminals": terminals,
         "terminal_enrollments": enrollments,
+        "client_keys": client_keys,
         "service_keys": service_keys,
         "invitations": invitations,
     }
@@ -2961,35 +3312,50 @@ def auth_migration_scope_update(conn, principal, required_clients,
             "compatibility": auth_activation_readiness(conn, server=server)}
 
 
-def auth_activate(conn, principal, confirmed, expected_readiness_version,
-                  server=None):
+def auth_activate(conn, principal, confirmed, expected_readiness_version=None,
+                  server=None, enabled=True):
+    """Owner-only D-17 authentication enforcement toggle.
+
+    ``expected_readiness_version`` is accepted but intentionally ignored for
+    one compatibility release.  Client migration and QA evidence no longer
+    form an authentication state machine.
+    """
     if not principal.get("is_owner"):
         raise AuthorizationError("server_owner_required: activation denied")
     if confirmed is not True:
-        raise AttaccaError("activation requires confirmed=true")
+        raise AttaccaError("authentication toggle requires confirmed=true")
+    if enabled not in (True, False):
+        raise AttaccaError("enabled must be true or false")
     with write_tx(conn):
+        claimed_owner_aliases = auth_claim_single_user_legacy_owner_aliases(
+            conn, principal) if enabled else []
+        claimed_project_memberships = \
+            auth_grant_single_user_legacy_project_memberships(
+                conn, principal) if enabled else []
         readiness = auth_activation_readiness(
             conn, server=server, include_details=False)
-        if str(expected_readiness_version or "") != \
-                readiness["readiness_version"]:
+        if enabled and not readiness["ready"]:
             raise AuthorizationError(
-                "authentication readiness changed; reload before activation")
-        if not readiness["ready"]:
-            raise AuthorizationError(
-                "authentication cannot activate until migration readiness passes")
+                "authentication cannot activate before account bootstrap")
         nowi = now_iso()
         for key, value in {
-                "auth.activation_requested": True,
-                "auth.activated": True,
-                "auth.activated_by": principal["username"],
-                "auth.activated_at": nowi}.items():
+                "auth.activation_requested": bool(enabled),
+                "auth.activated": bool(enabled),
+                "auth.activated_by": principal["username"] if enabled else None,
+                "auth.activated_at": nowi if enabled else None,
+                "auth.deactivated_by": (principal["username"]
+                                         if not enabled else None),
+                "auth.deactivated_at": nowi if not enabled else None}.items():
             conn.execute(
                 "INSERT INTO server_settings(setting_key,value,updated_at)"
                 " VALUES (?,?,?) ON CONFLICT(setting_key) DO UPDATE SET"
                 " value=excluded.value,updated_at=excluded.updated_at",
                 (key, json.dumps(value, separators=(",", ":")), nowi))
-    return {"ok": True, "activated": True,
-            "activated_by": principal["username"],
+    return {"ok": True, "activated": bool(enabled),
+            "changed_by": principal["username"],
+            "claimed_legacy_owner_aliases": claimed_owner_aliases,
+            "claimed_legacy_project_memberships":
+                claimed_project_memberships,
             "readiness_version": readiness["readiness_version"]}
 
 
@@ -3028,7 +3394,71 @@ def _normalize_evidence(evidence):
         raise AttaccaError(
             'evidence must be an array of objects, e.g. '
             '[{"kind":"test","name":"pytest","result":"pass"}]')
+    for item in evidence:
+        if not item or not any(
+                value is False or value == 0 or bool(value)
+                for value in item.values()):
+            raise AttaccaError(
+                "evidence objects must contain meaningful non-empty fields")
     return evidence
+
+
+_EVIDENCE_VERDICT_KEYS = {
+    "result", "status", "outcome", "passed", "success", "ok",
+    "verified", "exit_code", "returncode", "exit_status",
+}
+_EVIDENCE_PASS_VALUES = {
+    "pass", "passed", "success", "succeeded", "successful", "ok",
+    "green", "verified", "complete", "completed",
+}
+_EVIDENCE_FAIL_VALUES = {
+    "fail", "failed", "failure", "error", "errored", "red",
+    "blocked", "cancelled", "canceled", "timeout", "timed_out",
+}
+
+
+def _evidence_verification(evidence):
+    """Classify structured task evidence without trusting mere object count."""
+    credible_pass = False
+    explicit_failure = False
+    for item in evidence:
+        identifying = any(
+            key not in _EVIDENCE_VERDICT_KEYS and
+            (value is False or value == 0 or bool(value))
+            for key, value in item.items())
+        item_pass = False
+        item_failure = False
+        for key, value in item.items():
+            normalized_key = str(key).strip().lower()
+            if normalized_key not in _EVIDENCE_VERDICT_KEYS:
+                continue
+            if normalized_key in {"passed", "success", "ok", "verified"}:
+                if value is True:
+                    item_pass = True
+                elif value is False:
+                    item_failure = True
+                continue
+            if normalized_key in {"exit_code", "returncode", "exit_status"}:
+                try:
+                    code = int(value)
+                except (TypeError, ValueError):
+                    continue
+                item_pass = item_pass or code == 0
+                item_failure = item_failure or code != 0
+                continue
+            verdict = str(value or "").strip().lower().replace("-", "_")
+            if verdict in _EVIDENCE_PASS_VALUES:
+                item_pass = True
+            elif verdict in _EVIDENCE_FAIL_VALUES:
+                item_failure = True
+        explicit_failure = explicit_failure or item_failure
+        credible_pass = credible_pass or (identifying and item_pass and
+                                           not item_failure)
+    if explicit_failure:
+        return "failed"
+    if credible_pass:
+        return "verified"
+    return "unverified"
 
 
 class write_tx:
@@ -3457,6 +3887,72 @@ def _task_brief(task):
     return brief
 
 
+def workflow_warnings(conn, project_id, actor_id=None, actor_type="agent"):
+    """Return cheap board-vs-checkout drift warnings for hooks and status.
+
+    These are advisory: Git can move for legitimate reasons, but a coding AI
+    should not silently mutate a checkout with no active board claim, nor keep
+    treating an expired lease as ownership.
+    """
+    if actor_type != "agent" or not actor_id:
+        return []
+    nowi = now_iso()
+    warnings = []
+    expired = conn.execute(
+        "SELECT task_id,title,lease_until FROM tasks WHERE project_id=?"
+        " AND status='claimed' AND claimed_by=? AND lease_until IS NOT NULL"
+        " AND lease_until<? ORDER BY task_id",
+        (project_id, actor_id, nowi)).fetchall()
+    for row in expired:
+        warnings.append({
+            "code": "stale_task_ownership",
+            "task_id": row["task_id"],
+            "message": ("Claim %s expired at %s; renew/reclaim it before"
+                        " continuing mutations." %
+                        (row["task_id"], row["lease_until"])),
+        })
+    active = conn.execute(
+        "SELECT task_id,title,base_revision,lease_until FROM tasks"
+        " WHERE project_id=? AND status='claimed' AND claimed_by=?"
+        " AND (lease_until IS NULL OR lease_until>=?) ORDER BY task_id",
+        (project_id, actor_id, nowi)).fetchall()
+    git_ctx = current_git_context()
+    revision = git_ctx.get("revision")
+    branch = git_ctx.get("branch")
+    if revision and not active:
+        device_id = git_ctx.get("device_id")
+        params = [project_id, actor_id]
+        sql = (
+            "SELECT base_revision,git_branch,seq,task_id FROM events"
+            " WHERE project_id=? AND actor_id=? AND base_revision IS NOT NULL")
+        if device_id:
+            sql += " AND device_id=?"
+            params.append(device_id)
+        sql += " ORDER BY seq DESC LIMIT 1"
+        previous = conn.execute(sql, params).fetchone()
+        revision_moved = bool(
+            previous and previous["base_revision"] != revision)
+        branch_moved = bool(
+            previous and branch and previous["git_branch"] and
+            previous["git_branch"] != branch)
+        if previous and (revision_moved or branch_moved):
+            warnings.append({
+                "code": "off_board_repository_mutation",
+                "from_revision": previous["base_revision"],
+                "to_revision": revision,
+                "from_branch": previous["git_branch"],
+                "to_branch": branch,
+                "message": (
+                    "Checkout moved from %s@%s to %s@%s while this AI has "
+                    "no active claimed task; claim/create the work before "
+                    "further mutations." %
+                    (previous["git_branch"] or "unknown",
+                     previous["base_revision"], branch or "unknown",
+                     revision)),
+            })
+    return warnings
+
+
 def get_handoff(conn, project_id, actor_id=None, actor_type="agent"):
     project = get_project(conn, project_id)
     row = _latest_handoff(conn, project_id)
@@ -3489,6 +3985,9 @@ def get_handoff(conn, project_id, actor_id=None, actor_type="agent"):
             "unread_addressed_to_you": peek["unread_addressed"],
             "unread_everyone": peek["unread_everyone"],
             "unread_group_context": peek["unread_group_context"],
+            "pending_disposition_total": peek.get(
+                "pending_disposition_total", 0),
+            "pending_dispositions": peek.get("pending_dispositions", []),
             "may_have_more": peek["may_have_more"],
             "messages_include_all_visible": True,
             "hint": ("read every message with check_inbox; mentions/replies "
@@ -3516,6 +4015,8 @@ def get_handoff(conn, project_id, actor_id=None, actor_type="agent"):
         "your_inbox": your_inbox,
         "bridges": bridges,
         "governance": governance,
+        "workflow_warnings": workflow_warnings(
+            conn, project_id, actor_id, actor_type),
         "project_rules": applicable_rules,
         "cloud_context": cloud_context_get(conn, project_id)["cloud_context"],
         "handoff": handoff,
@@ -3679,13 +4180,17 @@ def room_send(conn, project_id, actor_id, actor_type, body, msg_type="chat",
         # connected-workspace conversation instead of flattening every message
         # into one indistinguishable feed.
         payload["mirrored_to"] = [b["with"] for b in bridge_targets]
-    event = append_event(conn, project_id, actor_id, actor_type,
-                         "room.message", payload, task_id=task_id)
-    # An explicitly targeted bridge message is retained in both linked rooms
-    # so their agents' rooms and inboxes receive it. Mirrored copies carry
-    # origin_project and are never re-mirrored (loop protection).
+    # Source persistence and every exact destination copy form one delivery
+    # contract. A destination failure must roll the source back as well; a
+    # raised call can never leave a message that callers believe was unsent.
     mirrored_to = []
-    if bridge_targets:
+    with write_tx(conn):
+        event = append_event(
+            conn, project_id, actor_id, actor_type, "room.message", payload,
+            task_id=task_id, in_tx=True)
+        # An explicitly targeted bridge message is retained in both linked
+        # rooms. Mirrored copies carry origin_project and are never re-mirrored
+        # (loop protection).
         for bridge in bridge_targets:
             authority = None
             if bridge["relation"] == "master":
@@ -3702,7 +4207,7 @@ def room_send(conn, project_id, actor_id, actor_type, body, msg_type="chat",
             if authority:
                 mirror["authority"] = authority
             append_event(conn, bridge["with"], actor_id, actor_type,
-                         "room.message", mirror)
+                         "room.message", mirror, in_tx=True)
             mirrored_to.append(bridge["with"])
     warnings = []
     if msg_type == "decision":
@@ -3711,7 +4216,18 @@ def room_send(conn, project_id, actor_id, actor_type, body, msg_type="chat",
     if msg_type == "claim" and not task_id:
         warnings.append("claim messages should reference a task_id; use "
                         "task_claim to actually claim the work")
-    result = {"ok": True, "delivered_to": project_id, "event": event}
+    delivered_projects = [project_id] + list(mirrored_to)
+    result = {
+        "ok": True,
+        # Backward-compatible scalar retained for 0.4.x callers.
+        "delivered_to": project_id,
+        # Canonical truthful contract: local persistence plus every exact
+        # destination copy.  ``mirrored_to`` is always present, including []
+        # for local-only sends, so callers never infer delivery from absence.
+        "delivered_to_projects": delivered_projects,
+        "mirrored_to": list(mirrored_to),
+        "event": event,
+    }
     if mirrored_to:
         result["mirrored_to_bridged_projects"] = mirrored_to
     if warnings:
@@ -3858,6 +4374,150 @@ def _inbox_message_attention(conn, actor_ids, payload):
         "broadcast_to_everyone": broadcast,
         "addressed_to_you": addressed,
         "group_context": not addressed,
+    }
+
+
+MESSAGE_DISPOSITIONS = (
+    "acknowledged", "claimed", "deferred", "blocked", "completed",
+    "not_actionable",
+)
+UNRESOLVED_MESSAGE_DISPOSITIONS = {"claimed", "deferred", "blocked"}
+
+
+def _message_requires_disposition(attention, payload):
+    """Direct attention and broadcast directives require an explicit outcome."""
+    return bool(attention.get("directed_to_you") or (
+        attention.get("broadcast_to_everyone") and
+        payload.get("msg_type") == "directive"))
+
+
+def pending_message_dispositions(conn, project_id, actor_id,
+                                 actor_type="agent", limit=100):
+    """Return addressed work that was read but never explicitly disposed."""
+    get_project(conn, project_id)
+    limit = max(1, min(int(limit or 100), 500))
+    actor_ids = _actor_alias_ids(conn, project_id, actor_id)
+    rows = conn.execute(
+        "SELECT * FROM events WHERE project_id=?"
+        " AND event_type='room.message' ORDER BY seq",
+        (project_id,)).fetchall()
+    candidate_rows = [row for row in rows if row["actor_id"] not in actor_ids]
+    payloads = _room_policy_payloads(conn, project_id, candidate_rows)
+    disposition_rows = conn.execute(
+        "SELECT * FROM message_dispositions WHERE project_id=? AND actor_id=?",
+        (project_id, actor_id)).fetchall()
+    dispositions = {row["message_event_id"]: dict(row)
+                    for row in disposition_rows}
+    pending = []
+    for row, payload in zip(candidate_rows, payloads):
+        if not _bridge_message_visible(
+                conn, project_id, payload, actor_id, actor_type):
+            continue
+        attention = _inbox_message_attention(conn, actor_ids, payload)
+        if not _message_requires_disposition(attention, payload):
+            continue
+        disposition = dispositions.get(row["event_id"])
+        if disposition and disposition["disposition"] not in \
+                UNRESOLVED_MESSAGE_DISPOSITIONS:
+            continue
+        message = _room_message_dict(row, payload)
+        message.update(attention)
+        identity_project = message.get("origin_project") or project_id
+        attribution = immutable_event_attribution(
+            conn, identity_project, message["actor"], message["actor_type"],
+            message.get("owner"))
+        message["ledger_actor"] = message["actor"]
+        message["actor"] = attribution["actor_id"]
+        message["identity"] = attribution["identity"]
+        message["attribution"] = attribution
+        message["requires_disposition"] = True
+        message["disposition"] = disposition
+        pending.append(message)
+    has_more = len(pending) > limit
+    return {
+        "pending": pending[:limit],
+        "pending_total": len(pending),
+        "may_have_more": has_more,
+    }
+
+
+def message_dispose(conn, project_id, actor_id, actor_type, event_id,
+                    disposition, note=None, task_id=None):
+    """Record one durable outcome for an addressed room assignment/message."""
+    disposition = str(disposition or "").strip().lower()
+    if disposition not in MESSAGE_DISPOSITIONS:
+        raise AttaccaError(
+            "disposition must be one of %s" %
+            ", ".join(MESSAGE_DISPOSITIONS))
+    note = str(note or "").strip() or None
+    if disposition in ("deferred", "blocked", "not_actionable") and not note:
+        raise AttaccaError("%s disposition requires a note" % disposition)
+    row = conn.execute(
+        "SELECT * FROM events WHERE project_id=? AND event_id=?"
+        " AND event_type='room.message'", (project_id, event_id)).fetchone()
+    if not row:
+        raise AttaccaError("unknown room message %s" % event_id)
+    actor_ids = _actor_alias_ids(conn, project_id, actor_id)
+    if row["actor_id"] in actor_ids:
+        raise AttaccaError("cannot disposition your own room message")
+    payload = _room_policy_payload(conn, project_id, row)
+    if not _bridge_message_visible(
+            conn, project_id, payload, actor_id, actor_type):
+        raise AuthorizationError("room message is not visible to this actor")
+    attention = _inbox_message_attention(conn, actor_ids, payload)
+    if not _message_requires_disposition(attention, payload):
+        raise AttaccaError(
+            "message is group context, not assigned/addressed work")
+    event_task = str(row["task_id"] or "").strip() or None
+    supplied_task = str(task_id or "").strip() or None
+    if event_task and supplied_task and supplied_task != event_task:
+        raise AttaccaError(
+            "message is linked to task %s; disposition cannot substitute "
+            "unrelated task %s" % (event_task, supplied_task))
+    effective_task = event_task or supplied_task
+    if effective_task:
+        task = _task_row(conn, project_id, effective_task)
+    else:
+        task = None
+    if disposition in ("claimed", "completed") and not task:
+        raise AttaccaError(
+            "%s disposition requires a linked task_id" % disposition)
+    if disposition == "claimed" and (
+            task["status"] != "claimed" or task["claimed_by"] != actor_id):
+        raise AttaccaError(
+            "claimed disposition requires an active task claim by this actor")
+    if disposition == "completed" and task["status"] != "done":
+        raise AttaccaError(
+            "completed disposition requires the linked task to be done")
+    nowi = now_iso()
+    with write_tx(conn):
+        conn.execute(
+            "INSERT INTO message_dispositions"
+            " (project_id,actor_id,message_event_id,disposition,note,task_id,"
+            " updated_by,updated_owner,updated_at) VALUES (?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(project_id,actor_id,message_event_id) DO UPDATE SET"
+            " disposition=excluded.disposition,note=excluded.note,"
+            " task_id=excluded.task_id,updated_by=excluded.updated_by,"
+            " updated_owner=excluded.updated_owner,updated_at=excluded.updated_at",
+            (project_id, actor_id, event_id, disposition, note,
+             effective_task, actor_id, current_owner(), nowi))
+        event = append_event(
+            conn, project_id, actor_id, actor_type,
+            "room.message_disposition", {
+                "message_event_id": event_id,
+                "disposition": disposition,
+                "note": note,
+                "task_id": effective_task,
+            }, task_id=effective_task, in_tx=True)
+    pending = pending_message_dispositions(
+        conn, project_id, actor_id, actor_type=actor_type, limit=1)
+    return {
+        "ok": True,
+        "message_event_id": event_id,
+        "disposition": disposition,
+        "task_id": effective_task,
+        "pending_disposition_total": pending["pending_total"],
+        "event": event,
     }
 
 
@@ -4082,6 +4742,8 @@ def inbox_read(conn, project_id, actor_id, mark_read=True, limit=50,
                 " last_read_seq=excluded.last_read_seq,"
                 " updated_at=excluded.updated_at",
                 (project_id, actor_id, new_cursor, now_iso()))
+    disposition_state = pending_message_dispositions(
+        conn, project_id, actor_id, actor_type=actor_type, limit=limit)
     return {
         "project": project_id,
         "actor": actor_id,
@@ -4098,6 +4760,9 @@ def inbox_read(conn, project_id, actor_id, mark_read=True, limit=50,
         "may_have_more": may_have_more,
         "read_cursor": new_cursor if mark_read else cursor,
         "scanned_through_seq": new_cursor,
+        "pending_dispositions": disposition_state["pending"],
+        "pending_disposition_total": disposition_state["pending_total"],
+        "pending_disposition_may_have_more": disposition_state["may_have_more"],
         "hint": ("more unread group messages remain — call check_inbox again"
                  if may_have_more else
                  "all participation-visible unread room messages are included; "
@@ -4746,6 +5411,14 @@ def _task_dict(row, event_rows=None, conn=None, project_id=None,
         task["last_report"].setdefault("reported_owner", reported.get("owner"))
         task["last_report"].setdefault("reported_actor_type",
                                        reported.get("actor_type"))
+        task["verification_status"] = task["last_report"].get(
+            "verification_status") or (
+                "verified" if task["last_report"].get("evidence")
+                else "unverified")
+    elif task.get("status") == "done":
+        task["verification_status"] = "unverified"
+    else:
+        task["verification_status"] = "not_reported"
     task["attribution"]["current_claimant"] = _task_current_claimant(
         task, actions, conn, project_id)
     if task["status"] == "claimed" and task.get("lease_until") \
@@ -5260,6 +5933,13 @@ def task_report(conn, project_id, actor_id, actor_type, task_id, summary,
     if requested_state not in ("review", "done", "blocked", "queued"):
         raise AttaccaError("requested_state must be review|done|blocked|queued")
     evidence = _normalize_evidence(evidence)
+    requested_target = requested_state
+    verification_status = _evidence_verification(evidence)
+    # A bare assertion, ambiguous evidence, or an explicit failed check cannot
+    # create a green/done board state. Preserve the report and evidence in
+    # review so the missing/failing verification remains visible.
+    if requested_state == "done" and verification_status != "verified":
+        requested_state = "review"
     project = get_project(conn, project_id)
     base_revision = git_head(project.get("root_path"))
     with write_tx(conn):
@@ -5271,7 +5951,9 @@ def task_report(conn, project_id, actor_id, actor_type, task_id, summary,
                   "reported_by": actor_id, "reported_at": nowi,
                   "reported_owner": current_owner(),
                   "reported_actor_type": actor_type,
-                  "requested_state": requested_state,
+                  "requested_state": requested_target,
+                  "effective_state": requested_state,
+                  "verification_status": verification_status,
                   "base_revision_at_claim": row["base_revision"],
                   "base_revision_at_report": base_revision}
         # Giving a task back clears the claimant; otherwise the reporter owns
@@ -5314,15 +5996,24 @@ def task_report(conn, project_id, actor_id, actor_type, task_id, summary,
         warnings = []
         if row["base_revision"] and base_revision \
                 and row["base_revision"] != base_revision \
-                and not evidence:
+                and verification_status != "verified":
             warnings.append(
-                "repository moved from %s (claim) to %s (report) and no evidence "
-                "was attached — attach tests/commits so reviewers can verify"
+                "repository moved from %s (claim) to %s (report) without "
+                "verified passing evidence — attach identified checks with "
+                "an explicit passing result"
                 % (row["base_revision"], base_revision))
-        if not evidence:
-            warnings.append("no evidence attached: completion is 'agent says done', "
-                            "not verified (blueprint §8.4)")
+        if verification_status == "failed":
+            warnings.append(
+                "evidence contains an explicit failed check: completion "
+                "remains in review until passing verification is reported")
+        elif verification_status != "verified":
+            warnings.append(
+                "no credible passing evidence attached: completion remains "
+                "unverified and cannot enter done; identify the check and "
+                "include an explicit passing result")
     result = {"ok": True, "task_id": task_id, "status": requested_state,
+              "requested_state": requested_target,
+              "verification_status": verification_status,
               "warnings": warnings, "event": event}
     if context_version:
         result["context_version"] = context_version
@@ -5914,15 +6605,27 @@ def _migrate_actor_references_in_tx(conn, project_id, aliases, canonical_id,
 def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
                    display_name=None, role=None, runtime=None,
                    canonical_identity=False, registration_username=None,
-                   allow_foreign_owner=False):
+                   allow_foreign_owner=False,
+                   authorized_owner_labels=None):
     requested_id = agent_id or actor_id
     registration_username = str(registration_username or "").strip() or None
+    authorized_owner_keys = {
+        _auth_owner_alias_key(value)
+        for value in (authorized_owner_labels or []) if str(value or "").strip()
+    }
+    if registration_username:
+        authorized_owner_keys.add(
+            _auth_owner_alias_key(registration_username))
+
+    def owner_is_authorized(row):
+        return bool(row and row["owner"] and
+                    _auth_owner_alias_key(row["owner"]) in
+                    authorized_owner_keys)
 
     def owned_by_another(row):
         return bool(
             registration_username and row and row["owner"] and
-            str(row["owner"]).strip().casefold() !=
-            registration_username.casefold() and not allow_foreign_owner)
+            not owner_is_authorized(row) and not allow_foreign_owner)
 
     def protected_field_changes(row, requested_role, requested_runtime):
         """Return authority/ownership changes a member may not smuggle in.
@@ -5938,7 +6641,7 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
             return []
         changes = []
         effective_owner = str(row["owner"] or "").strip()
-        if effective_owner.casefold() != registration_username.casefold():
+        if not effective_owner or not owner_is_authorized(row):
             changes.append("owner")
         if requested_role is not None and row["role"] != requested_role:
             changes.append("role")
@@ -6413,6 +7116,8 @@ def project_status(conn, project_id, actor_id, actor_type, db_path):
         "counts": dict(counts),
         "git": {"head": git_head(project.get("root_path")),
                 "branch": git_branch(project.get("root_path"))},
+        "workflow_warnings": workflow_warnings(
+            conn, project_id, actor_id, actor_type),
     }
 
 
@@ -6791,6 +7496,24 @@ MCP_TOOLS = [
             "limit": _i("Max messages to scan (default 50)."),
             "project": PROJECT_PROP,
         }},
+    },
+    {
+        "name": "message_dispose",
+        "description": "Record the explicit outcome of an addressed message "
+                       "or broadcast directive. Reading is not completion: "
+                       "use acknowledged/not_actionable for closed messages, "
+                       "or claimed/deferred/blocked/completed to keep the "
+                       "assignment state durable. Claimed/completed require "
+                       "a linked task in the matching board state.",
+        "inputSchema": {"type": "object", "properties": {
+            "event_id": _s("Room message event_id."),
+            "disposition": _s("One of: %s." %
+                              " | ".join(MESSAGE_DISPOSITIONS)),
+            "note": _s("Reason/status; required for deferred, blocked, and "
+                       "not_actionable."),
+            "task_id": _s("Linked task id; required for claimed/completed."),
+            "project": PROJECT_PROP,
+        }, "required": ["event_id", "disposition"]},
     },
     {
         "name": "set_lead_director",
@@ -7203,6 +7926,9 @@ Session protocol:
 4. Claim a task (task_claim) before substantive work; create one if needed.
 5. Announce intent / coordinate via room_send; poll check_inbox / room_read
    and consider all relevant group context even when no action is assigned.
+   The lifecycle watcher performs routine checks; never make the human prompt
+   you to check messages. Reading does not dispose addressed work: call
+   message_dispose before yielding (and link claimed/completed work to a task).
    Messages tagged [MASTER-DIRECTIVE] come from a project whose
    directors rule this one — treat them as binding; [SUGGESTION]/[ADVICE]
    are input, not orders.
@@ -7582,6 +8308,13 @@ class McpSession:
                               mark_read=True if mark is None else bool(mark),
                               limit=args.get("limit") or 50,
                               actor_type=atype)
+
+        if name == "message_dispose":
+            project, actor = self._project_actor(args)
+            return self._guarded_write(project, lambda: message_dispose(
+                conn, project, actor, atype, args.get("event_id"),
+                args.get("disposition"), note=args.get("note"),
+                task_id=args.get("task_id")))
 
         if name == "set_lead_director":
             project, actor = self._project_actor(args)
@@ -8159,7 +8892,7 @@ def _offline_sync_runtime():
 
 
 def _terminal_flow_runtime():
-    """Load the bundled human-owned terminal/device authorization client."""
+    """Load the bundled per-install client-key authorization helper."""
     global _TERMINAL_FLOW_RUNTIME
     if _TERMINAL_FLOW_RUNTIME is not None:
         return _TERMINAL_FLOW_RUNTIME
@@ -8208,6 +8941,8 @@ def build_project_export_artifact(conn, project_id, export_format="zip"):
 
 SYNC_OPERATION_TO_TOOL = {
     "room.send": "room_send", "room_send": "room_send",
+    "message.dispose": "message_dispose",
+    "message_dispose": "message_dispose",
     "task.create": "task_create", "task_create": "task_create",
     "task.claim": "task_claim", "task_claim": "task_claim",
     "task.report": "task_report", "task_report": "task_report",
@@ -8308,7 +9043,7 @@ def _compatibility_sync_scope(handler, project_id):
     """Narrow anonymous migration sync to one registered actor and device."""
     if not handler._compatibility_active():
         raise AuthenticationError(
-            "terminal_enrollment_required: authentication principal missing")
+            "client_authorization_required: authentication principal missing")
     device_id = str(handler._request_device_id() or "").strip()
     claimed = str(handler.headers.get("X-Attacca-Actor") or "").strip()
     if not device_id or not claimed:
@@ -8369,7 +9104,18 @@ def _sync_authenticated_scope(handler, project_id):
         return _compatibility_sync_scope(handler, project_id)
     conn = handler._conn()
     project = get_project(conn, project_id)
-    if principal.get("token_kind") == "terminal":
+    if principal.get("token_kind") == "client":
+        if principal.get("project_id") != project_id:
+            raise AuthorizationError(
+                "client key selected workspace '%s'" %
+                principal.get("project_id"))
+        actor = principal.get("actor_id")
+        role = principal.get("role")
+        if not actor or not role:
+            raise AuthorizationError(
+                "client key requires one exact registered actor")
+        actor_type = "agent"
+    elif principal.get("token_kind") == "terminal":
         if principal.get("project_id") != project_id:
             raise AuthorizationError(
                 "terminal credential selected workspace '%s'" %
@@ -8577,6 +9323,11 @@ def _sync_projection(conn, scope):
     cursor = conn.execute(
         "SELECT * FROM inbox_cursors WHERE project_id=? AND actor_id=?",
         (scope["project_id"], scope["actor_id"])).fetchone()
+    dispositions = [dict(row) for row in conn.execute(
+        "SELECT * FROM message_dispositions"
+        " WHERE project_id=? AND actor_id=?"
+        " ORDER BY updated_at, message_event_id",
+        (scope["project_id"], scope["actor_id"])).fetchall()]
     rules = rule_list(
         conn, scope["project_id"], actor_id=scope["actor_id"],
         actor_type=scope["actor_type"])["rules"]
@@ -8600,6 +9351,7 @@ def _sync_projection(conn, scope):
             for event in visible_events
         ],
         "actor_aliases": snapshot["actor_aliases"],
+        "message_dispositions": dispositions,
     }
     return _sync_scrub_secrets(projection)
 
@@ -9155,7 +9907,7 @@ else:
 PYEOF
 else
   echo "attacca watcher: automatic upgrade restart is pending; no unverified process was stopped." >&2
-  echo "  Retry with: attacca watch upgrade" >&2
+  echo "  The next Attacca session hook will retry it automatically." >&2
 fi
 
 # Claude Code: native plugin install.
@@ -9340,9 +10092,11 @@ if command -v codex >/dev/null 2>&1; then
 fi
 
 echo ""
-echo "complete setup in the project you want to connect:"
-echo "  Codex native: \\$attacca:setup    Claude native: /attacca:setup"
-echo "  Kimi native: /attacca:setup        terminal/shell-only: attacca setup"
+echo "Open the project in your coding client. Its AI runs complete setup."
+echo "If authentication is required, the AI opens Attacca Settings and collects"
+echo "the client API key through a hidden terminal prompt automatically."
+echo "Credential authorization hot-loads immediately: no auth command or client"
+echo "restart is required. (Executable plugin updates may still require reload.)"
 echo "Kimi native manual install/refresh alternative:"
 echo "  /plugins install $BASE/plugin.zip    then /reload (or start a new session)"
 echo "attacca web panel:"
@@ -9753,8 +10507,9 @@ class AttaccaHandler(BaseHTTPRequestHandler):
                     (sha256_hex(raw_bearer),)).fetchone()
                 kind = historical["token_kind"] if historical else None
                 modern_credential = bool(
-                    kind in ("terminal", "service", "human") or
-                    raw_bearer.startswith(("atd_", "atsvc_", "ats_")))
+                    kind in ("client", "terminal", "service", "human") or
+                    raw_bearer.startswith(
+                        ("atkey_", "atd_", "atsvc_", "ats_")))
                 if modern_credential:
                     # Compatibility is a bounded bridge for stale historical
                     # actor credentials, never a revocation bypass for modern
@@ -9770,9 +10525,64 @@ class AttaccaHandler(BaseHTTPRequestHandler):
                     "invalid_credential: bearer is invalid, expired or revoked")
             token_kind = principal.get("token_kind") or (
                 "actor" if principal.get("actor_type") == "agent" else "human")
+            if token_kind == "client":
+                expected_instance = str(
+                    principal.get("client_instance") or "")
+                supplied_instance = str(
+                    self.headers.get(CLIENT_INSTANCE_HEADER) or "")
+                if not supplied_instance or not hmac.compare_digest(
+                        supplied_instance, expected_instance):
+                    raise AuthorizationError(
+                        "client_instance_mismatch: API key belongs to another"
+                        " Attacca installation")
+                expected_device = str(principal.get("device_id") or "")
+                if expected_device:
+                    supplied_device = str(self._request_device_id() or "")
+                    if not supplied_device or not hmac.compare_digest(
+                            supplied_device, expected_device):
+                        raise AuthorizationError(
+                            "client_device_mismatch: API key belongs to another"
+                            " device")
+                requested_project = self._request_project_id()
+                if requested_project:
+                    path = urllib.parse.urlparse(self.path).path
+                    registration = bool(
+                        self.command == "POST" and re.match(
+                            r"^/v1/projects/[^/]+/agents$", path))
+                    setup_discovery = bool(
+                        self.command in ("GET", "HEAD") and re.match(
+                            r"^/v1/projects/[^/]+/"
+                            r"(?:status|agents|bridges|inbox)$", path))
+                    try:
+                        scope = auth_client_principal_scope(
+                            self._conn(), principal, requested_project,
+                            self.headers.get("X-Attacca-Actor"))
+                        principal.update(scope)
+                    except AuthorizationError as error:
+                        if not (registration or setup_discovery) \
+                                or not str(error).startswith(
+                                    "client_actor_not_registered:"):
+                            raise
+                        principal.update({
+                            "project_id": auth_client_project_access(
+                                self._conn(), principal, requested_project),
+                            "actor_id": None,
+                            "actor_type": "client",
+                            "runtime": "client",
+                            "role": "client",
+                            # A newly installed runtime must see the bounded
+                            # read-only setup context before POST /agents can
+                            # create its exact actor.  This flag never grants
+                            # MCP, sync, task, room, export, or mutation access.
+                            "client_setup_discovery": setup_discovery,
+                        })
+                return principal
             if token_kind == "actor" and self._auth_enabled():
                 raise AuthorizationError(
-                    "legacy_actor_token_disabled: enroll a human-owned terminal device")
+                    "legacy_actor_token_disabled: create a client API key")
+            if token_kind == "terminal" and self._auth_enabled():
+                raise AuthorizationError(
+                    "terminal_credential_retired: create a client API key")
             if token_kind == "terminal":
                 supplied_device = self._request_device_id()
                 expected_device = str(principal.get("device_id") or "")
@@ -9940,6 +10750,14 @@ class AttaccaHandler(BaseHTTPRequestHandler):
     def _actor(self):
         principal = getattr(self, "principal", None)
         if principal:
+            if principal.get("token_kind") == "client":
+                actor_id = principal.get("actor_id")
+                if actor_id:
+                    return actor_id, "agent"
+                # Project creation is the only client-key route that has no
+                # existing actor yet; attribute that bootstrap mutation to the
+                # immutable signed-in human and register the AI afterward.
+                return "web.%s" % principal["username"], "human"
             if principal.get("token_kind") == "terminal":
                 actor_id = principal.get("actor_id")
                 if not actor_id:
@@ -10015,6 +10833,45 @@ class AttaccaHandler(BaseHTTPRequestHandler):
             "service_route_denied: service credentials cannot access account,"
             " server, activation, or project-creation routes")
 
+    def _enforce_client_route_scope(self, http_method, path):
+        """Keep client-install keys on AI/project surfaces only."""
+        principal = getattr(self, "principal", None)
+        if not principal or principal.get("token_kind") != "client":
+            return
+        method = "GET" if http_method == "HEAD" else http_method
+        if method == "GET" and path in (
+                "/healthz", "/v1/auth/status", "/v1/projects",
+                "/v1/settings"):
+            return
+        if method == "GET" and path == "/v1/managed-law" \
+                and principal.get("actor_type") == "agent":
+            return
+        if path == "/v1/projects" and method == "POST":
+            return
+        if re.match(r"^/v1/projects/[^/]+(?:/|$)", path):
+            if path.endswith("/export"):
+                raise AuthorizationError(
+                    "client_export_denied: full export requires browser sign-in")
+            if principal.get("actor_type") == "agent":
+                return
+            if principal.get("client_setup_discovery") and method == "GET" \
+                    and re.match(
+                        r"^/v1/projects/[^/]+/"
+                        r"(?:status|agents|bridges|inbox)$", path):
+                return
+            if method == "POST" and path.endswith("/agents") \
+                    and principal.get("project_id"):
+                return
+            raise AuthorizationError(
+                "client_actor_required: project requests need one exact"
+                " registered X-Attacca-Actor")
+        if path == "/mcp" and principal.get("actor_type") == "agent":
+            return
+        raise AuthorizationError(
+            "client_key_route_denied: client keys cannot manage accounts,"
+            " API keys, invitations, authentication enforcement, or server"
+            " settings")
+
     def _enforce_terminal_route_scope(self, http_method, path):
         """Separate provisional human setup from bound AI authority."""
         principal = getattr(self, "principal", None)
@@ -10087,6 +10944,24 @@ class AttaccaHandler(BaseHTTPRequestHandler):
                 "authorized_project": None,
             }
         owner = principal["username"]
+        if principal.get("token_kind") == "client":
+            project = principal.get("project_id")
+            actor = principal.get("actor_id")
+            if not project or not actor:
+                raise AuthorizationError(
+                    "client_actor_required: MCP needs a workspace and exact"
+                    " registered actor")
+            if requested_project and requested_project != project:
+                raise AuthorizationError(
+                    "client key selected workspace '%s'" % project)
+            return {
+                "actor": actor,
+                "actor_type": "agent",
+                "owner": owner,
+                "auth_user_id": principal["user_id"],
+                "requested_project": project,
+                "authorized_project": project,
+            }
         if principal.get("token_kind") == "terminal":
             project = principal.get("project_id")
             actor = principal.get("actor_id")
@@ -10222,14 +11097,14 @@ class AttaccaHandler(BaseHTTPRequestHandler):
                                "/install.sh", "/plugin.zip",
                                "/plugin/marketplace.json",
                                "/v1/auth/status", "/v1/auth/bootstrap",
-                               "/v1/auth/login", "/v1/auth/device/start",
-                               "/v1/auth/device/poll",
+                               "/v1/auth/login",
                                "/v1/auth/invitations/accept")
                       or path.startswith("/plugin.git/"))
             if self._auth_enabled() and not public and not self.principal:
                 raise AuthenticationError(
-                    "terminal_enrollment_required: authenticated credential missing")
+                    "client_authorization_required: authenticated credential missing")
             self._enforce_service_route_scope(http_method, path)
+            self._enforce_client_route_scope(http_method, path)
             self._enforce_terminal_route_scope(http_method, path)
             self._enforce_project_route_membership(path)
             if self.principal and self.principal.get("project_id"):
@@ -10285,8 +11160,7 @@ class AttaccaHandler(BaseHTTPRequestHandler):
                 "error": message,
                 "code": code,
                 "login_required": True,
-                "device_authorization_endpoint": "/v1/auth/device/start",
-                "device_token_endpoint": "/v1/auth/device/poll",
+                "api_key_settings_uri": _base_url(self) + "/app#settings",
                 "verification_uri": _base_url(self) + "/app#settings",
             },
                              {"WWW-Authenticate": "Bearer"})
@@ -10909,13 +11783,15 @@ def _auth_status_payload(h):
         "user": None,
         "principal": None,
         "csrf_token": None,
-        "terminal_enrollment_required": bool(
-            bootstrapped and readiness["activation_requested"] and
-            not principal),
+        "api_key_required": bool(enabled and not principal),
+        "terminal_enrollment_required": False,
         "credential_policy": {
-            "terminal": "supported",
+            "client_api_key": "supported",
+            "browser_session": "supported",
+            "terminal": "retired",
             "legacy_actor": ("disabled" if enabled else "migration_only"),
             "new_actor_tokens": False,
+            "actor_bound_keys": False,
         },
     }
     if not principal:
@@ -10934,7 +11810,10 @@ def _auth_status_payload(h):
         "auth_kind", "token_kind", "token_id", "actor_id", "actor_type",
         "project_id", "runtime", "device_id", "client_label",
         "client_instance", "expires_at", "is_admin", "is_owner")}
-    if principal.get("token_kind") == "terminal":
+    if principal.get("token_kind") == "client":
+        result["principal"]["project_memberships"] = \
+            auth_token_project_bindings(h._conn(), principal["token_id"])
+    elif principal.get("token_kind") == "terminal":
         result["principal"]["bindings"] = auth_terminal_bindings(
             h._conn(), principal["token_id"])
     elif principal.get("token_kind") == "service":
@@ -11043,7 +11922,8 @@ def _r_auth_tokens_create(h, m, q):
         if h._auth_enabled() or h.server.auth_mode != "compatibility" \
                 or body.get("legacy_migration") is not True:
             raise AuthorizationError(
-                "actor_token_creation_disabled: use terminal device enrollment")
+                "actor_token_creation_disabled: create a client API key in"
+                " Attacca Settings")
     h._reply_json(201, auth_token_create(
         h._conn(), principal["username"], body.get("label"),
         actor_id=body.get("actor_id"),
@@ -11211,6 +12091,31 @@ def _r_auth_invitations(h, m, q):
                   {"Cache-Control": "no-store"})
 
 
+def _r_auth_client_keys(h, m, q):
+    principal = _require_auth_session(h)
+    h._reply_json(200, {
+        "client_keys": auth_client_key_list(h._conn(), principal)},
+        {"Cache-Control": "no-store"})
+
+
+def _r_auth_client_key_create(h, m, q):
+    principal = _require_auth_session(h)
+    body = h._body_json()
+    h._reply_json(201, auth_client_key_create(
+        h._conn(), principal, body.get("label"),
+        body.get("client_instance"),
+        memberships=body.get("project_memberships"),
+        expires_at=body.get("expires_at"),
+        device_id=body.get("device_id")), {"Cache-Control": "no-store"})
+
+
+def _r_auth_client_key_revoke(h, m, q):
+    principal = _require_auth_session(h)
+    h._reply_json(200, auth_client_key_revoke(
+        h._conn(), principal, urllib.parse.unquote(m.group(1))),
+        {"Cache-Control": "no-store"})
+
+
 def _r_auth_invitation_create(h, m, q):
     principal = _require_admin_session(h)
     body = h._body_json()
@@ -11260,8 +12165,9 @@ def _r_auth_activation(h, m, q):
     body = h._body_json()
     result = auth_activate(
         h._conn(), principal, body.get("confirmed"),
-        body.get("expected_readiness_version"), server=h.server)
-    h.server.auth_requested = True
+        body.get("expected_readiness_version"), server=h.server,
+        enabled=body.get("enabled", True))
+    h.server.auth_requested = bool(result["activated"])
     h._reply_json(200, result, {"Cache-Control": "no-store"})
 
 
@@ -11279,6 +12185,9 @@ def _r_projects_create(h, m, q):
     actor, atype = h._actor()
     body = h._body_json()
     principal = getattr(h, "principal", None)
+    account_creation = bool(principal and (
+        principal.get("actor_type") == "human" or
+        principal.get("token_kind") == "client"))
     if principal and principal.get("project_id") \
             and body.get("project_id") != principal["project_id"]:
         raise AuthorizationError(
@@ -11291,14 +12200,14 @@ def _r_projects_create(h, m, q):
         h._conn(), _validated_repository_fingerprint(
             body.get("repository_fingerprint")))
     preexisting_target = explicit if explicit in known_projects else matched
-    if principal and principal.get("actor_type") == "human" \
+    if account_creation \
             and preexisting_target \
             and not auth_has_project_membership(
                 h._conn(), principal, preexisting_target):
         raise AuthorizationError(
             "project_membership_required: existing workspace access denied")
     result = _api_project_init(h._conn(), actor, atype, body)
-    if principal and principal.get("actor_type") == "human":
+    if account_creation:
         has_access = auth_has_project_membership(
             h._conn(), principal, result["project_id"])
         if result.get("already_existed") and not has_access:
@@ -11331,10 +12240,10 @@ def _settings_payload(h):
         "authentication": h._auth_enabled(),
         "auth_bootstrapped": auth_is_enabled(h._conn()),
         "installer": "curl -fsSL %s/install.sh | sh" % base,
-        "terminal_authorization": {
-            "device_authorization_endpoint": "/v1/auth/device/start",
-            "device_token_endpoint": "/v1/auth/device/poll",
-            "verification_uri": base + "/app#settings",
+        "client_authorization": {
+            "api_keys_endpoint": "/v1/auth/client-keys",
+            "sign_in_uri": base + "/app#settings",
+            "credential_model": "browser-session-or-client-api-key",
         },
     }
 
@@ -11469,7 +12378,7 @@ def _sync_route_scope(h, project_id):
     if not getattr(h, "principal", None) \
             and not h._compatibility_active():
         raise AuthenticationError(
-            "terminal_enrollment_required: authenticated sync principal missing")
+            "client_authorization_required: authenticated sync principal missing")
     if not h._conn().execute(
             "SELECT 1 FROM projects WHERE project_id=?", (project_id,)).fetchone():
         h._reply_json(404, {
@@ -11491,7 +12400,11 @@ def _r_sync_snapshot(h, m, q):
         return
     protocol, server = _sync_runtime()
     try:
-        result = _sync_engine(h, scope).snapshot(scope)
+        capabilities = protocol.projection_capabilities_from_query(
+            q.get("projection_schema_version"),
+            q.get("projection_resources"))
+        result = _sync_engine(h, scope).snapshot(
+            scope, projection_capabilities=capabilities)
         protocol.validate_snapshot(result, expected_scope=scope)
     except protocol.SyncProtocolError as error:
         _sync_protocol_error(h, error)
@@ -11524,7 +12437,11 @@ def _r_sync_pull(h, m, q):
                 int(q["context_version"])),
             q["visibility_fingerprint"],
             limit=int(q.get("limit") or 200))
-        result = _sync_engine(h, scope).pull(scope, request)
+        capabilities = protocol.projection_capabilities_from_query(
+            q.get("projection_schema_version"),
+            q.get("projection_resources"))
+        result = _sync_engine(h, scope).pull(
+            scope, request, projection_capabilities=capabilities)
         protocol.validate_pull_result(result)
     except protocol.SyncProtocolError as error:
         _sync_protocol_error(h, error)
@@ -11561,7 +12478,11 @@ def _r_sync_push(h, m, q):
             raise protocol.SyncProtocolError(
                 "cross_device_push",
                 "push device_id differs from the authenticated request device")
-        result = _sync_engine(h, scope).push(scope, envelope)
+        capabilities = protocol.projection_capabilities_from_query(
+            q.get("projection_schema_version"),
+            q.get("projection_resources"))
+        result = _sync_engine(h, scope).push(
+            scope, envelope, projection_capabilities=capabilities)
         protocol.validate_push_result(result, expected_scope=scope)
     except protocol.SyncProtocolError as error:
         _sync_protocol_error(h, error)
@@ -11664,6 +12585,11 @@ def _r_inbox_get(h, m, q):
     mark_read = str(q.get("mark_read", "1")).lower() not in (
         "0", "false", "no")
     principal = getattr(h, "principal", None)
+    if principal and principal.get("client_setup_discovery"):
+        # Setup discovery is deliberately read-only even if a caller omits
+        # mark_read=0.  The actor does not exist yet, so it cannot own a
+        # durable inbox cursor or disposition.
+        mark_read = False
     if principal and principal.get("token_kind") == "service" \
             and atype == "service":
         # An unbound service credential is a read-only integration.  Reading
@@ -11675,6 +12601,15 @@ def _r_inbox_get(h, m, q):
     h._reply_json(200, inbox_read(
         h._conn(), m.group(1), actor, mark_read=mark_read,
         limit=int(q.get("limit") or 50), actor_type=atype))
+
+
+def _r_message_dispose(h, m, q):
+    actor, atype = h._actor()
+    body = h._body_json()
+    h._reply_json(200, message_dispose(
+        h._conn(), m.group(1), actor, atype, body.get("event_id"),
+        body.get("disposition"), note=body.get("note"),
+        task_id=body.get("task_id")))
 
 
 def _r_handoff_set(h, m, q):
@@ -11969,23 +12904,29 @@ def _r_agent_register(h, m, q):
     body = h._body_json()
     principal = getattr(h, "principal", None)
     project_id = m.group(1)
-    if principal and principal.get("auth_kind") == "session" \
+    if principal and (principal.get("auth_kind") == "session" or
+                      principal.get("token_kind") == "client") \
             and not auth_has_project_membership(
                 h._conn(), principal, project_id):
         raise AuthorizationError(
             "project_membership_required: actor registration access denied")
+    registration_username = principal.get("username") if principal else None
+    authorized_owner_labels = auth_principal_owner_labels(
+        h._conn(), principal) if principal and principal.get("user_id") else []
     result = agent_register(
         h._conn(), m.group(1), actor, atype, agent_id=body.get("agent_id"),
         display_name=body.get("display_name"), role=body.get("role"),
         runtime=body.get("runtime"),
         canonical_identity=(atype == "agent" or
+                            bool(principal and
+                                 principal.get("token_kind") == "client") or
                             (atype == "human" and
                              body.get("canonical_identity") is True)),
-        registration_username=(principal.get("username")
-                               if principal else None),
+        registration_username=registration_username,
         allow_foreign_owner=bool(
             principal and principal.get("auth_kind") == "session"
-            and principal.get("is_admin")))
+            and principal.get("is_admin")),
+        authorized_owner_labels=authorized_owner_labels)
     h._reply_json(200, result)
 
 
@@ -12026,22 +12967,11 @@ ROUTES = [
     (*_route_def("POST", "/v1/auth/login"), _r_auth_login),
     (*_route_def("POST", "/v1/auth/logout"), _r_auth_logout),
     (*_route_def("GET", "/v1/auth/access"), _r_auth_access),
-    (*_route_def("POST", "/v1/auth/device/start"), _r_auth_device_start),
-    (*_route_def("POST", "/v1/auth/device/poll"), _r_auth_device_poll),
-    (*_route_def("GET", "/v1/auth/terminal-enrollments"),
-     _r_auth_terminal_enrollments),
-    (*_route_def("GET", "/v1/auth/terminal-enrollments/%s" % _PID),
-     _r_auth_terminal_enrollment_get),
-    (*_route_def("POST", "/v1/auth/terminal-enrollments"),
-     _r_auth_terminal_enrollment_start),
-    (*_route_def("POST", "/v1/auth/terminal-enrollments/%s/approve" % _PID),
-     _r_auth_terminal_enrollment_approve),
-    (*_route_def("POST", "/v1/auth/terminal-enrollments/%s/deny" % _PID),
-     _r_auth_terminal_enrollment_deny),
-    (*_route_def("DELETE", "/v1/auth/terminals/%s" % _PID),
-     _r_auth_terminal_revoke),
-    (*_route_def("POST", "/v1/auth/terminals/%s/bindings" % _PID),
-     _r_auth_terminal_add_binding),
+    (*_route_def("GET", "/v1/auth/client-keys"), _r_auth_client_keys),
+    (*_route_def("POST", "/v1/auth/client-keys"),
+     _r_auth_client_key_create),
+    (*_route_def("DELETE", "/v1/auth/client-keys/%s" % _PID),
+     _r_auth_client_key_revoke),
     (*_route_def("GET", "/v1/auth/service-keys"), _r_auth_service_keys),
     (*_route_def("POST", "/v1/auth/service-keys"),
      _r_auth_service_key_create),
@@ -12054,8 +12984,6 @@ ROUTES = [
      _r_auth_invitation_revoke),
     (*_route_def("POST", "/v1/auth/invitations/accept"),
      _r_auth_invitation_accept),
-    (*_route_def("POST", "/v1/auth/migration-scope"),
-     _r_auth_migration_scope),
     (*_route_def("POST", "/v1/auth/activation"), _r_auth_activation),
     (*_route_def("GET", "/v1/auth/tokens"), _r_auth_tokens_list),
     (*_route_def("POST", "/v1/auth/tokens"), _r_auth_tokens_create),
@@ -12072,6 +13000,8 @@ ROUTES = [
     (*_route_def("GET", "/v1/projects/%s/sync/pull" % _PID), _r_sync_pull),
     (*_route_def("POST", "/v1/projects/%s/sync/push" % _PID), _r_sync_push),
     (*_route_def("GET", "/v1/projects/%s/inbox" % _PID), _r_inbox_get),
+    (*_route_def("POST", "/v1/projects/%s/inbox/dispositions" % _PID),
+     _r_message_dispose),
     (*_route_def("PUT", "/v1/projects/%s/lead" % _PID), _r_lead_set),
     (*_route_def("GET", "/v1/projects/%s/bridges" % _PID), _r_bridges_list),
     (*_route_def("POST", "/v1/projects/%s/bridges" % _PID), _r_bridges_add),
@@ -12173,6 +13103,7 @@ OFFLINE_PROXY_READ_TOOLS = {
 }
 OFFLINE_PROXY_WRITE_OPERATIONS = {
     "room_send": "room.send",
+    "message_dispose": "message.dispose",
     "task_create": "task.create",
     "task_claim": "task.claim",
     "task_report": "task.report",
@@ -12324,14 +13255,12 @@ def _offline_proxy_latch_auth_required(url, project_id, root, actor_hint,
                 "connection_error"}]
         pending.append({
             "fingerprint": fingerprint, "created_at": now_iso(),
-            "kind": "terminal_enrollment_required",
+            "kind": "authentication_required",
             "summary": (
-                "terminal_enrollment_required workspace=%s http_status=%s "
-                "device_authorization_endpoint=%s/v1/auth/device/start "
-                "device_token_endpoint=%s/v1/auth/device/poll "
-                "verification_uri=%s/app#settings offline_access=blocked" % (
-                    project_id, int(http_status), str(url).rstrip("/"),
-                    str(url).rstrip("/"), str(url).rstrip("/"))),
+                "client_authorization_required workspace=%s http_status=%s "
+                "api_key_settings_uri=%s/app#settings "
+                "offline_access=blocked_until_identity_is_verified" % (
+                    project_id, int(http_status), str(url).rstrip("/"))),
         })
         current["pending"] = pending[-100:]
         _atomic_switch_write(
@@ -12354,11 +13283,8 @@ def _offline_proxy_adapter(url, project_id, root, actor_hint, runtime,
             url, project_id, root, actor_hint, runtime, device_id)
     if entry.get("auth_required"):
         raise AttaccaError(
-            "terminal_enrollment_required: cached mirror access is blocked; "
-            "device_authorization_endpoint=%s/v1/auth/device/start; "
-            "device_token_endpoint=%s/v1/auth/device/poll; "
-            "verification_uri=%s/app#settings" % (
-                normalized_url, normalized_url, normalized_url))
+            "client_authorization_required: cached mirror access is blocked; "
+            "api_key_settings_uri=%s/app#settings" % normalized_url)
     required = {
         "key", "plugin_root", "canonical_actor_id", "actor_role",
         "sync_scope", "sync_visibility_fingerprint", "sync_schema_version",
@@ -12663,6 +13589,63 @@ class OfflineProxySession:
             })
             return message
 
+        def cached_pending_dispositions(limit=100):
+            """Project cursor-independent assignment state plus local writes."""
+            limit = max(1, min(int(limit or 100), 500))
+            dispositions = {
+                item.get("message_event_id"): dict(item)
+                for item in projection.get("message_dispositions") or []
+                if item.get("message_event_id")
+            }
+            # A disposition queued during the outage is authoritative for this
+            # exact local identity view, but remains visibly pending_sync until
+            # the hosted ledger accepts it.
+            for overlay in adapter.pending_overlays("message_dispositions"):
+                if overlay.get("operation") != "message.dispose":
+                    continue
+                payload = overlay.get("payload") or {}
+                event_id = payload.get("event_id")
+                if not event_id:
+                    continue
+                dispositions[event_id] = {
+                    "project_id": project_id,
+                    "actor_id": scope["actor_id"],
+                    "message_event_id": event_id,
+                    "disposition": payload.get("disposition"),
+                    "note": payload.get("note"),
+                    "task_id": payload.get("task_id"),
+                    "updated_by": scope["actor_id"],
+                    "updated_owner": scope["principal_id"],
+                    "pending_sync": True,
+                    "local_only": True,
+                    "client_mutation_id": overlay.get(
+                        "client_mutation_id"),
+                    "sync_state": overlay.get("sync_state"),
+                }
+            pending = []
+            for item in cached_room:
+                sender = item.get("actor") or item.get("actor_id")
+                if sender in aliases:
+                    continue
+                message = classify_room(item)
+                requires = bool(message.get("directed_to_you") or (
+                    message.get("broadcast_to_everyone") and
+                    message.get("msg_type") == "directive"))
+                if not requires:
+                    continue
+                disposition = dispositions.get(message.get("event_id"))
+                if disposition and disposition.get("disposition") not in \
+                        UNRESOLVED_MESSAGE_DISPOSITIONS:
+                    continue
+                message["requires_disposition"] = True
+                message["disposition"] = disposition
+                pending.append(message)
+            return {
+                "pending": pending[:limit],
+                "pending_total": len(pending),
+                "may_have_more": len(pending) > limit,
+            }
+
         def cached_inbox(mark_read=True, limit=50):
             limit = max(1, min(int(limit or 50), 500))
             cursor_row = projection.get("inbox_cursor") or {}
@@ -12697,6 +13680,7 @@ class OfflineProxySession:
                 bool(item.get("broadcast_to_everyone")) for item in page)
             group_count = sum(
                 bool(item.get("group_context")) for item in page)
+            disposition_state = cached_pending_dispositions(limit=limit)
             return {
                 "project": project_id, "actor": scope["actor_id"],
                 "messages": page, "messages_include_all_visible": True,
@@ -12711,6 +13695,11 @@ class OfflineProxySession:
                 "scanned_through_seq": scanned_through,
                 "hosted_read_cursor": hosted_cursor,
                 "offline_mark_read_deferred": bool(mark_read),
+                "pending_dispositions": disposition_state["pending"],
+                "pending_disposition_total":
+                    disposition_state["pending_total"],
+                "pending_disposition_may_have_more":
+                    disposition_state["may_have_more"],
                 "hint": ("cached group inbox page; call check_inbox again "
                          "while may_have_more is true. This process remembers "
                          "the page locally, but the hosted cursor advances "
@@ -12790,6 +13779,12 @@ class OfflineProxySession:
                     "unread_group_context": peek["unread_group_context"],
                     "may_have_more": peek["may_have_more"],
                     "messages_include_all_visible": True,
+                    "pending_dispositions": peek[
+                        "pending_dispositions"],
+                    "pending_disposition_total": peek[
+                        "pending_disposition_total"],
+                    "pending_disposition_may_have_more": peek[
+                        "pending_disposition_may_have_more"],
                     "hint": ("read every message with check_inbox; mentions/"
                              "replies assign attention, not visibility"),
                 }, "bridges": bridges,
@@ -14145,7 +15140,8 @@ def machine_server_set(server_url, home=None, validate=True, probe=None):
                     for line in original.splitlines())
                 if codex_present:
                     repaired = repair.replace_attacca_tables(
-                        original, codex_connect_toml(server_url))
+                        original, codex_connect_toml(
+                            server_url, home=resolved_home))
                     repair.validate_repaired_toml(repaired)
             except repair.CodexConfigRepairError as error:
                 raise AttaccaError(
@@ -14418,15 +15414,146 @@ def _resume_provisional_setup_terminal(url, terminal_flow, device_id,
     }
 
 
+def _ensure_client_setup_auth(url, actor_id, interactive=False,
+                              paste_token=False):
+    """D-17 integrated setup authorization for one installed client."""
+    server_url = configured_server_url(url)
+    anonymous = remote_json(
+        server_url, "GET", "/v1/auth/status", actor=actor_id,
+        actor_type="agent", use_auth=False)
+    if anonymous.get("bootstrap_required"):
+        raise AuthenticationError(
+            "account_bootstrap_required: open %s/app#settings" % server_url)
+    try:
+        link = find_project_link(Path(os.getcwd()).resolve())
+    except Exception:
+        link = None
+    project_id = (link or {}).get("project_id")
+    runtime = normalize_agent_runtime(actor=actor_id)
+    client_instance = load_client_instance_id(runtime)
+    flow = _terminal_flow_runtime()
+    # Native MCP configs may inject the already-issued install key through
+    # ATTACCA_API_TOKEN instead of the private registry.  Treat that exact
+    # process-local secret as a first-class hot-load source; verify the signed
+    # client instance with the server before setup uses it and never copy the
+    # value into another file or response.
+    environment_token = str(os.environ.get(ENV_API_TOKEN) or "").strip()
+    if environment_token:
+        try:
+            checked = remote_json(
+                server_url, "GET", "/v1/auth/status", actor=actor_id,
+                actor_type="agent", bearer_token=environment_token,
+                project_id=project_id)
+        except AttaccaError:
+            checked = {}
+        principal = checked.get("principal") or {}
+        if checked.get("authenticated") \
+                and principal.get("token_kind") == "client" \
+                and principal.get("client_instance") == client_instance:
+            _remote_setup_auth.context = {
+                "server_url": server_url,
+                "kind": "token",
+                "bearer_token": environment_token,
+                "token_kind": "client",
+                "token_id": principal.get("token_id"),
+                "client_instance": client_instance,
+            }
+            return {
+                "required": bool(anonymous.get("authentication_required")),
+                "authenticated": True,
+                "kind": "client_api_key",
+                "token_kind": "client",
+                "client_instance": client_instance,
+                "username": (checked.get("user") or {}).get("username"),
+                "hot_reload": True,
+                "credential_source": "environment",
+            }
+    local = flow.client_api_key_status(
+        server_url, client_instance=client_instance, runtime=runtime,
+        project_id=project_id, credentials_path=CREDENTIALS_FILE)
+    if local.get("authorized"):
+        token = flow.load_client_api_key(
+            server_url, client_instance=client_instance, runtime=runtime,
+            project_id=project_id, credentials_path=CREDENTIALS_FILE)
+        try:
+            checked = remote_json(
+                server_url, "GET", "/v1/auth/status", actor=actor_id,
+                actor_type="agent", bearer_token=token,
+                project_id=project_id)
+        except AttaccaError:
+            checked = {}
+        principal = checked.get("principal") or {}
+        if checked.get("authenticated") \
+                and principal.get("token_kind") == "client" \
+                and principal.get("client_instance") == client_instance:
+            _remote_setup_auth.context = {
+                "server_url": server_url,
+                "kind": "token",
+                "bearer_token": token,
+                "token_kind": "client",
+                "token_id": principal.get("token_id"),
+                "client_instance": client_instance,
+            }
+            return {
+                "required": bool(anonymous.get("authentication_required")),
+                "authenticated": True,
+                "kind": "client_api_key",
+                "token_kind": "client",
+                "client_instance": client_instance,
+                "username": (checked.get("user") or {}).get("username"),
+                "hot_reload": True,
+                "credentials_file": str(CREDENTIALS_FILE),
+            }
+    if not anonymous.get("authentication_required") and not (
+            interactive or paste_token):
+        return {"required": False, "authenticated": False,
+                "client_instance": client_instance, "hot_reload": True}
+    try:
+        result = flow.authorize_client(
+            server_url, client_instance=client_instance, runtime=runtime,
+            project_id=project_id,
+            actor_id=actor_id if project_id else None,
+            device_id=load_device_id(),
+            credentials_path=CREDENTIALS_FILE,
+            open_browser=True, prompt=True)
+    except flow.TerminalFlowError as error:
+        raise AuthenticationError(
+            "client_authorization_required: open %s" %
+            flow.client_key_settings_url(server_url, client_instance)) \
+            from error
+    if not result.get("authorized"):
+        raise AuthenticationError(
+            "client_authorization_required: open %s; the active AI will"
+            " collect the key in a hidden terminal prompt" %
+            result.get("authorization_url"))
+    # The credential was server-verified before it was atomically persisted;
+    # load it immediately so the same setup process continues without restart.
+    token = flow.load_client_api_key(
+        server_url, client_instance=client_instance, runtime=runtime,
+        project_id=project_id, credentials_path=CREDENTIALS_FILE)
+    _remote_setup_auth.context = {
+        "server_url": server_url, "kind": "token",
+        "bearer_token": token, "token_kind": "client",
+        "token_id": result.get("token_id"),
+        "client_instance": client_instance,
+    }
+    return dict(result, required=True, authenticated=True,
+                kind="client_api_key", token_kind="client",
+                credentials_file=str(CREDENTIALS_FILE))
+
+
 def ensure_remote_setup_auth(url, actor_id, interactive=False, ask=None,
                              login_username=None, paste_token=False):
-    """Ensure setup has a human-owned terminal/device credential.
+    """Authorize this installed client with a browser-created API key.
 
-    Account passwords and actor-bound tokens are no longer the agent setup
-    path.  The caller starts or advances the bundled browser device flow; the
-    only manual fallback reads a terminal credential from a real controlling
-    TTY and verifies it before private storage.
+    The active AI opens Settings and collects the one-time plaintext through a
+    hidden controlling-terminal prompt. The key authenticates the installation;
+    exact project/actor selection remains separate on every request.
     """
+    return _ensure_client_setup_auth(
+        url, actor_id, interactive=interactive,
+        paste_token=bool(paste_token or login_username))
+
     server_url = configured_server_url(url)
     anonymous = remote_json(
         server_url, "GET", "/v1/auth/status", actor=actor_id,
@@ -14579,8 +15706,74 @@ def provision_setup_agent_token(url, project_id, actor_id):
     actor_id = str(actor_id or "").strip()
     if not project_id or not actor_id:
         raise AttaccaError(
-            "terminal_binding_required: project_id and actor_id are required")
+            "client_actor_required: project_id and actor_id are required")
     runtime = normalize_agent_runtime(actor=actor_id)
+    flow = _terminal_flow_runtime()
+    client_instance = load_client_instance_id(runtime)
+    active = _remote_setup_session(url) or {}
+    if active.get("kind") == "token" \
+            and active.get("token_kind") == "client" \
+            and active.get("client_instance") == client_instance:
+        # Discovery/apply may already be authenticated from an injected
+        # process-local key. Re-verify the now-registered exact actor and keep
+        # using that same installation credential; do not force a second
+        # browser prompt or silently duplicate an environment secret into the
+        # private registry.
+        encoded = urllib.parse.quote(project_id, safe="")
+        checked = remote_json(
+            configured_server_url(url), "GET",
+            "/v1/projects/%s/agents" % encoded,
+            actor=actor_id, actor_type="agent",
+            bearer_token=active.get("bearer_token"),
+            project_id=project_id)
+        if any(item.get("agent_id") == actor_id
+               for item in (checked.get("agents") or [])):
+            return {
+                "created": False,
+                "credential_kind": "client",
+                "status": "ready",
+                "actor_id": actor_id,
+                "project_id": project_id,
+                "runtime": runtime,
+                "client_instance": client_instance,
+                "credential_saved": False,
+                "credential_source": "active_process",
+                "hot_reload": True,
+            }
+    status = flow.client_api_key_status(
+        configured_server_url(url), client_instance=client_instance,
+        runtime=runtime, project_id=project_id,
+        credentials_path=CREDENTIALS_FILE)
+    if not status.get("authorized"):
+        try:
+            status = flow.authorize_client(
+                configured_server_url(url), client_instance=client_instance,
+                runtime=runtime, project_id=project_id, actor_id=actor_id,
+                device_id=load_device_id(),
+                credentials_path=CREDENTIALS_FILE,
+                open_browser=True, prompt=True)
+        except flow.TerminalFlowError as error:
+            raise AuthenticationError(
+                "client_authorization_required: open %s" %
+                flow.client_key_settings_url(
+                    configured_server_url(url), client_instance)) from error
+    if not status.get("authorized"):
+        raise AuthenticationError(
+            "client_authorization_required: open %s" %
+            status.get("authorization_url"))
+    return {
+        "created": False,
+        "credential_kind": "client",
+        "status": "ready",
+        "actor_id": actor_id,
+        "project_id": project_id,
+        "runtime": runtime,
+        "client_instance": client_instance,
+        "credential_saved": True,
+        "hot_reload": True,
+        "credentials_file": str(CREDENTIALS_FILE),
+    }
+
     terminal_flow = _terminal_flow_runtime()
     device_id = load_device_id()
     state_path = CREDENTIALS_FILE.with_name("terminal-flow.json")
@@ -14644,30 +15837,42 @@ def provision_setup_agent_token(url, project_id, actor_id):
             _remote_setup_auth.context = None
 
 
-def mcp_server_config(actor, project_id, db_path):
+def _client_instance_for_runtime(runtime, home=None):
+    flow = _terminal_flow_runtime()
+    path = flow.default_client_instance_path(home=home, runtime=runtime)
+    return flow.load_client_instance_id(storage_path=path, runtime=runtime)
+
+
+def mcp_server_config(actor, project_id, db_path, home=None):
     """Stdio (direct-DB) MCP config: the tool spawns a local shim."""
     # Always pin the DB path: the config already pins the absolute script
     # path, and the server may be spawned from any cwd/env.
-    env = {ENV_ACTOR: actor, ENV_DB: str(db_path)}
+    env = {ENV_ACTOR: actor, ENV_DB: str(db_path),
+           ENV_CLIENT_INSTANCE: _client_instance_for_runtime(actor, home)}
     if project_id:
         env[ENV_PROJECT] = project_id
     return {"command": "python3", "args": [script_path(), "mcp"], "env": env}
 
 
-def mcp_http_config(actor, project_id, url):
+def mcp_http_config(actor, project_id, url, home=None):
     """HTTP MCP config: the tool is a thin client of the hosted server."""
-    headers = {"X-Attacca-Actor": actor}
+    headers = {"X-Attacca-Actor": actor,
+               CLIENT_INSTANCE_HEADER:
+                   _client_instance_for_runtime(actor, home)}
     if project_id:
         headers["X-Attacca-Project"] = project_id
     return {"type": "http", "url": url.rstrip("/") + "/mcp", "headers": headers}
 
 
-def mcp_connect_config(actor, url):
+def mcp_connect_config(actor, url, home=None):
     """Stdio-shaped config that is still a pure server client: the tool
     spawns `attacca.py connect`, which forwards to the server and resolves a
     confirmed checkout link or matching Git remote."""
     return {"command": "python3", "args": [script_path(), "connect"],
-            "env": {ENV_ACTOR: actor, "ATTACCA_URL": url.rstrip("/")}}
+            "env": {
+                ENV_ACTOR: actor,
+                ENV_CLIENT_INSTANCE: _client_instance_for_runtime(actor, home),
+                "ATTACCA_URL": url.rstrip("/")}}
 
 
 def codex_http_toml(project_id, url):
@@ -14681,21 +15886,25 @@ def codex_http_toml(project_id, url):
     ])
 
 
-def codex_connect_toml(url):
+def codex_connect_toml(url, home=None):
     """Global Codex config: connect proxy, project resolved per checkout.
     Works on every Codex version (plain stdio server from Codex's view)."""
     return "\n".join([
         "[mcp_servers.attacca]",
         'command = "python3"',
         'args = ["%s", "connect"]' % script_path(),
-        'env = { "%s" = "codex", "ATTACCA_URL" = "%s" }'
-        % (ENV_ACTOR, url.rstrip("/")),
+        'env = { "%s" = "codex", "%s" = "%s", "ATTACCA_URL" = "%s" }'
+        % (ENV_ACTOR, ENV_CLIENT_INSTANCE,
+           _client_instance_for_runtime("codex", home), url.rstrip("/")),
     ])
 
 
-def codex_stdio_toml(project_id, db_path):
+def codex_stdio_toml(project_id, db_path, home=None):
     path = script_path()
     env_pairs = ['"%s" = "codex"' % ENV_ACTOR,
+                 '"%s" = "%s"' % (
+                     ENV_CLIENT_INSTANCE,
+                     _client_instance_for_runtime("codex", home)),
                  '"%s" = "%s"' % (ENV_DB, db_path)]
     if project_id:
         env_pairs.append('"%s" = "%s"' % (ENV_PROJECT, project_id))
@@ -15134,8 +16343,8 @@ def configure_codex(project_id, url, db_path, stdio=False, home=None):
     """
     codex_dir = codex_config_dir(home)
     codex_dir.mkdir(parents=True, exist_ok=True)
-    block = codex_stdio_toml(project_id, db_path) if stdio \
-        else codex_connect_toml(url)
+    block = codex_stdio_toml(project_id, db_path, home=home) if stdio \
+        else codex_connect_toml(url, home=home)
     target = codex_dir / "config.toml"
     repair = _codex_config_repair_module()
     try:
@@ -15170,8 +16379,10 @@ def _merge_json_config(path, top_key, entry_name, value, backup=True):
     return str(path)
 
 
-def _http_headers(actor, project_id):
-    headers = {"X-Attacca-Actor": actor}
+def _http_headers(actor, project_id, home=None):
+    headers = {"X-Attacca-Actor": actor,
+               CLIENT_INSTANCE_HEADER:
+                   _client_instance_for_runtime(actor, home)}
     if project_id:
         headers["X-Attacca-Project"] = project_id
     return headers
@@ -15193,7 +16404,7 @@ def connect_tools(project_id, root, db_path, url=DEFAULT_URL, stdio=False,
     configured, missing = [], []
 
     def stdio_cfg(actor):
-        return mcp_server_config(actor, project_id, db_path)
+        return mcp_server_config(actor, project_id, db_path, home=home)
 
     def record(tool, path):
         configured.append({"tool": tool, "path": path})
@@ -15220,7 +16431,7 @@ def connect_tools(project_id, root, db_path, url=DEFAULT_URL, stdio=False,
         if hit:
             # stdio-shaped but still a server client (connect proxy)
             value = stdio_cfg("cline") if stdio \
-                else mcp_connect_config("cline", url)
+                else mcp_connect_config("cline", url, home=home)
             record("cline", _merge_json_config(hit, "mcpServers", "attacca",
                                                value))
         else:
@@ -15231,7 +16442,7 @@ def connect_tools(project_id, root, db_path, url=DEFAULT_URL, stdio=False,
             # ~/.cursor/mcp.json is global: use the connect proxy so the
             # project is auto-detected per working directory.
             value = stdio_cfg("cursor") if stdio \
-                else mcp_connect_config("cursor", url)
+                else mcp_connect_config("cursor", url, home=home)
             record("cursor", _merge_json_config(home / ".cursor" / "mcp.json",
                                                 "mcpServers", "attacca", value))
         else:
@@ -15241,7 +16452,7 @@ def connect_tools(project_id, root, db_path, url=DEFAULT_URL, stdio=False,
         windsurf_dir = home / ".codeium" / "windsurf"
         if windsurf_dir.is_dir():
             value = stdio_cfg("windsurf") if stdio \
-                else mcp_connect_config("windsurf", url)
+                else mcp_connect_config("windsurf", url, home=home)
             record("windsurf", _merge_json_config(
                 windsurf_dir / "mcp_config.json", "mcpServers", "attacca",
                 value))
@@ -15253,7 +16464,7 @@ def connect_tools(project_id, root, db_path, url=DEFAULT_URL, stdio=False,
             # ~/.kimi-code/mcp.json is user-level (every project): use the
             # connect proxy so the project is auto-detected per directory.
             value = stdio_cfg("kimi") if stdio \
-                else mcp_connect_config("kimi", url)
+                else mcp_connect_config("kimi", url, home=home)
             record("kimi", _merge_json_config(home / ".kimi-code" / "mcp.json",
                                               "mcpServers", "attacca", value))
         else:
@@ -15263,7 +16474,7 @@ def connect_tools(project_id, root, db_path, url=DEFAULT_URL, stdio=False,
         if (home / ".gemini").is_dir() and root:
             value = stdio_cfg("gemini") if stdio else \
                 {"httpUrl": mcp_url,
-                 "headers": _http_headers("gemini", project_id)}
+                 "headers": _http_headers("gemini", project_id, home=home)}
             record("gemini", _merge_json_config(
                 Path(root) / ".gemini" / "settings.json", "mcpServers",
                 "attacca", value, backup=False))
@@ -15275,7 +16486,8 @@ def connect_tools(project_id, root, db_path, url=DEFAULT_URL, stdio=False,
                      or (Path(root) / ".vscode").is_dir()):
             value = {"type": "stdio", **stdio_cfg("vscode")} if stdio \
                 else {"type": "http", "url": mcp_url,
-                      "headers": _http_headers("vscode", project_id)}
+                      "headers": _http_headers(
+                          "vscode", project_id, home=home)}
             record("vscode", _merge_json_config(
                 Path(root) / ".vscode" / "mcp.json", "servers", "attacca",
                 value, backup=False))
@@ -15292,7 +16504,8 @@ def connect_tools(project_id, root, db_path, url=DEFAULT_URL, stdio=False,
                          "environment": cfg["env"]}
             else:
                 value = {"type": "remote", "url": mcp_url,
-                         "headers": _http_headers("opencode", project_id)}
+                         "headers": _http_headers(
+                             "opencode", project_id, home=home)}
             record("opencode", _merge_json_config(
                 Path(root) / "opencode.json", "mcp", "attacca", value,
                 backup=False))
@@ -15374,8 +16587,9 @@ def _configure_checkout(project_id, root, db_path, url, stdio,
         mcp_json = None
         claude_connection = "native_plugin"
     else:
-        config = mcp_server_config("claude", project_id, db_path) \
-            if stdio else mcp_http_config("claude", project_id, url)
+        config = mcp_server_config(
+            "claude", project_id, db_path, home=home) if stdio else \
+            mcp_http_config("claude", project_id, url, home=home)
         mcp_json = write_mcp_json_file(root, config)
         claude_connection = "project_mcp"
     configured, not_detected = ([], [])
@@ -16041,6 +17255,11 @@ def managed_instruction_block(project_id, db_path):
     lines.append("   mentions and no reply target is sent to everyone. Consider relevant design,")
     lines.append("   requirement, and project-context changes even when you are not assigned to")
     lines.append("   act on them. Continue draining `check_inbox` while `may_have_more` is true.")
+    lines.append("   The lifecycle watcher, not the human, owns routine checking: never ask the")
+    lines.append("   user to type 'check messages'. Addressed messages and broadcast directives")
+    lines.append("   remain pending even after their read cursor advances; before yielding, call")
+    lines.append("   `message_dispose` with acknowledged/claimed/deferred/blocked/completed/")
+    lines.append("   not_actionable. A claimed/completed disposition must link the matching task.")
     lines.append("   Never choose, open, or ask about another Attacca database/store. Do not")
     lines.append("   rely on prior chat memory or re-discover the repo from scratch. Inbox items")
     lines.append("   tagged [MASTER-DIRECTIVE] come from a project that rules this one —")
@@ -16915,10 +18134,14 @@ def poll_status(conn, project_id, actor_id=None, actor_type="agent",
             "unread_everyone": peek.get("unread_everyone", 0),
             "unread_group_context": peek.get("unread_group_context", 0),
             "unread_broadcasts": peek.get("unread_broadcasts", 0),
+            "pending_disposition_total": peek.get(
+                "pending_disposition_total", 0),
+            "pending_dispositions": peek.get("pending_dispositions", []),
             "may_have_more": bool(peek.get("may_have_more")),
             "messages_include_all_visible": True,
             "has_new_mail": bool(peek.get("unread_total") or
-                                 peek.get("may_have_more")),
+                                 peek.get("may_have_more") or
+                                 peek.get("pending_disposition_total")),
         }
     head = conn.execute(
         "SELECT MAX(seq) AS s FROM events WHERE project_id=?",
@@ -16926,6 +18149,8 @@ def poll_status(conn, project_id, actor_id=None, actor_type="agent",
     return {"project": project_id,
             "context_version": project["context_version"],
             "update": update, "mail": mail,
+            "workflow_warnings": workflow_warnings(
+                conn, project_id, actor_id, actor_type),
             "cursor": {"event_seq": (head["s"] if head else 0) or 0}}
 
 
@@ -17249,11 +18474,9 @@ def build_parser():
     p.add_argument("-i", "--interactive", action="store_true",
                    help="show a numbered workspace picker and tool choices")
     p.add_argument("--login", metavar="USERNAME", default=None,
-                   help="start browser/device authorization for hosted setup; "
-                        "the legacy username value is not sent or stored")
+                   help=argparse.SUPPRESS)
     p.add_argument("--paste-token", action="store_true",
-                   help="read and verify a terminal credential from the real "
-                        "controlling TTY (never argv, hook stdin, or chat)")
+                   help=argparse.SUPPRESS)
     p.add_argument("--owner", default=None,
                    help="your name for attribution — every ledger event and "
                         "agent is tagged separately; it is never prefixed to "
@@ -18117,15 +19340,17 @@ def cli_main(argv=None):
                           network_result["actions"]) or "already configured"))
         if credential_result and credential_result.get("status") in (
                 "ready", "approved"):
-            print("✔ terminal access: %s" % credential_result["actor_id"])
-            print("  human-owned device credential stored privately in %s" %
-                  credential_result["credentials_file"])
-        elif credential_result and credential_result.get("verification_uri"):
-            print("· terminal enrollment pending: %s" %
-                  credential_result["verification_uri"])
-            if credential_result.get("user_code"):
-                print("  verification code: %s" %
-                      credential_result["user_code"])
+            print("✔ client authorization: %s" %
+                  credential_result.get("client_instance", "this install"))
+            if credential_result.get("credentials_file"):
+                print("  client API key stored privately in %s" %
+                      credential_result["credentials_file"])
+            else:
+                print("  client API key hot-loaded from this active process")
+            print("  AI actor and Run by user attribution remain separate")
+        elif credential_result and credential_result.get("authorization_url"):
+            print("· client authorization pending in Settings: %s" %
+                  credential_result["authorization_url"])
         if watcher_result and not watcher_error:
             action = "already running" if watcher_result.get(
                 "already_running") else "started"

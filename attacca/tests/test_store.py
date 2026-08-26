@@ -405,6 +405,7 @@ class StoreTestCase(unittest.TestCase):
             " WHERE project_id='p1' AND task_id=?", (tid,))
         report = c.task_report(self.conn, "p1", "bob", "agent", tid,
                                summary="finishing abandoned work",
+                               evidence=[{"kind": "test", "result": "pass"}],
                                requested_state="done")
         self.assertEqual(report["status"], "done")
         # duplicate done report is rejected, context version bumped only once
