@@ -11666,6 +11666,16 @@ def _r_migration_directive(h, m, q):
     h._reply_json(200, migration_directive(root))
 
 
+def _r_poll_status(h, m, q):
+    actor, atype = h._actor()
+    actor = q.get("actor") or actor
+    h._reply_json(200, poll_status(
+        h._conn(), m.group(1), actor_id=actor,
+        actor_type=q.get("actor_type") or atype,
+        plugin_version=q.get("plugin_version"),
+        law_version=q.get("law_version")), {"Cache-Control": "no-store"})
+
+
 def _r_agents_list(h, m, q):
     h._reply_json(200, agent_list(h._conn(), m.group(1)))
 
@@ -11818,6 +11828,7 @@ ROUTES = [
      _r_cloud_context_get),
     (*_route_def("PUT", "/v1/projects/%s/cloud-context" % _PID),
      _r_cloud_context_set),
+    (*_route_def("GET", "/v1/projects/%s/poll-status" % _PID), _r_poll_status),
     (*_route_def("GET", "/v1/projects/%s/agents" % _PID), _r_agents_list),
     (*_route_def("POST", "/v1/projects/%s/agents" % _PID), _r_agent_register),
     (*_route_def("GET", "/v1/projects/%s/search" % _PID), _r_search),
@@ -16407,6 +16418,60 @@ def refresh_cloud_context_block(conn, project_id, root_path, files=None,
         results.append({"file": str(target), "changed": True, "status": status})
     return {"ok": True, "project": project_id, "files": results,
             "version": cc.get("version"), "sha256": cc.get("sha256")}
+
+
+def _version_tuple(value):
+    parts = []
+    for chunk in str(value or "").split("."):
+        digits = ""
+        for ch in chunk:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts) or (0,)
+
+
+def poll_status(conn, project_id, actor_id=None, actor_type="agent",
+                plugin_version=None, law_version=None):
+    """One compact status for every hook/cron poll. Reports whether the plugin
+    BINARY or the managed-law/MD block need updating (MONOTONIC — only being
+    BEHIND the server counts, never a downgrade), and unread mail for the actor.
+    Cheap and safe to call on every request."""
+    project = get_project(conn, project_id)
+    meta = managed_instruction_metadata(project_id, None)
+    server_law_version = MANAGED_BLOCK_VERSION
+    binary_update = bool(plugin_version) and \
+        _version_tuple(plugin_version) < _version_tuple(VERSION)
+    law_update = False
+    if law_version is not None:
+        try:
+            law_update = int(law_version) < server_law_version
+        except (TypeError, ValueError):
+            law_update = False
+    update = {
+        "server_version": VERSION,
+        "server_law_version": server_law_version,
+        "server_law_sha256": meta.get("law_sha256"),
+        "binary_update_available": binary_update,
+        "managed_law_update_available": law_update,
+        "up_to_date": not (binary_update or law_update),
+    }
+    mail = None
+    if actor_id:
+        peek = inbox_read(conn, project_id, actor_id, mark_read=False,
+                          limit=200, actor_type=actor_type)
+        mail = {"unread_addressed": len(peek["messages"]),
+                "unread_broadcasts": peek.get("unread_broadcasts", 0),
+                "has_new_mail": bool(peek["messages"])}
+    head = conn.execute(
+        "SELECT MAX(seq) AS s FROM events WHERE project_id=?",
+        (project_id,)).fetchone()
+    return {"project": project_id,
+            "context_version": project["context_version"],
+            "update": update, "mail": mail,
+            "cursor": {"event_seq": (head["s"] if head else 0) or 0}}
 
 
 def build_parser():
