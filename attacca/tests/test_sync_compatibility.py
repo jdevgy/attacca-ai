@@ -198,7 +198,7 @@ class ClientNegotiationTests(unittest.TestCase):
     def test_http_400_schema_code_is_not_auth_and_visibility_has_own_type(self):
         legacy = protocol.legacy_projection_capabilities()
         schema_error = RecordingTransport({
-            "error": "client projection is newer", 
+            "error": "client projection is newer",
             "code": "unsupported_projection_schema",
         }, status=400)
         with self.assertRaises(
