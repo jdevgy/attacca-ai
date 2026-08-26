@@ -141,7 +141,7 @@ LOG_EXCLUDED_MSG_TYPES = {"chat", "status"}
 
 MANAGED_BEGIN = "<!-- MANAGED_ATTACCA:BEGIN"
 MANAGED_END = "<!-- MANAGED_ATTACCA:END -->"
-MANAGED_BLOCK_VERSION = 7
+MANAGED_BLOCK_VERSION = 8
 _MANAGED_TEMPLATE_PROJECT = "attacca-project"
 _MANAGED_BEGIN_LINE = re.compile(
     r"(?m)^<!-- MANAGED_ATTACCA:BEGIN\b[^\r\n]*-->[ \t]*\r?$")
@@ -958,6 +958,15 @@ CREATE TABLE IF NOT EXISTS project_rules (
 );
 CREATE INDEX IF NOT EXISTS idx_project_rules_list
   ON project_rules (project_id, enabled, scope, priority, rule_id);
+CREATE TABLE IF NOT EXISTS project_cloud_context (
+  project_id    TEXT NOT NULL,
+  content       TEXT NOT NULL DEFAULT '',
+  version       INTEGER NOT NULL DEFAULT 1,
+  updated_by    TEXT,
+  updated_owner TEXT,
+  updated_at    TEXT NOT NULL,
+  PRIMARY KEY (project_id)
+);
 CREATE TABLE IF NOT EXISTS agents (
   project_id    TEXT NOT NULL,
   agent_id      TEXT NOT NULL,
@@ -3467,6 +3476,7 @@ def get_handoff(conn, project_id, actor_id=None, actor_type="agent"):
         "bridges": bridges,
         "governance": governance,
         "project_rules": applicable_rules,
+        "cloud_context": cloud_context_get(conn, project_id)["cloud_context"],
         "handoff": handoff,
         "handoff_updated_by": row["updated_by"] if row else None,
         "handoff_updated_owner": (handoff_attribution or {}).get("owner"),
@@ -5496,6 +5506,100 @@ def rule_update(conn, project_id, actor_id, actor_type, rule_id, updates,
             "context_version": context_version, "event": event}
 
 
+def _require_cloud_context_manager(conn, project_id, actor_id, actor_type):
+    """Cloud context, like Project Rules, may only be edited by a human or a
+    registered Director. Advisors and workers are rejected."""
+    if actor_type == "human":
+        return "human"
+    role = _registered_actor_role(conn, project_id, actor_id) \
+        if actor_type == "agent" else "unassigned"
+    if actor_type != "agent" or role != "director":
+        raise AttaccaError(
+            "cloud context may only be edited by a human or registered "
+            "Director; '%s' is %s" % (actor_id, role))
+    return role
+
+
+def _cloud_context_row(conn, project_id):
+    return conn.execute(
+        "SELECT * FROM project_cloud_context WHERE project_id=?",
+        (project_id,)).fetchone()
+
+
+def _cloud_context_dict(row):
+    if not row:
+        return {"content": "", "version": 0, "updated_by": None,
+                "updated_owner": None, "updated_at": None}
+    return {"content": row["content"], "version": row["version"],
+            "updated_by": row["updated_by"],
+            "updated_owner": row["updated_owner"],
+            "updated_at": row["updated_at"]}
+
+
+def cloud_context_get(conn, project_id, actor_id=None, actor_type="agent"):
+    """Read the project cloud context: a single shared free-text document, like
+    a hosted AGENTS.md / CLAUDE.md, that is injected into every session brief.
+    Any worker may read it; only humans and Directors may edit it."""
+    get_project(conn, project_id)
+    return {"project": project_id,
+            "cloud_context": _cloud_context_dict(_cloud_context_row(
+                conn, project_id))}
+
+
+def cloud_context_set(conn, project_id, actor_id, actor_type, content,
+                      expected_version=None):
+    """Replace the cloud context document (human/Director only) with optimistic
+    version checking. Bumps project context so active clients re-read it."""
+    if content is None:
+        raise AttaccaError("cloud_context_set: content is required")
+    content = str(content)
+    if len(content) > 100000:
+        raise AttaccaError("cloud context is limited to 100000 characters")
+    if expected_version is not None:
+        try:
+            expected_version = int(expected_version)
+        except (TypeError, ValueError):
+            raise AttaccaError("expected_version must be an integer")
+    with write_tx(conn):
+        get_project(conn, project_id)
+        _require_cloud_context_manager(conn, project_id, actor_id, actor_type)
+        row = _cloud_context_row(conn, project_id)
+        current_version = row["version"] if row else 0
+        if expected_version is not None and expected_version != current_version:
+            raise AttaccaError(
+                "cloud context conflict: expected v%d but it is v%d; reload "
+                "and reconcile before writing"
+                % (expected_version, current_version))
+        if row is not None and row["content"] == content:
+            return {"ok": True, "already_current": True,
+                    "cloud_context": _cloud_context_dict(row),
+                    "context_version": get_project(
+                        conn, project_id)["context_version"]}
+        new_version = current_version + 1
+        nowi = now_iso()
+        owner = current_owner()
+        if row is None:
+            conn.execute(
+                "INSERT INTO project_cloud_context (project_id, content,"
+                " version, updated_by, updated_owner, updated_at)"
+                " VALUES (?,?,?,?,?,?)",
+                (project_id, content, new_version, actor_id, owner, nowi))
+        else:
+            conn.execute(
+                "UPDATE project_cloud_context SET content=?, version=?,"
+                " updated_by=?, updated_owner=?, updated_at=?"
+                " WHERE project_id=? AND version=?",
+                (content, new_version, actor_id, owner, nowi, project_id,
+                 current_version))
+        context_version = bump_context_version(conn, project_id)
+        event = append_event(
+            conn, project_id, actor_id, actor_type, "cloud_context.updated",
+            {"version": new_version, "length": len(content)}, in_tx=True)
+        result = _cloud_context_dict(_cloud_context_row(conn, project_id))
+    return {"ok": True, "cloud_context": result,
+            "context_version": context_version, "event": event}
+
+
 # --- agents ----------------------------------------------------------------
 
 def _migrate_actor_references_in_tx(conn, project_id, aliases, canonical_id,
@@ -6799,6 +6903,27 @@ MCP_TOOLS = [
         }, "required": ["rule_id", "expected_version"]},
     },
     {
+        "name": "cloud_context_get",
+        "description": "Read the project cloud context: a shared free-text document "
+                       "(like a hosted AGENTS.md/CLAUDE.md) injected into every session "
+                       "brief. Any worker may read it.",
+        "inputSchema": {"type": "object", "properties": {
+            "project": PROJECT_PROP,
+        }},
+    },
+    {
+        "name": "cloud_context_set",
+        "description": "Replace the project cloud context document. Only humans and "
+                       "registered Directors may edit it. The change bumps project "
+                       "context so active clients re-read it automatically.",
+        "inputSchema": {"type": "object", "properties": {
+            "content": _s("Full replacement text of the cloud context document."),
+            "expected_version": _i("Current cloud context version; stale writes are "
+                                   "rejected. Omit to overwrite unconditionally."),
+            "project": PROJECT_PROP,
+        }, "required": ["content"]},
+    },
+    {
         "name": "agent_register",
         "description": "Register (or refresh) your agent identity for this project: role, "
                        "display name, runtime. Do this once when you first join a project.",
@@ -7456,6 +7581,17 @@ class McpSession:
             return self._guarded_write(project, lambda: rule_update(
                 conn, project, actor, atype, rule_id=args.get("rule_id"),
                 updates=updates,
+                expected_version=args.get("expected_version")))
+
+        if name == "cloud_context_get":
+            project, actor = self._project_actor(args)
+            return cloud_context_get(conn, project, actor_id=actor,
+                                     actor_type=atype)
+
+        if name == "cloud_context_set":
+            project, actor = self._project_actor(args)
+            return self._guarded_write(project, lambda: cloud_context_set(
+                conn, project, actor, atype, content=args.get("content"),
                 expected_version=args.get("expected_version")))
 
         if name == "agent_register":
@@ -11482,6 +11618,20 @@ def _r_rule_update(h, m, q):
         expected_version=body.get("expected_version")))
 
 
+def _r_cloud_context_get(h, m, q):
+    actor, atype = h._actor()
+    h._reply_json(200, cloud_context_get(
+        h._conn(), m.group(1), actor_id=actor, actor_type=atype))
+
+
+def _r_cloud_context_set(h, m, q):
+    actor, atype = h._actor()
+    body = h._body_json()
+    h._reply_json(200, cloud_context_set(
+        h._conn(), m.group(1), actor, atype, content=body.get("content"),
+        expected_version=body.get("expected_version")))
+
+
 def _r_agents_list(h, m, q):
     h._reply_json(200, agent_list(h._conn(), m.group(1)))
 
@@ -11629,6 +11779,10 @@ ROUTES = [
     (*_route_def("POST", "/v1/projects/%s/rules" % _PID), _r_rule_create),
     (*_route_def("PUT", "/v1/projects/%s/rules/%s" % (_PID, _PID)),
      _r_rule_update),
+    (*_route_def("GET", "/v1/projects/%s/cloud-context" % _PID),
+     _r_cloud_context_get),
+    (*_route_def("PUT", "/v1/projects/%s/cloud-context" % _PID),
+     _r_cloud_context_set),
     (*_route_def("GET", "/v1/projects/%s/agents" % _PID), _r_agents_list),
     (*_route_def("POST", "/v1/projects/%s/agents" % _PID), _r_agent_register),
     (*_route_def("GET", "/v1/projects/%s/search" % _PID), _r_search),
@@ -15386,11 +15540,14 @@ def managed_instruction_block(project_id, db_path):
     lines.append("   prior chat memory or re-discover the repo from scratch. Inbox items tagged")
     lines.append("   [MASTER-DIRECTIVE] come from a project that rules this one — binding;")
     lines.append("   [SUGGESTION]/[ADVICE] are input, not orders.")
-    lines.append("2. **Project Rules — binding dynamic instructions**: read the `project_rules`")
-    lines.append("   in the startup brief. If they are absent, call `rule_list` before work.")
-    lines.append("   Rules scoped to `everyone` plus your registered role are mandatory. Reload")
-    lines.append("   them after a context/staleness warning and on automatic refresh. Only humans")
-    lines.append("   and registered Directors may create, edit, enable, or disable rules.")
+    lines.append("2. **Project Rules — binding dynamic instructions**: the mandatory")
+    lines.append("   Project Rules for `everyone` plus your registered role are pinned as a")
+    lines.append("   compact banner at the TOP of every turn’s brief and are BINDING on every")
+    lines.append("   response — never bypass them. Do not rely on a truncated brief: if the")
+    lines.append("   pinned rules banner is ever absent from your context, call `rule_list`")
+    lines.append("   before acting. Reload them after a context/staleness warning and on")
+    lines.append("   automatic refresh. Only humans and registered Directors may create, edit,")
+    lines.append("   enable, or disable rules.")
     lines.append("3. **History first**: when work depends on what happened, why, or who did it,")
     lines.append("   call `search` with relevant terms before filesystem or Git archaeology.")
     lines.append("   Follow with `get_project_log`, `task_show`, or the matching durable record.")

@@ -139,7 +139,7 @@ class ProjectRulesLiveApiTest(unittest.TestCase):
         self.assertIn("Attacca active", payload["systemMessage"])
         context = payload["hookSpecificOutput"]["additionalContext"]
         self.assertIn("ATTACCA ACTIVE SESSION BRIEF", context)
-        brief = json.loads(context.split("\n\n", 1)[1])
+        brief = json.loads(context[context.index("{"):])
         return payload, context, brief
 
     def test_rest_crud_toggle_and_optimistic_version_conflict(self):

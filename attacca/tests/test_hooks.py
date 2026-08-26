@@ -958,8 +958,8 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             self.assertEqual(agents.read_text(), before + desired + after)
             self.assertIn("AGENTS.md", notice["context"])
 
-    def test_managed_law_v6_auto_refreshes_to_v7_without_touching_user_bytes(self):
-        self.assertEqual(c.MANAGED_BLOCK_VERSION, 7)
+    def test_managed_law_v7_auto_refreshes_to_v8_without_touching_user_bytes(self):
+        self.assertEqual(c.MANAGED_BLOCK_VERSION, 8)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             checkout = root / "repo"
@@ -970,10 +970,10 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                 "schema_version": 1, "project_id": "shared"}))
             desired = c.managed_instruction_block("shared", None)
             previous = desired.replace(
-                "MANAGED_ATTACCA:BEGIN v=7",
-                "MANAGED_ATTACCA:BEGIN v=6", 1).replace(
-                    "If hosted MCP is unreachable, continue only through the installed plugin's",
-                    "If MCP tools or the automatic brief are unavailable, stop and report the",
+                "MANAGED_ATTACCA:BEGIN v=8",
+                "MANAGED_ATTACCA:BEGIN v=7", 1).replace(
+                    "compact banner at the TOP of every turn",
+                    "read the `project_rules` in the startup brief before",
                     1)
             prefix = "# Human instructions\n\nKeep before byte-for-byte.\n\n"
             suffix = "\n\n## Human tail\nKeep after byte-for-byte.\n"

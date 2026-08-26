@@ -247,7 +247,7 @@ class InstructionBoundaryRegressionTest(unittest.TestCase):
 
             payload = json.loads(result.stdout)
             context = payload["hookSpecificOutput"]["additionalContext"]
-            brief = json.loads(context.split("\n\n", 1)[1])
+            brief = json.loads(context[context.index("{"):])
             returned = {
                 rule["title"]: rule for rule in brief["project_rules"]
             }

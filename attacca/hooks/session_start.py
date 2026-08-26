@@ -3259,6 +3259,35 @@ def _needs_role_setup(snapshot):
     return role not in CONFIGURED_AI_ROLES
 
 
+def _mandatory_rules_banner(rules):
+    """Compact banner of the mandatory Project Rules, pinned near the very
+    top of every injected turn so it survives host-side truncation of the
+    larger state payload. Returns None when no rules apply."""
+    applicable = [r for r in (rules or []) if r.get("enabled", True)]
+    if not applicable:
+        return None
+    applicable = sorted(
+        applicable,
+        key=lambda r: (r.get("priority", 100), str(r.get("rule_id") or "")))
+    lines = [
+        "===================== ATTACCA MANDATORY PROJECT RULES ====================",
+        "BINDING on EVERY response \u2014 do not bypass. Re-pinned every turn; if this",
+        "section is ever missing from your context, call rule_list before acting.",
+        "",
+    ]
+    for r in applicable:
+        body = " ".join(str(r.get("body") or "").split())
+        if len(body) > 600:
+            body = body[:597] + "..."
+        lines.append("\u2022 [%s \u00b7 priority %s \u00b7 %s] %s" % (
+            r.get("rule_id"), r.get("priority"), r.get("scope"),
+            " ".join(str(r.get("title") or "").split())))
+        lines.append("    %s" % body)
+    lines.append(
+        "==========================================================================")
+    return "\n".join(lines)
+
+
 def _poll_view(snapshot):
     """Stable shared-state markers used to suppress no-change hook output."""
     handoff = snapshot.get("handoff") or {}
@@ -3275,6 +3304,7 @@ def _poll_view(snapshot):
         "handoff": handoff.get("handoff"),
         "decisions": handoff.get("decisions") or [],
         "project_rules": rules.get("rules") or [],
+        "cloud_context": handoff.get("cloud_context"),
         "tasks": [_task_view(task) for task in (tasks.get("tasks") or [])],
         "room_keys": [_message_key(message)
                       for message in (room.get("messages") or [])],
@@ -3341,6 +3371,7 @@ def _compact_snapshot(snapshot):
         "open_tasks": handoff.get("open_tasks"),
         "decisions": handoff.get("decisions"),
         "project_rules": rules.get("rules") or [],
+        "cloud_context": handoff.get("cloud_context"),
         "recent_activity": handoff.get("recent_activity"),
         "inbox": messages(inbox.get("messages"), 20),
         "unread_broadcasts": inbox.get("unread_broadcasts"),
@@ -3966,6 +3997,10 @@ coordination. If any later Attacca response reports stale_context_warning,
 reload the handoff before further writes.
 
 %s""" % json.dumps(brief, indent=2, ensure_ascii=False)
+            _rules_banner = _mandatory_rules_banner(
+                (snapshot.get("rules") or {}).get("rules"))
+            if _rules_banner:
+                context = _rules_banner + "\n\n" + context
             output = _event_context_output(
                 "SessionStart",
                 "Attacca active · %s · MCP startup rules, handoff, inbox, room and tasks checked"
@@ -4175,7 +4210,21 @@ def _periodic_output(status, event_name, offline_adapter=None,
     # old hook throttle and are delivered immediately; otherwise this boundary
     # stays quiet and leaves network polling to the autonomous watcher.
     if watcher_healthy and not is_kimi_prompt:
-        return _append_notices(None, event_name, notices)
+        # The healthy watcher owns network polling, but the mandatory
+        # Project Rules must still be re-pinned at the start of every
+        # response so they never fall out of a long conversation.
+        banner_output = None
+        if event_name == "UserPromptSubmit":
+            _identity, _entry = _poll_entry(status, config)
+            _snap = (_entry or {}).get("snapshot") or {}
+            _rules_banner = _mandatory_rules_banner(
+                _snap.get("project_rules"))
+            if _rules_banner:
+                banner_output = _event_context_output(
+                    event_name,
+                    "Attacca \u00b7 mandatory project rules pinned",
+                    _rules_banner)
+        return _append_notices(banner_output, event_name, notices)
     interval = _settings_interval(config, entry=offline_entry)
     identity, entry = _poll_entry(status, config)
     # Polling Off still allows Kimi's first native prompt to validate the link
