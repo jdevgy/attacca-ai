@@ -19,6 +19,7 @@ import re
 import signal
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -47,6 +48,14 @@ WATCHER_WAKE_SECONDS = 5
 WATCHER_EVENT_PAGE_SIZE = 200
 WATCHER_EVENT_MAX_PAGES = 20
 WATCHER_OUTAGE_BACKOFF_MAX_SECONDS = 15 * 60
+# A missing checkout is not automatically abandoned. External/network volumes
+# can disappear temporarily, and a server/auth failure says nothing about the
+# local checkout lifecycle. The daemon therefore requires both sustained,
+# filesystem-proven absence and several distinct observations before removing
+# only the polling registration. Shared identity-scoped mirrors/outboxes remain
+# available when the checkout returns or another checkout uses the identity.
+WATCHER_MISSING_GRACE_SECONDS = 24 * 60 * 60
+WATCHER_MISSING_MIN_OBSERVATIONS = 3
 DEFAULT_UPDATE_INTERVAL_SECONDS = 60
 CONFIGURED_AI_ROLES = {"director", "advisor", "worker"}
 UPDATE_CHOICES = {"install", "later", "skip"}
@@ -1380,6 +1389,120 @@ def _watcher_subscription_key(status, config, runtime=None):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+_WATCHER_MISSING_FIELDS = (
+    "local_path_missing_since_epoch",
+    "local_path_missing_last_checked_epoch",
+    "local_path_missing_observations",
+    "local_path_missing_reason",
+)
+
+
+def _watcher_expected_path_state(value, expected_kind):
+    """Return present/absent/unknown for one absolute subscription path.
+
+    Only ``FileNotFoundError``/``NotADirectoryError`` or an existing object of
+    the wrong kind are affirmative absence evidence. Permission, transient IO,
+    malformed metadata, and relative paths are unknown and can never advance
+    pruning. ``os.stat`` follows a project.json symlink, matching normal link
+    resolution while treating a broken symlink as absent.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return "unknown"
+    try:
+        path = Path(value).expanduser()
+    except (OSError, TypeError, ValueError):
+        return "unknown"
+    if not path.is_absolute():
+        return "unknown"
+    try:
+        mode = os.stat(str(path)).st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return "absent"
+    except OSError:
+        return "unknown"
+    if expected_kind == "directory":
+        return "present" if stat.S_ISDIR(mode) else "absent"
+    if expected_kind == "file":
+        return "present" if stat.S_ISREG(mode) else "absent"
+    return "unknown"
+
+
+def _watcher_subscription_missing_reason(entry):
+    """Return path-only absence evidence, or None when healthy/unknown."""
+    if not isinstance(entry, dict):
+        return None
+    root_state = _watcher_expected_path_state(entry.get("root"), "directory")
+    if root_state == "absent":
+        return "checkout_root_absent"
+    if root_state != "present":
+        return None
+    link_state = _watcher_expected_path_state(entry.get("link_path"), "file")
+    if link_state == "absent":
+        return "project_link_absent"
+    return None
+
+
+def _prune_missing_watcher_subscriptions(now=None):
+    """Age out sustained, filesystem-proven dead checkout registrations.
+
+    This mutation is serialized with registration and every watcher update.
+    A re-registration clears the observation window. We intentionally retain
+    the shared offline directory: it is partitioned by authenticated identity,
+    not subscription, and can contain exact-once outbox writes or a mirror used
+    by another checkout. Network/auth errors are never consulted here.
+    """
+    now = time.time() if now is None else float(now)
+    result = {"observed": [], "recovered": [], "removed": []}
+
+    def mutate(state):
+        subscriptions = state.get("subscriptions")
+        if not isinstance(subscriptions, dict):
+            return
+        for key, entry in list(subscriptions.items()):
+            if not isinstance(entry, dict):
+                continue
+            reason = _watcher_subscription_missing_reason(entry)
+            if reason is None:
+                if any(field in entry for field in _WATCHER_MISSING_FIELDS):
+                    for field in _WATCHER_MISSING_FIELDS:
+                        entry.pop(field, None)
+                    result["recovered"].append(key)
+                continue
+
+            since = entry.get("local_path_missing_since_epoch")
+            if not isinstance(since, (int, float)):
+                since = now
+                entry["local_path_missing_since_epoch"] = now
+                observations = 0
+            else:
+                observations = entry.get("local_path_missing_observations", 0)
+                if not isinstance(observations, int) or observations < 0:
+                    observations = 0
+
+            last_checked = entry.get("local_path_missing_last_checked_epoch")
+            # A busy loop or repeated calls with the same clock instant count
+            # as one observation, not as artificial proof of sustained loss.
+            if not isinstance(last_checked, (int, float)) or now > last_checked:
+                observations += 1
+                entry["local_path_missing_observations"] = observations
+                entry["local_path_missing_last_checked_epoch"] = now
+            entry["local_path_missing_reason"] = reason
+            result["observed"].append(key)
+
+            elapsed = max(0.0, now - float(since))
+            if observations >= WATCHER_MISSING_MIN_OBSERVATIONS \
+                    and elapsed >= WATCHER_MISSING_GRACE_SECONDS:
+                # Delete by identity only while holding the state lock. A
+                # concurrent registration runs before or after this mutation:
+                # before clears markers; after safely recreates the entry.
+                if subscriptions.get(key) is entry:
+                    subscriptions.pop(key, None)
+                    result["removed"].append(key)
+
+    _mutate_state(_watcher_state_path(), mutate)
+    return result
+
+
 def _register_watcher_subscription(status, plugin_root, config, runtime=None,
                                    now=None):
     """Register one checkout without storing credentials or project data."""
@@ -1410,6 +1533,11 @@ def _register_watcher_subscription(status, plugin_root, config, runtime=None,
             "offline_directory": str(_watcher_offline_directory(key)),
             "last_registered_at": datetime.now(timezone.utc).isoformat(),
         })
+        # Registration is positive evidence that this checkout is active.
+        # Clear a prior temporary-unmount observation atomically so a daemon
+        # pruning pass cannot remove a newly renewed subscription.
+        for field in _WATCHER_MISSING_FIELDS:
+            entry.pop(field, None)
         if previous_plugin_root \
                 and previous_plugin_root != installed_plugin_root:
             entry["next_poll_at_epoch"] = 0
@@ -1867,7 +1995,9 @@ def _watcher_status_payload():
                 "offline_mirror_stale", "offline_mirror_cursor",
                 "offline_mirror_verified_at", "offline_directory",
                 "sync_schema_version", "sync_activated_at",
-                "sync_bootstrap_error")
+                "sync_bootstrap_error", "local_path_missing_reason",
+                "local_path_missing_since_epoch",
+                "local_path_missing_observations")
         } | {"pending_count": len(entry.get("pending") or []),
              "queued_notice_count": len(entry.get("pending") or [])})
     return {"daemon": daemon, "daemon_launch": launch,
@@ -3755,6 +3885,7 @@ def _watcher_daemon_loop(plugin_root, nonce, wait=None, clock=None,
             started_at=datetime.now(timezone.utc).isoformat(),
             heartbeat_at_epoch=clock())
         while True:
+            prune = _prune_missing_watcher_subscriptions(now=clock())
             state = _read_state(path)
             keys = list((state.get("subscriptions") or {}).keys())
             for key in keys:
@@ -3765,11 +3896,18 @@ def _watcher_daemon_loop(plugin_root, nonce, wait=None, clock=None,
                     options["remote_factory"] = remote_factory
                 _watcher_tick(key, now=clock(), **options)
             ticks += 1
+            prior_pruned = ((state.get("daemon") or {}).get(
+                "pruned_subscription_count"))
+            if not isinstance(prior_pruned, int) or prior_pruned < 0:
+                prior_pruned = 0
             _watcher_mark_daemon(
                 nonce, plugin_root, launch_identity=launch_identity,
                 running=True,
                 heartbeat_at=datetime.now(timezone.utc).isoformat(),
-                heartbeat_at_epoch=clock(), subscription_count=len(keys))
+                heartbeat_at_epoch=clock(), subscription_count=len(keys),
+                missing_subscription_count=len(prune["observed"]),
+                pruned_subscription_count=(prior_pruned
+                                           + len(prune["removed"])))
             if max_ticks is not None and ticks >= max_ticks:
                 break
             wait(WATCHER_WAKE_SECONDS)
