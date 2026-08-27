@@ -149,6 +149,7 @@ class AuthPanelTestCase(unittest.TestCase):
             "// TESTABLE_CLIENT_AUTHORIZATION_HINTS:END", hint_start)
         hints = self.script[hint_start:hint_end]
         self.assertIn('params.get("pairing_code")', hints)
+        self.assertIn('[A-Z2-7]{4}', hints)
         self.assertNotIn("secret", hints.lower())
         self.assertNotIn("token", hints.lower())
 

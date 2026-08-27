@@ -56,19 +56,21 @@ function parse(hash) {
   return clientAuthorizationHintsFromLocation();
 }
 process.stdout.write(JSON.stringify({
-  valid: parse("#settings&pairing_code=pair_ABC-123"),
+  valid: parse("#settings&pairing_code=AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH-JJJJ-KKKK-LLLL-MMMM-NNNN"),
   badId: parse("#settings&pairing_code=%3Cscript%3E"),
   tooLong: parse("#settings&pairing_code=" + "c".repeat(129)),
   other: parse("#room&pairing_code=pair_abc"),
-  secretLike: parse("#settings&pairing_code=pair_abc&pairing_secret=atpair_leak")
+  secretLike: parse("#settings&pairing_code=AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH-JJJJ-KKKK-LLLL-MMMM-NNNN&pairing_secret=atpair_leak")
 }));
 """
         result = json.loads(self.run_node(program))
-        self.assertEqual(result["valid"], {"pairingCode": "pair_ABC-123"})
+        canonical = ("AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH-JJJJ-"
+                     "KKKK-LLLL-MMMM-NNNN")
+        self.assertEqual(result["valid"], {"pairingCode": canonical})
         self.assertEqual(result["badId"]["pairingCode"], "")
         self.assertEqual(result["tooLong"]["pairingCode"], "")
         self.assertEqual(result["other"], {"pairingCode": ""})
-        self.assertEqual(result["secretLike"], {"pairingCode": "pair_abc"})
+        self.assertEqual(result["secretLike"], {"pairingCode": canonical})
 
     def test_access_normalization_fails_closed_without_client_keys_array(self):
         helpers = self.marked("EMPTY_CREDENTIAL_ACCESS") + self.marked(

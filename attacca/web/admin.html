@@ -616,7 +616,7 @@
           if (view !== "settings") return { pairingCode: "" };
           const params = new URLSearchParams(parts.join("&"));
           const pairingCode = params.get("pairing_code") || "";
-          return { pairingCode: /^[A-Za-z0-9_-]{6,128}$/.test(pairingCode) ? pairingCode : "" };
+          return { pairingCode: /^[A-Z2-7]{4}(?:-[A-Z2-7]{4}){12}$/.test(pairingCode) ? pairingCode : "" };
         } catch (_) { return { pairingCode: "" }; }
       }
       // TESTABLE_CLIENT_AUTHORIZATION_HINTS:END
