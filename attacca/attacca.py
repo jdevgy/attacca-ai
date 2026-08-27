@@ -28,6 +28,7 @@ Run `attacca.py --help` for everything.
 """
 
 import argparse
+import base64
 import contextlib
 import fnmatch
 import getpass
@@ -68,6 +69,11 @@ VERSION = "0.5.0"
 MCP_SUPPORTED_PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18")
 MCP_DEFAULT_PROTOCOL = "2025-06-18"
 DEFAULT_UPDATE_INTERVAL_SECONDS = 60
+
+_PAIRING_LOOKUP_FAILURES = {}
+_PAIRING_LOOKUP_FAILURES_LOCK = threading.Lock()
+_PAIRING_LOOKUP_WINDOW_SECONDS = 60
+_PAIRING_LOOKUP_MAX_FAILURES = 5
 
 ENV_DB = "ATTACCA_DB"
 ENV_PROJECT = "ATTACCA_PROJECT"
@@ -1992,10 +1998,13 @@ def auth_client_key_delete(conn, principal, token_id):
 
 
 def _auth_client_pairing_code(conn):
-    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     for _ in range(20):
-        raw = "".join(secrets.choice(alphabet) for _ in range(8))
-        code = raw[:4] + "-" + raw[4:]
+        # 32 random bytes are encoded without padding: all 256 random bits are
+        # retained in a canonical 52-character Base32 value. Grouping is only
+        # for readability and never reduces or normalizes away entropy.
+        raw = base64.b32encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
+        code = "-".join(raw[index:index + 4]
+                        for index in range(0, len(raw), 4))
         if not conn.execute(
                 "SELECT 1 FROM auth_client_pairings WHERE pairing_code=?",
                 (code,)).fetchone():
@@ -2045,6 +2054,10 @@ def auth_client_pairing_start(conn, base_url, client_instance, label,
 
 def _auth_client_pairing_row(conn, pairing_code):
     code = str(pairing_code or "").strip().upper()
+    modern = re.fullmatch(r"(?:[A-Z2-7]{4}-){12}[A-Z2-7]{4}", code)
+    legacy = re.fullmatch(r"[A-Z2-9]{4}-[A-Z2-9]{4}", code)
+    if not modern and not legacy:
+        raise AttaccaError("invalid client pairing code format")
     row = conn.execute(
         "SELECT * FROM auth_client_pairings WHERE pairing_code=?", (code,)
     ).fetchone()
@@ -10349,7 +10362,8 @@ if command -v codex >/dev/null 2>&1; then
   fi
   ATTACCA_CODEX_ACTIVE_VERSION="$(python3 - "$DEST/.codex-plugin/plugin.json" <<'PYEOF'
 import json, sys
-print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])
+with open(sys.argv[1], encoding="utf-8") as handle:
+    print(json.load(handle)["version"])
 PYEOF
 )"
   python3 "$DEST/codex_hook_compat.py" prune \
@@ -12427,11 +12441,42 @@ def _r_auth_client_pairing_poll(h, m, q):
         device_id=body.get("device_id")), {"Cache-Control": "no-store"})
 
 
+def _auth_pairing_lookup_throttle_key(h, principal):
+    address = h.client_address[0] if getattr(h, "client_address", None) else ""
+    return "%s|%s" % (principal.get("user_id") or "", address)
+
+
+def _auth_pairing_lookup_check(key):
+    cutoff = time.monotonic() - _PAIRING_LOOKUP_WINDOW_SECONDS
+    with _PAIRING_LOOKUP_FAILURES_LOCK:
+        failures = [stamp for stamp in _PAIRING_LOOKUP_FAILURES.get(key, [])
+                    if stamp >= cutoff]
+        _PAIRING_LOOKUP_FAILURES[key] = failures
+        if len(failures) >= _PAIRING_LOOKUP_MAX_FAILURES:
+            raise AuthorizationError(
+                "client_pairing_lookup_throttled: wait before retrying")
+
+
+def _auth_pairing_lookup_failed(key):
+    with _PAIRING_LOOKUP_FAILURES_LOCK:
+        _PAIRING_LOOKUP_FAILURES.setdefault(key, []).append(time.monotonic())
+
+
 def _r_auth_client_pairing_get(h, m, q):
-    _require_auth_session(h)
-    h._reply_json(200, auth_client_pairing_record(
-        h._conn(), urllib.parse.unquote(m.group(1))),
-        {"Cache-Control": "no-store"})
+    principal = _require_auth_session(h)
+    key = _auth_pairing_lookup_throttle_key(h, principal)
+    _auth_pairing_lookup_check(key)
+    try:
+        record = auth_client_pairing_record(
+            h._conn(), urllib.parse.unquote(m.group(1)))
+    except AttaccaError:
+        _auth_pairing_lookup_failed(key)
+        # One response for malformed and unknown codes avoids a format/existence
+        # oracle while the per-account+address limiter bounds guessing.
+        raise AttaccaError("client pairing request unavailable")
+    with _PAIRING_LOOKUP_FAILURES_LOCK:
+        _PAIRING_LOOKUP_FAILURES.pop(key, None)
+    h._reply_json(200, record, {"Cache-Control": "no-store"})
 
 
 def _r_auth_client_pairing_authorize(h, m, q):
