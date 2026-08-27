@@ -903,7 +903,7 @@ def start_client_pairing(server_url, *, client_instance=None, runtime=None,
         value.get("authorization_request"))
     url = value.get("verification_uri_complete")
     expected_url = (_endpoint(server_url, "/app") +
-                    "#authorization_request=" +
+                    "#settings&authorization_request=" +
                     quote(request_token, safe=""))
     if not isinstance(url, str) or url != expected_url:
         raise TerminalFlowProtocolError(

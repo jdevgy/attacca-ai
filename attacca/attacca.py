@@ -18675,6 +18675,8 @@ def build_parser():
         description="Local Project Attacca Layer: shared event ledger, task "
                     "claims, decisions, project room and handoff for humans and "
                     "AI coding agents (Claude Code, Codex, GLM, ...).")
+    parser.add_argument("--version", action="version",
+                        version="attacca %s" % VERSION)
     parser.add_argument("--db", default=None,
                         help="database path (default $%s or %s)" % (ENV_DB, DEFAULT_DB))
     parser.add_argument("--project", default=None,
