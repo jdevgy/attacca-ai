@@ -1088,6 +1088,26 @@ CREATE TABLE IF NOT EXISTS auth_client_key_deletions (
 );
 CREATE INDEX IF NOT EXISTS idx_auth_client_key_deletions_user
   ON auth_client_key_deletions (user_id, deleted_at);
+CREATE TABLE IF NOT EXISTS auth_client_pairings (
+  pairing_secret_hash TEXT PRIMARY KEY,
+  pairing_code        TEXT NOT NULL UNIQUE,
+  client_instance     TEXT NOT NULL,
+  client_label        TEXT NOT NULL,
+  device_id           TEXT,
+  status              TEXT NOT NULL DEFAULT 'pending',
+  approved_user_id    TEXT,
+  approved_by         TEXT,
+  approved_at         TEXT,
+  approved_projects   TEXT,
+  denied_at           TEXT,
+  issued_token_id     TEXT,
+  delivered_at        TEXT,
+  created_at          TEXT NOT NULL,
+  expires_at          TEXT NOT NULL,
+  last_polled_at      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_auth_client_pairings_code
+  ON auth_client_pairings (pairing_code, status, expires_at);
 CREATE TABLE IF NOT EXISTS auth_sessions (
   session_hash TEXT PRIMARY KEY,
   user_id      TEXT NOT NULL,
@@ -1964,6 +1984,191 @@ def auth_client_key_delete(conn, principal, token_id):
         conn.execute("DELETE FROM auth_tokens WHERE token_id=?", (token_id,))
     return {"ok": True, "token_id": token_id, "deleted": True,
             "deleted_at": deleted_at}
+
+
+def _auth_client_pairing_code(conn):
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    for _ in range(20):
+        raw = "".join(secrets.choice(alphabet) for _ in range(8))
+        code = raw[:4] + "-" + raw[4:]
+        if not conn.execute(
+                "SELECT 1 FROM auth_client_pairings WHERE pairing_code=?",
+                (code,)).fetchone():
+            return code
+    raise AttaccaError("could not allocate a client pairing code")
+
+
+def auth_client_pairing_start(conn, base_url, client_instance, label,
+                              device_id=None):
+    """Start a short-lived browser authorization for one client install."""
+    client_instance = str(client_instance or "").strip()
+    label = str(label or "Attacca client").strip()
+    device_id = str(device_id or "").strip() or None
+    if not _CLIENT_INSTALL_ID_RE.fullmatch(client_instance) \
+            or len(client_instance) > 120:
+        raise AttaccaError(
+            "client_instance must be a safe 1-120 character installation ID")
+    if not label or len(label) > 120:
+        raise AttaccaError("client label must be 1-120 characters")
+    if device_id and not _CLIENT_INSTALL_ID_RE.fullmatch(device_id):
+        raise AttaccaError("device_id must be a safe 1-240 character device ID")
+    raw_secret = "atpair_%s.%s" % (
+        secrets.token_urlsafe(12), secrets.token_urlsafe(32))
+    pairing_code = _auth_client_pairing_code(conn)
+    created = now_iso()
+    expires = (now_dt() + timedelta(minutes=10)).strftime(
+        "%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    with write_tx(conn):
+        conn.execute(
+            "INSERT INTO auth_client_pairings"
+            " (pairing_secret_hash,pairing_code,client_instance,client_label,"
+            " device_id,status,created_at,expires_at)"
+            " VALUES (?,?,?,?,?,'pending',?,?)",
+            (sha256_hex(raw_secret), pairing_code, client_instance, label,
+             device_id, created, expires))
+    base = base_url.rstrip("/")
+    return {
+        "pairing_secret": raw_secret,
+        "pairing_code": pairing_code,
+        "verification_uri": base + "/app#settings",
+        "verification_uri_complete": "%s/app?pairing_code=%s#settings" % (
+            base, urllib.parse.quote(pairing_code, safe="")),
+        "expires_in": 600,
+        "interval": 5,
+    }
+
+
+def _auth_client_pairing_row(conn, pairing_code):
+    code = str(pairing_code or "").strip().upper()
+    row = conn.execute(
+        "SELECT * FROM auth_client_pairings WHERE pairing_code=?", (code,)
+    ).fetchone()
+    if not row:
+        raise AttaccaError("unknown client pairing code")
+    if row["expires_at"] <= now_iso() and row["status"] in (
+            "pending", "approved"):
+        with write_tx(conn):
+            conn.execute(
+                "UPDATE auth_client_pairings SET status='expired'"
+                " WHERE pairing_secret_hash=?",
+                (row["pairing_secret_hash"],))
+        raise AttaccaError("client pairing code expired")
+    return row
+
+
+def auth_client_pairing_record(conn, pairing_code):
+    row = _auth_client_pairing_row(conn, pairing_code)
+    record = {key: row[key] for key in (
+        "pairing_code", "client_instance", "client_label", "device_id",
+        "status", "created_at", "expires_at")}
+    record["project_memberships"] = json.loads(
+        row["approved_projects"] or "[]")
+    record["scope_mode"] = ("selected_workspaces" if
+                            record["project_memberships"] else
+                            "account_memberships")
+    return record
+
+
+def auth_client_pairing_decide(conn, pairing_code, principal, authorize,
+                               memberships=None):
+    row = _auth_client_pairing_row(conn, pairing_code)
+    if row["status"] != "pending":
+        raise AttaccaError("client pairing is already %s" % row["status"])
+    nowi = now_iso()
+    status = "approved" if authorize else "denied"
+    projects = (_auth_validate_client_projects(
+        conn, principal, memberships) if authorize else [])
+    with write_tx(conn):
+        if authorize:
+            cur = conn.execute(
+                "UPDATE auth_client_pairings SET status='approved',"
+                " approved_user_id=?,approved_by=?,approved_at=?,"
+                " approved_projects=?"
+                " WHERE pairing_secret_hash=? AND status='pending'",
+                (principal["user_id"], principal["username"], nowi,
+                 canonical_json(projects),
+                 row["pairing_secret_hash"]))
+        else:
+            cur = conn.execute(
+                "UPDATE auth_client_pairings SET status='denied',"
+                " approved_by=?,denied_at=?"
+                " WHERE pairing_secret_hash=? AND status='pending'",
+                (principal["username"], nowi, row["pairing_secret_hash"]))
+        if cur.rowcount != 1:
+            raise AttaccaError("client pairing decision raced; reload")
+    return {"ok": True, "pairing_code": row["pairing_code"],
+            "status": status, "project_memberships": projects,
+            "scope_mode": ("selected_workspaces" if projects else
+                           "account_memberships"),
+            "credential_issued": False}
+
+
+def auth_client_pairing_poll(conn, pairing_secret, client_instance,
+                             device_id=None):
+    """Promote the device-held pairing secret into a client key exactly once."""
+    raw = str(pairing_secret or "").strip()
+    row = conn.execute(
+        "SELECT * FROM auth_client_pairings WHERE pairing_secret_hash=?",
+        (sha256_hex(raw),)).fetchone() if raw else None
+    if not row:
+        raise AuthenticationError("invalid client pairing secret")
+    if not hmac.compare_digest(
+            str(client_instance or "").strip(), row["client_instance"]):
+        raise AuthorizationError("client_pairing_instance_mismatch")
+    expected_device = str(row["device_id"] or "")
+    supplied_device = str(device_id or "").strip()
+    if expected_device and (not supplied_device or not hmac.compare_digest(
+            supplied_device, expected_device)):
+        raise AuthorizationError("client_pairing_device_mismatch")
+    if row["expires_at"] <= now_iso():
+        raise AttaccaError("client pairing code expired")
+    if row["status"] == "pending":
+        conn.execute(
+            "UPDATE auth_client_pairings SET last_polled_at=?"
+            " WHERE pairing_secret_hash=?", (now_iso(), row["pairing_secret_hash"]))
+        return {"status": "pending", "interval": 5}
+    if row["status"] == "denied":
+        return {"status": "denied"}
+    if row["status"] != "approved" or row["delivered_at"]:
+        raise AuthenticationError("client pairing credential already delivered")
+    user = conn.execute(
+        "SELECT * FROM auth_users WHERE user_id=? AND disabled_at IS NULL",
+        (row["approved_user_id"],)).fetchone()
+    if not user:
+        raise AuthenticationError("client pairing owner is unavailable")
+    token_id = new_id("key")
+    nowi = now_iso()
+    with write_tx(conn):
+        current = conn.execute(
+            "SELECT * FROM auth_client_pairings WHERE pairing_secret_hash=?",
+            (row["pairing_secret_hash"],)).fetchone()
+        if current["status"] != "approved" or current["delivered_at"]:
+            raise AuthenticationError("client pairing credential already delivered")
+        conn.execute(
+            "INSERT INTO auth_tokens"
+            " (token_id,user_id,label,token_prefix,token_hash,token_kind,"
+            " actor_id,actor_type,project_id,runtime,device_id,client_label,"
+            " client_instance,created_at)"
+            " VALUES (?,?,?,?,?,'client',NULL,'client',NULL,'client',?,?,?,?)",
+            (token_id, user["user_id"], row["client_label"], raw[:22],
+             row["pairing_secret_hash"], row["device_id"],
+             row["client_label"], row["client_instance"], nowi))
+        conn.execute(
+            "UPDATE auth_client_pairings SET status='consumed',"
+            " issued_token_id=?,delivered_at=?,last_polled_at=?"
+            " WHERE pairing_secret_hash=? AND status='approved'"
+            " AND delivered_at IS NULL",
+            (token_id, nowi, nowi, row["pairing_secret_hash"]))
+        for project_id in json.loads(row["approved_projects"] or "[]"):
+            conn.execute(
+                "INSERT INTO auth_token_project_bindings"
+                " (token_id,project_id,created_at,revoked_at)"
+                " VALUES (?,?,?,NULL)", (token_id, project_id, nowi))
+    token_row = conn.execute(
+        "SELECT t.*,u.username FROM auth_tokens t JOIN auth_users u"
+        " ON u.user_id=t.user_id WHERE t.token_id=?", (token_id,)).fetchone()
+    return {"status": "approved", "credential": {
+        "token": raw, "record": auth_client_key_record(conn, token_row)}}
 
 
 def auth_client_project_access(conn, principal, project_id):
@@ -11164,7 +11369,9 @@ class AttaccaHandler(BaseHTTPRequestHandler):
                                "/plugin/marketplace.json",
                                "/v1/auth/status", "/v1/auth/bootstrap",
                                "/v1/auth/login",
-                               "/v1/auth/invitations/accept")
+                               "/v1/auth/invitations/accept",
+                               "/v1/auth/client-pairings",
+                               "/v1/auth/client-pairings/poll")
                       or path.startswith("/plugin.git/"))
             if self._auth_enabled() and not public and not self.principal:
                 raise AuthenticationError(
@@ -12189,6 +12396,44 @@ def _r_auth_client_key_delete(h, m, q):
         {"Cache-Control": "no-store"})
 
 
+def _r_auth_client_pairing_start(h, m, q):
+    body = h._body_json()
+    h._reply_json(201, auth_client_pairing_start(
+        h._conn(), _base_url(h), body.get("client_instance"),
+        body.get("label"), device_id=body.get("device_id")),
+        {"Cache-Control": "no-store"})
+
+
+def _r_auth_client_pairing_poll(h, m, q):
+    body = h._body_json()
+    h._reply_json(200, auth_client_pairing_poll(
+        h._conn(), body.get("pairing_secret"), body.get("client_instance"),
+        device_id=body.get("device_id")), {"Cache-Control": "no-store"})
+
+
+def _r_auth_client_pairing_get(h, m, q):
+    _require_auth_session(h)
+    h._reply_json(200, auth_client_pairing_record(
+        h._conn(), urllib.parse.unquote(m.group(1))),
+        {"Cache-Control": "no-store"})
+
+
+def _r_auth_client_pairing_authorize(h, m, q):
+    principal = _require_auth_session(h)
+    body = h._body_json()
+    h._reply_json(200, auth_client_pairing_decide(
+        h._conn(), urllib.parse.unquote(m.group(1)), principal, True,
+        memberships=body.get("project_memberships")),
+        {"Cache-Control": "no-store"})
+
+
+def _r_auth_client_pairing_deny(h, m, q):
+    principal = _require_auth_session(h)
+    h._reply_json(200, auth_client_pairing_decide(
+        h._conn(), urllib.parse.unquote(m.group(1)), principal, False),
+        {"Cache-Control": "no-store"})
+
+
 def _r_auth_invitation_create(h, m, q):
     principal = _require_admin_session(h)
     body = h._body_json()
@@ -13047,6 +13292,16 @@ ROUTES = [
      _r_auth_client_key_revoke),
     (*_route_def("DELETE", "/v1/auth/client-keys/%s/permanent" % _PID),
      _r_auth_client_key_delete),
+    (*_route_def("POST", "/v1/auth/client-pairings"),
+     _r_auth_client_pairing_start),
+    (*_route_def("POST", "/v1/auth/client-pairings/poll"),
+     _r_auth_client_pairing_poll),
+    (*_route_def("GET", "/v1/auth/client-pairings/%s" % _PID),
+     _r_auth_client_pairing_get),
+    (*_route_def("POST", "/v1/auth/client-pairings/%s/authorize" % _PID),
+     _r_auth_client_pairing_authorize),
+    (*_route_def("POST", "/v1/auth/client-pairings/%s/deny" % _PID),
+     _r_auth_client_pairing_deny),
     (*_route_def("GET", "/v1/auth/service-keys"), _r_auth_service_keys),
     (*_route_def("POST", "/v1/auth/service-keys"),
      _r_auth_service_key_create),
