@@ -224,6 +224,9 @@ Attacca supports exactly two advertised authentication forms:
 Settings authorizes, lists, and revokes client-install keys. A new installation
 opens a short-lived non-secret pairing link; the signed-in human reviews the
 client and optional workspace scope, then explicitly selects Authorize or Deny.
+The displayed pairing code retains 256 random bits as canonical unpadded
+Base32, grouped for readability; failed or unknown browser lookups are
+rate-limited without revealing whether a code exists.
 The client polls silently and receives the one-time credential directly after
 approval—there is no copy/paste step and the browser never displays the key.
 Leaving workspace selection empty follows the authenticated human's current

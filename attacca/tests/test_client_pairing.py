@@ -1,6 +1,7 @@
 """Secure browser authorization pairing for D-17 client-install keys."""
 
 import importlib.util
+import base64
 import tempfile
 import unittest
 from pathlib import Path
@@ -39,6 +40,12 @@ class ClientPairingTest(unittest.TestCase):
             self.conn, "http://server", "install-1", "Codex laptop",
             device_id="device-1")
         secret = started["pairing_secret"]
+        groups = started["pairing_code"].split("-")
+        self.assertEqual(len(groups), 13)
+        self.assertTrue(all(len(group) == 4 for group in groups))
+        encoded = "".join(groups)
+        decoded = base64.b32decode(encoded + "=" * ((8 - len(encoded) % 8) % 8))
+        self.assertEqual(len(decoded), 32)
         self.assertNotIn(secret, str(dict(c._auth_client_pairing_row(
             self.conn, started["pairing_code"]))))
         self.assertEqual(c.auth_client_pairing_poll(
@@ -85,6 +92,33 @@ class ClientPairingTest(unittest.TestCase):
             "denied")
         self.assertEqual(self.conn.execute(
             "SELECT COUNT(*) AS n FROM auth_tokens").fetchone()["n"], 0)
+
+    def test_pairing_code_format_is_canonical_with_legacy_expiry_bridge(self):
+        with self.assertRaisesRegex(c.AttaccaError, "format"):
+            c._auth_client_pairing_row(self.conn, "AAAA-BBBB-CCCC")
+        with self.assertRaisesRegex(c.AttaccaError, "format"):
+            c._auth_client_pairing_row(
+                self.conn, "AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-"
+                "AAAA-AAAA-AAAA-AAAA-AAA1")
+
+        started = c.auth_client_pairing_start(
+            self.conn, "http://server", "install-legacy", "Legacy")
+        row = c._auth_client_pairing_row(self.conn, started["pairing_code"])
+        self.conn.execute(
+            "UPDATE auth_client_pairings SET pairing_code='ABCD-2345'"
+            " WHERE pairing_secret_hash=?", (row["pairing_secret_hash"],))
+        self.assertEqual(c._auth_client_pairing_row(
+            self.conn, "ABCD-2345")["status"], "pending")
+
+    def test_failed_lookup_throttle_is_bounded_and_non_oracular(self):
+        key = "user|127.0.0.1"
+        with c._PAIRING_LOOKUP_FAILURES_LOCK:
+            c._PAIRING_LOOKUP_FAILURES.pop(key, None)
+        for _ in range(c._PAIRING_LOOKUP_MAX_FAILURES):
+            c._auth_pairing_lookup_check(key)
+            c._auth_pairing_lookup_failed(key)
+        with self.assertRaisesRegex(c.AuthorizationError, "throttled"):
+            c._auth_pairing_lookup_check(key)
 
 
 if __name__ == "__main__":
