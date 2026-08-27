@@ -133,6 +133,65 @@ class WatcherSubscriptionHygieneTestCase(unittest.TestCase):
         self.assertEqual(state["subscriptions"][key]["last_error"],
                          "HTTP Error 401: Unauthorized")
 
+    def test_same_checkout_install_deduplicates_without_losing_queues(self):
+        key, _status, _root, _link = self.make_checkout()
+        duplicate_key = "f" * 64
+
+        def duplicate(state):
+            original = state["subscriptions"][key]
+            original.update({
+                "last_registered_at": "2026-08-27T00:00:01Z",
+                "pending": [{"fingerprint": "new", "summary": "new"}],
+                "attention": [{"message_key": "event:new", "seq": 2}],
+                "attention_ack_cursor": 2,
+            })
+            stale = json.loads(json.dumps(original))
+            stale.update({
+                "key": duplicate_key,
+                "actor": "legacy-codex-alias",
+                "last_registered_at": "2026-08-26T00:00:01Z",
+                "pending": [{"fingerprint": "old", "summary": "old"}],
+                "attention": [{"message_key": "event:old", "seq": 1}],
+                "attention_ack_cursor": 1,
+            })
+            state["subscriptions"][duplicate_key] = stale
+
+        self.mutate(duplicate)
+        result = watch._prune_missing_watcher_subscriptions(now=10)
+        state = self.state()
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["deduplicated"], [{
+            "removed": duplicate_key, "survivor": key}])
+        self.assertEqual(set(state["subscriptions"]), {key})
+        survivor = state["subscriptions"][key]
+        self.assertEqual(
+            {row["fingerprint"] for row in survivor["pending"]},
+            {"new", "old"})
+        self.assertEqual(
+            {row["message_key"] for row in survivor["attention"]},
+            {"event:new", "event:old"})
+        self.assertEqual(survivor["attention_ack_cursor"], 2)
+
+    def test_distinct_valid_roots_never_deduplicate_or_lose_updates(self):
+        first, _status, _root, _link = self.make_checkout("first")
+        second, _status, _root, _link = self.make_checkout("second")
+
+        def queue(state):
+            state["subscriptions"][first]["pending"] = [
+                {"fingerprint": "first", "summary": "first"}]
+            state["subscriptions"][second]["pending"] = [
+                {"fingerprint": "second", "summary": "second"}]
+
+        self.mutate(queue)
+        result = watch._prune_missing_watcher_subscriptions(now=10)
+        state = self.state()
+        self.assertEqual(result["deduplicated"], [])
+        self.assertEqual(set(state["subscriptions"]), {first, second})
+        self.assertEqual(state["subscriptions"][first]["pending"][0][
+            "fingerprint"], "first")
+        self.assertEqual(state["subscriptions"][second]["pending"][0][
+            "fingerprint"], "second")
+
     def test_relative_or_inaccessible_path_is_unknown_not_prunable(self):
         key, _status, _root, _link = self.make_checkout()
 

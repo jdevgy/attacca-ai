@@ -1671,7 +1671,8 @@ def _prune_missing_watcher_subscriptions(now=None):
     by another checkout. Network/auth errors are never consulted here.
     """
     now = time.time() if now is None else float(now)
-    result = {"observed": [], "recovered": [], "removed": []}
+    result = {"observed": [], "recovered": [], "removed": [],
+              "deduplicated": []}
 
     def mutate(state):
         subscriptions = state.get("subscriptions")
@@ -1717,6 +1718,61 @@ def _prune_missing_watcher_subscriptions(now=None):
                 if subscriptions.get(key) is entry:
                     subscriptions.pop(key, None)
                     result["removed"].append(key)
+
+        # Rolling versions historically included actor/device details in the
+        # subscription hash, so the same installed client could accumulate
+        # multiple live registrations for one checkout. Collapse only entries
+        # whose canonical real root, server, project, runtime, and stable client
+        # installation all agree. The newest registration owns live identity
+        # and sync authority; only durable notification queues are unioned.
+        groups = {}
+        for key, entry in subscriptions.items():
+            if not isinstance(entry, dict) or \
+                    _watcher_subscription_missing_reason(entry) is not None:
+                continue
+            try:
+                root_path = Path(entry["root"]).expanduser()
+                if not root_path.is_absolute() or not root_path.is_dir():
+                    continue
+                root = str(root_path.resolve())
+                identity = (
+                    _normalized_server_url(entry.get("server_url")),
+                    str(entry.get("project_id") or ""),
+                    str(entry.get("runtime") or "").strip().lower(),
+                    str(entry.get("client_instance") or ""), root)
+            except Exception:
+                continue
+            if all(identity):
+                groups.setdefault(identity, []).append((key, entry))
+        for rows in groups.values():
+            if len(rows) < 2:
+                continue
+            rows.sort(key=lambda item: (
+                str(item[1].get("last_registered_at") or ""), item[0]))
+            survivor_key, survivor = rows[-1]
+            for duplicate_key, duplicate in rows[:-1]:
+                for field, identity_field in (
+                        ("pending", "fingerprint"),
+                        ("attention", "message_key"),
+                        ("pending_dispositions", "message_key")):
+                    target = survivor.setdefault(field, [])
+                    known = {item.get(identity_field) for item in target
+                             if isinstance(item, dict)}
+                    for item in duplicate.get(field) or []:
+                        marker = item.get(identity_field) \
+                            if isinstance(item, dict) else None
+                        if marker and marker not in known:
+                            target.append(item)
+                            known.add(marker)
+                survivor["attention_ack_cursor"] = max(
+                    int(survivor.get("attention_ack_cursor") or 0),
+                    int(duplicate.get("attention_ack_cursor") or 0))
+                survivor["pending_disposition_total"] = max(
+                    int(survivor.get("pending_disposition_total") or 0),
+                    int(duplicate.get("pending_disposition_total") or 0))
+                subscriptions.pop(duplicate_key, None)
+                result["deduplicated"].append({
+                    "removed": duplicate_key, "survivor": survivor_key})
 
     _mutate_state(_watcher_state_path(), mutate)
     return result
