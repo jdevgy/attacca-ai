@@ -16,6 +16,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -76,9 +77,9 @@ def _save_state(path, versions):
 
 
 def snapshot_codex_cache(cache_root, state_path):
-    """Persist and return every cache version an open session may hold."""
+    """Persist the newest pre-upgrade cache generation as one rollback."""
     cache_root = Path(cache_root)
-    versions = set(_load_state(state_path))
+    candidates = []
     if cache_root.is_dir():
         for child in cache_root.iterdir():
             try:
@@ -88,10 +89,59 @@ def snapshot_codex_cache(cache_root, state_path):
             # Directories and directory symlinks are both valid retained
             # plugin paths. Files and broken symlinks are never recorded.
             if child.is_dir():
-                versions.add(version)
-    ordered = sorted(versions)
+                candidates.append((child.stat().st_mtime_ns, version))
+    if candidates:
+        ordered = [max(candidates)[1]]
+    else:
+        prior = _load_state(state_path)
+        ordered = prior[-1:]  # interrupted update: retain one known rollback
     _save_state(state_path, ordered)
     return ordered
+
+
+def prune_attacca_cache(cache_root, active_version=None, rollback_count=1):
+    """Prune only verified Attacca generations, retaining active + rollback.
+
+    Unknown files and cache entries without Attacca's runtime and manifest are
+    never removed.  Claude's ``.in_use`` generations are active, not rollback
+    copies, and therefore remain until Claude releases them.
+    """
+    cache_root = Path(cache_root)
+    if not cache_root.is_dir():
+        return {"removed": [], "kept": [], "skipped": []}
+    owned, skipped = [], []
+    for child in cache_root.iterdir():
+        try:
+            version = _version(child.name)
+        except ValueError:
+            skipped.append(child.name)
+            continue
+        resolved = child.resolve() if child.is_symlink() else child
+        manifests = (resolved / ".codex-plugin" / "plugin.json",
+                     resolved / ".claude-plugin" / "plugin.json")
+        if not (resolved.is_dir() and (resolved / "attacca.py").is_file()
+                and any(item.is_file() for item in manifests)):
+            skipped.append(version)
+            continue
+        owned.append((child.stat().st_mtime_ns, version, child))
+    protected = {str(active_version)} if active_version else set()
+    protected.update(version for _, version, child in owned
+                     if (child / ".in_use").exists())
+    rollback = sorted(
+        (item for item in owned if item[1] not in protected), reverse=True)
+    protected.update(item[1] for item in rollback[:max(0, rollback_count)])
+    removed, kept = [], []
+    for _, version, child in owned:
+        if version in protected:
+            kept.append(version)
+            continue
+        if child.is_symlink():
+            child.unlink()
+        else:
+            shutil.rmtree(child)
+        removed.append(version)
+    return {"removed": sorted(removed), "kept": sorted(kept),
+            "skipped": sorted(skipped)}
 
 
 def restore_codex_cache(cache_root, stable_root, versions):
@@ -137,6 +187,10 @@ def _parser():
     restore.add_argument("--cache-root", required=True)
     restore.add_argument("--stable-root", required=True)
     restore.add_argument("--versions-json", required=True)
+    prune = sub.add_parser("prune")
+    prune.add_argument("--cache-root", required=True)
+    prune.add_argument("--active-version")
+    prune.add_argument("--rollback-count", type=int, default=1)
     return parser
 
 
@@ -145,6 +199,11 @@ def main(argv=None):
     if args.command == "snapshot":
         print(json.dumps(snapshot_codex_cache(
             args.cache_root, args.state), separators=(",", ":")))
+        return 0
+    if args.command == "prune":
+        print(json.dumps(prune_attacca_cache(
+            args.cache_root, args.active_version, args.rollback_count),
+            separators=(",", ":")))
         return 0
     try:
         versions = json.loads(args.versions_json)

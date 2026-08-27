@@ -33,6 +33,12 @@ class CodexUpgradeLifecycleTestCase(unittest.TestCase):
         (stable / "hooks").mkdir(parents=True)
         (stable / "hooks" / "session_start.py").write_text(
             "print('stable-hook-ran')\n", encoding="utf-8")
+        (stable / "attacca.py").write_text(
+            "VERSION = 'test'\n", encoding="utf-8")
+        (stable / ".codex-plugin").mkdir()
+        (stable / ".codex-plugin" / "plugin.json").write_text(
+            '{"name":"attacca","version":"0.5.0+codex.test"}\n',
+            encoding="utf-8")
         shutil.copy2(ROOT / "codex_hook_compat.py",
                      stable / "codex_hook_compat.py")
         return stable
@@ -92,6 +98,41 @@ class CodexUpgradeLifecycleTestCase(unittest.TestCase):
             self.assertEqual(invalid.read_text(encoding="utf-8"),
                              "do not replace")
 
+    def test_prune_keeps_active_one_rollback_and_unrelated_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "cache"
+            stable = self._stable_plugin(root)
+            for index, version in enumerate(("0.4.0", "0.4.1", "0.5.0")):
+                target = cache / version
+                shutil.copytree(stable, target)
+                manifest = target / ".codex-plugin" / "plugin.json"
+                manifest.parent.mkdir(parents=True, exist_ok=True)
+                manifest.write_text('{"name":"attacca"}\n', encoding="utf-8")
+                os.utime(target, ns=(index + 1, index + 1))
+            unrelated = cache / "not-attacca"
+            unrelated.mkdir()
+            (unrelated / "keep.txt").write_text("safe", encoding="utf-8")
+
+            result = compat.prune_attacca_cache(
+                cache, active_version="0.5.0", rollback_count=1)
+            self.assertEqual(result["removed"], ["0.4.0"])
+            self.assertEqual(result["kept"], ["0.4.1", "0.5.0"])
+            self.assertTrue((unrelated / "keep.txt").is_file())
+
+    def test_snapshot_collapses_old_registry_to_one_newest_rollback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "cache"
+            state = root / "state.json"
+            for index, version in enumerate(("0.4.0", "0.4.5")):
+                self._cached_hook(cache, version)
+                os.utime(cache / version, ns=(index + 1, index + 1))
+            compat._save_state(state, ["0.3.0", "0.3.5"])
+            self.assertEqual(
+                compat.snapshot_codex_cache(cache, state), ["0.4.5"])
+            self.assertEqual(compat._load_state(state), ["0.4.5"])
+
     def test_rendered_installer_restores_cache_deleted_by_fake_codex(self):
         script = c.INSTALL_SH_TEMPLATE.format(
             base="http://127.0.0.1:1", version=c.VERSION,
@@ -106,6 +147,9 @@ class CodexUpgradeLifecycleTestCase(unittest.TestCase):
                         codex_block.index("plugin marketplace remove"))
         self.assertGreater(codex_block.index("attacca_restore_codex_cache; then"),
                            codex_block.index("codex plugin add"))
+        self.assertIn("codex_hook_compat.py\" prune", codex_block)
+        self.assertLess(codex_block.index("plugin marketplace remove"),
+                        codex_block.index("plugin marketplace add"))
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -154,6 +198,27 @@ class CodexUpgradeLifecycleTestCase(unittest.TestCase):
                 json.loads(state.read_text(encoding="utf-8"))[
                     "cache_versions"], [old_version])
 
+    def test_installer_retains_exactly_one_bundle_rollback_outside_active(self):
+        script = c.INSTALL_SH_TEMPLATE.format(
+            base="http://127.0.0.1:1", version=c.VERSION,
+            required_files=repr(c.PLUGIN_FILES))
+        replace = script[
+            script.index("stage = tempfile.mkdtemp"):
+            script.index("PYEOF\nrm -rf", script.index(
+                "stage = tempfile.mkdtemp"))]
+        self.assertIn('"plugin-data", "rollback",', replace)
+        self.assertIn("remove_path(rollback)", replace)
+        self.assertIn("os.replace(backup, rollback)", replace)
+        self.assertNotIn("credentials", replace.lower())
+        self.assertNotIn("project.json", replace)
+
+        claude_start = script.index("# Claude Code: native plugin install")
+        claude_end = script.index("# Upgrade an already-setup checkout", claude_start)
+        claude = script[claude_start:claude_end]
+        self.assertIn("plugin marketplace remove agentg", claude)
+        self.assertIn("plugin marketplace add \"$DEST\"", claude)
+        self.assertIn("codex_hook_compat.py\" prune", claude)
+        self.assertIn("--rollback-count 1", claude)
     def test_distributed_hook_uses_stable_non_cache_command(self):
         manifest = json.loads(
             (ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))
