@@ -57,7 +57,8 @@ function parse(hash) {
 }
 process.stdout.write(JSON.stringify({
   valid: parse("#settings&pairing_code=AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH-JJJJ-KKKK-LLLL-MMMM-NNNN"),
-  legacy: parse("#settings&pairing_code=ABCD-2345"),
+  legacy: parse("#settings&pairing_code=ABCD-2389"),
+  ambiguousLegacy: parse("#settings&pairing_code=ABCI-23O9"),
   badId: parse("#settings&pairing_code=%3Cscript%3E"),
   tooLong: parse("#settings&pairing_code=" + "c".repeat(129)),
   other: parse("#room&pairing_code=pair_abc"),
@@ -68,7 +69,8 @@ process.stdout.write(JSON.stringify({
         canonical = ("AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH-JJJJ-"
                      "KKKK-LLLL-MMMM-NNNN")
         self.assertEqual(result["valid"], {"pairingCode": canonical})
-        self.assertEqual(result["legacy"], {"pairingCode": "ABCD-2345"})
+        self.assertEqual(result["legacy"], {"pairingCode": "ABCD-2389"})
+        self.assertEqual(result["ambiguousLegacy"], {"pairingCode": ""})
         self.assertEqual(result["badId"]["pairingCode"], "")
         self.assertEqual(result["tooLong"]["pairingCode"], "")
         self.assertEqual(result["other"], {"pairingCode": ""})
