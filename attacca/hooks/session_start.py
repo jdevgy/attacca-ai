@@ -6041,8 +6041,10 @@ def _periodic_output(status, event_name, offline_adapter=None,
         # Project Rules must still be re-pinned at the start of every
         # response so they never fall out of a long conversation.
         banner_output = None
-        if event_name == "UserPromptSubmit" or (
-                event_name == "Stop" and any(notices)):
+        # Rules are pinned SILENTLY at every UserPromptSubmit (additionalContext,
+        # never displayed). Re-pinning them on Stop would surface as a visible
+        # blocking-reason wall in the client chat, so Stop never emits the banner.
+        if event_name == "UserPromptSubmit":
             _identity, _entry = _poll_entry(status, config)
             _snap = (_entry or {}).get("snapshot") or {}
             _rules_banner = _mandatory_rules_banner(
@@ -6060,8 +6062,9 @@ def _periodic_output(status, event_name, offline_adapter=None,
     interval = _settings_interval(config, entry=offline_entry)
     identity, entry = _poll_entry(status, config)
     cached_rules_output = None
-    if event_name == "UserPromptSubmit" or (
-            event_name == "Stop" and any(notices)):
+    # Same rule as above: the banner is a UserPromptSubmit-only silent injection,
+    # never a Stop blocking-reason (which the client renders as a visible wall).
+    if event_name == "UserPromptSubmit":
         cached_poll = (entry or {}).get("snapshot") or {}
         cached_banner = _mandatory_rules_banner(
             cached_poll.get("project_rules"),
@@ -6109,14 +6112,9 @@ def _periodic_output(status, event_name, offline_adapter=None,
                     "Attacca · mandatory project rules pinned",
                     rules_banner)
         summary = _change_summary(status, previous, current, snapshot, interval)
-        if summary and event_name == "Stop" and not rules_output:
-            rules_banner = _mandatory_rules_banner(
-                (snapshot.get("rules") or {}).get("rules"))
-            if rules_banner:
-                rules_output = _event_context_output(
-                    event_name,
-                    "Attacca · mandatory project rules pinned",
-                    rules_banner)
+        # On Stop we deliver only a genuine change summary (short), never the
+        # rules banner — that stays a UserPromptSubmit-only silent injection so
+        # the client chat is not flooded with a re-pinned wall every turn.
         if not summary:
             return _append_notices(rules_output, event_name, notices)
         if rules_output:
