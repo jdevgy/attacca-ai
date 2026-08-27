@@ -1235,6 +1235,12 @@ def connect(db_path):
         conn.execute("PRAGMA synchronous=NORMAL")
         # Schema is idempotent (IF NOT EXISTS) so concurrent first-open is safe.
         conn.executescript(SCHEMA)
+        # Human login and identity are one canonical account name. Keep the
+        # legacy column as a mirror so old databases cannot retain a second
+        # human identity through auth payloads or client setup.
+        conn.execute(
+            "UPDATE auth_users SET display_name=username"
+            " WHERE display_name IS NULL OR display_name<>username")
         # Migrations for databases created before newer columns existed.
         for table, column in (("projects", "lead_director"),
                               ("projects", "repository_fingerprint"),
@@ -1412,7 +1418,6 @@ def _password_hash(password, salt_hex, iterations=PASSWORD_ITERATIONS):
 
 def _public_auth_user(row):
     return {"user_id": row["user_id"], "username": row["username"],
-            "display_name": row["display_name"],
             "is_admin": bool(row["is_admin"]),
             "created_at": row["created_at"],
             "disabled": bool(row["disabled_at"])}
@@ -2507,9 +2512,6 @@ def auth_invitation_accept(conn, raw_token, username, password,
         raise AuthenticationError(
             "invalid_invitation: invitation is invalid, expired or consumed")
     username = _clean_username(username)
-    display_name = str(display_name or username).strip()
-    if not display_name:
-        raise AttaccaError("display name is required")
     salt = secrets.token_hex(16)
     digest = _password_hash(password, salt)
     user_id = new_id("usr")
@@ -2529,7 +2531,7 @@ def auth_invitation_accept(conn, raw_token, username, password,
                 " (user_id,username,display_name,password_salt,password_hash,"
                 " password_iterations,is_admin,created_at)"
                 " VALUES (?,?,?,?,?,?,?,?)",
-                (user_id, username, display_name, salt, digest,
+                (user_id, username, username, salt, digest,
                  PASSWORD_ITERATIONS, 1 if current["is_admin"] else 0, nowi))
         except sqlite3.IntegrityError:
             raise AttaccaError("Attacca user '%s' already exists" % username)
@@ -2697,9 +2699,6 @@ def auth_compatibility_active(conn, server):
 def auth_create_user(conn, username, password, display_name=None,
                      is_admin=False, bootstrap=False):
     username = _clean_username(username)
-    display_name = str(display_name or username).strip()
-    if not display_name:
-        raise AttaccaError("display name is required")
     salt = secrets.token_hex(16)
     digest = _password_hash(password, salt)
     with write_tx(conn):
@@ -2714,7 +2713,7 @@ def auth_create_user(conn, username, password, display_name=None,
                 "INSERT INTO auth_users (user_id, username, display_name,"
                 " password_salt, password_hash, password_iterations, is_admin,"
                 " created_at) VALUES (?,?,?,?,?,?,?,?)",
-                (user_id, username, display_name, salt, digest,
+                (user_id, username, username, salt, digest,
                  PASSWORD_ITERATIONS, 1 if (is_admin or not count) else 0,
                  now_iso()))
         except sqlite3.IntegrityError:
@@ -2788,7 +2787,7 @@ def auth_create_session(conn, user_row):
 def _auth_principal(conn, user_row, kind, **extra):
     result = {"user_id": user_row["user_id"],
               "username": user_row["username"],
-              "display_name": user_row["display_name"],
+              "display_name": user_row["username"],
               "is_admin": bool(user_row["is_admin"]),
               "is_owner": bool(user_row["user_id"] == _auth_setting(
                   conn, "auth.owner_user_id", None)),
@@ -12075,7 +12074,6 @@ def _auth_status_payload(h):
     result["user"] = _public_auth_user(row) if row else {
         "user_id": principal["user_id"],
         "username": principal["username"],
-        "display_name": principal["display_name"],
         "is_admin": bool(principal["is_admin"]),
     }
     result["user"]["is_owner"] = bool(principal.get("is_owner"))
