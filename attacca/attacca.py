@@ -2055,7 +2055,7 @@ def auth_client_pairing_start(conn, base_url, client_instance, label,
 def _auth_client_pairing_row(conn, pairing_code):
     code = str(pairing_code or "").strip().upper()
     modern = re.fullmatch(r"(?:[A-Z2-7]{4}-){12}[A-Z2-7]{4}", code)
-    legacy = re.fullmatch(r"[A-Z2-9]{4}-[A-Z2-9]{4}", code)
+    legacy = re.fullmatch(r"[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}", code)
     if not modern and not legacy:
         raise AttaccaError("invalid client pairing code format")
     row = conn.execute(
@@ -12449,6 +12449,17 @@ def _auth_pairing_lookup_throttle_key(h, principal):
 def _auth_pairing_lookup_check(key):
     cutoff = time.monotonic() - _PAIRING_LOOKUP_WINDOW_SECONDS
     with _PAIRING_LOOKUP_FAILURES_LOCK:
+        # Opportunistic bounded pruning prevents attacker-selected source keys
+        # from growing process memory without limit.
+        if len(_PAIRING_LOOKUP_FAILURES) > 4096:
+            for existing in list(_PAIRING_LOOKUP_FAILURES):
+                recent = [stamp for stamp in
+                          _PAIRING_LOOKUP_FAILURES[existing]
+                          if stamp >= cutoff]
+                if recent:
+                    _PAIRING_LOOKUP_FAILURES[existing] = recent
+                else:
+                    _PAIRING_LOOKUP_FAILURES.pop(existing, None)
         failures = [stamp for stamp in _PAIRING_LOOKUP_FAILURES.get(key, [])
                     if stamp >= cutoff]
         _PAIRING_LOOKUP_FAILURES[key] = failures
@@ -12460,6 +12471,11 @@ def _auth_pairing_lookup_check(key):
 def _auth_pairing_lookup_failed(key):
     with _PAIRING_LOOKUP_FAILURES_LOCK:
         _PAIRING_LOOKUP_FAILURES.setdefault(key, []).append(time.monotonic())
+
+
+def _auth_pairing_lookup_succeeded(key):
+    with _PAIRING_LOOKUP_FAILURES_LOCK:
+        _PAIRING_LOOKUP_FAILURES.pop(key, None)
 
 
 def _r_auth_client_pairing_get(h, m, q):
@@ -12474,25 +12490,38 @@ def _r_auth_client_pairing_get(h, m, q):
         # One response for malformed and unknown codes avoids a format/existence
         # oracle while the per-account+address limiter bounds guessing.
         raise AttaccaError("client pairing request unavailable")
-    with _PAIRING_LOOKUP_FAILURES_LOCK:
-        _PAIRING_LOOKUP_FAILURES.pop(key, None)
+    _auth_pairing_lookup_succeeded(key)
     h._reply_json(200, record, {"Cache-Control": "no-store"})
 
 
 def _r_auth_client_pairing_authorize(h, m, q):
     principal = _require_auth_session(h)
     body = h._body_json()
-    h._reply_json(200, auth_client_pairing_decide(
-        h._conn(), urllib.parse.unquote(m.group(1)), principal, True,
-        memberships=body.get("project_memberships")),
-        {"Cache-Control": "no-store"})
+    key = _auth_pairing_lookup_throttle_key(h, principal)
+    _auth_pairing_lookup_check(key)
+    try:
+        result = auth_client_pairing_decide(
+            h._conn(), urllib.parse.unquote(m.group(1)), principal, True,
+            memberships=body.get("project_memberships"))
+    except AttaccaError:
+        _auth_pairing_lookup_failed(key)
+        raise AttaccaError("client pairing request unavailable")
+    _auth_pairing_lookup_succeeded(key)
+    h._reply_json(200, result, {"Cache-Control": "no-store"})
 
 
 def _r_auth_client_pairing_deny(h, m, q):
     principal = _require_auth_session(h)
-    h._reply_json(200, auth_client_pairing_decide(
-        h._conn(), urllib.parse.unquote(m.group(1)), principal, False),
-        {"Cache-Control": "no-store"})
+    key = _auth_pairing_lookup_throttle_key(h, principal)
+    _auth_pairing_lookup_check(key)
+    try:
+        result = auth_client_pairing_decide(
+            h._conn(), urllib.parse.unquote(m.group(1)), principal, False)
+    except AttaccaError:
+        _auth_pairing_lookup_failed(key)
+        raise AttaccaError("client pairing request unavailable")
+    _auth_pairing_lookup_succeeded(key)
+    h._reply_json(200, result, {"Cache-Control": "no-store"})
 
 
 def _r_auth_invitation_create(h, m, q):

@@ -5,6 +5,7 @@ import base64
 import tempfile
 import unittest
 from pathlib import Path
+import re
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -119,6 +120,38 @@ class ClientPairingTest(unittest.TestCase):
             c._auth_pairing_lookup_failed(key)
         with self.assertRaisesRegex(c.AuthorizationError, "throttled"):
             c._auth_pairing_lookup_check(key)
+
+    def test_authorize_and_deny_cannot_bypass_lookup_throttle(self):
+        class Handler:
+            def __init__(inner, address):
+                inner.principal = self.principal
+                inner.client_address = (address, 1234)
+
+            def _conn(inner):
+                return self.conn
+
+            def _body_json(inner):
+                return {}
+
+            def _reply_json(inner, *_args, **_kwargs):
+                self.fail("unknown pairing must not produce a reply")
+
+        unknown = re.match(
+            r"(.+)", "AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-"
+            "AAAA-AAAA-AAAA-AAAA-AAAA")
+        for endpoint, address in (
+                (c._r_auth_client_pairing_authorize, "192.0.2.10"),
+                (c._r_auth_client_pairing_deny, "192.0.2.11")):
+            handler = Handler(address)
+            key = c._auth_pairing_lookup_throttle_key(
+                handler, self.principal)
+            with c._PAIRING_LOOKUP_FAILURES_LOCK:
+                c._PAIRING_LOOKUP_FAILURES.pop(key, None)
+            for _ in range(c._PAIRING_LOOKUP_MAX_FAILURES):
+                with self.assertRaisesRegex(c.AttaccaError, "unavailable"):
+                    endpoint(handler, unknown, {})
+            with self.assertRaisesRegex(c.AuthorizationError, "throttled"):
+                endpoint(handler, unknown, {})
 
 
 if __name__ == "__main__":
