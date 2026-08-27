@@ -181,23 +181,32 @@ class ClientAuthorizationRedTeamTest(unittest.TestCase):
 
     def test_authorization_public_result_and_message_never_reflect_key(self):
         opened = []
-
-        @contextlib.contextmanager
-        def no_tty():
-            raise flow.ControllingTerminalUnavailable("no tty")
-            yield  # pragma: no cover
+        pairing_secret = "pairing_secret_never_reflect_12345"
+        transport = StaticTransport(201, {
+            "status": "pending", "pairing_secret": pairing_secret,
+            "pairing_code": "ABCD-1234",
+            "verification_uri_complete":
+                self.server + "/app#pairing=ABCD-1234",
+            "expires_in": 600, "interval": 5,
+        })
 
         result = flow.authorize_client(
             self.server, client_instance=self.instance,
             credentials_path=self.credentials,
             browser_open=lambda value: opened.append(value) or True,
-            tty_opener=no_tty)
+            transport=transport)
         message = flow.format_authorization_message(result, self.server)
         serialized = json.dumps(result) + message + "".join(opened)
         self.assertNotIn(self.token, serialized)
+        self.assertNotIn(pairing_secret, serialized)
         self.assertNotIn("device code", serialized.lower())
         self.assertNotIn("actor binding", serialized.lower())
         self.assertNotIn("run attacca", serialized.lower())
+        self.assertEqual(len(transport.calls), 1)
+        payload = transport.calls[0][3]
+        self.assertNotIn("actor", payload)
+        self.assertNotIn("project", payload)
+        self.assertNotIn("runtime", payload)
 
     def test_hidden_paste_does_not_accept_ordinary_stdin(self):
         fake = io.StringIO(self.token)
@@ -213,15 +222,30 @@ class ClientAuthorizationRedTeamTest(unittest.TestCase):
                 credentials_path=self.credentials, tty_opener=opener)
 
     def test_compatibility_wrappers_never_call_retired_endpoints(self):
-        transport = StaticTransport(500, {})
+        transport = StaticTransport(201, {
+            "status": "pending",
+            "pairing_secret": "pairing_secret_wrapper_12345",
+            "pairing_code": "WXYZ-9876",
+            "verification_uri_complete":
+                self.server + "/app#pairing=WXYZ-9876",
+            "expires_in": 600, "interval": 5,
+        })
         result = flow.start_device_flow(
             self.server, device_id="device_a", client_instance_id=self.instance,
             requested_bindings=[{
                 "project_id": "alpha", "actor_id": "alpha.worker.codex"}],
             credentials_path=self.credentials, transport=transport,
             open_browser=False)
-        self.assertEqual(result["status"], "authorization_required")
-        self.assertEqual(transport.calls, [])
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(len(transport.calls), 1)
+        method, url, _headers, payload = transport.calls[0]
+        self.assertEqual(method, "POST")
+        self.assertTrue(url.endswith("/v1/auth/client-pairings"))
+        self.assertNotIn("actor", payload)
+        self.assertNotIn("project", payload)
+        self.assertNotIn("runtime", payload)
+        self.assertNotIn("/terminal/", url)
+        self.assertNotIn("device-code", url)
         self.assertNotIn("device_code", json.dumps(result))
         self.assertNotIn("user_code", json.dumps(result))
 
