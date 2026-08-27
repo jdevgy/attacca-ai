@@ -226,23 +226,60 @@ class ClientAuthorizationFlowTest(unittest.TestCase):
 
     def test_authorize_opens_settings_and_defers_without_tty(self):
         opened = []
-
-        @contextlib.contextmanager
-        def unavailable():
-            raise flow.ControllingTerminalUnavailable("no tty")
-            yield  # pragma: no cover
+        transport = FakeTransport(flow.JsonResponse(201, {}, {
+            "status": "pending", "pairing_secret": "secret_pair_1234",
+            "pairing_code": "ABCD-1234",
+            "verification_uri_complete": self.server + "/app#pair=ABCD-1234",
+            "interval": 5,
+        }))
 
         result = flow.authorize_client(
             self.server, client_instance=self.instance,
             client_label="Laptop Codex", credentials_path=self.credentials,
             browser_open=lambda url: opened.append(url) or True,
-            tty_opener=unavailable)
-        self.assertEqual(result["status"], "authorization_required")
+            transport=transport)
+        self.assertEqual(result["status"], "pending")
         self.assertTrue(result["hot_reload"])
         self.assertEqual(opened, [result["authorization_url"]])
-        self.assertIn("#settings&client_instance=", opened[0])
+        self.assertIn("#pair=ABCD-1234", opened[0])
         self.assertNotIn("atkey_", opened[0])
         self.assertNotIn("restart", json.dumps(result).lower())
+        self.assertEqual(transport.calls[0]["payload"]["label"],
+                         "Laptop Codex")
+        self.assertNotIn("actor", transport.calls[0]["payload"])
+        stored = flow.read_credentials_store(self.credentials)
+        pairing = flow._pairing_record(stored, self.server, self.instance)
+        self.assertEqual(pairing["pairing_secret"], "secret_pair_1234")
+
+    def test_silent_poll_persists_approved_key_and_forgets_pairing_secret(self):
+        start = FakeTransport(flow.JsonResponse(201, {}, {
+            "status": "pending", "pairing_secret": "secret_pair_1234",
+            "pairing_code": "ABCD-1234",
+            "verification_uri_complete": self.server + "/app#pair=ABCD-1234",
+            "interval": 5,
+        }))
+        flow.start_client_pairing(
+            self.server, client_instance=self.instance,
+            credentials_path=self.credentials, transport=start,
+            open_browser=False)
+        approved = FakeTransport(flow.JsonResponse(200, {}, {
+            "status": "approved", "credential": {
+                "token": self.token,
+                "record": {key: value for key, value in self.record().items()
+                           if key != "token"},
+            },
+        }))
+        result = flow.poll_client_pairing(
+            self.server, client_instance=self.instance,
+            credentials_path=self.credentials, transport=approved)
+        self.assertEqual(result["status"], "ready")
+        self.assertNotIn(self.token, json.dumps(result))
+        self.assertEqual(flow.load_client_api_key(
+            self.server, client_instance=self.instance,
+            credentials_path=self.credentials), self.token)
+        stored = flow.read_credentials_store(self.credentials)
+        self.assertIsNone(flow._pairing_record(
+            stored, self.server, self.instance))
 
     def test_authorize_ready_does_not_open_browser_or_prompt(self):
         flow.save_client_api_key(
@@ -318,7 +355,7 @@ class ClientAuthorizationFlowTest(unittest.TestCase):
         }, self.server, "alpha")
         lowered = message.lower()
         self.assertIn("active ai opened", lowered)
-        self.assertIn("hidden terminal prompt", lowered)
+        self.assertIn("polls silently", lowered)
         self.assertIn("never paste", lowered)
         self.assertIn("no coding-client restart", lowered)
         self.assertNotIn("run `", lowered)

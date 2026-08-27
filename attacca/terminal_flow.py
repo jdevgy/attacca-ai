@@ -10,16 +10,16 @@ or role.  Every project request separately supplies the exact workspace and
 canonical ``workspace.role.runtime`` actor.  The server then checks the
 human's workspace membership and ownership of that already-registered actor.
 
-The active AI starts this flow itself.  It opens the browser to Settings and,
-when a real foreground controlling terminal exists, accepts the newly-created
-key with hidden input.  The key is never accepted in argv, ordinary stdin, a
-URL, a log line, or the AI conversation.  A successful paste is available to
-the current process immediately; no coding-client restart is required.
+The active AI starts a one-click browser pairing itself.  The signed-in human
+approves the installation, while the client silently polls with a private
+one-time pairing secret.  The delivered key is written atomically to the
+private credential store and is available to the watcher immediately; it is
+never pasted into argv, stdin, a URL, a log line, or the AI conversation, and
+no coding-client restart is required.
 
 Older releases imported several ``terminal_*`` and ``device_flow`` symbols.
-Narrow compatibility wrappers remain at the bottom of this module so a
-rolling source update fails safely.  They use only the client-key model and
-never create, poll, approve, or bind a device code.
+Narrow compatibility wrappers remain at the bottom of this module and now map
+onto the install-only pairing flow; no pairing binds an AI actor or role.
 """
 
 from __future__ import annotations
@@ -60,6 +60,7 @@ MAX_PRIVATE_STATE_BYTES = 1024 * 1024
 
 AUTH_STATUS_PATH = "/v1/auth/status"
 CLIENT_KEYS_PATH = "/v1/auth/client-keys"
+CLIENT_PAIRINGS_PATH = "/v1/auth/client-pairings"
 CLIENT_INSTANCE_HEADER = "X-Attacca-Client-Instance"
 DEVICE_ID_HEADER = "X-Attacca-Device-ID"
 PROJECT_HEADER = "X-Attacca-Project"
@@ -836,6 +837,132 @@ def client_key_settings_url(server_url, client_instance=None,
     return _endpoint(server_url, "/app") + "#" + fragment
 
 
+def _pairing_record(data, server_url, client_instance):
+    server = server_record_for_url(data, server_url)
+    rows = server.get("client_pairings") if isinstance(server, dict) else None
+    return rows.get(client_instance) if isinstance(rows, dict) else None
+
+
+def _validate_pairing_secret(value):
+    if not isinstance(value, str) or not 16 <= len(value) <= MAX_TOKEN_BYTES \
+            or any(character.isspace() for character in value):
+        raise TerminalFlowProtocolError(
+            "Attacca returned an invalid pairing secret")
+    return value
+
+
+def _store_pairing(server_url, instance, pairing, credentials_path=None):
+    def install(data):
+        server = canonical_server_record_for_update(data, server_url)
+        server.setdefault("client_pairings", {})[instance] = pairing
+        return data
+    update_credentials_store(credentials_path, install)
+
+
+def _forget_pairing(server_url, instance, credentials_path=None):
+    def remove(data):
+        server = server_record_for_url(data, server_url)
+        if isinstance(server, dict) and isinstance(
+                server.get("client_pairings"), dict):
+            server["client_pairings"].pop(instance, None)
+        return data
+    update_credentials_store(credentials_path, remove)
+
+
+def start_client_pairing(server_url, *, client_instance=None, runtime=None,
+                         storage_path=None, client_label="Attacca client",
+                         device_id=None, credentials_path=None, transport=None,
+                         timeout=DEFAULT_TIMEOUT_SECONDS, open_browser=True,
+                         browser_open=None):
+    """Start one install-only browser pairing and persist its secret privately."""
+    instance = _resolved_client_instance_id(
+        client_instance, runtime=runtime, storage_path=storage_path)
+    response = (transport or UrllibJsonTransport()).request(
+        "POST", _endpoint(server_url, CLIENT_PAIRINGS_PATH),
+        headers={"Accept": "application/json"}, payload={
+            "client_instance": instance,
+            "label": str(client_label or "Attacca client")[:120],
+            "device_id": device_id,
+        }, timeout=timeout)
+    if response.status not in {200, 201}:
+        raise TerminalFlowProtocolError(
+            "Attacca could not start client authorization")
+    value = response.value
+    secret = _validate_pairing_secret(value.get("pairing_secret"))
+    code = _bounded_safe_id(value.get("pairing_code"), "pairing_code")
+    url = value.get("verification_uri_complete")
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        raise TerminalFlowProtocolError(
+            "Attacca returned an invalid authorization link")
+    pairing = {
+        "pairing_secret": secret, "pairing_code": code,
+        "authorization_url": url,
+        "expires_at": value.get("expires_at"),
+        "expires_in": value.get("expires_in"),
+        "interval": max(1, int(value.get("interval") or 5)),
+        "device_id": device_id,
+        "created_at": _now_iso(), "browser_prompted": True,
+    }
+    _store_pairing(server_url, instance, pairing, credentials_path)
+    opened = False
+    if open_browser:
+        try:
+            opened = bool((browser_open or webbrowser.open)(url))
+        except Exception:
+            opened = False
+    return {"status": "pending", "authorized": False,
+            "client_instance": instance, "pairing_code": code,
+            "authorization_url": url, "browser_opened": opened,
+            "interval": pairing["interval"], "hot_reload": True}
+
+
+def poll_client_pairing(server_url, *, client_instance=None, runtime=None,
+                        storage_path=None, credentials_path=None,
+                        transport=None, timeout=DEFAULT_TIMEOUT_SECONDS):
+    """Poll silently; consume and persist an approved one-time credential."""
+    instance = _resolved_client_instance_id(
+        client_instance, runtime=runtime, storage_path=storage_path)
+    pairing = _pairing_record(
+        read_credentials_store(credentials_path), server_url, instance)
+    if not isinstance(pairing, dict):
+        return {"status": "authorization_required", "authorized": False,
+                "client_instance": instance, "hot_reload": True}
+    response = (transport or UrllibJsonTransport()).request(
+        "POST", _endpoint(server_url, CLIENT_PAIRINGS_PATH + "/poll"),
+        headers={"Accept": "application/json"}, payload={
+            "pairing_secret": pairing.get("pairing_secret"),
+            "client_instance": instance,
+            "device_id": pairing.get("device_id"),
+        }, timeout=timeout)
+    value = response.value
+    state = str(value.get("status") or "").lower()
+    if response.status in {202, 428} or state in {"pending", "slow_down"}:
+        return {"status": "pending", "authorized": False,
+                "client_instance": instance,
+                "authorization_url": pairing.get("authorization_url"),
+                "pairing_code": pairing.get("pairing_code"),
+                "interval": pairing.get("interval", 5), "hot_reload": True}
+    if response.status != 200 or state not in {"approved", "ready"}:
+        if state in {"denied", "expired"} or response.status in {404, 410}:
+            _forget_pairing(server_url, instance, credentials_path)
+        return {"status": state or "authorization_required",
+                "authorized": False, "client_instance": instance,
+                "hot_reload": True}
+    credential = value.get("credential") or value.get("client_api_key")
+    if isinstance(credential, str):
+        credential = {"token": credential}
+    if not isinstance(credential, dict):
+        credential = dict(value)
+        credential["token"] = value.get("token")
+    credential.setdefault("client_instance", instance)
+    credential.setdefault("token_kind", "client")
+    result = save_client_api_key(
+        server_url, credential, client_instance=instance,
+        credentials_path=credentials_path)
+    _forget_pairing(server_url, instance, credentials_path)
+    return result
+
+
 @contextlib.contextmanager
 def open_controlling_terminal():
     """Yield only a real foreground controlling TTY, never hook/chat stdin."""
@@ -947,7 +1074,7 @@ def authorize_client(server_url, *, client_instance=None, runtime=None,
                      timeout=DEFAULT_TIMEOUT_SECONDS, open_browser=True,
                      browser_open=None, prompt=True,
                      tty_opener=open_controlling_terminal):
-    """AI-initiated browser + hidden-paste authorization with hot reload."""
+    """AI-initiated one-click browser pairing with silent hot reload."""
     instance = _resolved_client_instance_id(
         client_instance, runtime=runtime, storage_path=storage_path)
     status = client_api_key_status(
@@ -955,29 +1082,21 @@ def authorize_client(server_url, *, client_instance=None, runtime=None,
         credentials_path=credentials_path)
     if status.get("authorized"):
         return status
-    url = client_key_settings_url(server_url, instance, client_label)
-    browser_opened = False
-    if open_browser:
-        try:
-            browser_opened = bool((browser_open or webbrowser.open)(url))
-        except Exception:
-            browser_opened = False
-    if prompt:
-        try:
-            return paste_client_api_key(
-                server_url, client_instance=instance, project_id=project_id,
-                actor_id=actor_id, device_id=device_id,
-                credentials_path=credentials_path, transport=transport,
-                timeout=timeout, tty_opener=tty_opener)
-        except ControllingTerminalUnavailable:
-            pass
-    return {
-        "status": "authorization_required", "authorized": False,
-        "client_instance": instance, "authorization_url": url,
-        "browser_opened": browser_opened, "hot_reload": True,
-        "next_action": "create a client API key in Settings; the active AI will"
-                       " collect it through a hidden terminal prompt",
-    }
+    existing = _pairing_record(
+        read_credentials_store(credentials_path), server_url, instance)
+    if isinstance(existing, dict):
+        polled = poll_client_pairing(
+            server_url, client_instance=instance,
+            credentials_path=credentials_path, transport=transport,
+            timeout=timeout)
+        if polled.get("status") not in {"expired", "denied",
+                                         "authorization_required"}:
+            return polled
+    return start_client_pairing(
+        server_url, client_instance=instance, client_label=client_label,
+        device_id=device_id, credentials_path=credentials_path,
+        transport=transport, timeout=timeout, open_browser=open_browser,
+        browser_open=browser_open)
 
 
 def fallback_login_url(server_url):
@@ -1008,10 +1127,10 @@ def format_authorization_message(result, server_url, project_id=None):
     url = result.get("authorization_url") or fallback_login_url(server_url)
     return (
         "Attacca needs browser sign-in and client authorization%s. The active "
-        "AI opened %s so the signed-in "
-        "human can create a key for this client installation, then the AI will "
-        "collect it through a hidden terminal prompt and reconnect immediately. "
-        "Never paste an API key into chat or an ordinary shell command; no "
+        "AI opened %s so the signed-in human can approve this client "
+        "installation. Attacca polls silently, stores the delivered credential "
+        "privately, and reconnects immediately. Never paste an API key into "
+        "chat or an ordinary shell command; no "
         "coding-client restart is required." % (workspace, url))
 
 
@@ -1122,10 +1241,11 @@ def start_device_flow(server_url, *, device_id=None,
 def poll_device_flow(server_url, *, device_id=None, credentials_path=None,
                      client_instance_id=None, requested_bindings=None,
                      **kwargs):
-    project_id, _actor_id = _first_binding(requested_bindings)
-    return client_api_key_status(
+    return poll_client_pairing(
         server_url, client_instance=client_instance_id,
-        project_id=project_id, credentials_path=credentials_path)
+        credentials_path=credentials_path,
+        transport=kwargs.get("transport"),
+        timeout=kwargs.get("timeout", DEFAULT_TIMEOUT_SECONDS))
 
 
 def advance_device_flow(server_url, *, device_id=None,

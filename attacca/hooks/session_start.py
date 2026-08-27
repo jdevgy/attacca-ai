@@ -3181,6 +3181,7 @@ def _watcher_queue_auth_required(key, entry, error, now):
     message = _trim(error, 300)
     recovery_message = None
     recovery_status = None
+    recovery_interval = DEFAULT_UPDATE_INTERVAL_SECONDS
     try:
         status = _watcher_subscription_status(entry)
         config = _watcher_subscription_config(entry)
@@ -3188,6 +3189,13 @@ def _watcher_queue_auth_required(key, entry, error, now):
             status, config, "SessionStart", entry)
         recovery_message = recovery["message"]
         recovery_status = recovery["result"].get("status")
+        try:
+            recovery_interval = max(1, min(
+                DEFAULT_UPDATE_INTERVAL_SECONDS,
+                int(recovery["result"].get("interval") or
+                    DEFAULT_UPDATE_INTERVAL_SECONDS)))
+        except (TypeError, ValueError):
+            recovery_interval = DEFAULT_UPDATE_INTERVAL_SECONDS
     except Exception:
         recovery_message = (
             "Open %s/app to complete secure browser sign-in. The native "
@@ -3207,7 +3215,7 @@ def _watcher_queue_auth_required(key, entry, error, now):
             "last_error": message,
             "next_poll_at_epoch": now if recovery_status in {
                 "approved", "ready"} else
-                now + DEFAULT_UPDATE_INTERVAL_SECONDS,
+                now + recovery_interval,
             "auth_required": True,
             "auth_required_at": datetime.now(timezone.utc).isoformat(),
             "offline_mode": "auth_required",
