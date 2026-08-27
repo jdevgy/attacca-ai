@@ -2045,7 +2045,7 @@ def auth_client_pairing_start(conn, base_url, client_instance, label,
         "pairing_secret": raw_secret,
         "pairing_code": pairing_code,
         "verification_uri": base + "/app#settings",
-        "verification_uri_complete": "%s/app?pairing_code=%s#settings" % (
+        "verification_uri_complete": "%s/app#settings&pairing_code=%s" % (
             base, urllib.parse.quote(pairing_code, safe="")),
         "expires_in": 600,
         "interval": 5,

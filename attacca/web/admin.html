@@ -615,7 +615,12 @@
           const [view, ...parts] = raw.split("&");
           if (view !== "settings") return { pairingCode: "" };
           const params = new URLSearchParams(parts.join("&"));
-          const pairingCode = params.get("pairing_code") || "";
+          // Current clients keep the public code in the Settings fragment.
+          // Accept the short-lived query form emitted by the first pairing
+          // build so already-open requests do not strand their waiting client.
+          const query = new URLSearchParams(String(location.search || ""));
+          const pairingCode = params.get("pairing_code") ||
+            query.get("pairing_code") || "";
           const canonical = /^(?:[A-Z2-7]{4}-){12}[A-Z2-7]{4}$/;
           const expiringLegacy = /^[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/;
           return { pairingCode: canonical.test(pairingCode) || expiringLegacy.test(pairingCode) ? pairingCode : "" };

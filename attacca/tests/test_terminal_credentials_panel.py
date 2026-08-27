@@ -51,12 +51,13 @@ class ClientCredentialsPanelTestCase(unittest.TestCase):
     def test_client_fragment_hints_are_non_secret_strict_and_cross_view_safe(self):
         helper = self.marked("CLIENT_AUTHORIZATION_HINTS")
         program = helper + r"""
-function parse(hash) {
-  global.location = {hash};
+function parse(hash, search = "") {
+  global.location = {hash, search};
   return clientAuthorizationHintsFromLocation();
 }
 process.stdout.write(JSON.stringify({
   valid: parse("#settings&pairing_code=AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH-JJJJ-KKKK-LLLL-MMMM-NNNN"),
+  queryCompatibility: parse("#settings", "?pairing_code=AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH-JJJJ-KKKK-LLLL-MMMM-NNNN"),
   legacy: parse("#settings&pairing_code=ABCD-2389"),
   ambiguousLegacy: parse("#settings&pairing_code=ABCI-23O9"),
   badId: parse("#settings&pairing_code=%3Cscript%3E"),
@@ -69,6 +70,8 @@ process.stdout.write(JSON.stringify({
         canonical = ("AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH-JJJJ-"
                      "KKKK-LLLL-MMMM-NNNN")
         self.assertEqual(result["valid"], {"pairingCode": canonical})
+        self.assertEqual(result["queryCompatibility"],
+                         {"pairingCode": canonical})
         self.assertEqual(result["legacy"], {"pairingCode": "ABCD-2389"})
         self.assertEqual(result["ambiguousLegacy"], {"pairingCode": ""})
         self.assertEqual(result["badId"]["pairingCode"], "")

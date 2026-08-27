@@ -40,6 +40,10 @@ class ClientPairingTest(unittest.TestCase):
         started = c.auth_client_pairing_start(
             self.conn, "http://server", "install-1", "Codex laptop",
             device_id="device-1")
+        self.assertIn("/app#settings&pairing_code=",
+                      started["verification_uri_complete"])
+        self.assertNotIn("?pairing_code=",
+                         started["verification_uri_complete"])
         secret = started["pairing_secret"]
         groups = started["pairing_code"].split("-")
         self.assertEqual(len(groups), 13)
