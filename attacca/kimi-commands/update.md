@@ -4,15 +4,16 @@ description: Load a fresh full-project update from Attacca in Kimi Code (/attacc
 
 Before the seven reads, treat a hosted 401/403 as an AI-owned authorization
 transition. Kimi itself starts the packaged client-key helper in its active
-terminal; never give the human a shell command. The helper opens Settings for
-this exact installation, accepts the `atkey_` value only through hidden
-foreground-terminal input, verifies it, stores it in the private 0600 file,
-and hot-reloads it before retrying hosted sync. Never collect a key in chat,
-argv, a URL, logs, ordinary stdin, or `$ARGUMENTS`. The human-owned key is not
+terminal; never give the human a shell command. The helper opens a short-lived,
+non-secret Settings link for this exact installation. The human signs in,
+reviews it, and explicitly selects **Authorize** or **Deny**. Kimi polls
+silently, stores the one-time delivered credential in the private 0600 file,
+and hot-reloads it before retrying hosted sync. Never ask anyone to create,
+copy, reveal, or paste an API key. The human-owned key is not
 an actor or model credential: each project request still sends the exact
 workspace and canonical actor for server-side membership, ownership, and role
-validation. No TTY remains a deferred, nonblocking browser flow; never force a
-restart.
+validation. If the browser cannot open, show the safe link and keep lifecycle
+polling deferred and nonblocking; never force a restart.
 
 Refresh the current project's shared state through the `attacca` MCP tools.
 Call all seven, even if the SessionStart brief already ran:

@@ -29,8 +29,11 @@ class AuthOnboardingTestCase(unittest.TestCase):
                 self.assertIn("terminal_flow.py", source)
                 self.assertTrue(
                     "client_instance" in source or "client-install ID" in source)
-                self.assertIn("atkey_", source)
                 self.assertIn("Settings", source)
+                self.assertIn("Authorize", source)
+                self.assertIn("Deny", source)
+                self.assertIn("polls silently", source)
+                self.assertIn("reconnect", source)
                 self.assertNotIn("browser/device", source)
                 self.assertNotIn("zero-binding", source)
                 self.assertNotIn("provisional human", source.lower())
@@ -38,10 +41,8 @@ class AuthOnboardingTestCase(unittest.TestCase):
                 self.assertIn("browser cookies", source.lower())
                 self.assertIn("exact", source.lower())
                 self.assertIn("actor", source.lower())
-                self.assertIn("controlling", source.lower())
-                self.assertTrue(
-                    "tty" in source.lower()
-                    or "foreground-terminal" in source.lower())
+                self.assertNotIn("hidden terminal", source.lower())
+                self.assertNotIn("foreground-terminal", source.lower())
                 self.assertNotIn("setup --interactive", source)
                 self.assertNotIn("--paste-token", source)
                 self.assertIn("never", source.lower())
@@ -79,12 +80,12 @@ class AuthOnboardingTestCase(unittest.TestCase):
                 "CSRF",
                 "atkey_",
                 "client_instance",
-                "plaintext key appears once",
+                "one-time credential directly",
                 "~/.attacca/credentials.json",
                 "mode `0600`",
-                "hidden foreground controlling-TTY",
+                "no copy/paste step",
                 "Signing out",
-                "Settings creates, lists, and revokes client-install keys",
+                "Settings authorizes, lists, and revokes client-install keys",
                 "remain public",
                 "does not terminate TLS"):
             self.assertIn(phrase, normalized)

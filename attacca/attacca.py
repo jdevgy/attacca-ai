@@ -10059,6 +10059,8 @@ parent = os.path.dirname(dest)
 os.makedirs(parent, exist_ok=True)
 stage = tempfile.mkdtemp(prefix=".attacca-stage-", dir=parent)
 backup = None
+rollback = os.path.join(os.path.dirname(parent), "plugin-data", "rollback",
+                        "attacca")
 
 def remove_path(path):
     if not path or not os.path.lexists(path):
@@ -10137,7 +10139,10 @@ try:
             os.replace(backup, dest)
             backup = None
         raise
-    remove_path(backup)
+    if backup is not None:
+        os.makedirs(os.path.dirname(rollback), exist_ok=True)
+        remove_path(rollback)
+        os.replace(backup, rollback)
     backup = None
 finally:
     remove_path(stage)
@@ -10231,6 +10236,10 @@ PYEOF
     echo "claude code: marketplace added — finish inside Claude Code with:"
     echo "  /plugin install attacca@agentg"
   fi
+  python3 "$DEST/codex_hook_compat.py" prune \
+    --cache-root "$HOME/.claude/plugins/cache/agentg/attacca" \
+    --active-version "$EXPECTED_VERSION" --rollback-count 1 >/dev/null || \
+    echo "claude code: warning — Attacca cache cleanup was incomplete." >&2
 else
   echo "claude code: CLI not found — skipping (install later from $DEST)."
 fi
@@ -10338,6 +10347,15 @@ if command -v codex >/dev/null 2>&1; then
     echo "codex: failed to preserve an open session's old hook path." >&2
     exit 1
   fi
+  ATTACCA_CODEX_ACTIVE_VERSION="$(python3 - "$DEST/.codex-plugin/plugin.json" <<'PYEOF'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])
+PYEOF
+)"
+  python3 "$DEST/codex_hook_compat.py" prune \
+    --cache-root "$ATTACCA_CODEX_CACHE_ROOT" \
+    --active-version "$ATTACCA_CODEX_ACTIVE_VERSION" --rollback-count 1 || \
+    echo "codex: warning — Attacca cache cleanup was incomplete." >&2
   trap - 0 1 2 15
   if [ "$ATTACCA_CODEX_NATIVE" = "1" ]; then
     echo "codex: native plugin installed/updated."
@@ -10363,10 +10381,10 @@ fi
 
 echo ""
 echo "Open the project in your coding client. Its AI runs complete setup."
-echo "If authentication is required, the AI opens Attacca Settings and collects"
-echo "the client API key through a hidden terminal prompt automatically."
-echo "Credential authorization hot-loads immediately: no auth command or client"
-echo "restart is required. (Executable plugin updates may still require reload.)"
+echo "If authentication is required, the AI opens a short-lived Attacca Settings"
+echo "link. Sign in, review the client, then explicitly Authorize or Deny it."
+echo "The client polls silently, stores the credential, and reconnects"
+echo "automatically: no key copy/paste, auth command, or client restart."
 echo "Kimi native manual install/refresh alternative:"
 echo "  /plugins install $BASE/plugin.zip    then /reload (or start a new session)"
 echo "attacca web panel:"
@@ -15886,8 +15904,9 @@ def _ensure_client_setup_auth(url, actor_id, interactive=False,
             from error
     if not result.get("authorized"):
         raise AuthenticationError(
-            "client_authorization_required: open %s; the active AI will"
-            " collect the key in a hidden terminal prompt" %
+            "client_authorization_required: open %s; sign in, review the"
+            " client, and explicitly Authorize or Deny it; this client polls"
+            " silently and reconnects automatically" %
             result.get("authorization_url"))
     # The credential was server-verified before it was atomically persisted;
     # load it immediately so the same setup process continues without restart.
@@ -15907,11 +15926,12 @@ def _ensure_client_setup_auth(url, actor_id, interactive=False,
 
 def ensure_remote_setup_auth(url, actor_id, interactive=False, ask=None,
                              login_username=None, paste_token=False):
-    """Authorize this installed client with a browser-created API key.
+    """Authorize this installation through explicit browser pairing.
 
-    The active AI opens Settings and collects the one-time plaintext through a
-    hidden controlling-terminal prompt. The key authenticates the installation;
-    exact project/actor selection remains separate on every request.
+    The active AI opens a non-secret link, silently polls the human's explicit
+    Authorize/Deny choice, stores the one-time credential, and reconnects.
+    Exact project/actor selection remains separate on every request. Legacy
+    paste flags remain parser-compatible but are not part of normal setup.
     """
     return _ensure_client_setup_auth(
         url, actor_id, interactive=interactive,

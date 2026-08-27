@@ -42,16 +42,16 @@ not the shell account such as `vscode`.
 If the server needs its first owner, open the displayed `/app` URL and ask the
 human only to create or sign in to that account in the browser. On a 401/403,
 Kimi itself starts the packaged `terminal_flow.py authorize` helper in the
-active terminal; never give the human a recovery command. The helper opens
-Attacca Settings with the exact non-secret client-install ID filled in. The
-signed-in human creates one `atkey_` API key for that installation, optionally
-limits its workspace memberships, and pastes it only into the helper's hidden
-foreground-terminal prompt. Never accept the key in chat, `$ARGUMENTS`, argv,
-a URL, logs, or ordinary stdin. With no controlling TTY, leave authorization
-deferred and nonblocking while the lifecycle hook retries.
+active terminal; never give the human a recovery command. The helper opens a
+short-lived, non-secret Attacca Settings link for the exact client-install ID.
+The human signs in, reviews the installation and optional workspace scope, and
+explicitly selects **Authorize** or **Deny**. Kimi polls silently; after
+approval it receives and atomically stores the one-time credential in the
+private 0600 credentials file, then reconnects MCP/watcher automatically.
+Never ask anyone to create, copy, reveal, or paste an API key. If the browser
+cannot open, show the safe link and keep lifecycle polling nonblockingly.
 
-The helper verifies the key and atomically stores it in the private 0600
-credentials file. It belongs to the authenticated human and one client
+The credential belongs to the authenticated human and one client
 installation—not to Kimi, Claude, Codex, any actor, or any role. Every project
 request separately sends the exact workspace and canonical actor; the server
 checks membership, actor ownership, and the actor's registered role. The key

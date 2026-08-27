@@ -50,16 +50,14 @@ If the server needs its first owner, the AI opens the displayed `/app` URL and
 asks the human only to create or sign in to that account in the browser. If a
 401/403 says this installation needs a credential, the AI itself starts the
 packaged `terminal_flow.py authorize` flow in its active terminal. Never tell
-the human to run a command. The helper opens Attacca Settings with this exact
-non-secret `client_instance` already filled in. The signed-in human creates one
-API key for this client installation, optionally limits it to selected
-workspaces, and pastes it only into the helper's hidden foreground-terminal
-prompt. If no controlling terminal is available, leave the browser flow
-deferred and let the lifecycle hook retry; never collect the key in chat,
-ordinary stdin, argv, a URL, or logs.
-
-The helper verifies that the value is an `atkey_` client key for this exact
-installation and atomically stores it in the private 0600 credentials file.
+the human to run a command. The helper opens a short-lived, non-secret Attacca
+Settings link for this exact `client_instance`. The human signs in, reviews the
+client and optional workspace scope, and explicitly selects **Authorize** or
+**Deny**. The helper polls silently; after approval the server delivers the
+one-time credential directly to that installation, stores it atomically in the
+private 0600 credentials file, and reconnects MCP/watcher automatically. Never
+ask anyone to create, copy, reveal, or paste an API key. If the browser cannot
+open, show the safe link and leave lifecycle hooks polling nonblockingly.
 The credential is human-owned and may be used by Claude, Codex, Kimi, or a
 generic MCP client only from that one installation. It is **not** bound to an
 AI model, runtime, actor, or role. Every project request still sends the exact

@@ -221,11 +221,13 @@ Attacca supports exactly two advertised authentication forms:
   stable `client_instance`; it does not identify or bind an AI model, runtime,
   actor, role, or Git checkout.
 
-Settings creates, lists, and revokes client-install keys through
-`/v1/auth/client-keys`. Creation may restrict the key to selected workspace
-memberships; leaving the selection empty follows the authenticated human's
-current memberships. The plaintext key appears once, is kept only in page
-memory, and is never returned by list responses. Stored records contain only a
+Settings authorizes, lists, and revokes client-install keys. A new installation
+opens a short-lived non-secret pairing link; the signed-in human reviews the
+client and optional workspace scope, then explicitly selects Authorize or Deny.
+The client polls silently and receives the one-time credential directly after
+approval—there is no copy/paste step and the browser never displays the key.
+Leaving workspace selection empty follows the authenticated human's current
+memberships. Stored records contain only a
 hash, prefix, human owner, client installation, scope, timestamps, and status.
 Revoking one installation does not revoke another installation or rewrite any
 AI identity or audit history.
@@ -242,12 +244,12 @@ key: the same installed client can select any valid actor owned by that human.
 When a protected server needs authorization, the native setup/update skill or
 lifecycle hook starts the packaged helper inside the active AI terminal. The
 helper generates or loads that installation's stable non-secret client ID and
-opens the browser directly on Settings with only the client ID and label in the
-URL fragment. The signed-in human creates the key there; if a manual transfer is
-needed, the helper accepts it only through a hidden foreground controlling-TTY
-prompt. The AI runs this flow itself: the product never tells the human to run a
-recovery shell command, and secrets are never accepted in chat, argv, stdin,
-URLs, logs, or browser storage.
+opens the browser directly on Settings with only a short-lived pairing code in
+the URL. The signed-in human explicitly Authorizes or Denies the reviewed
+installation. The helper polls silently, stores the delivered credential, and
+automatically reconnects MCP and watcher sync in the same running client. The
+AI runs this flow itself: the product never tells the human to run a recovery
+shell command or asks anyone to create, copy, reveal, or paste a key.
 
 After verification, the helper atomically stores the key in the private
 `~/.attacca/credentials.json` registry with mode `0600`, scoped by the full

@@ -1041,7 +1041,10 @@ def paste_client_api_key(server_url, *, client_instance=None, runtime=None,
                          device_id=None, credentials_path=None, transport=None,
                          timeout=DEFAULT_TIMEOUT_SECONDS,
                          tty_opener=open_controlling_terminal):
-    """Accept, verify, and persist one key through hidden terminal input."""
+    """Compatibility-only import for a previously issued client key.
+
+    Normal setup uses browser pairing and never calls or advertises this path.
+    """
     instance = _resolved_client_instance_id(
         client_instance, runtime=runtime, storage_path=storage_path)
     token = None
@@ -1049,7 +1052,7 @@ def paste_client_api_key(server_url, *, client_instance=None, runtime=None,
         with tty_opener() as terminal:
             token = _read_hidden_line(
                 terminal,
-                "Paste the Attacca client API key (hidden; never paste it in chat): ")
+                "Legacy key import (hidden input; browser pairing is preferred): ")
         checked = verify_client_api_key(
             server_url, token, client_instance=instance,
             project_id=project_id, actor_id=actor_id, device_id=device_id,
@@ -1268,7 +1271,9 @@ def format_recovery_message(result, server_url, project_id=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Authorize this installed Attacca client")
+        description="Authorize this installed Attacca client by browser pairing",
+        epilog=("The 'paste' action is retained only for migration of an"
+                " already-issued legacy key; normal setup never uses it."))
     parser.add_argument("action", choices=("authorize", "open", "paste", "status"))
     parser.add_argument("--server-url", required=True)
     parser.add_argument("--runtime", default="generic")
