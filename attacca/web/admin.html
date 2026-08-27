@@ -616,7 +616,9 @@
           if (view !== "settings") return { pairingCode: "" };
           const params = new URLSearchParams(parts.join("&"));
           const pairingCode = params.get("pairing_code") || "";
-          return { pairingCode: /^[A-Z2-7]{4}(?:-[A-Z2-7]{4}){12}$/.test(pairingCode) ? pairingCode : "" };
+          const canonical = /^(?:[A-Z2-7]{4}-){12}[A-Z2-7]{4}$/;
+          const expiringLegacy = /^[A-Z2-7]{4}-[A-Z2-7]{4}$/;
+          return { pairingCode: canonical.test(pairingCode) || expiringLegacy.test(pairingCode) ? pairingCode : "" };
         } catch (_) { return { pairingCode: "" }; }
       }
       // TESTABLE_CLIENT_AUTHORIZATION_HINTS:END
