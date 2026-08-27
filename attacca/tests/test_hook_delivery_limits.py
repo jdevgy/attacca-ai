@@ -372,13 +372,19 @@ class HookBriefContextBudgetTestCase(unittest.TestCase):
                     status, event_name, offline_adapter=object())
             context = output["reason"] if event_name == "Stop" else \
                 output["hookSpecificOutput"]["additionalContext"]
-            self.assertTrue(context.startswith(RULES_BANNER_PREFIX))
-            self.assertIn("Omitted binding rule_ids:", context)
-            for rule_id in (cached_poll["project_rules_omitted_ids"] or []):
-                self.assertIn(rule_id, context)
-            self.assertIn(
-                "STOP before other work and call rule_list for those exact "
-                "rule_ids", context)
+            # Prompt turns carry the full rules banner + omission warning
+            # (silent additionalContext). A Stop turn must not surface the
+            # banner wall, but genuine cached coordination must still survive.
+            if event_name == "Stop":
+                self.assertFalse(context.startswith(RULES_BANNER_PREFIX))
+            else:
+                self.assertTrue(context.startswith(RULES_BANNER_PREFIX))
+                self.assertIn("Omitted binding rule_ids:", context)
+                for rule_id in (cached_poll["project_rules_omitted_ids"] or []):
+                    self.assertIn(rule_id, context)
+                self.assertIn(
+                    "STOP before other work and call rule_list for those exact "
+                    "rule_ids", context)
             self.assertIn("CACHED-NOTICE-MUST-SURVIVE", context)
 
 
@@ -672,12 +678,19 @@ class WatcherNoLossDeliveryTestCase(unittest.TestCase):
                 else:
                     context = output[
                         "hookSpecificOutput"]["additionalContext"]
-                self.assertTrue(context.startswith(RULES_BANNER_PREFIX))
-                footer_at = context.index(
-                    "==========================================================================")
-                mail_at = context.index(
-                    "ATTACCA PENDING ASSIGNMENTS + UNREAD GROUP MAIL")
-                self.assertGreater(mail_at, footer_at)
+                # The rules banner is pinned only on prompt turns (silent
+                # additionalContext). A Stop turn must NOT surface the banner
+                # wall in the client chat, but unread mail must still reach the
+                # AI so it never goes idle on pending coordination (no-loss).
+                if event_name == "Stop":
+                    self.assertFalse(context.startswith(RULES_BANNER_PREFIX))
+                else:
+                    self.assertTrue(context.startswith(RULES_BANNER_PREFIX))
+                    footer_at = context.index(
+                        "==========================================================================")
+                    mail_at = context.index(
+                        "ATTACCA PENDING ASSIGNMENTS + UNREAD GROUP MAIL")
+                    self.assertGreater(mail_at, footer_at)
                 self.assertIn(
                     "TOP-MAIL-%s-%s" % (runtime, event_name), context)
                 self.assertIn("no user needs to type", context)

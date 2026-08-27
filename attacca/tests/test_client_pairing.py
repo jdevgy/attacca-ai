@@ -1,7 +1,6 @@
 """Secure browser authorization pairing for D-17 client-install keys."""
 
 import importlib.util
-import base64
 import tempfile
 import unittest
 from pathlib import Path
@@ -40,25 +39,23 @@ class ClientPairingTest(unittest.TestCase):
         started = c.auth_client_pairing_start(
             self.conn, "http://server", "install-1", "Codex laptop",
             device_id="device-1")
-        self.assertIn("/app#settings&pairing_code=",
+        self.assertIn("/app#settings&authorization_request=",
                       started["verification_uri_complete"])
-        self.assertNotIn("?pairing_code=",
+        self.assertNotIn("?authorization_request=",
                          started["verification_uri_complete"])
-        secret = started["pairing_secret"]
-        groups = started["pairing_code"].split("-")
-        self.assertEqual(len(groups), 13)
-        self.assertTrue(all(len(group) == 4 for group in groups))
-        encoded = "".join(groups)
-        decoded = base64.b32decode(encoded + "=" * ((8 - len(encoded) % 8) % 8))
-        self.assertEqual(len(decoded), 32)
+        secret = started["poll_secret"]
+        # The approval link carries an opaque 256-bit base64url request token,
+        # not a human-formatted pairing code.
+        request = started["authorization_request"]
+        self.assertRegex(request, r"^[A-Za-z0-9_-]{43}$")
         self.assertNotIn(secret, str(dict(c._auth_client_pairing_row(
-            self.conn, started["pairing_code"]))))
+            self.conn, request))))
         self.assertEqual(c.auth_client_pairing_poll(
             self.conn, secret, "install-1", "device-1")["status"],
             "pending")
 
         approved = c.auth_client_pairing_decide(
-            self.conn, started["pairing_code"], self.principal, True,
+            self.conn, request, self.principal, True,
             memberships=["project"])
         self.assertEqual(approved["project_memberships"], ["project"])
         delivered = c.auth_client_pairing_poll(
@@ -88,32 +85,36 @@ class ClientPairingTest(unittest.TestCase):
             self.conn, "http://server", "install-2", "Claude desktop")
         with self.assertRaisesRegex(c.AuthorizationError, "instance"):
             c.auth_client_pairing_poll(
-                self.conn, started["pairing_secret"], "another-install")
+                self.conn, started["poll_secret"], "another-install")
         denied = c.auth_client_pairing_decide(
-            self.conn, started["pairing_code"], self.principal, False)
+            self.conn, started["authorization_request"], self.principal, False)
         self.assertEqual(denied["status"], "denied")
         self.assertEqual(c.auth_client_pairing_poll(
-            self.conn, started["pairing_secret"], "install-2")["status"],
+            self.conn, started["poll_secret"], "install-2")["status"],
             "denied")
         self.assertEqual(self.conn.execute(
             "SELECT COUNT(*) AS n FROM auth_tokens").fetchone()["n"], 0)
 
-    def test_pairing_code_format_is_canonical_with_legacy_expiry_bridge(self):
-        with self.assertRaisesRegex(c.AttaccaError, "format"):
+    def test_authorization_request_format_is_validated_before_lookup(self):
+        # A non-opaque or wrong-length token is rejected on format alone,
+        # before any database lookup (no lookup oracle for malformed input).
+        with self.assertRaisesRegex(
+                c.AttaccaError, "invalid client authorization request"):
             c._auth_client_pairing_row(self.conn, "AAAA-BBBB-CCCC")
-        with self.assertRaisesRegex(c.AttaccaError, "format"):
-            c._auth_client_pairing_row(
-                self.conn, "AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-"
-                "AAAA-AAAA-AAAA-AAAA-AAA1")
+        with self.assertRaisesRegex(
+                c.AttaccaError, "invalid client authorization request"):
+            c._auth_client_pairing_row(self.conn, "short-token")
+        # A well-formed but unknown 43-char base64url token is reported unknown.
+        with self.assertRaisesRegex(
+                c.AttaccaError, "unknown client authorization request"):
+            c._auth_client_pairing_row(self.conn, "A" * 43)
 
         started = c.auth_client_pairing_start(
             self.conn, "http://server", "install-legacy", "Legacy")
-        row = c._auth_client_pairing_row(self.conn, started["pairing_code"])
-        self.conn.execute(
-            "UPDATE auth_client_pairings SET pairing_code='ABCD-2345'"
-            " WHERE pairing_secret_hash=?", (row["pairing_secret_hash"],))
-        self.assertEqual(c._auth_client_pairing_row(
-            self.conn, "ABCD-2345")["status"], "pending")
+        row = c._auth_client_pairing_row(
+            self.conn, started["authorization_request"])
+        self.assertEqual(row["client_instance"], "install-legacy")
+        self.assertEqual(row["status"], "pending")
 
     def test_failed_lookup_throttle_is_bounded_and_non_oracular(self):
         key = "user|127.0.0.1"

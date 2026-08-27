@@ -28,7 +28,6 @@ Run `attacca.py --help` for everything.
 """
 
 import argparse
-import base64
 import contextlib
 import fnmatch
 import getpass
@@ -65,7 +64,7 @@ try:
 except ImportError:  # pragma: no cover - Windows keeps thread serialization
     fcntl = None
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 MCP_SUPPORTED_PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18")
 MCP_DEFAULT_PROTOCOL = "2025-06-18"
 DEFAULT_UPDATE_INTERVAL_SECONDS = 60
@@ -15999,7 +15998,7 @@ def _ensure_client_setup_auth(url, actor_id, interactive=False,
     except flow.TerminalFlowError as error:
         raise AuthenticationError(
             "client_authorization_required: open %s" %
-            flow.client_key_settings_url(server_url, client_instance)) \
+            flow.fallback_login_url(server_url)) \
             from error
     if not result.get("authorized"):
         raise AuthenticationError(
@@ -16237,8 +16236,7 @@ def provision_setup_agent_token(url, project_id, actor_id):
         except flow.TerminalFlowError as error:
             raise AuthenticationError(
                 "client_authorization_required: open %s" %
-                flow.client_key_settings_url(
-                    configured_server_url(url), client_instance)) from error
+                flow.fallback_login_url(configured_server_url(url))) from error
     if not status.get("authorized"):
         raise AuthenticationError(
             "client_authorization_required: open %s" %

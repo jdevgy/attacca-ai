@@ -188,7 +188,7 @@ class ClientAuthorizationRedTeamTest(unittest.TestCase):
             "authorization_request": request_token,
             "verification_uri_complete":
                 self.server +
-                "/app#authorization_request=" + request_token,
+                "/app#settings&authorization_request=" + request_token,
             "expires_in": 600, "interval": 5,
         })
 
@@ -231,7 +231,7 @@ class ClientAuthorizationRedTeamTest(unittest.TestCase):
             "authorization_request": request_token,
             "verification_uri_complete":
                 self.server +
-                "/app#authorization_request=" + request_token,
+                "/app#settings&authorization_request=" + request_token,
             "expires_in": 600, "interval": 5,
         })
         result = flow.start_device_flow(

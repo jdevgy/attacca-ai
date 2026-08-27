@@ -231,7 +231,7 @@ class ClientAuthorizationFlowTest(unittest.TestCase):
             "status": "pending", "poll_secret": "secret_poll_12345",
             "authorization_request": request_token,
             "verification_uri_complete":
-                self.server + "/app#authorization_request=" + request_token,
+                self.server + "/app#settings&authorization_request=" + request_token,
             "interval": 5,
         }))
 
@@ -243,7 +243,7 @@ class ClientAuthorizationFlowTest(unittest.TestCase):
         self.assertEqual(result["status"], "pending")
         self.assertTrue(result["hot_reload"])
         self.assertEqual(opened, [result["authorization_url"]])
-        self.assertIn("#authorization_request=", opened[0])
+        self.assertIn("#settings&authorization_request=", opened[0])
         self.assertNotIn("atkey_", opened[0])
         self.assertNotIn("restart", json.dumps(result).lower())
         self.assertEqual(transport.calls[0]["payload"]["label"],
@@ -261,7 +261,7 @@ class ClientAuthorizationFlowTest(unittest.TestCase):
             "status": "pending", "poll_secret": "secret_poll_12345",
             "authorization_request": request_token,
             "verification_uri_complete":
-                self.server + "/app#authorization_request=" + request_token,
+                self.server + "/app#settings&authorization_request=" + request_token,
             "interval": 5,
         }))
         flow.start_client_pairing(
@@ -289,7 +289,7 @@ class ClientAuthorizationFlowTest(unittest.TestCase):
 
     def test_repeated_authorize_reuses_pending_request_without_overwrite(self):
         request_token = "C" * 43
-        url = self.server + "/app#authorization_request=" + request_token
+        url = self.server + "/app#settings&authorization_request=" + request_token
         start = FakeTransport(flow.JsonResponse(201, {}, {
             "status": "pending", "poll_secret": "secret_poll_12345",
             "authorization_request": request_token,

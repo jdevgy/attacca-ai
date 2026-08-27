@@ -5518,12 +5518,17 @@ def _offline_failure_output(status, config, event_name, err, adapter,
         "reconciliation confirms it. The machine-global watcher retries with "
         "backoff and injects accepted/conflict results.\n\n%s" %
         json.dumps(brief, indent=2, ensure_ascii=False))
-    rules_banner = _mandatory_rules_banner(
-        brief.get("project_rules"),
-        pre_omitted=brief.get("project_rules_omitted_count"),
-        pre_omitted_ids=brief.get("project_rules_omitted_ids"))
-    if rules_banner:
-        context = rules_banner + "\n\n" + context
+    # SessionStart/UserPromptSubmit inject the banner SILENTLY (additionalContext);
+    # only a Stop turn renders it as a visible blocking-reason wall (worse here —
+    # it would drag the full offline brief JSON along). Suppress the banner on
+    # Stop only; the offline brief itself still reaches the AI on every turn.
+    if event_name != "Stop":
+        rules_banner = _mandatory_rules_banner(
+            brief.get("project_rules"),
+            pre_omitted=brief.get("project_rules_omitted_count"),
+            pre_omitted_ids=brief.get("project_rules_omitted_ids"))
+        if rules_banner:
+            context = rules_banner + "\n\n" + context
     return _event_context_output(
         event_name,
         "Attacca offline · %s · verified local mirror active; work may continue"

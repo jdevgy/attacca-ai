@@ -610,6 +610,22 @@ def _client_key_record(data, server_url, client_instance):
     return keys.get(client_instance)
 
 
+def _authorization_hint_url(data, server_url, instance):
+    """Link to show when a client is not authorized.
+
+    Prefer the opaque pending-pairing link (``/app#settings&authorization_request=``)
+    which drives the browser "Authorize client installation" card; fall back to
+    the plain settings sign-in URL. Never surface the legacy
+    ``client_instance``/``client_label`` hint link — it no longer drives approval
+    and reads as a confusing "old parameters" link to the human."""
+    pairing = _pairing_record(data, server_url, instance)
+    if isinstance(pairing, dict):
+        url = pairing.get("authorization_url")
+        if isinstance(url, str) and "authorization_request=" in url:
+            return url
+    return _endpoint(server_url, "/app") + "#settings"
+
+
 def client_api_key_status(server_url, *, client_instance=None, runtime=None,
                           storage_path=None, project_id=None,
                           credentials_path=None, now=None, **_ignored):
@@ -626,8 +642,8 @@ def client_api_key_status(server_url, *, client_instance=None, runtime=None,
             "authorized": False,
             "client_instance": instance,
             "legacy_credential_present": legacy,
-            "authorization_url": client_key_settings_url(
-                server_url, instance),
+            "authorization_url": _authorization_hint_url(
+                data, server_url, instance),
             "hot_reload": True,
         }
     try:
@@ -635,24 +651,24 @@ def client_api_key_status(server_url, *, client_instance=None, runtime=None,
     except TerminalFlowProtocolError as error:
         return {"status": "invalid", "authorized": False,
                 "client_instance": instance, "error": str(error),
-                "authorization_url": client_key_settings_url(
-                    server_url, instance), "hot_reload": True}
+                "authorization_url": _authorization_hint_url(
+                    data, server_url, instance), "hot_reload": True}
     instant = now or datetime.now(timezone.utc)
     expiry = _parse_expiry(record.get("expires_at"))
     if expiry and expiry <= instant:
         return {"status": "expired", "authorized": False,
                 "client_instance": instance, "token_id": record.get("token_id"),
                 "username": record.get("username"),
-                "authorization_url": client_key_settings_url(
-                    server_url, instance), "hot_reload": True}
+                "authorization_url": _authorization_hint_url(
+                    data, server_url, instance), "hot_reload": True}
     memberships = record["project_memberships"]
     if project_id and memberships and project_id not in memberships:
         return {"status": "wrong_workspace", "authorized": False,
                 "client_instance": instance, "token_id": record.get("token_id"),
                 "username": record.get("username"),
                 "project_memberships": memberships,
-                "authorization_url": client_key_settings_url(
-                    server_url, instance), "hot_reload": True}
+                "authorization_url": _authorization_hint_url(
+                    data, server_url, instance), "hot_reload": True}
     return {
         "status": "ready",
         "authorized": True,
