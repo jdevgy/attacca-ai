@@ -17,6 +17,32 @@ to type a number or displayed name. Keep exact project and actor ids from
 discovery only as internal arguments; never display, invent, or ask for a raw
 id.
 
+## FAST PATH — this is a DECISION flow, NOT a thinking job
+
+Setup is: pick a workspace, pick a role, apply. Do it fast. Do NOT investigate,
+audit, narrate reasoning, weigh trade-offs, or run extra commands. The single
+`setup --discover` call already returns everything you need.
+
+On invocation, do exactly this:
+1. Run `setup --discover` **once** (one command). Nothing before it.
+2. **Immediately** present the decisions in a **single** native choice-UI call
+   (Claude Code AskUserQuestion): put the workspace choice and the role choice
+   in the **same** call (add the relationship question only if a bridge
+   decision is actually pending). Do not write prose between discovery and the
+   popup — go straight to the popup.
+3. Apply the confirmed choices in **one** `setup …` command, then one short
+   confirmation line.
+
+Budget: ~2 commands + 1 popup. If discovery shows a valid credential and an
+already-linked/obvious workspace, skip straight to the role choice (or straight
+to apply if the role is already set). If auth is needed, surface the one link
+from the CLI and stop — do not loop or advise. Never spend a turn "thinking"
+about setup; if you catch yourself investigating, stop and show the popup.
+
+The sections below are REFERENCE for the exact CLI arguments and edge cases —
+consult them only as needed to fill in a choice; they are not a script to
+narrate step by step.
+
 ## 0. Resolve the runtime and authenticate before MCP
 
 Resolve the exact installed runtime **before any Attacca MCP call**. In Claude Code,
