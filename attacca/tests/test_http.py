@@ -140,12 +140,14 @@ class HttpTestCase(unittest.TestCase):
                       panel)
         self.assertIn("Workspace · Role · Runtime", panel)
         self.assertIn(
-            "Canonical AI actors keep their own workspace, role, and runtime; "
-            "a client key never renames, binds, or impersonates them", panel)
+            "It authorizes clients but never renames or replaces an AI "
+            "identity", panel)
+        self.assertIn("immutable account name", panel)
         self.assertIn("Run by user", panel)
         self.assertNotIn('placeholder="analytics-admin.director.web"', panel)
-        self.assertIn("Signed in: ${account.display_name || account.username}",
-                      panel)
+        self.assertIn("Signed in: @${account.username}", panel)
+        self.assertNotIn('id="auth-display-name"', panel)
+        self.assertNotIn('id="invite-accept-display-name"', panel)
         self.assertIn('actor: `web.${state.auth.user.username}`', panel)
         self.assertIn("Browser identity headers cannot override", panel)
         self.assertNotIn('`${state.prefs.owner}.${state.prefs.actor}`', panel)

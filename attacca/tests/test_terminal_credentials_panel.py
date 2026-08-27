@@ -56,26 +56,19 @@ function parse(hash) {
   return clientAuthorizationHintsFromLocation();
 }
 process.stdout.write(JSON.stringify({
-  valid: parse("#settings&client_instance=client_abc-123&client_label=Office%20Codex"),
-  badId: parse("#settings&client_instance=%3Cscript%3E&client_label=ok"),
-  tooLong: parse("#settings&client_instance=" + "c".repeat(121)),
-  other: parse("#room&client_instance=client_abc"),
-  tokenLike: parse("#settings&client_instance=atkey_key.secret&token=atkey_leak")
+  valid: parse("#settings&pairing_code=pair_ABC-123"),
+  badId: parse("#settings&pairing_code=%3Cscript%3E"),
+  tooLong: parse("#settings&pairing_code=" + "c".repeat(129)),
+  other: parse("#room&pairing_code=pair_abc"),
+  secretLike: parse("#settings&pairing_code=pair_abc&pairing_secret=atpair_leak")
 }));
 """
         result = json.loads(self.run_node(program))
-        self.assertEqual(result["valid"], {
-            "clientInstance": "client_abc-123",
-            "clientLabel": "Office Codex",
-        })
-        self.assertEqual(result["badId"]["clientInstance"], "")
-        self.assertEqual(result["tooLong"]["clientInstance"], "")
-        self.assertEqual(result["other"], {
-            "clientInstance": "", "clientLabel": ""})
-        # A token-shaped value is merely a non-secret ID hint and is never
-        # consumed as the key. There is no token field in the result.
-        self.assertEqual(set(result["tokenLike"]), {
-            "clientInstance", "clientLabel"})
+        self.assertEqual(result["valid"], {"pairingCode": "pair_ABC-123"})
+        self.assertEqual(result["badId"]["pairingCode"], "")
+        self.assertEqual(result["tooLong"]["pairingCode"], "")
+        self.assertEqual(result["other"], {"pairingCode": ""})
+        self.assertEqual(result["secretLike"], {"pairingCode": "pair_abc"})
 
     def test_access_normalization_fails_closed_without_client_keys_array(self):
         helpers = self.marked("EMPTY_CREDENTIAL_ACCESS") + self.marked(
@@ -125,38 +118,35 @@ process.stdout.write(JSON.stringify({
 
     def test_effective_renderer_has_no_actor_key_binding_choice(self):
         settings = self.client_surface()
-        self.assertIn("one human-owned key per installed client", settings)
-        self.assertIn("optional", settings)
+        self.assertIn("one human-owned key per authorized client", settings)
+        self.assertIn("explicit human approval required", settings)
         self.assertIn("all workspaces available", settings)
         self.assertIn("AI actor, role, runtime, and Run by user", settings)
         self.assertNotIn("actor_bindings", settings)
         self.assertNotIn("allowed AI actor", settings)
-        self.assertNotIn("device_id", settings)
         self.assertNotIn("migration", settings.lower())
 
-    def test_create_handler_validates_exact_instance_and_escapes_response(self):
-        start = self.script.index('if (kind === "create-client-key")')
-        end = self.script.index(
-            'if (kind === "save-panel-behavior")', start)
+    def test_pairing_handler_requires_explicit_review_without_plaintext(self):
+        start = self.script.index(
+            'if (action === "authorize-client-pairing"')
+        end = self.script.index('if (action === "toggle-authentication")', start)
         handler = self.script[start:end]
-        self.assertIn(
-            '/^[A-Za-z0-9][A-Za-z0-9._:/@+\\-]{0,119}$/.test(clientInstance)',
-            handler)
-        self.assertIn("result.record.client_instance !== clientInstance",
-                      handler)
-        self.assertIn('result.token.startsWith("atkey_")', handler)
-        self.assertIn("state.oneTimeCredential", handler)
-        self.assertNotIn("localStorage", handler)
-        self.assertNotIn("sessionStorage", handler)
+        self.assertIn("Review its installation ID and workspace scope", handler)
+        self.assertIn('/v1/auth/client-pairings/${encodeURIComponent', handler)
+        self.assertIn('authorize ? "authorize" : "deny"', handler)
+        bootstrap = self.script[
+            self.script.index("async function bootstrap()"):self.script.index(
+                "async function loadProjects()")]
+        self.assertNotIn("/authorize", bootstrap)
+        self.assertNotIn("/deny", bootstrap)
         settings = self.client_surface()
-        self.assertIn('${h(value.secret)}', settings)
-        self.assertNotRegex(
-            settings,
-            r'data-[a-z-]+="\$\{h\(value\.secret\)\}')
+        self.assertIn("browser never displays or asks you to copy", settings)
+        self.assertNotIn("one-time-client-secret", settings)
+        self.assertNotIn('data-form="create-client-key"', settings)
 
     def test_key_list_never_contains_plaintext_property(self):
         start = self.script.index("function renderClientKeyRow")
-        end = self.script.index("function renderOneTimeClientCredential", start)
+        end = self.script.index("function renderPendingClientPairing", start)
         renderer = self.script[start:end]
         for expression in (
                 'h(key.label || "Attacca client")',

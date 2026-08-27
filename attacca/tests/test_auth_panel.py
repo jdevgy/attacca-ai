@@ -72,7 +72,7 @@ class AuthPanelTestCase(unittest.TestCase):
                 'data-action="revoke-client-key"',
                 'data-action="delete-client-key"',
                 'data-action="toggle-authentication"',
-                "client installation", "Human owner:", "Run by user:"):
+                "client installation", "Human owner:", "Account name"):
             self.assertIn(value, surface)
         for value in (
                 "approve-terminal-enrollment", "start-terminal-enrollment",
@@ -104,11 +104,14 @@ class AuthPanelTestCase(unittest.TestCase):
     def test_authenticated_account_cannot_be_overridden_by_settings_form(self):
         settings = self.client_surface()
         self.assertIn("Signed in as", settings)
-        self.assertIn("web.${h(account.username)}", settings)
-        self.assertIn("Run by user: ${h(account.username)}", settings)
+        self.assertIn("immutable account name", settings)
+        self.assertIn("Account name", settings)
+        self.assertNotIn("account.display_name", settings)
+        self.assertNotIn("web.${h(account.username)}", settings)
+        self.assertNotIn("Run by user: ${h(account.username)}", settings)
         self.assertNotIn('name="owner"', settings)
         self.assertNotIn('name="actor"', settings)
-        self.assertIn("Canonical AI actors", settings)
+        self.assertIn("never renames or replaces an AI identity", settings)
 
     def test_refresh_and_expiry_reenter_auth_gate(self):
         refresh_start = self.script.index(
