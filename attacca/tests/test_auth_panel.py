@@ -66,7 +66,9 @@ class AuthPanelTestCase(unittest.TestCase):
         settings = self.effective_settings()
         surface = self.client_surface()
         for value in (
-                "Client API keys", 'data-form="create-client-key"',
+                "Client API keys", "Authorize client installation",
+                'data-action="authorize-client-pairing"',
+                'data-action="deny-client-pairing"',
                 'data-action="revoke-client-key"',
                 'data-action="delete-client-key"',
                 'data-action="toggle-authentication"',
@@ -79,18 +81,7 @@ class AuthPanelTestCase(unittest.TestCase):
                 "create-service-key", "device code"):
             self.assertNotIn(value, settings)
 
-    def test_client_key_handlers_use_exact_endpoints_and_one_time_atkey(self):
-        create_start = self.script.index('if (kind === "create-client-key")')
-        create_end = self.script.index(
-            'if (kind === "save-panel-behavior")', create_start)
-        create = self.script[create_start:create_end]
-        self.assertIn('api("/v1/auth/client-keys"', create)
-        self.assertIn('result.token.startsWith("atkey_")', create)
-        self.assertIn("client_instance: clientInstance", create)
-        self.assertIn('formData.getAll("project_memberships")', create)
-        self.assertNotIn("actor", create.lower())
-        self.assertIn('kind: "client", secret: result.token', create)
-
+    def test_client_pairing_requires_explicit_actions_and_exact_endpoints(self):
         action_start = self.script.index(
             'if (action === "revoke-client-key")')
         action_end = self.script.index(
@@ -99,9 +90,16 @@ class AuthPanelTestCase(unittest.TestCase):
         self.assertIn('/v1/auth/client-keys/${encodeURIComponent', actions)
         self.assertIn('/permanent', actions)
         self.assertIn("Permanently delete this revoked", actions)
+        self.assertIn('action === "authorize-client-pairing"', actions)
+        self.assertIn('action === "deny-client-pairing"', actions)
+        self.assertIn('/v1/auth/client-pairings/${encodeURIComponent', actions)
         self.assertIn(
             'body: { enabled, confirmed: true }', actions)
         self.assertNotIn("expected_readiness_version", actions)
+        bootstrap_start = self.script.index("async function bootstrap()")
+        bootstrap_end = self.script.index("async function loadProjects()", bootstrap_start)
+        self.assertNotIn("/authorize", self.script[bootstrap_start:bootstrap_end])
+        self.assertNotIn("/deny", self.script[bootstrap_start:bootstrap_end])
 
     def test_authenticated_account_cannot_be_overridden_by_settings_form(self):
         settings = self.client_surface()
@@ -132,13 +130,11 @@ class AuthPanelTestCase(unittest.TestCase):
         self.assertIn("state.oneTimeCredential = null", recovery)
         self.assertIn("renderAuth();", recovery)
 
-    def test_secret_is_escaped_memory_only_and_never_in_url(self):
+    def test_pairing_url_contains_only_non_secret_code(self):
         settings = self.client_surface()
-        self.assertIn(
-            'id="one-time-client-secret">${h(value.secret)}', settings)
-        self.assertIn(
-            "navigator.clipboard.writeText(state.oneTimeCredential.secret)",
-            self.script)
+        self.assertIn("browser never displays or asks you to copy an API key", settings)
+        self.assertNotIn("one-time-client-secret", settings)
+        self.assertNotIn("copy it into", self.script.lower())
         self.assertNotRegex(
             self.script,
             r"storageSet\([^)]*(?:oneTimeCredential|client.*secret)")
@@ -149,8 +145,8 @@ class AuthPanelTestCase(unittest.TestCase):
         hint_end = self.script.index(
             "// TESTABLE_CLIENT_AUTHORIZATION_HINTS:END", hint_start)
         hints = self.script[hint_start:hint_end]
-        self.assertIn('params.get("client_instance")', hints)
-        self.assertIn('params.get("client_label")', hints)
+        self.assertIn('params.get("pairing_code")', hints)
+        self.assertNotIn("secret", hints.lower())
         self.assertNotIn("token", hints.lower())
 
 

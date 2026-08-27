@@ -606,22 +606,18 @@
         catch (_) { return false; }
       }
 
-      // The terminal helper opens Settings with non-secret client-install
-      // hints in the fragment. No API key is ever accepted from a URL.
+      // The client opens Settings with only a short-lived, non-secret pairing
+      // code. Credentials and poll secrets are never accepted from a URL.
       // TESTABLE_CLIENT_AUTHORIZATION_HINTS:BEGIN
       function clientAuthorizationHintsFromLocation() {
         try {
           const raw = String(location.hash || "").replace(/^#/, "");
           const [view, ...parts] = raw.split("&");
-          if (view !== "settings") return { clientInstance: "", clientLabel: "" };
+          if (view !== "settings") return { pairingCode: "" };
           const params = new URLSearchParams(parts.join("&"));
-          const clientInstance = params.get("client_instance") || "";
-          const clientLabel = params.get("client_label") || "";
-          return {
-            clientInstance: /^[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,119}$/.test(clientInstance) ? clientInstance : "",
-            clientLabel: clientLabel.slice(0, 120)
-          };
-        } catch (_) { return { clientInstance: "", clientLabel: "" }; }
+          const pairingCode = params.get("pairing_code") || "";
+          return { pairingCode: /^[A-Za-z0-9_-]{6,128}$/.test(pairingCode) ? pairingCode : "" };
+        } catch (_) { return { pairingCode: "" }; }
       }
       // TESTABLE_CLIENT_AUTHORIZATION_HINTS:END
 
@@ -680,6 +676,8 @@
         credentialAccess: null,
         oneTimeCredential: null,
         clientAuthorization: clientAuthorizationHintsFromLocation(),
+        pendingClientPairing: null,
+        pendingClientPairingError: "",
         pendingInvitationToken: consumeInvitationTokenFromLocation(),
         invitationAcceptanceError: "",
         authTokens: [],
@@ -1009,6 +1007,19 @@
         }
       }
 
+      async function loadPendingClientPairing() {
+        const pairingCode = state.clientAuthorization?.pairingCode || "";
+        state.pendingClientPairing = null;
+        state.pendingClientPairingError = "";
+        if (!state.auth?.authenticated || !pairingCode) return;
+        try {
+          state.pendingClientPairing = await api(
+            `/v1/auth/client-pairings/${encodeURIComponent(pairingCode)}`);
+        } catch (error) {
+          state.pendingClientPairingError = error.message || String(error);
+        }
+      }
+
       async function loadWorkspaceAgentDirectory(projects = state.projects) {
         if (!state.auth?.authenticated) {
           state.workspaceAgents = {};
@@ -1220,6 +1231,7 @@
           state.serverSettings = settings;
           state.authTokens = tokens?.tokens || [];
           state.credentialAccess = credentialAccess || emptyCredentialAccess();
+          await loadPendingClientPairing();
           projectsResult = projects;
         } catch (error) {
           // A protected request may have discovered an expired session and
@@ -1892,10 +1904,20 @@
         return `<div class="list-row"><div><div class="cluster"><strong>${h(key.label || "Attacca client")}</strong>${statusBadge(status)}</div><div class="list-meta"><span>Human owner: @${h(credentialOwner(key, account))}</span><span>Client installation: ${h(key.client_instance || "not recorded")}</span><span>Prefix: ${h(key.token_prefix || "atkey_")}…</span><span>Last use: ${h(fmtTime(key.last_used_at))}</span><span>${key.expires_at ? `Expires: ${h(fmtTime(key.expires_at))}` : "No expiry"}</span></div><div class="cluster section-gap"><span class="faint small">Workspace scope</span>${scope}</div><p class="muted small section-gap">This key authenticates the client installation only. AI actor, role, runtime, and Run by user attribution are resolved separately on every request.</p></div>${action}</div>`;
       }
 
-      function renderOneTimeClientCredential() {
-        const value = state.oneTimeCredential;
-        if (value?.kind !== "client" || !value.secret) return "";
-        return `<div class="notice ok"><span>✓</span><div><strong>Copy this client API key now</strong><br><code id="one-time-client-secret">${h(value.secret)}</code>${value.expires_at ? ` · expires ${h(fmtTime(value.expires_at))}` : ""}<div class="cluster section-gap"><button class="button primary small" type="button" data-action="copy-one-time-secret">Copy client key</button><button class="button quiet small" type="button" data-action="dismiss-one-time-credential">Dismiss permanently</button></div><span class="help">Paste it only into the hidden prompt already opened by the active Attacca AI. Never paste it into chat or an ordinary shell command. The plaintext is not returned by later API responses or stored in browser storage.</span></div></div>`;
+      function renderPendingClientPairing() {
+        const pairingCode = state.clientAuthorization?.pairingCode || "";
+        if (!pairingCode) return "";
+        if (state.pendingClientPairingError) {
+          return `<div class="notice error"><span>!</span><div><strong>Client authorization request unavailable.</strong><br>${h(state.pendingClientPairingError)}</div></div>`;
+        }
+        const pairing = state.pendingClientPairing;
+        if (!pairing) return `<div class="notice"><span>…</span><div>Loading client authorization request…</div></div>`;
+        const status = String(pairing.status || "pending");
+        const scope = `<strong>All workspaces available to @${h(state.auth?.user?.username || "this account")}</strong>`;
+        const actions = status === "pending"
+          ? `<div class="form-actions"><button class="button primary" type="button" data-action="authorize-client-pairing" data-pairing-code="${h(pairingCode)}">Authorize client</button><button class="button danger" type="button" data-action="deny-client-pairing" data-pairing-code="${h(pairingCode)}">Deny</button></div>`
+          : `<div class="notice ${status === "approved" ? "ok" : status === "denied" ? "error" : ""}"><span>i</span><div>This request is ${h(status)}. No further authorization action is available.</div></div>`;
+        return `<section class="card" style="grid-column:1/-1"><div class="card-head"><div><h2>Authorize client installation</h2><span class="faint small">explicit human approval required</span></div>${statusBadge(status)}</div><div class="card-body"><div class="notice"><span>i</span><div><strong>Review before authorizing.</strong><br>This grants the client installation access as your human account. It does not select or bind an AI identity.</div></div><div class="list section-gap"><div class="list-row"><span class="muted">Client label</span><strong>${h(pairing.label || "Attacca client")}</strong></div><div class="list-row"><span class="muted">Client installation</span><code>${h(pairing.client_instance || "not recorded")}</code></div><div class="list-row"><span class="muted">Device</span><code>${h(pairing.device_id || "not recorded")}</code></div><div class="list-row"><span class="muted">Workspace scope</span>${scope}</div><div class="list-row"><span class="muted">Expires</span><span>${h(fmtTime(pairing.expires_at))}</span></div></div>${actions}</div></section>`;
       }
 
       function renderAuthenticatedSettings() {
@@ -1907,9 +1929,6 @@
         const keyRows = keys.length
           ? keys.map(key => renderClientKeyRow(key, account)).join("")
           : `<div class="muted">No client API keys yet.</div>`;
-        const hint = state.clientAuthorization || {};
-        const clientInstance = hint.clientInstance || "";
-        const clientLabel = hint.clientLabel || "";
         const activationText = eligibility.enabled
           ? "Authentication is enforced. Browser sessions or a valid client-install API key are required."
           : "Authentication enforcement is off. Create keys for active client installations before enabling it.";
@@ -1919,9 +1938,10 @@
         return pageHead("Account and access", "Settings", "Manage browser sign-in, human-owned API keys for installed clients, and server behavior. AI identities remain separate.") +
           `<div class="notice"><span>✓</span><div><strong>Signed in as ${h(account.display_name || account.username)}</strong><br>Human account: <code>web.${h(account.username)}</code> · <strong>Run by user: ${h(account.username)}</strong>. Canonical AI actors keep their own workspace, role, and runtime; a client key never renames, binds, or impersonates them.</div></div>
           <div class="grid two section-gap">
+            ${renderPendingClientPairing()}
             <section class="card"><div class="card-head"><h2>Human account</h2><span class="badge accepted">${account.is_owner ? "server owner" : account.is_admin ? "admin" : "user"}</span></div><div class="card-body"><div class="list"><div class="list-row"><span class="muted">Username</span><code>@${h(account.username)}</code></div><div class="list-row"><span class="muted">Display name</span><strong>${h(account.display_name || account.username)}</strong></div><div class="list-row"><span class="muted">Authentication authority</span><strong>${account.is_owner ? "Owner toggle available" : "Read only · server owner required"}</strong></div></div><div class="form-actions"><button class="button danger" type="button" data-action="auth-logout">Sign out</button></div></div></section>
             <section class="card"><div class="card-head"><h2>Authentication enforcement</h2>${statusBadge(eligibility.enabled ? "enabled" : "off")}</div><div class="card-body"><p class="muted">${h(activationText)}</p>${eligibility.reasons.length ? `<div class="notice section-gap"><span>i</span><div>${h(eligibility.reasons.join(" "))}</div></div>` : ""}<div class="form-actions"><button class="button ${eligibility.enabled ? "danger" : "primary"}" type="button" data-action="toggle-authentication" ${eligibility.allowed ? "" : "disabled"} data-enabled="${eligibility.enabled ? "false" : "true"}">${h(activationButton)}</button></div></div></section>
-            <section class="card" style="grid-column:1/-1"><div class="card-head"><div><h2>Client API keys</h2><span class="faint small">one human-owned key per installed client</span></div><span class="badge">${h(keys.length)} key${keys.length === 1 ? "" : "s"}</span></div><div class="card-body">${renderOneTimeClientCredential()}<div class="notice"><span>i</span><div><strong>Client identity and AI identity are different.</strong><br>Create a key for a concrete Claude, Codex, Kimi, or generic MCP installation. The same installation may run different AI actors; every request still supplies the exact workspace and canonical actor for server-side membership, ownership, and role checks.</div></div>${access.supported ? `<form data-form="create-client-key" class="section-gap"><div class="form-grid"><div class="field"><label for="client-key-label">Client label</label><input id="client-key-label" name="label" maxlength="120" value="${h(clientLabel)}" placeholder="Office laptop · Codex" required></div><div class="field"><label for="client-instance">Client installation ID</label><input id="client-instance" name="client_instance" maxlength="120" pattern="[A-Za-z0-9][A-Za-z0-9._:/@+\\-]*" value="${h(clientInstance)}" placeholder="Filled automatically by the active AI" required><span class="help">Generated by that installation. It is non-secret and cannot select an actor.</span></div><div class="field"><label for="client-key-expires">Expires <span class="faint">optional</span></label><input id="client-key-expires" name="expires_at" type="datetime-local"></div><div class="field wide"><label>Workspace scope <span class="faint">optional</span></label><div class="cluster">${state.projects.map(project => `<label class="chip"><input type="checkbox" name="project_memberships" value="${h(project.project_id)}"> ${h(project.name)} · ${h(project.project_id)}</label>`).join("") || `<span class="muted">No workspaces are currently available.</span>`}</div><span class="help">Leave all unchecked to follow every workspace membership of this human account, including memberships added later.</span></div></div><div class="form-actions"><button class="button primary" type="submit">Create client API key</button></div></form>` : `<div class="notice error section-gap"><span>!</span><div><strong>Client API key management is unavailable.</strong><br>Upgrade the hosted Attacca service before enabling authentication.</div></div>`}<div class="list section-gap">${keyRows}</div></div></section>
+            <section class="card" style="grid-column:1/-1"><div class="card-head"><div><h2>Client API keys</h2><span class="faint small">one human-owned key per authorized client</span></div><span class="badge">${h(keys.length)} key${keys.length === 1 ? "" : "s"}</span></div><div class="card-body"><div class="notice"><span>i</span><div><strong>Client authorization and AI identity are separate.</strong><br>New installations open a short-lived authorization request here. Review the client and scope, then explicitly authorize or deny it. The browser never displays or asks you to copy an API key.</div></div>${access.supported ? "" : `<div class="notice error section-gap"><span>!</span><div><strong>Client API key management is unavailable.</strong><br>Upgrade the hosted Attacca service before enabling authentication.</div></div>`}<div class="list section-gap">${keyRows}</div></div></section>
             <section class="card"><div class="card-head"><h2>Browser refresh</h2></div><div class="card-body"><form data-form="save-panel-behavior"><div class="form-grid"><div class="field"><label for="settings-refresh">Refresh interval</label><input id="settings-refresh" name="refreshSeconds" type="number" min="5" max="300" value="${h(state.prefs.refreshSeconds)}"></div><div class="field"><label for="settings-auto">Live refresh</label><select id="settings-auto" name="autoRefresh"><option value="true" ${state.prefs.autoRefresh ? "selected" : ""}>On</option><option value="false" ${!state.prefs.autoRefresh ? "selected" : ""}>Off</option></select></div></div><div class="form-actions"><button class="button primary" type="submit">Save browser settings</button></div></form></div></section>
             <section class="card"><div class="card-head"><h2>Server runtime</h2>${statusBadge(state.health?.ok ? "ok" : "error")}</div><div class="card-body"><form data-form="save-runtime"><div class="form-grid"><div class="field wide"><label for="runtime-default">Default workspace</label><select id="runtime-default" name="default_project"><option value="">No server default</option>${state.projects.map(project => `<option value="${h(project.project_id)}" ${settings.default_project === project.project_id ? "selected" : ""}>${h(project.name)} · ${h(project.project_id)}</option>`).join("")}</select></div><div class="field"><label for="runtime-update-interval">AI update checks</label><select id="runtime-update-interval" name="update_interval_seconds">${[[0,"Off"],[60,"Every minute (default)"],[300,"Every 5 minutes"],[600,"Every 10 minutes"],[1800,"Every 30 minutes"],[3600,"Every hour"]].map(([seconds,label]) => `<option value="${seconds}" ${Number(settings.update_interval_seconds) === seconds ? "selected" : ""}>${label}</option>`).join("")}</select></div><div class="field"><label for="runtime-verbose">Request logging</label><select id="runtime-verbose" name="verbose"><option value="false" ${!settings.verbose ? "selected" : ""}>Quiet</option><option value="true" ${settings.verbose ? "selected" : ""}>Verbose</option></select></div></div><div class="form-actions"><button class="button primary" type="submit">Save watcher settings</button></div></form><div class="notice section-gap"><span>↗</span><div><strong>Connection changes stay local to each client installation.</strong><br>The active AI opens sign-in and secure key collection itself; this panel never asks a human to run a shell command.</div></div></div></section>
             <section class="card" style="grid-column:1/-1"><div class="card-head"><h2>Download all workspace data</h2></div><div class="card-body"><p class="muted">Download a deterministic snapshot of the selected workspace, including the ledger and full logs. Authentication secrets are excluded. This is a private human backup, not the agent sync mirror; a failed download stays visible and no empty placeholder file is saved.</p><div class="form-actions" style="justify-content:flex-start"><button class="button primary" type="button" data-action="download-export" data-format="zip" ${state.projectId ? "" : "disabled"}>ZIP</button><button class="button" type="button" data-action="download-export" data-format="json" ${state.projectId ? "" : "disabled"}>Full JSON</button><button class="button" type="button" data-action="download-export" data-format="ledger.ndjson" ${state.projectId ? "" : "disabled"}>Ledger NDJSON</button><button class="button" data-action="download-export" data-format="full-log.txt" ${state.projectId ? "" : "disabled"}>Full log</button></div></div></section>
@@ -2009,7 +2029,7 @@
           if (action === "copy-one-time-secret") {
             if (!state.oneTimeCredential?.secret) throw new Error("The one-time credential is no longer available.");
             await navigator.clipboard.writeText(state.oneTimeCredential.secret);
-            toast(state.oneTimeCredential.kind === "client" ? "Client API key copied" : state.oneTimeCredential.kind === "invitation" ? "Invitation token copied" : "Credential copied");
+            toast(state.oneTimeCredential.kind === "invitation" ? "Invitation token copied" : "Credential copied");
           }
           if (action === "copy-one-time-link") {
             if (state.oneTimeCredential?.kind !== "invitation" || !state.oneTimeCredential.link) throw new Error("The one-time invitation link is no longer available.");
@@ -2042,6 +2062,17 @@
             state.credentialAccess = await loadCredentialAccess();
             render({ force: true });
             toast("Client API key permanently deleted");
+          }
+          if (action === "authorize-client-pairing" || action === "deny-client-pairing") {
+            const pairingCode = button.dataset.pairingCode || "";
+            if (!pairingCode || pairingCode !== state.clientAuthorization?.pairingCode) throw new Error("The client authorization request changed; refresh and review it again.");
+            const authorize = action === "authorize-client-pairing";
+            if (!confirm(`${authorize ? "Authorize" : "Deny"} this client installation? Review its installation ID and workspace scope before continuing.`)) return;
+            await api(`/v1/auth/client-pairings/${encodeURIComponent(pairingCode)}/${authorize ? "authorize" : "deny"}`, { method: "POST", body: {} });
+            await loadPendingClientPairing();
+            state.credentialAccess = await loadCredentialAccess();
+            render({ force: true });
+            toast(`Client authorization ${authorize ? "approved" : "denied"}`);
           }
           if (action === "toggle-authentication") {
             const eligibility = activationEligibility(state.credentialAccess || emptyCredentialAccess(), state.auth?.user || {});
@@ -2313,30 +2344,6 @@
               renderAuth();
               throw error;
             }
-          }
-          if (kind === "create-client-key") {
-            if (state.credentialAccess?.capabilities?.client_keys !== true) throw new Error("Client API key management is unavailable on this server.");
-            const clientInstance = String(values.client_instance || "").trim();
-            if (!/^[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,119}$/.test(clientInstance)) throw new Error("Enter the exact client installation ID supplied by the active AI (120 characters maximum).");
-            const body = {
-              label: String(values.label || "").trim(),
-              client_instance: clientInstance,
-              project_memberships: formData.getAll("project_memberships").map(String)
-            };
-            if (values.expires_at) body.expires_at = new Date(values.expires_at).toISOString();
-            const result = await api("/v1/auth/client-keys", { method: "POST", body });
-            if (typeof result.token !== "string" || !result.token.startsWith("atkey_")) throw new Error("The server did not return a one-time client API key.");
-            if (!result.record || result.record.client_instance !== clientInstance) throw new Error("The server returned a key for a different client installation.");
-            state.oneTimeCredential = {
-              kind: "client", secret: result.token,
-              label: result.record.label || body.label,
-              client_instance: clientInstance,
-              expires_at: result.record.expires_at || null
-            };
-            state.credentialAccess = await loadCredentialAccess();
-            state.clientAuthorization = { clientInstance: "", clientLabel: "" };
-            render({ force: true });
-            toast("Client API key created; copy it into the active AI's hidden prompt now");
           }
           if (kind === "save-panel-behavior") {
             state.prefs = { ...state.prefs, autoRefresh: values.autoRefresh === "true", refreshSeconds: Math.max(5, Math.min(300, Number(values.refreshSeconds) || 15)) };
