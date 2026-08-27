@@ -68,6 +68,7 @@ class AuthPanelTestCase(unittest.TestCase):
         for value in (
                 "Client API keys", 'data-form="create-client-key"',
                 'data-action="revoke-client-key"',
+                'data-action="delete-client-key"',
                 'data-action="toggle-authentication"',
                 "client installation", "Human owner:", "Run by user:"):
             self.assertIn(value, surface)
@@ -96,6 +97,8 @@ class AuthPanelTestCase(unittest.TestCase):
             'if (action === "select-project")', action_start)
         actions = self.script[action_start:action_end]
         self.assertIn('/v1/auth/client-keys/${encodeURIComponent', actions)
+        self.assertIn('/permanent', actions)
+        self.assertIn("Permanently delete this revoked", actions)
         self.assertIn(
             'body: { enabled, confirmed: true }', actions)
         self.assertNotIn("expected_readiness_version", actions)

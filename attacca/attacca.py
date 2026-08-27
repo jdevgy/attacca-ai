@@ -1074,6 +1074,20 @@ CREATE TABLE IF NOT EXISTS auth_tokens (
 );
 CREATE INDEX IF NOT EXISTS idx_auth_tokens_user
   ON auth_tokens (user_id, revoked_at, created_at);
+CREATE TABLE IF NOT EXISTS auth_client_key_deletions (
+  token_id         TEXT PRIMARY KEY,
+  user_id          TEXT NOT NULL,
+  label            TEXT NOT NULL,
+  token_prefix     TEXT NOT NULL,
+  client_instance  TEXT,
+  created_at       TEXT NOT NULL,
+  revoked_at       TEXT NOT NULL,
+  deleted_at       TEXT NOT NULL,
+  deleted_by_user  TEXT NOT NULL,
+  deleted_by_name  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_auth_client_key_deletions_user
+  ON auth_client_key_deletions (user_id, deleted_at);
 CREATE TABLE IF NOT EXISTS auth_sessions (
   session_hash TEXT PRIMARY KEY,
   user_id      TEXT NOT NULL,
@@ -1915,6 +1929,43 @@ def auth_client_key_revoke(conn, principal, token_id):
     return {"ok": True, "token_id": token_id, "revoked": True}
 
 
+def auth_client_key_delete(conn, principal, token_id):
+    """Permanently remove an already-revoked client credential.
+
+    The verifier and all scope bindings are deleted.  A deliberately
+    non-secret tombstone remains so operators can audit who deleted which
+    revoked credential without retaining material that can authenticate.
+    """
+    row = conn.execute(
+        "SELECT * FROM auth_tokens WHERE token_id=? AND token_kind='client'",
+        (token_id,)).fetchone()
+    if not row or (row["user_id"] != principal.get("user_id")
+                   and not principal.get("is_admin")):
+        raise AuthorizationError("client_key_not_owned")
+    if not row["revoked_at"]:
+        raise AttaccaError("client_key_must_be_revoked_before_delete")
+    deleted_at = now_iso()
+    with write_tx(conn):
+        conn.execute(
+            "INSERT INTO auth_client_key_deletions"
+            " (token_id,user_id,label,token_prefix,client_instance,created_at,"
+            " revoked_at,deleted_at,deleted_by_user,deleted_by_name)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (row["token_id"], row["user_id"], row["label"],
+             row["token_prefix"], row["client_instance"], row["created_at"],
+             row["revoked_at"], deleted_at, principal["user_id"],
+             principal.get("username") or principal["user_id"]))
+        conn.execute(
+            "DELETE FROM auth_token_project_bindings WHERE token_id=?",
+            (token_id,))
+        conn.execute(
+            "DELETE FROM auth_token_actor_bindings WHERE token_id=?",
+            (token_id,))
+        conn.execute("DELETE FROM auth_tokens WHERE token_id=?", (token_id,))
+    return {"ok": True, "token_id": token_id, "deleted": True,
+            "deleted_at": deleted_at}
+
+
 def auth_client_project_access(conn, principal, project_id):
     """Validate one client key's account/workspace scope."""
     if principal.get("token_kind") != "client":
@@ -1931,7 +1982,13 @@ def auth_client_project_access(conn, principal, project_id):
 
 
 def auth_client_principal_scope(conn, principal, project_id, claimed_actor):
-    """Resolve a client key to one existing actor without binding the key."""
+    """Authorize one request actor without binding it into the client key.
+
+    ``claimed_actor`` is request metadata, not credential identity.  Resolve an
+    explicit migration alias before applying the registered actor's owner and
+    role checks so an installed client survives an actor rename without ever
+    acquiring an actor/role/runtime binding of its own.
+    """
     project_id = auth_client_project_access(conn, principal, project_id)
     actor_id = str(claimed_actor or "").strip()
     if not actor_id:
@@ -1940,6 +1997,15 @@ def auth_client_principal_scope(conn, principal, project_id, claimed_actor):
     row = conn.execute(
         "SELECT * FROM agents WHERE project_id=? AND agent_id=?",
         (project_id, actor_id)).fetchone()
+    if not row:
+        alias = conn.execute(
+            "SELECT canonical_actor_id FROM actor_aliases"
+            " WHERE project_id=? AND legacy_actor_id=?",
+            (project_id, actor_id)).fetchone()
+        if alias:
+            row = conn.execute(
+                "SELECT * FROM agents WHERE project_id=? AND agent_id=?",
+                (project_id, alias["canonical_actor_id"])).fetchone()
     if not row:
         raise AuthorizationError(
             "client_actor_not_registered: '%s' is not registered in '%s'" %
@@ -12116,6 +12182,13 @@ def _r_auth_client_key_revoke(h, m, q):
         {"Cache-Control": "no-store"})
 
 
+def _r_auth_client_key_delete(h, m, q):
+    principal = _require_auth_session(h)
+    h._reply_json(200, auth_client_key_delete(
+        h._conn(), principal, urllib.parse.unquote(m.group(1))),
+        {"Cache-Control": "no-store"})
+
+
 def _r_auth_invitation_create(h, m, q):
     principal = _require_admin_session(h)
     body = h._body_json()
@@ -12972,6 +13045,8 @@ ROUTES = [
      _r_auth_client_key_create),
     (*_route_def("DELETE", "/v1/auth/client-keys/%s" % _PID),
      _r_auth_client_key_revoke),
+    (*_route_def("DELETE", "/v1/auth/client-keys/%s/permanent" % _PID),
+     _r_auth_client_key_delete),
     (*_route_def("GET", "/v1/auth/service-keys"), _r_auth_service_keys),
     (*_route_def("POST", "/v1/auth/service-keys"),
      _r_auth_service_key_create),

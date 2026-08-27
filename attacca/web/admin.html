@@ -1472,7 +1472,7 @@
         if (capabilities.client_keys === true) return;
         const form = $('form[data-form="create-client-key"]', content);
         if (form) form.hidden = true;
-        $$('[data-action="revoke-client-key"]', content).forEach(button => {
+        $$('[data-action="revoke-client-key"], [data-action="delete-client-key"]', content).forEach(button => {
           button.disabled = true;
           button.title = "Client API key management is unavailable in this server build.";
         });
@@ -1886,7 +1886,10 @@
         const scope = memberships.length
           ? memberships.map(projectId => `<span class="chip">${h(projectName(projectId))} · ${h(projectId)}</span>`).join("")
           : `<span class="chip">all workspaces available to @${h(credentialOwner(key, account))}</span>`;
-        return `<div class="list-row"><div><div class="cluster"><strong>${h(key.label || "Attacca client")}</strong>${statusBadge(status)}</div><div class="list-meta"><span>Human owner: @${h(credentialOwner(key, account))}</span><span>Client installation: ${h(key.client_instance || "not recorded")}</span><span>Prefix: ${h(key.token_prefix || "atkey_")}…</span><span>Last use: ${h(fmtTime(key.last_used_at))}</span><span>${key.expires_at ? `Expires: ${h(fmtTime(key.expires_at))}` : "No expiry"}</span></div><div class="cluster section-gap"><span class="faint small">Workspace scope</span>${scope}</div><p class="muted small section-gap">This key authenticates the client installation only. AI actor, role, runtime, and Run by user attribution are resolved separately on every request.</p></div>${status === "active" ? `<button class="button danger small" type="button" data-action="revoke-client-key" data-key="${h(key.token_id)}">Revoke key</button>` : ""}</div>`;
+        const action = status === "active"
+          ? `<button class="button danger small" type="button" data-action="revoke-client-key" data-key="${h(key.token_id)}">Revoke key</button>`
+          : `<button class="button danger small" type="button" data-action="delete-client-key" data-key="${h(key.token_id)}">Delete permanently</button>`;
+        return `<div class="list-row"><div><div class="cluster"><strong>${h(key.label || "Attacca client")}</strong>${statusBadge(status)}</div><div class="list-meta"><span>Human owner: @${h(credentialOwner(key, account))}</span><span>Client installation: ${h(key.client_instance || "not recorded")}</span><span>Prefix: ${h(key.token_prefix || "atkey_")}…</span><span>Last use: ${h(fmtTime(key.last_used_at))}</span><span>${key.expires_at ? `Expires: ${h(fmtTime(key.expires_at))}` : "No expiry"}</span></div><div class="cluster section-gap"><span class="faint small">Workspace scope</span>${scope}</div><p class="muted small section-gap">This key authenticates the client installation only. AI actor, role, runtime, and Run by user attribution are resolved separately on every request.</p></div>${action}</div>`;
       }
 
       function renderOneTimeClientCredential() {
@@ -2030,6 +2033,15 @@
             state.credentialAccess = await loadCredentialAccess();
             render({ force: true });
             toast("Client API key revoked");
+          }
+          if (action === "delete-client-key") {
+            if (state.credentialAccess?.capabilities?.client_keys !== true) throw new Error("Client API key management is unavailable on this server.");
+            if (!button.dataset.key) throw new Error("The client API key has no identifier.");
+            if (!confirm("Permanently delete this revoked client API key? Its credential and workspace bindings will be removed. Non-secret deletion audit evidence is retained.")) return;
+            await api(`/v1/auth/client-keys/${encodeURIComponent(button.dataset.key)}/permanent`, { method: "DELETE", body: {} });
+            state.credentialAccess = await loadCredentialAccess();
+            render({ force: true });
+            toast("Client API key permanently deleted");
           }
           if (action === "toggle-authentication") {
             const eligibility = activationEligibility(state.credentialAccess || emptyCredentialAccess(), state.auth?.user || {});
