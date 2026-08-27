@@ -57,6 +57,7 @@ WATCHER_OUTAGE_BACKOFF_MAX_SECONDS = 15 * 60
 WATCHER_MISSING_GRACE_SECONDS = 24 * 60 * 60
 WATCHER_MISSING_MIN_OBSERVATIONS = 3
 DEFAULT_UPDATE_INTERVAL_SECONDS = 60
+WATCHER_FULL_SYNC_SAFETY_SECONDS = 10 * 60
 CONFIGURED_AI_ROLES = {"director", "advisor", "worker"}
 UPDATE_CHOICES = {"install", "later", "skip"}
 AUXILIARY_HTTP_TIMEOUT_SECONDS = 1
@@ -2207,6 +2208,7 @@ def _watcher_status_payload():
                 "device_id", "root", "interval_seconds", "last_poll_at",
                 "next_poll_at_epoch", "last_error", "event_cursor",
                 "event_cursor_initialized", "offline_mode",
+                "last_full_sync_at_epoch", "last_full_sync_reason",
                 "offline_failure_count", "offline_pending_sync",
                 "offline_pending_count", "offline_conflict_count",
                 "offline_convergence_awaiting_count",
@@ -3499,7 +3501,7 @@ def _watcher_write_markdown_mirror(entry, adapter):
 def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
                   force=False, offline_adapter=None, offline_factory=None,
                   remote_adapter=None, remote_factory=None):
-    """Advance one subscription cursor and durably queue relevant deltas."""
+    """Poll lightweight signals and refresh the full mirror only when due."""
     now = time.time() if now is None else float(now)
     state = _read_state(_watcher_state_path())
     entry = (state.get("subscriptions") or {}).get(key)
@@ -3552,9 +3554,66 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
                     "error": entry.get("last_error") or
                     "credential/AI scope repair is required", "key": key}
         return {"ok": True, "due": True, "disabled": True, "key": key}
+
+    # The minute cadence is a lightweight signal poll, not a minute-by-minute
+    # download of the identity-scoped project projection.  Read the bounded
+    # append-only event feed first and reuse this response below.  A relevant
+    # change triggers an immediate verified mirror refresh; otherwise a full
+    # refresh is only a ten-minute safety reconciliation.  Pending local
+    # writes always bypass both timers so durable outbox replay remains prompt.
+    cursor = max(0, int(entry.get("event_cursor") or 0))
+    initialized = bool(entry.get("event_cursor_initialized"))
+    # Explicit forced checks are diagnostic/recovery operations. Preserve
+    # their historical guarantee that authentication/sync is attempted even
+    # if the auxiliary event feed is unavailable; normal daemon ticks always
+    # perform the lightweight signal request.
+    priority_sync = bool(
+        force or write_woke or int(entry.get("offline_failure_count") or 0))
+    loader = (lambda after: {
+        "events": [], "next_after": after, "may_have_more": False,
+    }) if priority_sync and delta_loader is None else (delta_loader or (
+        lambda after: _watcher_event_delta(entry, after)))
+    try:
+        delta = loader(cursor)
+        events = delta.get("events")
+        next_cursor = int(delta.get("next_after", cursor))
+        may_have_more = bool(delta.get("may_have_more"))
+        if not isinstance(events, list) or any(
+                not isinstance(event, dict) for event in events):
+            raise RuntimeError("event delta loader returned invalid events")
+        if next_cursor < cursor:
+            raise RuntimeError("event delta loader moved the cursor backwards")
+    except Exception as err:
+        if _authentication_required_error(err):
+            _watcher_queue_auth_required(key, entry, err, now)
+            return {"ok": False, "due": True,
+                    "authentication_required": True, "offline": False,
+                    "error": str(err), "key": key}
+        _watcher_queue_error(
+            key, entry, err, now, offline_status=adapter_status,
+            offline_adapter=adapter)
+        return {"ok": False, "due": True, "error": str(err), "key": key}
+    if initialized:
+        relevant = [event for event in events
+                    if _watcher_relevant_event(event)]
+    else:
+        registered_at = entry.get("cursor_registered_at_epoch")
+        relevant = [
+            event for event in events
+            if _watcher_relevant_event(event)
+            and isinstance(_watcher_event_epoch(event), (int, float))
+            and isinstance(registered_at, (int, float))
+            and _watcher_event_epoch(event) >= registered_at]
+    last_full_sync = float(entry.get("last_full_sync_at_epoch") or 0)
+    safety_sync_due = now - last_full_sync >= WATCHER_FULL_SYNC_SAFETY_SECONDS
+    retry_sync_due = (int(entry.get("offline_failure_count") or 0) > 0 or
+                      str((adapter_status or {}).get("mode") or "") ==
+                      "offline")
+    perform_full_sync = bool(force or write_woke or relevant or
+                             safety_sync_due or retry_sync_due)
     sync_result = None
     sync_notice_queued = False
-    if adapter is not None:
+    if adapter is not None and perform_full_sync:
         # A bootstrap factory may have persisted the authenticated scope while
         # constructing the local adapter. Refresh before building the remote.
         entry = (((_read_state(_watcher_state_path()).get(
@@ -3691,6 +3750,11 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
                 "last_offline_write_marker": _offline_write_marker(
                     adapter_status),
                 "last_sync_at": datetime.now(timezone.utc).isoformat(),
+                "last_full_sync_at_epoch": now,
+                "last_full_sync_reason": (
+                    "forced" if force else "local_write" if write_woke else
+                    "relevant_change" if relevant else
+                    "retry" if retry_sync_due else "safety_refresh"),
                 "last_sync_result": sync_state,
                 "sync_scope": entry["sync_scope"],
                 "sync_visibility_fingerprint": entry[
@@ -3744,48 +3808,6 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
             # Do not let one failed auxiliary inbox request suppress the raw
             # event feed or verified offline synchronization. Hosted unread
             # state is not acknowledged on failure and retries next minute.
-    cursor = max(0, int(entry.get("event_cursor") or 0))
-    initialized = bool(entry.get("event_cursor_initialized"))
-    loader = delta_loader or (
-        lambda after: _watcher_event_delta(entry, after))
-    try:
-        delta = loader(cursor)
-        events = delta.get("events")
-        next_cursor = int(delta.get("next_after", cursor))
-        may_have_more = bool(delta.get("may_have_more"))
-        if not isinstance(events, list) or any(
-                not isinstance(event, dict) for event in events):
-            raise RuntimeError("event delta loader returned invalid events")
-        if next_cursor < cursor:
-            raise RuntimeError("event delta loader moved the cursor backwards")
-    except Exception as err:
-        if _authentication_required_error(err):
-            _watcher_queue_auth_required(key, entry, err, now)
-            return {"ok": False, "due": True,
-                    "authentication_required": True, "offline": False,
-                    "error": str(err), "key": key}
-        _watcher_queue_error(
-            key, entry, err, now, offline_status=adapter_status,
-            offline_adapter=adapter)
-        if entry.get("auth_required"):
-            return {"ok": False, "due": True,
-                    "authentication_required": True, "offline": False,
-                    "error": str(err), "key": key}
-        return {"ok": False, "due": True, "error": str(err), "key": key}
-    if initialized:
-        relevant = [event for event in events
-                    if _watcher_relevant_event(event)]
-    else:
-        # A first cursor walk establishes the historical baseline. Preserve
-        # events created after this subscription was registered so a message
-        # racing the startup snapshot cannot disappear into that baseline.
-        registered_at = entry.get("cursor_registered_at_epoch")
-        relevant = [
-            event for event in events
-            if _watcher_relevant_event(event)
-            and isinstance(_watcher_event_epoch(event), (int, float))
-            and isinstance(registered_at, (int, float))
-            and _watcher_event_epoch(event) >= registered_at]
     status = _watcher_subscription_status(entry)
     room_events = [event for event in relevant
                    if event.get("event_type") == "room.message"
@@ -3929,6 +3951,12 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
             "sync_queued": sync_notice_queued,
             "sync_status": ((sync_result or {}).get("status")
                             if sync_result is not None else None),
+            "full_sync_performed": bool(sync_result is not None),
+            "full_sync_reason": (
+                "forced" if force else "local_write" if write_woke else
+                "relevant_change" if relevant else
+                "retry" if retry_sync_due else
+                "safety_refresh" if safety_sync_due else None),
             "write_woke": write_woke,
             "key": key, "interval_seconds": interval,
             "event_count": len(events), "relevant_count": len(relevant),

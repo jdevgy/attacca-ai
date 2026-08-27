@@ -400,6 +400,65 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
         self.assertEqual(len(accepted), 1)
         self.assertIn("safely deduplicated", accepted[0]["summary"])
 
+    def test_minute_poll_skips_full_sync_without_relevant_change(self):
+        def current(state):
+            entry = state["subscriptions"][self.key]
+            entry.update({"event_cursor": 41,
+                          "event_cursor_initialized": True,
+                          "last_full_sync_at_epoch": 50,
+                          "next_poll_at_epoch": 0})
+
+        hook._mutate_state(hook._watcher_state_path(), current)
+        adapter = FakeOfflineAdapter(self.verified_status(
+            mode="online", pending_sync=False, pending_count=0,
+            journal_records=0, last_local_write_at=None), self.snapshot())
+        with mock.patch.object(hook, "_settings_interval", return_value=60), \
+             mock.patch.object(hook, "_watcher_refresh_inbox_entry",
+                               return_value={"ok": True, "staged": 0}):
+            result = hook._watcher_tick(
+                self.key, now=100, offline_adapter=adapter,
+                remote_adapter=object(),
+                delta_loader=lambda after: delta(next_after=41))
+        self.assertTrue(result["due"])
+        self.assertFalse(result["full_sync_performed"])
+        self.assertIsNone(result["full_sync_reason"])
+        self.assertEqual(adapter.sync_calls, [])
+
+    def test_relevant_signal_and_ten_minute_safety_refresh_full_mirror(self):
+        def current(state):
+            entry = state["subscriptions"][self.key]
+            entry.update({"event_cursor": 41,
+                          "event_cursor_initialized": True,
+                          "last_full_sync_at_epoch": 50,
+                          "next_poll_at_epoch": 0})
+
+        hook._mutate_state(hook._watcher_state_path(), current)
+        adapter = FakeOfflineAdapter(self.verified_status(
+            mode="online", pending_sync=False, pending_count=0,
+            journal_records=0, last_local_write_at=None), self.snapshot())
+        event = {"seq": 42, "event_id": "ev_42",
+                 "event_type": "task.updated", "task_id": "T-1",
+                 "payload": {}}
+        with mock.patch.object(hook, "_settings_interval", return_value=60), \
+             mock.patch.object(hook, "_watcher_refresh_inbox_entry",
+                               return_value={"ok": True, "staged": 0}):
+            changed = hook._watcher_tick(
+                self.key, now=100, offline_adapter=adapter,
+                remote_adapter=object(),
+                delta_loader=lambda after: delta([event], next_after=42))
+            safety = hook._watcher_tick(
+                self.key, now=700, offline_adapter=adapter,
+                remote_adapter=object(),
+                delta_loader=lambda after: delta(next_after=42))
+        self.assertTrue(changed["full_sync_performed"])
+        self.assertEqual(changed["full_sync_reason"], "relevant_change")
+        self.assertTrue(safety["full_sync_performed"])
+        self.assertEqual(safety["full_sync_reason"], "safety_refresh")
+        self.assertEqual(len(adapter.sync_calls), 2)
+        entry = self.watcher_state()["subscriptions"][self.key]
+        self.assertEqual(entry["last_full_sync_at_epoch"], 700)
+        self.assertEqual(entry["last_full_sync_reason"], "safety_refresh")
+
     def test_outage_uses_backoff_dedup_and_verified_mirror_state(self):
         adapter = FakeOfflineAdapter(
             self.verified_status(), self.snapshot(), result={

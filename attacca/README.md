@@ -268,10 +268,13 @@ The native plugins bundle lifecycle continuity. Claude/Codex use `SessionStart`,
 `UserPromptSubmit`, and `Stop`; Kimi uses its manifest startup skill plus native
 `UserPromptSubmit` and `Stop` hooks. Once setup writes `.attacca/project.json`,
 each new session loads handoff, Project Rules, inbox, room, tasks, agents, and
-status. Setup also starts one machine-global background watcher. It polls the
-hosted workspace at the server-configured interval (one minute by default,
-configurable or disableable in `/app` Settings) even while coding clients are
-idle, deduplicates changes, and queues a concise local notification. The next
+status. Setup also starts one machine-global background watcher. At the
+server-configured interval (one minute by default, configurable or disableable
+in `/app` Settings), it makes lightweight inbox and append-only event-feed
+checks even while coding clients are idle. A relevant change or pending local
+write immediately triggers a verified mirror refresh; otherwise the full mirror
+receives a ten-minute safety refresh. The watcher deduplicates changes and
+queues a concise local notification. The next
 supported lifecycle boundary injects that queue into the AI's context. The user
 never has to type “check messages,” and there is no second project database.
 
