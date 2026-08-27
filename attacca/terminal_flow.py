@@ -33,6 +33,7 @@ import re
 import secrets
 import socket
 import stat
+import sys
 import tempfile
 import threading
 import time
@@ -60,7 +61,7 @@ MAX_PRIVATE_STATE_BYTES = 1024 * 1024
 
 AUTH_STATUS_PATH = "/v1/auth/status"
 CLIENT_KEYS_PATH = "/v1/auth/client-keys"
-CLIENT_PAIRINGS_PATH = "/v1/auth/client-pairings"
+CLIENT_AUTHORIZATIONS_PATH = "/v1/auth/client-authorizations"
 CLIENT_INSTANCE_HEADER = "X-Attacca-Client-Instance"
 DEVICE_ID_HEADER = "X-Attacca-Device-ID"
 PROJECT_HEADER = "X-Attacca-Project"
@@ -839,7 +840,8 @@ def client_key_settings_url(server_url, client_instance=None,
 
 def _pairing_record(data, server_url, client_instance):
     server = server_record_for_url(data, server_url)
-    rows = server.get("client_pairings") if isinstance(server, dict) else None
+    rows = server.get("client_authorizations") \
+        if isinstance(server, dict) else None
     return rows.get(client_instance) if isinstance(rows, dict) else None
 
 
@@ -851,10 +853,18 @@ def _validate_pairing_secret(value):
     return value
 
 
+def _validate_authorization_request(value):
+    if not isinstance(value, str) or len(value) != 43 or \
+            re.fullmatch(r"[A-Za-z0-9_-]{43}", value) is None:
+        raise TerminalFlowProtocolError(
+            "Attacca returned an invalid authorization request")
+    return value
+
+
 def _store_pairing(server_url, instance, pairing, credentials_path=None):
     def install(data):
         server = canonical_server_record_for_update(data, server_url)
-        server.setdefault("client_pairings", {})[instance] = pairing
+        server.setdefault("client_authorizations", {})[instance] = pairing
         return data
     update_credentials_store(credentials_path, install)
 
@@ -863,8 +873,8 @@ def _forget_pairing(server_url, instance, credentials_path=None):
     def remove(data):
         server = server_record_for_url(data, server_url)
         if isinstance(server, dict) and isinstance(
-                server.get("client_pairings"), dict):
-            server["client_pairings"].pop(instance, None)
+                server.get("client_authorizations"), dict):
+            server["client_authorizations"].pop(instance, None)
         return data
     update_credentials_store(credentials_path, remove)
 
@@ -878,7 +888,7 @@ def start_client_pairing(server_url, *, client_instance=None, runtime=None,
     instance = _resolved_client_instance_id(
         client_instance, runtime=runtime, storage_path=storage_path)
     response = (transport or UrllibJsonTransport()).request(
-        "POST", _endpoint(server_url, CLIENT_PAIRINGS_PATH),
+        "POST", _endpoint(server_url, CLIENT_AUTHORIZATIONS_PATH),
         headers={"Accept": "application/json"}, payload={
             "client_instance": instance,
             "label": str(client_label or "Attacca client")[:120],
@@ -888,14 +898,19 @@ def start_client_pairing(server_url, *, client_instance=None, runtime=None,
         raise TerminalFlowProtocolError(
             "Attacca could not start client authorization")
     value = response.value
-    secret = _validate_pairing_secret(value.get("pairing_secret"))
-    code = _bounded_safe_id(value.get("pairing_code"), "pairing_code")
+    secret = _validate_pairing_secret(value.get("poll_secret"))
+    request_token = _validate_authorization_request(
+        value.get("authorization_request"))
     url = value.get("verification_uri_complete")
-    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+    expected_url = (_endpoint(server_url, "/app") +
+                    "#authorization_request=" +
+                    quote(request_token, safe=""))
+    if not isinstance(url, str) or url != expected_url:
         raise TerminalFlowProtocolError(
             "Attacca returned an invalid authorization link")
     pairing = {
-        "pairing_secret": secret, "pairing_code": code,
+        "poll_secret": secret,
+        "authorization_request": request_token,
         "authorization_url": url,
         "expires_at": value.get("expires_at"),
         "expires_in": value.get("expires_in"),
@@ -911,7 +926,7 @@ def start_client_pairing(server_url, *, client_instance=None, runtime=None,
         except Exception:
             opened = False
     return {"status": "pending", "authorized": False,
-            "client_instance": instance, "pairing_code": code,
+            "client_instance": instance,
             "authorization_url": url, "browser_opened": opened,
             "interval": pairing["interval"], "hot_reload": True}
 
@@ -928,9 +943,9 @@ def poll_client_pairing(server_url, *, client_instance=None, runtime=None,
         return {"status": "authorization_required", "authorized": False,
                 "client_instance": instance, "hot_reload": True}
     response = (transport or UrllibJsonTransport()).request(
-        "POST", _endpoint(server_url, CLIENT_PAIRINGS_PATH + "/poll"),
+        "POST", _endpoint(server_url, CLIENT_AUTHORIZATIONS_PATH + "/poll"),
         headers={"Accept": "application/json"}, payload={
-            "pairing_secret": pairing.get("pairing_secret"),
+            "poll_secret": pairing.get("poll_secret"),
             "client_instance": instance,
             "device_id": pairing.get("device_id"),
         }, timeout=timeout)
@@ -940,7 +955,6 @@ def poll_client_pairing(server_url, *, client_instance=None, runtime=None,
         return {"status": "pending", "authorized": False,
                 "client_instance": instance,
                 "authorization_url": pairing.get("authorization_url"),
-                "pairing_code": pairing.get("pairing_code"),
                 "interval": pairing.get("interval", 5), "hot_reload": True}
     if response.status != 200 or state not in {"approved", "ready"}:
         if state in {"denied", "expired"} or response.status in {404, 410}:
@@ -1076,7 +1090,8 @@ def authorize_client(server_url, *, client_instance=None, runtime=None,
                      credentials_path=None, transport=None,
                      timeout=DEFAULT_TIMEOUT_SECONDS, open_browser=True,
                      browser_open=None, prompt=True,
-                     tty_opener=open_controlling_terminal):
+                     tty_opener=open_controlling_terminal,
+                     wait=False, max_wait_seconds=None, on_link=None):
     """AI-initiated one-click browser pairing with silent hot reload."""
     instance = _resolved_client_instance_id(
         client_instance, runtime=runtime, storage_path=storage_path)
@@ -1095,11 +1110,53 @@ def authorize_client(server_url, *, client_instance=None, runtime=None,
         if polled.get("status") not in {"expired", "denied",
                                          "authorization_required"}:
             return polled
-    return start_client_pairing(
+    started = start_client_pairing(
         server_url, client_instance=instance, client_label=client_label,
         device_id=device_id, credentials_path=credentials_path,
         transport=transport, timeout=timeout, open_browser=open_browser,
         browser_open=browser_open)
+    if not wait or started.get("authorized") \
+            or str(started.get("status") or "").lower() != "pending":
+        return started
+    # The human approves in the browser; poll SILENTLY until resolved instead
+    # of returning after a single check. Show the link once, up front, so the
+    # human can act while we wait. This is what makes approval take effect
+    # automatically (no re-run, no "I have no authorizations").
+    link = started.get("authorization_url")
+    if callable(on_link):
+        try:
+            on_link(link)
+        except Exception:
+            pass
+    elif link:
+        try:
+            sys.stderr.write(
+                "\nAttacca: open this link and Authorize this client, then "
+                "wait:\n  %s\n" % link)
+            sys.stderr.flush()
+        except Exception:
+            pass
+    interval = max(1, int(started.get("interval") or 5))
+    deadline = time.monotonic() + (
+        float(max_wait_seconds) if max_wait_seconds is not None else 110.0)
+    last = started
+    while time.monotonic() < deadline:
+        time.sleep(interval)
+        try:
+            polled = poll_client_pairing(
+                server_url, client_instance=instance,
+                credentials_path=credentials_path, transport=transport,
+                timeout=timeout)
+        except TerminalFlowError:
+            continue
+        last = polled
+        state = str(polled.get("status") or "").lower()
+        if polled.get("authorized") or state in {"approved", "ready"}:
+            return polled
+        if state in {"denied", "expired"}:
+            return polled
+        interval = max(1, int(polled.get("interval") or interval))
+    return last
 
 
 def fallback_login_url(server_url):

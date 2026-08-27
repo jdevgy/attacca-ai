@@ -606,25 +606,27 @@
         catch (_) { return false; }
       }
 
-      // The client opens Settings with only a short-lived, non-secret pairing
-      // code. Credentials and poll secrets are never accepted from a URL.
+      // The client opens Settings with one opaque authorization request in the
+      // fragment. Consume it into memory and erase it before any API request.
       // TESTABLE_CLIENT_AUTHORIZATION_HINTS:BEGIN
       function clientAuthorizationHintsFromLocation() {
         try {
           const raw = String(location.hash || "").replace(/^#/, "");
           const [view, ...parts] = raw.split("&");
-          if (view !== "settings") return { pairingCode: "" };
+          if (view !== "settings") return { authorizationRequest: "" };
           const params = new URLSearchParams(parts.join("&"));
-          // Current clients keep the public code in the Settings fragment.
-          // Accept the short-lived query form emitted by the first pairing
-          // build so already-open requests do not strand their waiting client.
-          const query = new URLSearchParams(String(location.search || ""));
-          const pairingCode = params.get("pairing_code") ||
-            query.get("pairing_code") || "";
-          const canonical = /^(?:[A-Z2-7]{4}-){12}[A-Z2-7]{4}$/;
-          const expiringLegacy = /^[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/;
-          return { pairingCode: canonical.test(pairingCode) || expiringLegacy.test(pairingCode) ? pairingCode : "" };
-        } catch (_) { return { pairingCode: "" }; }
+          const candidate = params.get("authorization_request") || "";
+          params.delete("authorization_request");
+          const safe = candidate.length === 43 && [...candidate].every(char =>
+            (char >= "A" && char <= "Z") ||
+            (char >= "a" && char <= "z") ||
+            (char >= "0" && char <= "9") || char === "-" || char === "_");
+          if (typeof history !== "undefined" && history.replaceState) {
+            const remainder = params.toString();
+            history.replaceState(null, "", `#settings${remainder ? `&${remainder}` : ""}`);
+          }
+          return { authorizationRequest: safe ? candidate : "" };
+        } catch (_) { return { authorizationRequest: "" }; }
       }
       // TESTABLE_CLIENT_AUTHORIZATION_HINTS:END
 
@@ -683,8 +685,8 @@
         credentialAccess: null,
         oneTimeCredential: null,
         clientAuthorization: clientAuthorizationHintsFromLocation(),
-        pendingClientPairing: null,
-        pendingClientPairingError: "",
+        pendingClientAuthorization: null,
+        pendingClientAuthorizationError: "",
         pendingInvitationToken: consumeInvitationTokenFromLocation(),
         invitationAcceptanceError: "",
         authTokens: [],
@@ -1014,16 +1016,20 @@
         }
       }
 
-      async function loadPendingClientPairing() {
-        const pairingCode = state.clientAuthorization?.pairingCode || "";
-        state.pendingClientPairing = null;
-        state.pendingClientPairingError = "";
-        if (!state.auth?.authenticated || !pairingCode) return;
+      async function loadPendingClientAuthorization() {
+        const authorizationRequest = state.clientAuthorization?.authorizationRequest || "";
+        state.pendingClientAuthorization = null;
+        state.pendingClientAuthorizationError = "";
+        if (!state.auth?.authenticated || !authorizationRequest) return;
         try {
-          state.pendingClientPairing = await api(
-            `/v1/auth/client-pairings/${encodeURIComponent(pairingCode)}`);
+          state.pendingClientAuthorization = await api(
+            "/v1/auth/client-authorizations/lookup", {
+              method: "POST", body: { authorization_request: authorizationRequest }
+            });
         } catch (error) {
-          state.pendingClientPairingError = error.message || String(error);
+          state.pendingClientAuthorizationError = error.message || String(error);
+        } finally {
+          render({ force: true });
         }
       }
 
@@ -1238,7 +1244,7 @@
           state.serverSettings = settings;
           state.authTokens = tokens?.tokens || [];
           state.credentialAccess = credentialAccess || emptyCredentialAccess();
-          await loadPendingClientPairing();
+          await loadPendingClientAuthorization();
           projectsResult = projects;
         } catch (error) {
           // A protected request may have discovered an expired session and
@@ -1911,20 +1917,20 @@
         return `<div class="list-row"><div><div class="cluster"><strong>${h(key.label || "Attacca client")}</strong>${statusBadge(status)}</div><div class="list-meta"><span>Human owner: @${h(credentialOwner(key, account))}</span><span>Client installation: ${h(key.client_instance || "not recorded")}</span><span>Prefix: ${h(key.token_prefix || "atkey_")}…</span><span>Last use: ${h(fmtTime(key.last_used_at))}</span><span>${key.expires_at ? `Expires: ${h(fmtTime(key.expires_at))}` : "No expiry"}</span></div><div class="cluster section-gap"><span class="faint small">Workspace scope</span>${scope}</div><p class="muted small section-gap">This key authenticates the client installation only. AI actor, role, runtime, and Run by user attribution are resolved separately on every request.</p></div>${action}</div>`;
       }
 
-      function renderPendingClientPairing() {
-        const pairingCode = state.clientAuthorization?.pairingCode || "";
-        if (!pairingCode) return "";
-        if (state.pendingClientPairingError) {
-          return `<div class="notice error"><span>!</span><div><strong>Client authorization request unavailable.</strong><br>${h(state.pendingClientPairingError)}</div></div>`;
+      function renderPendingClientAuthorization() {
+        const authorizationRequest = state.clientAuthorization?.authorizationRequest || "";
+        if (!authorizationRequest) return "";
+        if (state.pendingClientAuthorizationError) {
+          return `<div class="notice error"><span>!</span><div><strong>Client authorization request unavailable.</strong><br>${h(state.pendingClientAuthorizationError)}</div></div>`;
         }
-        const pairing = state.pendingClientPairing;
-        if (!pairing) return `<div class="notice"><span>…</span><div>Loading client authorization request…</div></div>`;
-        const status = String(pairing.status || "pending");
+        const request = state.pendingClientAuthorization;
+        if (!request) return `<div class="notice"><span>…</span><div>Loading client authorization request…</div></div>`;
+        const status = String(request.status || "pending");
         const scope = `<strong>All workspaces available to @${h(state.auth?.user?.username || "this account")}</strong>`;
         const actions = status === "pending"
-          ? `<div class="form-actions"><button class="button primary" type="button" data-action="authorize-client-pairing" data-pairing-code="${h(pairingCode)}">Authorize client</button><button class="button danger" type="button" data-action="deny-client-pairing" data-pairing-code="${h(pairingCode)}">Deny</button></div>`
+          ? `<div class="form-actions"><button class="button primary" type="button" data-action="authorize-client-authorization">Authorize client</button><button class="button danger" type="button" data-action="deny-client-authorization">Deny</button></div>`
           : `<div class="notice ${status === "approved" ? "ok" : status === "denied" ? "error" : ""}"><span>i</span><div>This request is ${h(status)}. No further authorization action is available.</div></div>`;
-        return `<section class="card" style="grid-column:1/-1"><div class="card-head"><div><h2>Authorize client installation</h2><span class="faint small">explicit human approval required</span></div>${statusBadge(status)}</div><div class="card-body"><div class="notice"><span>i</span><div><strong>Review before authorizing.</strong><br>This grants the client installation access as your human account. It does not select or bind an AI identity.</div></div><div class="list section-gap"><div class="list-row"><span class="muted">Client label</span><strong>${h(pairing.label || "Attacca client")}</strong></div><div class="list-row"><span class="muted">Client installation</span><code>${h(pairing.client_instance || "not recorded")}</code></div><div class="list-row"><span class="muted">Device</span><code>${h(pairing.device_id || "not recorded")}</code></div><div class="list-row"><span class="muted">Workspace scope</span>${scope}</div><div class="list-row"><span class="muted">Expires</span><span>${h(fmtTime(pairing.expires_at))}</span></div></div>${actions}</div></section>`;
+        return `<section class="card" style="grid-column:1/-1"><div class="card-head"><div><h2>Authorize client installation</h2><span class="faint small">explicit human approval required</span></div>${statusBadge(status)}</div><div class="card-body"><div class="notice"><span>i</span><div><strong>Review before authorizing.</strong><br>This grants the client installation access as your human account. It does not select or bind an AI identity.</div></div><div class="list section-gap"><div class="list-row"><span class="muted">Client label</span><strong>${h(request.label || "Attacca client")}</strong></div><div class="list-row"><span class="muted">Client installation</span><code>${h(request.client_instance || "not recorded")}</code></div><div class="list-row"><span class="muted">Device</span><code>${h(request.device_id || "not recorded")}</code></div><div class="list-row"><span class="muted">Workspace scope</span>${scope}</div><div class="list-row"><span class="muted">Expires</span><span>${h(fmtTime(request.expires_at))}</span></div></div>${actions}</div></section>`;
       }
 
       function renderAuthenticatedSettings() {
@@ -1945,7 +1951,7 @@
         return pageHead("Account and access", "Settings", "Manage browser sign-in, human-owned API keys for installed clients, and server behavior. AI identities remain separate.") +
           `<div class="notice"><span>✓</span><div><strong>Signed in as @${h(account.username)}</strong><br>This immutable account name is used for login and audit attribution. It authorizes clients but never renames or replaces an AI identity.</div></div>
           <div class="grid two section-gap">
-            ${renderPendingClientPairing()}
+            ${renderPendingClientAuthorization()}
             <section class="card"><div class="card-head"><h2>Human account</h2><span class="badge accepted">${account.is_owner ? "server owner" : account.is_admin ? "admin" : "user"}</span></div><div class="card-body"><div class="list"><div class="list-row"><span class="muted">Account name</span><strong>@${h(account.username)}</strong></div><div class="list-row"><span class="muted">Authentication authority</span><strong>${account.is_owner ? "Owner toggle available" : "Read only · server owner required"}</strong></div></div><div class="form-actions"><button class="button danger" type="button" data-action="auth-logout">Sign out</button></div></div></section>
             <section class="card"><div class="card-head"><h2>Authentication enforcement</h2>${statusBadge(eligibility.enabled ? "enabled" : "off")}</div><div class="card-body"><p class="muted">${h(activationText)}</p>${eligibility.reasons.length ? `<div class="notice section-gap"><span>i</span><div>${h(eligibility.reasons.join(" "))}</div></div>` : ""}<div class="form-actions"><button class="button ${eligibility.enabled ? "danger" : "primary"}" type="button" data-action="toggle-authentication" ${eligibility.allowed ? "" : "disabled"} data-enabled="${eligibility.enabled ? "false" : "true"}">${h(activationButton)}</button></div></div></section>
             <section class="card" style="grid-column:1/-1"><div class="card-head"><div><h2>Client API keys</h2><span class="faint small">one human-owned key per authorized client</span></div><span class="badge">${h(keys.length)} key${keys.length === 1 ? "" : "s"}</span></div><div class="card-body"><div class="notice"><span>i</span><div><strong>Client authorization and AI identity are separate.</strong><br>New installations open a short-lived authorization request here. Review the client and scope, then explicitly authorize or deny it. The browser never displays or asks you to copy an API key.</div></div>${access.supported ? "" : `<div class="notice error section-gap"><span>!</span><div><strong>Client API key management is unavailable.</strong><br>Upgrade the hosted Attacca service before enabling authentication.</div></div>`}<div class="list section-gap">${keyRows}</div></div></section>
@@ -2070,13 +2076,13 @@
             render({ force: true });
             toast("Client API key permanently deleted");
           }
-          if (action === "authorize-client-pairing" || action === "deny-client-pairing") {
-            const pairingCode = button.dataset.pairingCode || "";
-            if (!pairingCode || pairingCode !== state.clientAuthorization?.pairingCode) throw new Error("The client authorization request changed; refresh and review it again.");
-            const authorize = action === "authorize-client-pairing";
+          if (action === "authorize-client-authorization" || action === "deny-client-authorization") {
+            const authorizationRequest = state.clientAuthorization?.authorizationRequest || "";
+            if (!authorizationRequest) throw new Error("The client authorization request changed; reopen it and review again.");
+            const authorize = action === "authorize-client-authorization";
             if (!confirm(`${authorize ? "Authorize" : "Deny"} this client installation? Review its installation ID and workspace scope before continuing.`)) return;
-            await api(`/v1/auth/client-pairings/${encodeURIComponent(pairingCode)}/${authorize ? "authorize" : "deny"}`, { method: "POST", body: {} });
-            await loadPendingClientPairing();
+            await api(`/v1/auth/client-authorizations/${authorize ? "authorize" : "deny"}`, { method: "POST", body: { authorization_request: authorizationRequest, ...(authorize ? { project_memberships: [] } : {}) } });
+            await loadPendingClientAuthorization();
             state.credentialAccess = await loadCredentialAccess();
             render({ force: true });
             toast(`Client authorization ${authorize ? "approved" : "denied"}`);
@@ -2487,7 +2493,7 @@
         finally { busy(false); }
       });
 
-      window.addEventListener("hashchange", () => {
+      window.addEventListener("hashchange", async () => {
         state.clientAuthorization = clientAuthorizationHintsFromLocation();
         const invitationToken = consumeInvitationTokenFromLocation();
         if (invitationToken) {
@@ -2498,7 +2504,11 @@
           return;
         }
         const view = viewFromLocationHash();
-        if (VIEWS.includes(view)) { state.view = view; render(); }
+        if (VIEWS.includes(view)) {
+          state.view = view;
+          render();
+          await loadPendingClientAuthorization();
+        }
       });
 
       document.addEventListener("visibilitychange", () => {

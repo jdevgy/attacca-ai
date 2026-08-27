@@ -181,12 +181,14 @@ class ClientAuthorizationRedTeamTest(unittest.TestCase):
 
     def test_authorization_public_result_and_message_never_reflect_key(self):
         opened = []
-        pairing_secret = "pairing_secret_never_reflect_12345"
+        poll_secret = "poll_secret_never_reflect_12345"
+        request_token = "D" * 43
         transport = StaticTransport(201, {
-            "status": "pending", "pairing_secret": pairing_secret,
-            "pairing_code": "ABCD-1234",
+            "status": "pending", "poll_secret": poll_secret,
+            "authorization_request": request_token,
             "verification_uri_complete":
-                self.server + "/app#pairing=ABCD-1234",
+                self.server +
+                "/app#authorization_request=" + request_token,
             "expires_in": 600, "interval": 5,
         })
 
@@ -198,7 +200,7 @@ class ClientAuthorizationRedTeamTest(unittest.TestCase):
         message = flow.format_authorization_message(result, self.server)
         serialized = json.dumps(result) + message + "".join(opened)
         self.assertNotIn(self.token, serialized)
-        self.assertNotIn(pairing_secret, serialized)
+        self.assertNotIn(poll_secret, serialized)
         self.assertNotIn("device code", serialized.lower())
         self.assertNotIn("actor binding", serialized.lower())
         self.assertNotIn("run attacca", serialized.lower())
@@ -222,12 +224,14 @@ class ClientAuthorizationRedTeamTest(unittest.TestCase):
                 credentials_path=self.credentials, tty_opener=opener)
 
     def test_compatibility_wrappers_never_call_retired_endpoints(self):
+        request_token = "E" * 43
         transport = StaticTransport(201, {
             "status": "pending",
-            "pairing_secret": "pairing_secret_wrapper_12345",
-            "pairing_code": "WXYZ-9876",
+            "poll_secret": "poll_secret_wrapper_12345",
+            "authorization_request": request_token,
             "verification_uri_complete":
-                self.server + "/app#pairing=WXYZ-9876",
+                self.server +
+                "/app#authorization_request=" + request_token,
             "expires_in": 600, "interval": 5,
         })
         result = flow.start_device_flow(
@@ -240,7 +244,7 @@ class ClientAuthorizationRedTeamTest(unittest.TestCase):
         self.assertEqual(len(transport.calls), 1)
         method, url, _headers, payload = transport.calls[0]
         self.assertEqual(method, "POST")
-        self.assertTrue(url.endswith("/v1/auth/client-pairings"))
+        self.assertTrue(url.endswith("/v1/auth/client-authorizations"))
         self.assertNotIn("actor", payload)
         self.assertNotIn("project", payload)
         self.assertNotIn("runtime", payload)

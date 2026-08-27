@@ -226,10 +226,12 @@ class ClientAuthorizationFlowTest(unittest.TestCase):
 
     def test_authorize_opens_settings_and_defers_without_tty(self):
         opened = []
+        request_token = "A" * 43
         transport = FakeTransport(flow.JsonResponse(201, {}, {
-            "status": "pending", "pairing_secret": "secret_pair_1234",
-            "pairing_code": "ABCD-1234",
-            "verification_uri_complete": self.server + "/app#pair=ABCD-1234",
+            "status": "pending", "poll_secret": "secret_poll_12345",
+            "authorization_request": request_token,
+            "verification_uri_complete":
+                self.server + "/app#authorization_request=" + request_token,
             "interval": 5,
         }))
 
@@ -241,7 +243,7 @@ class ClientAuthorizationFlowTest(unittest.TestCase):
         self.assertEqual(result["status"], "pending")
         self.assertTrue(result["hot_reload"])
         self.assertEqual(opened, [result["authorization_url"]])
-        self.assertIn("#pair=ABCD-1234", opened[0])
+        self.assertIn("#authorization_request=", opened[0])
         self.assertNotIn("atkey_", opened[0])
         self.assertNotIn("restart", json.dumps(result).lower())
         self.assertEqual(transport.calls[0]["payload"]["label"],
@@ -249,13 +251,17 @@ class ClientAuthorizationFlowTest(unittest.TestCase):
         self.assertNotIn("actor", transport.calls[0]["payload"])
         stored = flow.read_credentials_store(self.credentials)
         pairing = flow._pairing_record(stored, self.server, self.instance)
-        self.assertEqual(pairing["pairing_secret"], "secret_pair_1234")
+        self.assertEqual(pairing["poll_secret"], "secret_poll_12345")
+        self.assertNotEqual(pairing["poll_secret"],
+                            pairing["authorization_request"])
 
     def test_silent_poll_persists_approved_key_and_forgets_pairing_secret(self):
+        request_token = "B" * 43
         start = FakeTransport(flow.JsonResponse(201, {}, {
-            "status": "pending", "pairing_secret": "secret_pair_1234",
-            "pairing_code": "ABCD-1234",
-            "verification_uri_complete": self.server + "/app#pair=ABCD-1234",
+            "status": "pending", "poll_secret": "secret_poll_12345",
+            "authorization_request": request_token,
+            "verification_uri_complete":
+                self.server + "/app#authorization_request=" + request_token,
             "interval": 5,
         }))
         flow.start_client_pairing(
@@ -280,6 +286,40 @@ class ClientAuthorizationFlowTest(unittest.TestCase):
         stored = flow.read_credentials_store(self.credentials)
         self.assertIsNone(flow._pairing_record(
             stored, self.server, self.instance))
+
+    def test_repeated_authorize_reuses_pending_request_without_overwrite(self):
+        request_token = "C" * 43
+        url = self.server + "/app#authorization_request=" + request_token
+        start = FakeTransport(flow.JsonResponse(201, {}, {
+            "status": "pending", "poll_secret": "secret_poll_12345",
+            "authorization_request": request_token,
+            "verification_uri_complete": url,
+            "expires_in": 600, "interval": 5,
+        }))
+        first = flow.authorize_client(
+            self.server, client_instance=self.instance,
+            credentials_path=self.credentials, transport=start,
+            open_browser=False)
+        pending = FakeTransport(flow.JsonResponse(202, {}, {
+            "status": "pending", "interval": 5,
+        }))
+        second = flow.authorize_client(
+            self.server, client_instance=self.instance,
+            credentials_path=self.credentials, transport=pending,
+            open_browser=False)
+        self.assertEqual(first["authorization_url"], url)
+        self.assertEqual(second["authorization_url"], url)
+        self.assertEqual(len(start.calls), 1)
+        self.assertEqual(len(pending.calls), 1)
+        self.assertTrue(pending.calls[0]["url"].endswith(
+            "/v1/auth/client-authorizations/poll"))
+        self.assertEqual(pending.calls[0]["payload"]["poll_secret"],
+                         "secret_poll_12345")
+        stored = flow._pairing_record(
+            flow.read_credentials_store(self.credentials),
+            self.server, self.instance)
+        self.assertEqual(stored["authorization_request"], request_token)
+        self.assertEqual(stored["poll_secret"], "secret_poll_12345")
 
     def test_authorize_ready_does_not_open_browser_or_prompt(self):
         flow.save_client_api_key(

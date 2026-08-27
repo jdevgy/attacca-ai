@@ -1114,6 +1114,24 @@ CREATE TABLE IF NOT EXISTS auth_client_pairings (
 );
 CREATE INDEX IF NOT EXISTS idx_auth_client_pairings_code
   ON auth_client_pairings (pairing_code, status, expires_at);
+CREATE TABLE IF NOT EXISTS auth_client_authorizations (
+  request_token_hash TEXT PRIMARY KEY,
+  poll_secret_hash   TEXT NOT NULL UNIQUE,
+  client_instance   TEXT NOT NULL,
+  client_label      TEXT NOT NULL,
+  device_id         TEXT,
+  status            TEXT NOT NULL DEFAULT 'pending',
+  approved_user_id  TEXT,
+  approved_by       TEXT,
+  approved_at       TEXT,
+  approved_projects TEXT,
+  denied_at         TEXT,
+  issued_token_id   TEXT,
+  delivered_at      TEXT,
+  created_at        TEXT NOT NULL,
+  expires_at        TEXT NOT NULL,
+  last_polled_at    TEXT
+);
 CREATE TABLE IF NOT EXISTS auth_sessions (
   session_hash TEXT PRIMARY KEY,
   user_id      TEXT NOT NULL,
@@ -1241,6 +1259,12 @@ def connect(db_path):
         conn.execute("PRAGMA synchronous=NORMAL")
         # Schema is idempotent (IF NOT EXISTS) so concurrent first-open is safe.
         conn.executescript(SCHEMA)
+        # Human-readable pairing codes were replaced by opaque request tokens.
+        # They are short-lived, so expire any legacy pending approvals instead
+        # of migrating a plaintext browser selector into the new table.
+        conn.execute(
+            "UPDATE auth_client_pairings SET status='expired'"
+            " WHERE status IN ('pending','approved')")
         # Human login and identity are one canonical account name. Keep the
         # legacy column as a mirror so old databases cannot retain a second
         # human identity through auth payloads or client setup.
@@ -1997,19 +2021,14 @@ def auth_client_key_delete(conn, principal, token_id):
             "deleted_at": deleted_at}
 
 
-def _auth_client_pairing_code(conn):
+def _auth_client_authorization_token(conn):
     for _ in range(20):
-        # 32 random bytes are encoded without padding: all 256 random bits are
-        # retained in a canonical 52-character Base32 value. Grouping is only
-        # for readability and never reduces or normalizes away entropy.
-        raw = base64.b32encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
-        code = "-".join(raw[index:index + 4]
-                        for index in range(0, len(raw), 4))
+        token = secrets.token_urlsafe(32)
         if not conn.execute(
-                "SELECT 1 FROM auth_client_pairings WHERE pairing_code=?",
-                (code,)).fetchone():
-            return code
-    raise AttaccaError("could not allocate a client pairing code")
+                "SELECT 1 FROM auth_client_authorizations"
+                " WHERE request_token_hash=?", (sha256_hex(token),)).fetchone():
+            return token
+    raise AttaccaError("could not allocate a client authorization request")
 
 
 def auth_client_pairing_start(conn, base_url, client_instance, label,
@@ -2026,58 +2045,62 @@ def auth_client_pairing_start(conn, base_url, client_instance, label,
         raise AttaccaError("client label must be 1-120 characters")
     if device_id and not _CLIENT_INSTALL_ID_RE.fullmatch(device_id):
         raise AttaccaError("device_id must be a safe 1-240 character device ID")
-    raw_secret = "atpair_%s.%s" % (
+    poll_secret = "atpair_%s.%s" % (
         secrets.token_urlsafe(12), secrets.token_urlsafe(32))
-    pairing_code = _auth_client_pairing_code(conn)
+    request_token = _auth_client_authorization_token(conn)
     created = now_iso()
     expires = (now_dt() + timedelta(minutes=10)).strftime(
         "%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
     with write_tx(conn):
         conn.execute(
-            "INSERT INTO auth_client_pairings"
-            " (pairing_secret_hash,pairing_code,client_instance,client_label,"
+            "UPDATE auth_client_authorizations SET status='superseded'"
+            " WHERE client_instance=? AND COALESCE(device_id,'')=?"
+            " AND status IN ('pending','approved')",
+            (client_instance, device_id or ""))
+        conn.execute(
+            "INSERT INTO auth_client_authorizations"
+            " (request_token_hash,poll_secret_hash,client_instance,client_label,"
             " device_id,status,created_at,expires_at)"
             " VALUES (?,?,?,?,?,'pending',?,?)",
-            (sha256_hex(raw_secret), pairing_code, client_instance, label,
+            (sha256_hex(request_token), sha256_hex(poll_secret),
+             client_instance, label,
              device_id, created, expires))
     base = base_url.rstrip("/")
     return {
-        "pairing_secret": raw_secret,
-        "pairing_code": pairing_code,
+        "poll_secret": poll_secret,
+        "authorization_request": request_token,
         "verification_uri": base + "/app#settings",
-        "verification_uri_complete": "%s/app#settings&pairing_code=%s" % (
-            base, urllib.parse.quote(pairing_code, safe="")),
+        "verification_uri_complete": "%s/app#settings&authorization_request=%s" % (
+            base, urllib.parse.quote(request_token, safe="")),
         "expires_in": 600,
         "interval": 5,
     }
 
 
-def _auth_client_pairing_row(conn, pairing_code):
-    code = str(pairing_code or "").strip().upper()
-    modern = re.fullmatch(r"(?:[A-Z2-7]{4}-){12}[A-Z2-7]{4}", code)
-    legacy = re.fullmatch(r"[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}", code)
-    if not modern and not legacy:
-        raise AttaccaError("invalid client pairing code format")
+def _auth_client_pairing_row(conn, authorization_request):
+    token = str(authorization_request or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+        raise AttaccaError("invalid client authorization request")
     row = conn.execute(
-        "SELECT * FROM auth_client_pairings WHERE pairing_code=?", (code,)
+        "SELECT * FROM auth_client_authorizations WHERE request_token_hash=?",
+        (sha256_hex(token),)
     ).fetchone()
     if not row:
-        raise AttaccaError("unknown client pairing code")
+        raise AttaccaError("unknown client authorization request")
     if row["expires_at"] <= now_iso() and row["status"] in (
             "pending", "approved"):
         with write_tx(conn):
             conn.execute(
-                "UPDATE auth_client_pairings SET status='expired'"
-                " WHERE pairing_secret_hash=?",
-                (row["pairing_secret_hash"],))
-        raise AttaccaError("client pairing code expired")
+                "UPDATE auth_client_authorizations SET status='expired'"
+                " WHERE request_token_hash=?", (row["request_token_hash"],))
+        raise AttaccaError("client authorization request expired")
     return row
 
 
-def auth_client_pairing_record(conn, pairing_code):
-    row = _auth_client_pairing_row(conn, pairing_code)
+def auth_client_pairing_record(conn, authorization_request):
+    row = _auth_client_pairing_row(conn, authorization_request)
     record = {key: row[key] for key in (
-        "pairing_code", "client_instance", "client_label", "device_id",
+        "client_instance", "client_label", "device_id",
         "status", "created_at", "expires_at")}
     record["project_memberships"] = json.loads(
         row["approved_projects"] or "[]")
@@ -2087,9 +2110,9 @@ def auth_client_pairing_record(conn, pairing_code):
     return record
 
 
-def auth_client_pairing_decide(conn, pairing_code, principal, authorize,
+def auth_client_pairing_decide(conn, authorization_request, principal, authorize,
                                memberships=None):
-    row = _auth_client_pairing_row(conn, pairing_code)
+    row = _auth_client_pairing_row(conn, authorization_request)
     if row["status"] != "pending":
         raise AttaccaError("client pairing is already %s" % row["status"])
     nowi = now_iso()
@@ -2099,34 +2122,33 @@ def auth_client_pairing_decide(conn, pairing_code, principal, authorize,
     with write_tx(conn):
         if authorize:
             cur = conn.execute(
-                "UPDATE auth_client_pairings SET status='approved',"
+                "UPDATE auth_client_authorizations SET status='approved',"
                 " approved_user_id=?,approved_by=?,approved_at=?,"
                 " approved_projects=?"
-                " WHERE pairing_secret_hash=? AND status='pending'",
+                " WHERE request_token_hash=? AND status='pending'",
                 (principal["user_id"], principal["username"], nowi,
                  canonical_json(projects),
-                 row["pairing_secret_hash"]))
+                 row["request_token_hash"]))
         else:
             cur = conn.execute(
-                "UPDATE auth_client_pairings SET status='denied',"
+                "UPDATE auth_client_authorizations SET status='denied',"
                 " approved_by=?,denied_at=?"
-                " WHERE pairing_secret_hash=? AND status='pending'",
-                (principal["username"], nowi, row["pairing_secret_hash"]))
+                " WHERE request_token_hash=? AND status='pending'",
+                (principal["username"], nowi, row["request_token_hash"]))
         if cur.rowcount != 1:
             raise AttaccaError("client pairing decision raced; reload")
-    return {"ok": True, "pairing_code": row["pairing_code"],
-            "status": status, "project_memberships": projects,
+    return {"ok": True, "status": status, "project_memberships": projects,
             "scope_mode": ("selected_workspaces" if projects else
                            "account_memberships"),
             "credential_issued": False}
 
 
-def auth_client_pairing_poll(conn, pairing_secret, client_instance,
+def auth_client_pairing_poll(conn, poll_secret, client_instance,
                              device_id=None):
     """Promote the device-held pairing secret into a client key exactly once."""
-    raw = str(pairing_secret or "").strip()
+    raw = str(poll_secret or "").strip()
     row = conn.execute(
-        "SELECT * FROM auth_client_pairings WHERE pairing_secret_hash=?",
+        "SELECT * FROM auth_client_authorizations WHERE poll_secret_hash=?",
         (sha256_hex(raw),)).fetchone() if raw else None
     if not row:
         raise AuthenticationError("invalid client pairing secret")
@@ -2142,8 +2164,8 @@ def auth_client_pairing_poll(conn, pairing_secret, client_instance,
         raise AttaccaError("client pairing code expired")
     if row["status"] == "pending":
         conn.execute(
-            "UPDATE auth_client_pairings SET last_polled_at=?"
-            " WHERE pairing_secret_hash=?", (now_iso(), row["pairing_secret_hash"]))
+            "UPDATE auth_client_authorizations SET last_polled_at=?"
+            " WHERE poll_secret_hash=?", (now_iso(), row["poll_secret_hash"]))
         return {"status": "pending", "interval": 5}
     if row["status"] == "denied":
         return {"status": "denied"}
@@ -2158,8 +2180,8 @@ def auth_client_pairing_poll(conn, pairing_secret, client_instance,
     nowi = now_iso()
     with write_tx(conn):
         current = conn.execute(
-            "SELECT * FROM auth_client_pairings WHERE pairing_secret_hash=?",
-            (row["pairing_secret_hash"],)).fetchone()
+            "SELECT * FROM auth_client_authorizations WHERE poll_secret_hash=?",
+            (row["poll_secret_hash"],)).fetchone()
         if current["status"] != "approved" or current["delivered_at"]:
             raise AuthenticationError("client pairing credential already delivered")
         conn.execute(
@@ -2169,14 +2191,14 @@ def auth_client_pairing_poll(conn, pairing_secret, client_instance,
             " client_instance,created_at)"
             " VALUES (?,?,?,?,?,'client',NULL,'client',NULL,'client',?,?,?,?)",
             (token_id, user["user_id"], row["client_label"], raw[:22],
-             row["pairing_secret_hash"], row["device_id"],
+             row["poll_secret_hash"], row["device_id"],
              row["client_label"], row["client_instance"], nowi))
         conn.execute(
-            "UPDATE auth_client_pairings SET status='consumed',"
+            "UPDATE auth_client_authorizations SET status='consumed',"
             " issued_token_id=?,delivered_at=?,last_polled_at=?"
-            " WHERE pairing_secret_hash=? AND status='approved'"
+            " WHERE poll_secret_hash=? AND status='approved'"
             " AND delivered_at IS NULL",
-            (token_id, nowi, nowi, row["pairing_secret_hash"]))
+            (token_id, nowi, nowi, row["poll_secret_hash"]))
         for project_id in json.loads(row["approved_projects"] or "[]"):
             conn.execute(
                 "INSERT INTO auth_token_project_bindings"
@@ -11401,8 +11423,8 @@ class AttaccaHandler(BaseHTTPRequestHandler):
                                "/v1/auth/status", "/v1/auth/bootstrap",
                                "/v1/auth/login",
                                "/v1/auth/invitations/accept",
-                               "/v1/auth/client-pairings",
-                               "/v1/auth/client-pairings/poll")
+                               "/v1/auth/client-authorizations",
+                               "/v1/auth/client-authorizations/poll")
                       or path.startswith("/plugin.git/"))
             if self._auth_enabled() and not public and not self.principal:
                 raise AuthenticationError(
@@ -12437,7 +12459,7 @@ def _r_auth_client_pairing_start(h, m, q):
 def _r_auth_client_pairing_poll(h, m, q):
     body = h._body_json()
     h._reply_json(200, auth_client_pairing_poll(
-        h._conn(), body.get("pairing_secret"), body.get("client_instance"),
+        h._conn(), body.get("poll_secret"), body.get("client_instance"),
         device_id=body.get("device_id")), {"Cache-Control": "no-store"})
 
 
@@ -12480,11 +12502,12 @@ def _auth_pairing_lookup_succeeded(key):
 
 def _r_auth_client_pairing_get(h, m, q):
     principal = _require_auth_session(h)
+    body = h._body_json()
     key = _auth_pairing_lookup_throttle_key(h, principal)
     _auth_pairing_lookup_check(key)
     try:
         record = auth_client_pairing_record(
-            h._conn(), urllib.parse.unquote(m.group(1)))
+            h._conn(), body.get("authorization_request"))
     except AttaccaError:
         _auth_pairing_lookup_failed(key)
         # One response for malformed and unknown codes avoids a format/existence
@@ -12501,7 +12524,7 @@ def _r_auth_client_pairing_authorize(h, m, q):
     _auth_pairing_lookup_check(key)
     try:
         result = auth_client_pairing_decide(
-            h._conn(), urllib.parse.unquote(m.group(1)), principal, True,
+            h._conn(), body.get("authorization_request"), principal, True,
             memberships=body.get("project_memberships"))
     except AttaccaError:
         _auth_pairing_lookup_failed(key)
@@ -12512,11 +12535,12 @@ def _r_auth_client_pairing_authorize(h, m, q):
 
 def _r_auth_client_pairing_deny(h, m, q):
     principal = _require_auth_session(h)
+    body = h._body_json()
     key = _auth_pairing_lookup_throttle_key(h, principal)
     _auth_pairing_lookup_check(key)
     try:
         result = auth_client_pairing_decide(
-            h._conn(), urllib.parse.unquote(m.group(1)), principal, False)
+            h._conn(), body.get("authorization_request"), principal, False)
     except AttaccaError:
         _auth_pairing_lookup_failed(key)
         raise AttaccaError("client pairing request unavailable")
@@ -13382,15 +13406,15 @@ ROUTES = [
      _r_auth_client_key_revoke),
     (*_route_def("DELETE", "/v1/auth/client-keys/%s/permanent" % _PID),
      _r_auth_client_key_delete),
-    (*_route_def("POST", "/v1/auth/client-pairings"),
+    (*_route_def("POST", "/v1/auth/client-authorizations"),
      _r_auth_client_pairing_start),
-    (*_route_def("POST", "/v1/auth/client-pairings/poll"),
+    (*_route_def("POST", "/v1/auth/client-authorizations/poll"),
      _r_auth_client_pairing_poll),
-    (*_route_def("GET", "/v1/auth/client-pairings/%s" % _PID),
+    (*_route_def("POST", "/v1/auth/client-authorizations/lookup"),
      _r_auth_client_pairing_get),
-    (*_route_def("POST", "/v1/auth/client-pairings/%s/authorize" % _PID),
+    (*_route_def("POST", "/v1/auth/client-authorizations/authorize"),
      _r_auth_client_pairing_authorize),
-    (*_route_def("POST", "/v1/auth/client-pairings/%s/deny" % _PID),
+    (*_route_def("POST", "/v1/auth/client-authorizations/deny"),
      _r_auth_client_pairing_deny),
     (*_route_def("GET", "/v1/auth/service-keys"), _r_auth_service_keys),
     (*_route_def("POST", "/v1/auth/service-keys"),
@@ -15970,7 +15994,8 @@ def _ensure_client_setup_auth(url, actor_id, interactive=False,
             actor_id=actor_id if project_id else None,
             device_id=load_device_id(),
             credentials_path=CREDENTIALS_FILE,
-            open_browser=True, prompt=True)
+            open_browser=True, prompt=True,
+            wait=bool(interactive), max_wait_seconds=110)
     except flow.TerminalFlowError as error:
         raise AuthenticationError(
             "client_authorization_required: open %s" %

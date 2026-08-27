@@ -67,8 +67,8 @@ class AuthPanelTestCase(unittest.TestCase):
         surface = self.client_surface()
         for value in (
                 "Client API keys", "Authorize client installation",
-                'data-action="authorize-client-pairing"',
-                'data-action="deny-client-pairing"',
+                'data-action="authorize-client-authorization"',
+                'data-action="deny-client-authorization"',
                 'data-action="revoke-client-key"',
                 'data-action="delete-client-key"',
                 'data-action="toggle-authentication"',
@@ -81,7 +81,7 @@ class AuthPanelTestCase(unittest.TestCase):
                 "create-service-key", "device code"):
             self.assertNotIn(value, settings)
 
-    def test_client_pairing_requires_explicit_actions_and_exact_endpoints(self):
+    def test_client_authorization_requires_explicit_actions_and_post_bodies(self):
         action_start = self.script.index(
             'if (action === "revoke-client-key")')
         action_end = self.script.index(
@@ -90,9 +90,10 @@ class AuthPanelTestCase(unittest.TestCase):
         self.assertIn('/v1/auth/client-keys/${encodeURIComponent', actions)
         self.assertIn('/permanent', actions)
         self.assertIn("Permanently delete this revoked", actions)
-        self.assertIn('action === "authorize-client-pairing"', actions)
-        self.assertIn('action === "deny-client-pairing"', actions)
-        self.assertIn('/v1/auth/client-pairings/${encodeURIComponent', actions)
+        self.assertIn('action === "authorize-client-authorization"', actions)
+        self.assertIn('action === "deny-client-authorization"', actions)
+        self.assertIn('/v1/auth/client-authorizations/${authorize ?', actions)
+        self.assertIn("authorization_request: authorizationRequest", actions)
         self.assertIn(
             'body: { enabled, confirmed: true }', actions)
         self.assertNotIn("expected_readiness_version", actions)
@@ -133,7 +134,7 @@ class AuthPanelTestCase(unittest.TestCase):
         self.assertIn("state.oneTimeCredential = null", recovery)
         self.assertIn("renderAuth();", recovery)
 
-    def test_pairing_url_contains_only_non_secret_code(self):
+    def test_authorization_request_is_fragment_only_erased_and_not_rendered(self):
         settings = self.client_surface()
         self.assertIn("browser never displays or asks you to copy an API key", settings)
         self.assertNotIn("one-time-client-secret", settings)
@@ -148,10 +149,13 @@ class AuthPanelTestCase(unittest.TestCase):
         hint_end = self.script.index(
             "// TESTABLE_CLIENT_AUTHORIZATION_HINTS:END", hint_start)
         hints = self.script[hint_start:hint_end]
-        self.assertIn('params.get("pairing_code")', hints)
-        self.assertIn('[A-Z2-7]{4}', hints)
-        self.assertNotIn("secret", hints.lower())
-        self.assertNotIn("token", hints.lower())
+        self.assertIn('params.get("authorization_request")', hints)
+        self.assertIn('params.delete("authorization_request")', hints)
+        self.assertIn("history.replaceState", hints)
+        self.assertNotIn("location.search", hints)
+        self.assertNotIn("pairing", hints.lower())
+        self.assertNotIn("h(authorizationRequest)", settings)
+        self.assertNotIn("data-authorization-request", settings)
 
 
 if __name__ == "__main__":

@@ -51,33 +51,31 @@ class ClientCredentialsPanelTestCase(unittest.TestCase):
     def test_client_fragment_hints_are_non_secret_strict_and_cross_view_safe(self):
         helper = self.marked("CLIENT_AUTHORIZATION_HINTS")
         program = helper + r"""
-function parse(hash, search = "") {
-  global.location = {hash, search};
-  return clientAuthorizationHintsFromLocation();
+function parse(hash) {
+  let replaced = "";
+  global.location = {hash};
+  global.history = {replaceState: (_a, _b, value) => { replaced = value; }};
+  return {result: clientAuthorizationHintsFromLocation(), replaced};
 }
+const opaque = "A".repeat(43);
 process.stdout.write(JSON.stringify({
-  valid: parse("#settings&pairing_code=AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH-JJJJ-KKKK-LLLL-MMMM-NNNN"),
-  queryCompatibility: parse("#settings", "?pairing_code=AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH-JJJJ-KKKK-LLLL-MMMM-NNNN"),
-  legacy: parse("#settings&pairing_code=ABCD-2389"),
-  ambiguousLegacy: parse("#settings&pairing_code=ABCI-23O9"),
-  badId: parse("#settings&pairing_code=%3Cscript%3E"),
-  tooLong: parse("#settings&pairing_code=" + "c".repeat(129)),
-  other: parse("#room&pairing_code=pair_abc"),
-  secretLike: parse("#settings&pairing_code=AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH-JJJJ-KKKK-LLLL-MMMM-NNNN&pairing_secret=atpair_leak")
+  valid: parse("#settings&authorization_request=" + opaque + "&safe=1"),
+  malformed: parse("#settings&authorization_request=%3Cscript%3E"),
+  wrongLength: parse("#settings&authorization_request=" + "c".repeat(42)),
+  other: parse("#room&authorization_request=" + opaque)
 }));
 """
         result = json.loads(self.run_node(program))
-        canonical = ("AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-GGGG-HHHH-JJJJ-"
-                     "KKKK-LLLL-MMMM-NNNN")
-        self.assertEqual(result["valid"], {"pairingCode": canonical})
-        self.assertEqual(result["queryCompatibility"],
-                         {"pairingCode": canonical})
-        self.assertEqual(result["legacy"], {"pairingCode": "ABCD-2389"})
-        self.assertEqual(result["ambiguousLegacy"], {"pairingCode": ""})
-        self.assertEqual(result["badId"]["pairingCode"], "")
-        self.assertEqual(result["tooLong"]["pairingCode"], "")
-        self.assertEqual(result["other"], {"pairingCode": ""})
-        self.assertEqual(result["secretLike"], {"pairingCode": canonical})
+        opaque = "A" * 43
+        self.assertEqual(result["valid"]["result"],
+                         {"authorizationRequest": opaque})
+        self.assertEqual(result["valid"]["replaced"], "#settings&safe=1")
+        self.assertEqual(result["malformed"]["result"],
+                         {"authorizationRequest": ""})
+        self.assertEqual(result["wrongLength"]["result"],
+                         {"authorizationRequest": ""})
+        self.assertEqual(result["other"]["result"],
+                         {"authorizationRequest": ""})
 
     def test_access_normalization_fails_closed_without_client_keys_array(self):
         helpers = self.marked("EMPTY_CREDENTIAL_ACCESS") + self.marked(
@@ -135,14 +133,14 @@ process.stdout.write(JSON.stringify({
         self.assertNotIn("allowed AI actor", settings)
         self.assertNotIn("migration", settings.lower())
 
-    def test_pairing_handler_requires_explicit_review_without_plaintext(self):
+    def test_authorization_handler_requires_explicit_review_without_plaintext(self):
         start = self.script.index(
-            'if (action === "authorize-client-pairing"')
+            'if (action === "authorize-client-authorization"')
         end = self.script.index('if (action === "toggle-authentication")', start)
         handler = self.script[start:end]
         self.assertIn("Review its installation ID and workspace scope", handler)
-        self.assertIn('/v1/auth/client-pairings/${encodeURIComponent', handler)
-        self.assertIn('authorize ? "authorize" : "deny"', handler)
+        self.assertIn('/v1/auth/client-authorizations/${authorize ?', handler)
+        self.assertIn("authorization_request: authorizationRequest", handler)
         bootstrap = self.script[
             self.script.index("async function bootstrap()"):self.script.index(
                 "async function loadProjects()")]
@@ -155,7 +153,7 @@ process.stdout.write(JSON.stringify({
 
     def test_key_list_never_contains_plaintext_property(self):
         start = self.script.index("function renderClientKeyRow")
-        end = self.script.index("function renderPendingClientPairing", start)
+        end = self.script.index("function renderPendingClientAuthorization", start)
         renderer = self.script[start:end]
         for expression in (
                 'h(key.label || "Attacca client")',
