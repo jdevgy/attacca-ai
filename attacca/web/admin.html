@@ -498,6 +498,7 @@
         <button type="button" data-view="network"><span class="nav-icon">⇄</span>AI Network</button>
         <button type="button" data-view="decisions"><span class="nav-icon">⌘</span>Decisions</button>
         <button type="button" data-view="handoff"><span class="nav-icon">↗</span>Handoff</button>
+        <button type="button" data-view="log"><span class="nav-icon">≋</span>Project Log</button>
         <button type="button" data-view="activity"><span class="nav-icon">∿</span>Activity</button>
         <button type="button" data-view="settings"><span class="nav-icon">⚙</span>Settings</button>
       </nav>
@@ -532,7 +533,7 @@
     (() => {
       "use strict";
 
-      const VIEWS = ["overview", "workspaces", "tasks", "room", "rules", "context", "network", "decisions", "handoff", "activity", "settings"];
+      const VIEWS = ["overview", "workspaces", "tasks", "room", "rules", "context", "network", "decisions", "handoff", "log", "activity", "settings"];
       const HANDOFF_FIELDS = ["objective", "what_changed", "active_work", "blockers", "risks", "next_actions", "notes"];
       const BRIDGE_PARTICIPATION = [
         ["all", "All roles"],
@@ -589,6 +590,35 @@
       }
       // TESTABLE_FEED_HELPERS:END
 
+      // TESTABLE_SORT_HELPERS:BEGIN
+      function timestampMs(row, fields) {
+        for (const field of fields || []) {
+          const value = Date.parse(row?.[field]);
+          if (Number.isFinite(value)) return value;
+        }
+        return null;
+      }
+
+      function naturalEntityId(left, right) {
+        return String(left || "").localeCompare(String(right || ""), undefined,
+          { numeric: true, sensitivity: "base" });
+      }
+
+      function sortDatedRows(rows, { direction = "newest", dateFields = ["updated_at", "created_at"], idFields = ["task_id", "decision_id", "project_id", "rule_id", "version"] } = {}) {
+        const sign = direction === "oldest" ? 1 : -1;
+        return [...(rows || [])].sort((left, right) => {
+          const leftTime = timestampMs(left, dateFields);
+          const rightTime = timestampMs(right, dateFields);
+          if (leftTime == null && rightTime != null) return 1;
+          if (rightTime == null && leftTime != null) return -1;
+          if (leftTime != null && rightTime != null && leftTime !== rightTime) return sign * (leftTime - rightTime);
+          const leftId = idFields.map(field => left?.[field]).find(value => value != null);
+          const rightId = idFields.map(field => right?.[field]).find(value => value != null);
+          return sign * naturalEntityId(leftId, rightId);
+        });
+      }
+      // TESTABLE_SORT_HELPERS:END
+
       function newFeedState() {
         return { page: 0, pageCount: 1, followNewest: true, newCount: 0, newestSeq: 0, scopeKey: "", resetPending: true };
       }
@@ -604,6 +634,18 @@
       function storageSet(key, value) {
         try { localStorage.setItem(key, value); return true; }
         catch (_) { return false; }
+      }
+
+      function readListSorts() {
+        try {
+          const parsed = JSON.parse(storageGet("attacca.admin.sorts", "{}"));
+          return Object.fromEntries(Object.entries(parsed || {}).filter(([, value]) => ["newest", "oldest"].includes(value)));
+        } catch (_) { return {}; }
+      }
+
+      function sortDirection(view) { return state.listSort[view] || "newest"; }
+      function sortControl(view) {
+        return `<label class="cluster small" for="sort-${h(view)}"><span class="faint">Sort by date</span><select id="sort-${h(view)}" data-list-sort="${h(view)}" aria-label="Sort ${h(view)} by date"><option value="newest" ${sortDirection(view) === "newest" ? "selected" : ""}>Newest first</option><option value="oldest" ${sortDirection(view) === "oldest" ? "selected" : ""}>Oldest first</option></select></label>`;
       }
 
       // The client opens Settings with one opaque authorization request in the
@@ -705,6 +747,7 @@
         roomConversation: "local",
         activityFilter: "",
         ruleFilter: "",
+        listSort: readListSorts(),
         roomFeed: newFeedState(),
         activityFeed: newFeedState(),
         searchQuery: "",
@@ -1524,6 +1567,7 @@
           network: renderNetwork,
           decisions: renderDecisions,
           handoff: renderHandoff,
+          log: renderLog,
           activity: renderActivity,
           settings: renderAuthenticatedSettings
         }[state.view];
@@ -1592,10 +1636,11 @@
       }
 
       function renderWorkspaces() {
+        const projects = sortDatedRows(state.projects, { direction: sortDirection("workspaces"), dateFields: ["created_at"], idFields: ["project_id"] });
         return pageHead("Server workspaces", "Workspaces", "Create a logical project or switch which one this panel manages.") +
           `<div class="grid main-side">
             <section><div class="grid two">
-              ${state.projects.length ? state.projects.map(project => `<article class="card workspace-card ${project.project_id === state.projectId ? "selected" : ""}">
+              <div class="filterbar">${sortControl("workspaces")}</div>${projects.length ? projects.map(project => `<article class="card workspace-card ${project.project_id === state.projectId ? "selected" : ""}">
                 <div class="workspace-top"><div><div class="cluster"><h2 class="workspace-title">${h(project.name || project.project_id)}</h2>${project.project_id === state.projectId ? `<span class="badge accepted">Selected</span>` : ""}</div><div class="faint mono small" style="margin-top:5px">${h(project.project_id)}</div></div><button class="button small ${project.project_id === state.projectId ? "quiet" : ""}" data-action="select-project" data-project="${h(project.project_id)}" ${project.project_id === state.projectId ? "disabled" : ""}>${project.project_id === state.projectId ? "Active" : "Open"}</button></div>
                 <div class="workspace-stats"><div class="workspace-stat"><strong>${Number(project.events || 0).toLocaleString()}</strong><span>Events</span></div><div class="workspace-stat"><strong>${Number(project.open_tasks || 0).toLocaleString()}</strong><span>Open tasks</span></div></div>
                 <div class="list-meta"><span>Context v${h(project.context_version)}</span><span>Created ${h(fmtTime(project.created_at))}</span></div>
@@ -1617,16 +1662,16 @@
       function renderTasks() {
         const tasks = state.data.tasks?.tasks || [];
         const query = state.taskSearch.toLowerCase();
-        const filtered = tasks.filter(task => {
+        const filtered = sortDatedRows(tasks.filter(task => {
           const matchesFilter = state.taskFilter === "all" || (state.taskFilter === "active" ? !["done", "cancelled"].includes(task.status) : task.status === state.taskFilter);
           const haystack = `${task.task_id} ${task.title} ${task.description || ""} ${(task.expected_scope || []).join(" ")}`.toLowerCase();
           return matchesFilter && (!query || haystack.includes(query));
-        });
+        }), { direction: sortDirection("tasks"), dateFields: ["updated_at", "created_at"], idFields: ["task_id"] });
         return pageHead("Shared task board", "Tasks", "Claim work explicitly, coordinate overlapping paths, and attach evidence when reporting.") +
           (state.errors.tasks ? errorNotice(state.errors.tasks) : "") +
           `<div class="grid main-side">
             <section>
-              <div class="filterbar"><input id="task-search" type="search" value="${h(state.taskSearch)}" placeholder="Search tasks…" aria-label="Search tasks"><select id="task-filter" aria-label="Filter task status">${["active","all","queued","claimed","blocked","review","done","cancelled"].map(option => `<option value="${option}" ${option === state.taskFilter ? "selected" : ""}>${option[0].toUpperCase() + option.slice(1)}</option>`).join("")}</select><span class="faint small">${filtered.length} of ${tasks.length}</span></div>
+              <div class="filterbar"><input id="task-search" type="search" value="${h(state.taskSearch)}" placeholder="Search tasks…" aria-label="Search tasks"><select id="task-filter" aria-label="Filter task status">${["active","all","queued","claimed","blocked","review","done","cancelled"].map(option => `<option value="${option}" ${option === state.taskFilter ? "selected" : ""}>${option[0].toUpperCase() + option.slice(1)}</option>`).join("")}</select>${sortControl("tasks")}<span class="faint small">${filtered.length} of ${tasks.length}</span></div>
               <div class="stack">${filtered.length ? filtered.map(renderTaskCard).join("") : `<div class="card">${empty("No matching tasks", "Change the filter or create a new task.")}</div>`}</div>
             </section>
             <aside class="card"><div class="card-head"><h2>Create task</h2></div><div class="card-body">
@@ -1769,12 +1814,12 @@
       }
 
       function renderDecisions() {
-        const decisions = [...(state.data.decisions?.decisions || [])].reverse();
+        const decisions = sortDatedRows(state.data.decisions?.decisions || [], { direction: sortDirection("decisions"), dateFields: ["created_at"], idFields: ["decision_id"] });
         return pageHead("Durable choices", "Decisions", "Capture the choice, why it exists, and whether the project accepted it.") +
           (state.errors.decisions ? errorNotice(state.errors.decisions) : "") +
-          `<div class="grid main-side"><section class="stack">
+          `<div class="grid main-side"><section><div class="filterbar">${sortControl("decisions")}</div><div class="stack">
             ${decisions.length ? decisions.map(decision => `<article class="card decision-card"><div class="decision-top"><div><div class="cluster"><span class="mono muted">${h(decision.decision_id)}</span>${statusBadge(decision.status)}</div><h2 class="decision-title" style="margin-top:10px">${h(decision.title)}</h2></div><span class="faint small">${h(fmtTime(decision.created_at))}</span></div>${decision.detail ? `<p class="decision-detail">${h(decision.detail)}</p>` : ""}${decision.rationale ? `<div class="notice section-gap"><div><strong>Rationale</strong><br><span class="prose">${h(decision.rationale)}</span></div></div>` : ""}${decision.status === "proposed" ? `<div class="task-actions">${["accepted","rejected","superseded"].map(resolution => `<button class="button small ${resolution === "accepted" ? "primary" : resolution === "rejected" ? "danger" : "quiet"}" data-action="resolve-decision" data-decision="${h(decision.decision_id)}" data-resolution="${resolution}">${resolution[0].toUpperCase() + resolution.slice(1)}</button>`).join("")}</div>` : `<div class="list-meta"><span>Resolved by ${h(actorDisplay(decision.resolved_by || "unknown"))}</span><span>${h(fmtTime(decision.resolved_at))}</span></div>`}</article>`).join("") : `<div class="card">${empty("No decisions yet", "Propose the first durable project choice.")}</div>`}
-          </section><aside class="card"><div class="card-head"><h2>Propose decision</h2></div><div class="card-body"><form data-form="propose-decision"><div class="field"><label for="decision-title">Title</label><input id="decision-title" name="title" required placeholder="Adopt stable workspace IDs"></div><div class="field section-gap"><label for="decision-detail">Detail</label><textarea id="decision-detail" name="detail" placeholder="What exactly are we choosing?"></textarea></div><div class="field section-gap"><label for="decision-rationale">Rationale</label><textarea id="decision-rationale" name="rationale" placeholder="Why is this the right tradeoff?"></textarea></div><div class="form-actions"><button class="button primary" type="submit">Propose decision</button></div></form></div></aside></div>`;
+          </div></section><aside class="card"><div class="card-head"><h2>Propose decision</h2></div><div class="card-body"><form data-form="propose-decision"><div class="field"><label for="decision-title">Title</label><input id="decision-title" name="title" required placeholder="Adopt stable workspace IDs"></div><div class="field section-gap"><label for="decision-detail">Detail</label><textarea id="decision-detail" name="detail" placeholder="What exactly are we choosing?"></textarea></div><div class="field section-gap"><label for="decision-rationale">Rationale</label><textarea id="decision-rationale" name="rationale" placeholder="Why is this the right tradeoff?"></textarea></div><div class="form-actions"><button class="button primary" type="submit">Propose decision</button></div></form></div></aside></div>`;
       }
 
       function renderHandoff() {
@@ -1789,7 +1834,15 @@
         return pageHead("Cold-start brief", "Handoff", "Edit the current project brief so the next worker can resume without a rebrief.") +
           (state.errors.handoff ? errorNotice(state.errors.handoff) : "") +
           `<div class="grid main-side"><section class="card"><div class="card-head"><h2>Current handoff · context v${h(response.context_version ?? "—")}</h2><span class="faint small">${h(actorDisplay(response.handoff_updated_by || "not written"))} · ${h(fmtTime(response.handoff_updated_at))}</span></div><div class="card-body">${canWrite ? "" : `<div class="notice error"><span>!</span><div><strong>Director-only handoff.</strong><br>${h(actorDisplay(effectiveActor))} is ${h(actorRecord?.role || "not registered as a Director")}. ${state.prefs.owner ? `Owner ${h(state.prefs.owner)} is separate attribution and does not change the actor ID or role.` : ""} Use tasks and Room / Inbox to report work.</div></div>`}<form data-form="update-handoff" class="${canWrite ? "" : "section-gap"}"><div class="form-grid">${HANDOFF_FIELDS.map((field, index) => `<div class="field ${field === "objective" || field === "notes" ? "wide" : ""}"><label for="handoff-${field}">${h(labels[field])}</label><textarea id="handoff-${field}" name="${field}" ${index === 0 ? "required" : ""} ${canWrite ? "" : "disabled"} placeholder="${field === "blockers" ? "None" : "Write a concise, durable update…"}">${h(handoff[field] || "")}</textarea></div>`).join("")}</div><div class="form-actions"><button class="button primary" type="submit" ${canWrite ? "" : "disabled"}>Update handoff</button></div></form></div></section>
-          <aside class="stack"><div class="card pad"><div class="eyebrow">Repository snapshot</div><div class="list section-gap"><div class="list-row"><span class="muted">Branch</span><code>${h(response.git?.branch || "—")}</code></div><div class="list-row"><span class="muted">Revision</span><code>${h(response.git?.head || "—")}</code></div><div class="list-row"><span class="muted">Open tasks</span><strong>${h(response.open_tasks?.length || 0)}</strong></div><div class="list-row"><span class="muted">Live decisions</span><strong>${h(response.decisions?.length || 0)}</strong></div></div></div><div class="notice"><span>i</span><div><strong>Context versioning</strong><br>Updating the handoff advances project context. Workers with older briefs should re-read it before writing.</div></div></aside></div>${(() => { const versions = state.data.handoffHistory?.versions || []; return versions.length > 1 ? `<section class="card section-gap"><div class="card-head"><h2>Handoff history</h2><span class="faint small">${h(versions.length)} versions</span></div><div class="card-body"><div class="list">${versions.map(v => `<details class="list-row" style="display:block"><summary><span class="list-title">v${h(v.version)}</span> <span class="faint small">${h(actorDisplay(v.updated_by || "unknown"))} · ${h(fmtTime(v.updated_at))}</span></summary><div class="message-body section-gap">${HANDOFF_FIELDS.map(f => (v.content && v.content[f]) ? `<div><strong>${h(labels[f])}:</strong> ${h(v.content[f])}</div>` : "").join("")}</div></details>`).join("")}</div></div></section>` : ""; })()}`;
+          <aside class="stack"><div class="card pad"><div class="eyebrow">Repository snapshot</div><div class="list section-gap"><div class="list-row"><span class="muted">Branch</span><code>${h(response.git?.branch || "—")}</code></div><div class="list-row"><span class="muted">Revision</span><code>${h(response.git?.head || "—")}</code></div><div class="list-row"><span class="muted">Open tasks</span><strong>${h(response.open_tasks?.length || 0)}</strong></div><div class="list-row"><span class="muted">Live decisions</span><strong>${h(response.decisions?.length || 0)}</strong></div></div></div><div class="notice"><span>i</span><div><strong>Context versioning</strong><br>Updating the handoff advances project context. Workers with older briefs should re-read it before writing.</div></div></aside></div>${(() => { const versions = sortDatedRows(state.data.handoffHistory?.versions || [], { direction: sortDirection("handoff"), dateFields: ["updated_at"], idFields: ["version"] }); return versions.length > 1 ? `<section class="card section-gap"><div class="card-head"><h2>Handoff history</h2>${sortControl("handoff")}<span class="faint small">${h(versions.length)} versions</span></div><div class="card-body"><div class="list">${versions.map(v => `<details class="list-row" style="display:block"><summary><span class="list-title">v${h(v.version)}</span> <span class="faint small">${h(actorDisplay(v.updated_by || "unknown"))} · ${h(fmtTime(v.updated_at))}</span></summary><div class="message-body section-gap">${HANDOFF_FIELDS.map(f => (v.content && v.content[f]) ? `<div><strong>${h(labels[f])}:</strong> ${h(v.content[f])}</div>` : "").join("")}</div></details>`).join("")}</div></div></section>` : ""; })()}`;
+      }
+
+      function renderLog() {
+        const lines = [...(state.data.log?.log || [])];
+        if (sortDirection("log") === "newest") lines.reverse();
+        return pageHead("Curated cloud history", "Project Log", "Review meaningful task, decision, handoff, directive, and report milestones. Activity remains the complete raw event ledger.") +
+          (state.errors.log ? errorNotice(state.errors.log) : "") +
+          `<section class="card"><div class="card-head"><h2>${h(lines.length)} significant entries</h2>${sortControl("log")}</div><div class="card-body">${lines.length ? `<div class="timeline">${lines.map(line => `<div class="timeline-row"><div class="timeline-line prose">${h(line)}</div></div>`).join("")}</div>` : empty("No project log entries", "Meaningful project milestones will appear here.")}</div></section>`;
       }
 
       function renderSearchResults(result) {
@@ -1842,9 +1895,9 @@
         const rules = state.data.rules?.rules || [];
         const canManageRules = canManageProjectRules();
         const query = state.ruleFilter.trim().toLowerCase();
-        const visibleRules = rules.filter(rule => !query ||
+        const visibleRules = sortDatedRows(rules.filter(rule => !query ||
           `${rule.rule_id} ${rule.title} ${rule.body} ${rule.scope} ${rule.priority} ${rule.enabled ? "enabled" : "disabled"}`
-            .toLowerCase().includes(query));
+            .toLowerCase().includes(query)), { direction: sortDirection("rules"), dateFields: ["updated_at", "created_at"], idFields: ["rule_id"] });
         const enabledRules = rules.filter(rule => rule.enabled).length;
         const permission = canManageRules ? "Human / Director management enabled" : "Read only for this identity";
         return pageHead(
@@ -1857,7 +1910,7 @@
           (state.errors.rules ? errorNotice(state.errors.rules) : "") +
           `<section class="card section-gap" id="core-rules-manager"><div class="card-head"><div><h2>Workspace rules</h2><span class="faint small">${h(rules.length)} loaded · ${h(enabledRules)} enabled · ${h(permission)}</span></div>${canManageRules ? `<span class="badge accepted">management enabled</span>` : `<span class="badge blocked">read only</span>`}</div><div class="card-body">
             ${canManageRules ? "" : `<div class="notice error"><span>i</span><div><strong>Human or registered Director management only.</strong><br>${h(attributionText(state.prefs.actor, state.prefs.actorType, state.prefs.owner))} may read applicable enabled rules but cannot create, edit, enable, or disable them.</div></div>`}
-            <div class="filterbar ${canManageRules ? "" : "section-gap"}"><input id="rule-search" type="search" value="${h(state.ruleFilter)}" placeholder="Filter by title, body, scope, status, or rule ID…" aria-label="Filter Core Rules"><span class="faint small">${h(visibleRules.length)} shown of ${h(rules.length)}</span></div>
+            <div class="filterbar ${canManageRules ? "" : "section-gap"}"><input id="rule-search" type="search" value="${h(state.ruleFilter)}" placeholder="Filter by title, body, scope, status, or rule ID…" aria-label="Filter Core Rules">${sortControl("rules")}<span class="faint small">${h(visibleRules.length)} shown of ${h(rules.length)}</span></div>
             <div class="grid main-side"><section class="stack" aria-label="Core Rules list">${visibleRules.length ? visibleRules.map(rule => `<article class="bridge-panel" data-rule-card="${h(rule.rule_id)}"><div class="bridge-panel-head"><div><div class="cluster"><span class="mono muted">${h(rule.rule_id)}</span><span class="badge ${rule.enabled ? "accepted" : "done"}">${rule.enabled ? "enabled" : "disabled"}</span><span class="chip">${h(rule.scope)}</span><span class="chip">priority ${h(rule.priority)}</span></div><div class="list-meta"><span>version ${h(rule.version)}</span><span>updated ${h(fmtTime(rule.updated_at))}</span><span>by ${h(actorDisplay(rule.updated_by || "unknown"))}</span>${rule.updated_owner ? ownerChip(rule.updated_owner) : ""}</div></div>${canManageRules ? `<button class="button ${rule.enabled ? "danger" : "primary"} small" type="button" data-action="toggle-rule" data-rule="${h(rule.rule_id)}" data-version="${h(rule.version)}" data-enabled="${rule.enabled ? "true" : "false"}">${rule.enabled ? "Disable rule" : "Enable rule"}</button>` : ""}</div><form data-form="update-rule" data-rule="${h(rule.rule_id)}" class="section-gap"><input type="hidden" name="expected_version" value="${h(rule.version)}"><div class="form-grid"><div class="field"><label>Title</label><input name="title" required value="${h(rule.title)}" ${canManageRules ? "" : "disabled"}></div><div class="field"><label>Scope</label><select name="scope" ${canManageRules ? "" : "disabled"}>${RULE_SCOPES.map(scope => `<option value="${scope}" ${rule.scope === scope ? "selected" : ""}>${h(scope)}</option>`).join("")}</select></div><div class="field"><label>Priority</label><input name="priority" type="number" min="0" max="1000" required value="${h(rule.priority)}" ${canManageRules ? "" : "disabled"}><span class="help">Lower numbers load first.</span></div><div class="field wide"><label>Directive body</label><textarea name="body" required ${canManageRules ? "" : "disabled"}>${h(rule.body)}</textarea></div></div>${canManageRules ? `<div class="form-actions"><button class="button primary small" type="submit">Save rule changes</button></div>` : ""}</form></article>`).join("") : `<div class="bridge-panel">${empty(rules.length ? "No matching Core Rules" : "No Core Rules", rules.length ? "Change or clear the filter." : canManageRules ? "Create the first live workspace directive." : "No enabled rule applies to this panel identity.")}</div>`}</section>
               <aside class="card"><div class="card-head"><h3>Create Core Rule</h3></div><div class="card-body">${canManageRules ? `<form data-form="create-rule"><div class="field"><label for="rule-title">Title</label><input id="rule-title" name="title" required placeholder="Protect the v2 API boundary"></div><div class="field section-gap"><label for="rule-body">Directive body</label><textarea id="rule-body" name="body" required placeholder="State the durable instruction every applicable AI must follow."></textarea></div><div class="form-grid section-gap"><div class="field"><label for="rule-scope">Scope</label><select id="rule-scope" name="scope">${RULE_SCOPES.map(scope => `<option value="${scope}">${h(scope)}</option>`).join("")}</select></div><div class="field"><label for="rule-priority">Priority</label><input id="rule-priority" name="priority" type="number" min="0" max="1000" value="100" required><span class="help">0–1000; lower loads first.</span></div></div><div class="form-actions"><button class="button primary" type="submit">Create Core Rule</button></div></form>` : `<div class="muted">Switch the panel identity to a human or registered Director to manage Core Rules.</div>`}</div></aside>
             </div>
@@ -1865,25 +1918,25 @@
       }
 
       function renderNetwork() {
-        const agents = state.data.agents?.agents || [];
+        const agents = sortDatedRows(state.data.agents?.agents || [], { direction: sortDirection("agents"), dateFields: ["last_seen_at", "registered_at"], idFields: ["agent_id"] });
         const directors = agents.filter(agent => agent.role === "director");
         const bridges = state.data.bridges?.bridges || [];
         const status = state.data.status || {};
         const inbox = state.data.inbox?.messages || [];
-        const relationshipInbox = inbox.filter(message => message.origin_project || message.authority);
+        const relationshipInbox = sortDatedRows(inbox.filter(message => message.origin_project || message.authority), { direction: sortDirection("network"), dateFields: ["at", "created_at"], idFields: ["seq"] });
         const otherProjects = state.projects.filter(project => project.project_id !== state.projectId);
         return pageHead("Cross-workspace coordination", "AI Network", "Manage workspace authority relationships and room participation as separate controls.", `<button class="button" data-view="room">Open Room / Inbox</button>`) +
           (state.errors.bridges ? errorNotice(state.errors.bridges) : "") +
           `<div class="notice"><span>i</span><div><strong>Relationship and participation answer different questions.</strong><br>Peer / Master / Advisor defines authority between workspaces. Participation defines which AIs may enter that one inter-project conversation. Changing participation never deletes the relationship; deleting the relationship disconnects the workspace rooms entirely. Roles still follow the workspace, not the app window.</div></div>
           <div class="grid two section-gap">
-            <section class="card"><div class="card-head"><h2>Directors & workers</h2><span class="faint small">${agents.length} registered</span></div><div class="card-body">
+            <section class="card"><div class="card-head"><h2>Directors & workers</h2>${sortControl("agents")}<span class="faint small">${agents.length} registered</span></div><div class="card-body">
               <form data-form="set-lead"><div class="field"><label for="lead-agent">Lead Director</label><select id="lead-agent" name="agent_id"><option value="">No lead director</option>${directors.map(agent => `<option value="${h(agent.agent_id)}" ${status.lead_director === agent.agent_id ? "selected" : ""}>${h(agent.display_name || actorDisplay(agent.agent_id))}</option>`).join("")}</select><span class="help">Only registered Directors can lead. The choice persists across Claude, Codex, Kimi, and other clients in this workspace.</span></div><div class="form-actions"><button class="button primary" type="submit">Save lead</button></div></form>
               <div class="list section-gap">${agents.length ? agents.map(agent => `<div class="list-row"><div><div class="list-title">${h(agent.display_name || actorDisplay(agent.agent_id))}</div><div class="list-meta"><span title="${h(agent.agent_id)}">${h(actorDisplay(agent.agent_id))}</span>${ownerChip(agent.owner)}<span>${h(agent.role || "role not assigned")}</span><span>${h(agent.runtime || "runtime unknown")}</span></div></div>${agent.agent_id === status.lead_director ? `<span class="badge accepted">lead</span>` : statusBadge(agent.role || "unassigned")}</div>`).join("") : `<div class="muted">No AIs registered yet. Guided setup asks for the first AI's role and recommends Director.</div>`}</div>
             </div></section>
             <section class="card"><div class="card-head"><h2>Register or change an AI role</h2></div><div class="card-body"><form data-form="register-agent"><div class="form-grid"><div class="field"><label for="agent-pick">AI agent</label><select id="agent-pick" name="agent_id" data-agent-pick>${agents.map(agent => `<option value="${h(agent.agent_id)}">${h(agent.display_name || actorDisplay(agent.agent_id))} · ${h(agent.role || "unassigned")}</option>`).join("")}<option value="__new__">+ Register a new actor…</option></select><span class="help">Pick an existing AI to change its role, or choose "Register a new actor".</span></div><div class="field" data-new-actor ${agents.length ? "hidden" : ""}><label for="agent-id-new">New canonical actor ID</label><input id="agent-id-new" name="agent_id_new" placeholder="analytics-admin.director.codex"><span class="help">&lt;workspace&gt;.&lt;role&gt;.&lt;runtime&gt; — do not add the owner's name.</span></div><div class="field"><label for="agent-name">Display name</label><input id="agent-name" name="display_name" placeholder="Analytics Admin · Director · Codex"></div><div class="field"><label for="agent-role">Role</label><select id="agent-role" name="role"><option value="director">Director · may write handoff</option><option value="advisor">Advisor · no handoff writes</option><option value="worker">Worker · no handoff writes</option></select></div><div class="field" data-new-actor ${agents.length ? "hidden" : ""}><label for="agent-runtime">Runtime</label><input id="agent-runtime" name="runtime" placeholder="codex"></div></div><div class="form-actions"><button class="button primary" type="submit">Save AI role</button></div></form></div></section>
             <section class="card" style="grid-column:1/-1"><div class="card-head"><h2>Connect workspace rooms</h2><span class="faint small">default relationship: master</span></div><div class="card-body"><form data-form="add-bridge"><div class="field"><label for="bridge-project">Connected workspace</label><select id="bridge-project" name="other_project" required ${otherProjects.length ? "" : "disabled"}><option value="">Choose workspace…</option>${otherProjects.map(project => `<option value="${h(project.project_id)}">${h(project.name)} · ${h(project.project_id)}</option>`).join("")}</select></div><div class="bridge-relationship section-gap"><div class="eyebrow">Authority relationship</div><div class="form-grid section-gap"><div class="field"><label for="bridge-relation">Relationship</label><select id="bridge-relation" name="relation"><option value="master">Master / subordinate (default)</option><option value="peer">Peer</option><option value="advisor">Advisor</option></select></div><div class="field"><label for="bridge-principal">Who is master/advisor?</label><select id="bridge-principal" name="principal_side"><option value="other">Connected workspace (default)</option><option value="current">This workspace</option></select></div></div></div><div class="bridge-relationship section-gap"><div class="eyebrow">Initial room participation</div><p class="muted small">Set access atomically when creating the relationship. This policy does not change which workspace is master, advisor, or peer.</p><div class="form-grid section-gap">${bridgeParticipationFields("new", "local", state.projectId)}${bridgeParticipationFields("new", "peer", "Connected workspace")}</div></div><div class="form-actions"><button class="button primary" type="submit" ${otherProjects.length ? "" : "disabled"}>Create relationship</button></div></form><div class="notice section-gap"><span>i</span><div>Master directives are binding; advisor messages are advice; peers are equal. Participation independently limits who may read, send, or mutate the named inter-project conversation.</div></div></div></section>
             <section class="card" style="grid-column:1/-1"><div class="card-head"><h2>Connected rooms</h2><span class="faint small">${bridges.length} relationship${bridges.length === 1 ? "" : "s"}</span></div><div class="card-body">${bridges.length ? bridges.map(bridge => `<article class="bridge-panel"><div class="bridge-panel-head"><div><h3>${h(projectName(state.projectId))} ↔ ${h(projectName(bridge.with))}</h3><div class="list-meta"><span>${h(bridge.relation)} relationship</span>${bridge.principal ? `<span>${h(projectName(bridge.principal))} is ${h(bridge.relation === "master" ? "master" : "advisor")}</span>` : `<span>equal authority</span>`}<span>${h(projectName(state.projectId))}: ${h(bridgeParticipationLabel(bridge.participation))}</span><span>${h(projectName(bridge.with))}: ${h(bridgeParticipationLabel(bridge.peer_participation))}</span></div></div><div class="cluster">${bridge.can_participate === false ? `<span class="badge error">panel identity denied</span>` : bridge.can_participate === true ? `<span class="badge accepted">panel identity allowed</span>` : ""}</div></div><div class="grid two section-gap"><div class="bridge-relationship"><div class="eyebrow">Authority relationship</div><p class="muted small"><strong>${h(identityPart(bridge.relation))}</strong> controls authority only. Delete this relationship only when the workspace rooms should be disconnected.</p><div class="cluster section-gap"><button class="button small" data-action="open-connected-room" data-project="${h(bridge.with)}">View conversation</button><button class="button danger small" data-action="remove-bridge" data-project="${h(bridge.with)}">Delete relationship</button></div></div><div class="bridge-relationship"><div class="eyebrow">Room participation</div><form data-form="update-bridge-participation" data-project="${h(bridge.with)}"><div class="form-grid section-gap">${bridgeParticipationFields(bridge.with, "local", state.projectId, bridge.participation, bridge.allowed_agents)}${bridgeParticipationFields(bridge.with, "peer", bridge.with, bridge.peer_participation, bridge.peer_allowed_agents)}</div><div class="form-actions"><button class="button primary small" type="submit">Save participation</button></div></form><span class="help">Saving here changes access only. It never removes or changes the ${h(bridge.relation)} relationship.</span></div></div></article>`).join("") : `<div class="muted">No connected workspace rooms yet.</div>`}</div></section>
-            <section class="card" style="grid-column:1/-1"><div class="card-head"><h2>Relationship inbox evidence</h2><span class="faint small">read-only setup signal</span></div><div class="card-body">${relationshipInbox.length ? `<div class="list">${relationshipInbox.slice(-10).map(message => `<div class="list-row"><div><div class="cluster"><span class="list-title" title="Ledger actor: ${h(message.ledger_actor || message.actor)}">${h(attributionText(message.actor, message.actor_type, message.owner, message.attribution))}</span><span class="chip">from ${h(projectName(message.origin_project || "connected"))}</span>${message.authority ? `<span class="badge">${h(message.authority)}</span>` : ""}</div><div class="message-body">${h(message.body)}</div></div><span class="faint small">#${h(message.seq)}</span></div>`).join("")}</div>` : `<div class="muted">No cross-workspace messages are addressed to panel actor ${h(actorDisplay(state.prefs.actor))}. This says nothing about other actors' inboxes; open Room / Inbox to read every named inter-project conversation.</div>`}</div></section>
+            <section class="card" style="grid-column:1/-1"><div class="card-head"><h2>Relationship inbox evidence</h2>${sortControl("network")}<span class="faint small">read-only setup signal</span></div><div class="card-body">${relationshipInbox.length ? `<div class="list">${relationshipInbox.slice(0, 10).map(message => `<div class="list-row"><div><div class="cluster"><span class="list-title" title="Ledger actor: ${h(message.ledger_actor || message.actor)}">${h(attributionText(message.actor, message.actor_type, message.owner, message.attribution))}</span><span class="chip">from ${h(projectName(message.origin_project || "connected"))}</span>${message.authority ? `<span class="badge">${h(message.authority)}</span>` : ""}</div><div class="message-body">${h(message.body)}</div></div><span class="faint small">#${h(message.seq)}</span></div>`).join("")}</div>` : `<div class="muted">No cross-workspace messages are addressed to panel actor ${h(actorDisplay(state.prefs.actor))}. This says nothing about other actors' inboxes; open Room / Inbox to read every named inter-project conversation.</div>`}</div></section>
           </div>`;
       }
 
@@ -2251,6 +2304,11 @@
             }
           }
           if (event.target.id === "task-filter") { state.taskFilter = event.target.value; render(); }
+          if (event.target.matches("[data-list-sort]")) {
+            state.listSort[event.target.dataset.listSort] = event.target.value;
+            storageSet("attacca.admin.sorts", JSON.stringify(state.listSort));
+            render({ force: true });
+          }
           if (event.target.matches("[data-plan-version]") && event.target.value) {
             await openTaskPlan(
               event.target.dataset.planVersion,
