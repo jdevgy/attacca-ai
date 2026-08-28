@@ -269,7 +269,6 @@ class GroupRoomContractTest(unittest.TestCase):
         self.assertTrue(observer["messages"][0]["group_context"])
         self.assertEqual(denied["messages"], [])
         self.assertEqual(denied["unread_total"], 0)
-
         self.assertIn(
             "bridge message mentioning only the director",
             [message["body"] for message in c.room_read(
@@ -280,6 +279,36 @@ class GroupRoomContractTest(unittest.TestCase):
             [message["body"] for message in c.room_read(
                 self.conn, beta, actor_id=beta_denied,
                 actor_type="agent")["messages"]])
+
+    def test_cross_project_send_warns_when_no_responder_is_addressed(self):
+        alpha = "warning-alpha"
+        beta = "warning-beta"
+        self._project(alpha)
+        self._project(beta)
+        sender = self._agent(alpha, "director", "codex")
+        target = self._agent(beta, "director", "claude")
+        c.bridge_add(self.conn, alpha, "owner", "human", beta)
+
+        broadcast = c.room_send(
+            self.conn, alpha, sender, "agent", "everyone sees this",
+            target_project=beta)
+        self.assertEqual(broadcast["delivered_to_projects"], [alpha, beta])
+        self.assertIn("delivered as a broadcast", broadcast["warnings"][0])
+        self.assertIn("no mentions or reply_to", broadcast["warnings"][0])
+
+        context = c.room_send(
+            self.conn, alpha, sender, "agent", "status context",
+            msg_type="status", target_project=beta)
+        self.assertIn("delivered as group context", context["warnings"][0])
+        self.assertIn("no specific responder", context["warnings"][0])
+
+        addressed = c.room_send(
+            self.conn, alpha, sender, "agent", "specific question",
+            mentions=[target], target_project=beta)
+        self.assertNotIn("warnings", addressed)
+        local = c.room_send(
+            self.conn, alpha, sender, "agent", "local broadcast")
+        self.assertNotIn("warnings", local)
 
     def test_handoff_reports_group_totals_without_consuming_inbox(self):
         project = "handoff-peek"

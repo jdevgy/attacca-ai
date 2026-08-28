@@ -4551,6 +4551,7 @@ def room_send(conn, project_id, actor_id, actor_type, body, msg_type="chat",
             append_event(conn, bridge["with"], actor_id, actor_type,
                          "room.message", mirror, in_tx=True)
             mirrored_to.append(bridge["with"])
+    delivered_projects = [project_id] + list(mirrored_to)
     warnings = []
     if msg_type == "decision":
         warnings.append("room messages do not create durable decision records — "
@@ -4558,7 +4559,22 @@ def room_send(conn, project_id, actor_id, actor_type, body, msg_type="chat",
     if msg_type == "claim" and not task_id:
         warnings.append("claim messages should reference a task_id; use "
                         "task_claim to actually claim the work")
-    delivered_projects = [project_id] + list(mirrored_to)
+    if mirrored_to and not mentions and not reply_to:
+        destinations = ", ".join("'%s'" % item
+                                 for item in delivered_projects)
+        if msg_type in {"chat", "directive"}:
+            warnings.append(
+                "cross-project %s had no mentions or reply_to; it was "
+                "delivered as a broadcast addressed to every participation-"
+                "visible member of %s. Add mentions or reply_to when a "
+                "specific responder is intended" % (msg_type, destinations))
+        else:
+            warnings.append(
+                "cross-project %s had no mentions or reply_to; it was "
+                "delivered as group context visible to every participation-"
+                "visible member of %s, with no specific responder assigned. "
+                "Add mentions or reply_to when a response is expected" %
+                (msg_type, destinations))
     result = {
         "ok": True,
         # Backward-compatible scalar retained for 0.4.x callers.
