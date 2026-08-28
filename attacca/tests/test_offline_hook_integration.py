@@ -659,7 +659,7 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
         self.assertEqual(entry["pending"][0]["kind"],
                          "authentication_required")
         summary = entry["pending"][0]["summary"]
-        self.assertIn("server is reachable", summary)
+        self.assertIn("No installation credential was sent", summary)
         self.assertIn("Cached authority and offline queueing are blocked",
                       summary)
         self.assertNotIn("VERIFIED LOCAL MIRROR", summary)
@@ -684,10 +684,22 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
         self.assertEqual(entry["offline_mode"], "auth_required")
         self.assertEqual(entry["pending"][0]["kind"],
                          "authentication_required")
-        self.assertIn("workspace/AI credential",
+        self.assertIn("No installation credential was sent",
                       entry["pending"][0]["summary"])
         self.assertNotIn("continue work",
                          entry["pending"][0]["summary"].lower())
+
+    def test_auth_notice_distinguishes_rejected_sent_credential(self):
+        with mock.patch.object(
+                hook, "_watcher_api_token", return_value="atkey_present"):
+            hook._watcher_queue_auth_required(
+                self.key, self.watcher_state()["subscriptions"][self.key],
+                client.SyncAuthenticationError(
+                    "revoked client-install key", http_status=401), 0)
+        summary = self.watcher_state()["subscriptions"][self.key][
+            "pending"][-1]["summary"]
+        self.assertIn("server rejected the installation credential", summary)
+        self.assertNotIn("No installation credential was sent", summary)
 
     def test_auth_latch_survives_outage_then_verified_sync_clears_it(self):
         adapter = FakeOfflineAdapter(self.verified_status(), self.snapshot())

@@ -87,7 +87,7 @@ class ClientAuthorizationRedTeamTest(unittest.TestCase):
         self.assertNotIn("atkey_", url)
         self.assertNotIn("token", url.lower())
 
-    def test_only_atkey_values_can_enter_modern_store(self):
+    def test_only_structurally_valid_client_values_enter_modern_store(self):
         for secret in (
                 "atd_old.secret", "atsvc_old.secret", "atc_actor.secret",
                 "plain", "atkey_ bad", "atkey_bad\nleak", ""):
@@ -97,6 +97,14 @@ class ClientAuthorizationRedTeamTest(unittest.TestCase):
                         self.server, self.record(token=secret),
                         client_instance=self.instance,
                         credentials_path=self.credentials)
+        opaque = "future-client-format_" + "x" * 32
+        flow.save_client_api_key(
+            self.server, self.record(token=opaque),
+            client_instance=self.instance,
+            credentials_path=self.credentials)
+        self.assertEqual(flow.load_client_api_key(
+            self.server, client_instance=self.instance,
+            credentials_path=self.credentials), opaque)
 
     def test_wrong_kind_instance_human_or_scope_is_rejected(self):
         cases = (

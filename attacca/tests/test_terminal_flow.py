@@ -313,6 +313,39 @@ class ClientAuthorizationFlowTest(unittest.TestCase):
         self.assertEqual(flow.load_client_api_key(
             self.server, client_instance=self.instance,
             credentials_path=self.credentials), pairing_token)
+        self.assertTrue(approved.calls[-1]["payload"]["acknowledged"])
+
+    def test_delivery_is_preserved_before_metadata_validation(self):
+        request_token = "V" * 43
+        start = FakeTransport(flow.JsonResponse(201, {}, {
+            "status": "pending", "poll_secret": "secret_poll_12345",
+            "authorization_request": request_token,
+            "verification_uri_complete":
+                self.server + "/app#settings&authorization_request=" + request_token,
+        }))
+        flow.start_client_pairing(
+            self.server, client_instance=self.instance,
+            credentials_path=self.credentials, transport=start,
+            open_browser=False)
+        delivered = FakeTransport(flow.JsonResponse(200, {}, {
+            "status": "approved", "credential": {
+                "token": "futureprefix_" + "x" * 32,
+                "record": {"client_instance": self.instance,
+                           "token_kind": "client",
+                           "project_memberships": "invalid"},
+            },
+        }))
+        with self.assertRaises(flow.TerminalFlowProtocolError):
+            flow.poll_client_pairing(
+                self.server, client_instance=self.instance,
+                credentials_path=self.credentials, transport=delivered)
+        raw = flow._client_key_record(
+            flow.read_credentials_store(self.credentials),
+            self.server, self.instance)
+        self.assertEqual(raw["token"], "futureprefix_" + "x" * 32)
+        self.assertIsNotNone(flow._pairing_record(
+            flow.read_credentials_store(self.credentials),
+            self.server, self.instance))
 
     def test_repeated_authorize_reuses_pending_request_without_overwrite(self):
         request_token = "C" * 43

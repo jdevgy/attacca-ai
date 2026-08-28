@@ -1127,6 +1127,7 @@ CREATE TABLE IF NOT EXISTS auth_client_authorizations (
   denied_at         TEXT,
   issued_token_id   TEXT,
   delivered_at      TEXT,
+  acknowledged_at   TEXT,
   created_at        TEXT NOT NULL,
   expires_at        TEXT NOT NULL,
   last_polled_at    TEXT
@@ -1348,6 +1349,15 @@ def connect(db_path):
                         " ADD COLUMN %s TEXT" % column)
                 except sqlite3.OperationalError:
                     pass
+        authorization_cols = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(auth_client_authorizations)")}
+        if "acknowledged_at" not in authorization_cols:
+            try:
+                conn.execute(
+                    "ALTER TABLE auth_client_authorizations"
+                    " ADD COLUMN acknowledged_at TEXT")
+            except sqlite3.OperationalError:
+                pass
         invitation_cols = {r["name"] for r in conn.execute(
             "PRAGMA table_info(auth_invitations)")}
         if "is_admin" not in invitation_cols:
@@ -2143,7 +2153,7 @@ def auth_client_pairing_decide(conn, authorization_request, principal, authorize
 
 
 def auth_client_pairing_poll(conn, poll_secret, client_instance,
-                             device_id=None):
+                             device_id=None, acknowledged=False):
     """Promote the device-held pairing secret into a client key exactly once."""
     raw = str(poll_secret or "").strip()
     row = conn.execute(
@@ -2159,7 +2169,18 @@ def auth_client_pairing_poll(conn, poll_secret, client_instance,
     if expected_device and (not supplied_device or not hmac.compare_digest(
             supplied_device, expected_device)):
         raise AuthorizationError("client_pairing_device_mismatch")
-    if row["expires_at"] <= now_iso():
+    if acknowledged and row["status"] == "consumed" \
+            and row["issued_token_id"]:
+        with write_tx(conn):
+            conn.execute(
+                "UPDATE auth_client_authorizations SET acknowledged_at=?,"
+                " last_polled_at=? WHERE poll_secret_hash=?"
+                " AND acknowledged_at IS NULL",
+                (now_iso(), now_iso(), row["poll_secret_hash"]))
+        return {"status": "ready", "acknowledged": True}
+    if row["status"] == "consumed" and row["acknowledged_at"]:
+        raise AuthenticationError("client pairing credential already acknowledged")
+    if row["expires_at"] <= now_iso() and row["status"] != "consumed":
         raise AttaccaError("client pairing code expired")
     if row["status"] == "pending":
         conn.execute(
@@ -12476,7 +12497,8 @@ def _r_auth_client_pairing_poll(h, m, q):
     body = h._body_json()
     h._reply_json(200, auth_client_pairing_poll(
         h._conn(), body.get("poll_secret"), body.get("client_instance"),
-        device_id=body.get("device_id")), {"Cache-Control": "no-store"})
+        body.get("device_id"), acknowledged=body.get("acknowledged") is True),
+        {"Cache-Control": "no-store"})
 
 
 def _auth_pairing_lookup_throttle_key(h, principal):

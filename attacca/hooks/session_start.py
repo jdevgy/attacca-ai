@@ -3237,6 +3237,10 @@ def _watcher_subscription_config(entry):
 def _watcher_queue_auth_required(key, entry, error, now):
     """Queue a fail-closed credential notice without claiming offline mode."""
     message = _trim(error, 300)
+    try:
+        credential_sent = bool(_watcher_api_token(entry))
+    except Exception:
+        credential_sent = False
     recovery_message = None
     recovery_status = None
     recovery_interval = DEFAULT_UPDATE_INTERVAL_SECONDS
@@ -3293,14 +3297,17 @@ def _watcher_queue_auth_required(key, entry, error, now):
         if current.get("last_auth_error_fingerprint") == fingerprint:
             return
         current["last_auth_error_fingerprint"] = fingerprint
+        cause = (
+            "No installation credential was sent to the hosted server"
+            if not credential_sent else
+            "The hosted server rejected the installation credential or AI scope")
         summary = (
             "ATTACCA AUTHENTICATION REQUIRED · %s\n"
-            "- The hosted server is reachable but rejected this workspace/AI "
-            "credential: %s\n"
+            "- %s: %s\n"
             "- Cached authority and offline queueing are blocked. %s\n"
             "- The watcher will hot-reload the private terminal credential "
             "and clear this latch only after authenticated sync succeeds."
-            % (entry["project_id"], message, recovery_message))
+            % (entry["project_id"], cause, message, recovery_message))
         pending.append({
             "fingerprint": fingerprint,
             "created_at": datetime.now(timezone.utc).isoformat(),

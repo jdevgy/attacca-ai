@@ -81,6 +81,13 @@ class ClientPairingTest(unittest.TestCase):
         self.assertEqual(self.conn.execute(
             "SELECT COUNT(*) AS n FROM auth_tokens"
             " WHERE token_id=?", (token_id,)).fetchone()["n"], 1)
+        acknowledged = c.auth_client_pairing_poll(
+            self.conn, secret, "install-1", "device-1", acknowledged=True)
+        self.assertEqual(acknowledged,
+                         {"status": "ready", "acknowledged": True})
+        with self.assertRaisesRegex(c.AuthenticationError, "acknowledged"):
+            c.auth_client_pairing_poll(
+                self.conn, secret, "install-1", "device-1")
 
     def test_deny_and_install_binding_fail_closed(self):
         started = c.auth_client_pairing_start(

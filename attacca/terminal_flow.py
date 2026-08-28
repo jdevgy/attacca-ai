@@ -556,11 +556,11 @@ def _validate_token(token):
     if not isinstance(token, str):
         raise TerminalFlowProtocolError("client API key is invalid")
     token = token.strip()
-    # Client credentials historically used ``atkey_`` while browser pairing
-    # issues ``atpair_`` credentials.  Treat the prefix as an opaque server
-    # contract so independently deployed clients and servers remain
-    # compatible across that transition.
-    if not token.startswith(("atkey_", "atpair_")) or any(
+    # The server proves ``token_kind=client``; the printable token prefix is
+    # intentionally opaque so independently deployed clients and servers do
+    # not need to ship in lockstep.  Continue rejecting known legacy
+    # actor/service credential kinds and structurally implausible secrets.
+    if len(token) < 16 or token.startswith(("atd_", "atsvc_", "atc_")) or any(
             character.isspace() for character in token):
         raise TerminalFlowProtocolError(
             "Attacca rejected this value: expected a client API key")
@@ -738,6 +738,32 @@ def save_client_api_key(server_url, credential, *, client_instance=None,
         "scope_mode": checked.get("scope_mode"),
         "expires_at": checked.get("expires_at"), "hot_reload": True,
     }
+
+
+def _preserve_pairing_delivery(server_url, credential, instance,
+                               credentials_path=None):
+    """Durably retain a one-time delivery before nonessential validation."""
+    supplied = credential
+    if isinstance(credential, dict) and isinstance(credential.get("record"), dict):
+        supplied = dict(credential["record"])
+        supplied["token"] = credential.get("token")
+    if not isinstance(supplied, dict):
+        supplied = {"token": supplied}
+    recovery = dict(supplied)
+    recovery.setdefault("client_instance", instance)
+    recovery.setdefault("token_kind", "client")
+    recovery.setdefault("created_at", _now_iso())
+
+    def preserve(data):
+        server = canonical_server_record_for_update(data, server_url)
+        keys = server.setdefault("client_api_keys", {})
+        if not isinstance(keys, dict):
+            raise TerminalFlowProtocolError(
+                "Attacca client API key store is invalid")
+        keys[instance] = recovery
+        return data
+
+    update_credentials_store(credentials_path, preserve)
 
 
 def forget_client_api_key(server_url, *, client_instance=None, runtime=None,
@@ -990,9 +1016,28 @@ def poll_client_pairing(server_url, *, client_instance=None, runtime=None,
         credential["token"] = value.get("token")
     credential.setdefault("client_instance", instance)
     credential.setdefault("token_kind", "client")
+    _preserve_pairing_delivery(
+        server_url, credential, instance, credentials_path)
     result = save_client_api_key(
         server_url, credential, client_instance=instance,
         credentials_path=credentials_path)
+    # Receipt acknowledgement happens only after the normalized credential is
+    # durably installed.  A lost response or validation failure therefore
+    # remains replayable without minting another browser request.
+    try:
+        (transport or UrllibJsonTransport()).request(
+            "POST", _endpoint(server_url,
+                              CLIENT_AUTHORIZATIONS_PATH + "/poll"),
+            headers={"Accept": "application/json"}, payload={
+                "poll_secret": pairing.get("poll_secret"),
+                "client_instance": instance,
+                "device_id": pairing.get("device_id"),
+                "acknowledged": True,
+            }, timeout=timeout)
+    except TerminalFlowError:
+        # The installed credential is authoritative; ACK is a cleanup signal
+        # and a later retry can safely repeat it.
+        pass
     _forget_pairing(server_url, instance, credentials_path)
     return result
 
