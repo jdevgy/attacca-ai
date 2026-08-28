@@ -72,6 +72,11 @@ class PanelDateSortingTests(unittest.TestCase):
         self.assertIn("Activity remains the complete raw event ledger", self.source)
         self.assertIn("Newest first", self.source)
         self.assertIn("Oldest first", self.source)
+        self.assertIn('for (const warning of result?.warnings || [])',
+                      self.source)
+        self.assertIn('toast(warning, "warning")', self.source)
+        self.assertIn("Oldest first” sorts within this loaded window",
+                      self.source)
 
 
 if __name__ == "__main__":

@@ -24,6 +24,9 @@ class FakeTransport:
             "method": method, "url": url, "headers": dict(headers),
             "payload": payload, "timeout": timeout,
         })
+        if isinstance(payload, dict) and payload.get("acknowledged") is True:
+            return flow.JsonResponse(200, {}, {
+                "status": "ready", "acknowledged": True})
         if self.response is not None:
             return self.response
         instance = headers[flow.CLIENT_INSTANCE_HEADER]
@@ -344,6 +347,47 @@ class ClientAuthorizationFlowTest(unittest.TestCase):
             self.server, self.instance)
         self.assertEqual(raw["token"], "futureprefix_" + "x" * 32)
         self.assertIsNotNone(flow._pairing_record(
+            flow.read_credentials_store(self.credentials),
+            self.server, self.instance))
+
+    def test_failed_ack_is_retried_after_credential_is_ready(self):
+        request_token = "R" * 43
+        flow.start_client_pairing(
+            self.server, client_instance=self.instance,
+            credentials_path=self.credentials,
+            transport=FakeTransport(flow.JsonResponse(201, {}, {
+                "status": "pending", "poll_secret": "secret_poll_12345",
+                "authorization_request": request_token,
+                "verification_uri_complete": self.server +
+                    "/app#settings&authorization_request=" + request_token,
+            })), open_browser=False)
+
+        class DeliveryThenFailedAck(FakeTransport):
+            def request(inner, method, url, *, headers, payload=None, timeout=5):
+                inner.calls.append({"method": method, "url": url,
+                                    "headers": dict(headers),
+                                    "payload": payload, "timeout": timeout})
+                if payload.get("acknowledged"):
+                    return flow.JsonResponse(503, {}, {"status": "error"})
+                return flow.JsonResponse(200, {}, {
+                    "status": "approved", "credential": self.record()})
+
+        flow.poll_client_pairing(
+            self.server, client_instance=self.instance,
+            credentials_path=self.credentials,
+            transport=DeliveryThenFailedAck())
+        self.assertIsNotNone(flow._pairing_record(
+            flow.read_credentials_store(self.credentials),
+            self.server, self.instance))
+
+        retry = FakeTransport()
+        ready = flow.authorize_client(
+            self.server, client_instance=self.instance,
+            credentials_path=self.credentials, transport=retry,
+            open_browser=False)
+        self.assertTrue(ready["authorized"])
+        self.assertTrue(retry.calls[0]["payload"]["acknowledged"])
+        self.assertIsNone(flow._pairing_record(
             flow.read_credentials_store(self.credentials),
             self.server, self.instance))
 

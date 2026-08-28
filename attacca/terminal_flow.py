@@ -1024,8 +1024,9 @@ def poll_client_pairing(server_url, *, client_instance=None, runtime=None,
     # Receipt acknowledgement happens only after the normalized credential is
     # durably installed.  A lost response or validation failure therefore
     # remains replayable without minting another browser request.
+    acknowledged = False
     try:
-        (transport or UrllibJsonTransport()).request(
+        acknowledgement = (transport or UrllibJsonTransport()).request(
             "POST", _endpoint(server_url,
                               CLIENT_AUTHORIZATIONS_PATH + "/poll"),
             headers={"Accept": "application/json"}, payload={
@@ -1034,11 +1035,15 @@ def poll_client_pairing(server_url, *, client_instance=None, runtime=None,
                 "device_id": pairing.get("device_id"),
                 "acknowledged": True,
             }, timeout=timeout)
+        acknowledged = acknowledgement.status == 200 and (
+            acknowledgement.value.get("acknowledged") is True or
+            str(acknowledgement.value.get("status") or "").lower() == "ready")
     except TerminalFlowError:
         # The installed credential is authoritative; ACK is a cleanup signal
         # and a later retry can safely repeat it.
-        pass
-    _forget_pairing(server_url, instance, credentials_path)
+        acknowledged = False
+    if acknowledged:
+        _forget_pairing(server_url, instance, credentials_path)
     return result
 
 
@@ -1163,10 +1168,28 @@ def authorize_client(server_url, *, client_instance=None, runtime=None,
     status = client_api_key_status(
         server_url, client_instance=instance, project_id=project_id,
         credentials_path=credentials_path)
-    if status.get("authorized"):
-        return status
     existing = _pairing_record(
         read_credentials_store(credentials_path), server_url, instance)
+    if status.get("authorized"):
+        if isinstance(existing, dict):
+            try:
+                acknowledgement = (transport or UrllibJsonTransport()).request(
+                    "POST", _endpoint(
+                        server_url, CLIENT_AUTHORIZATIONS_PATH + "/poll"),
+                    headers={"Accept": "application/json"}, payload={
+                        "poll_secret": existing.get("poll_secret"),
+                        "client_instance": instance,
+                        "device_id": existing.get("device_id"),
+                        "acknowledged": True,
+                    }, timeout=timeout)
+                if acknowledgement.status == 200 and (
+                        acknowledgement.value.get("acknowledged") is True or
+                        str(acknowledgement.value.get("status") or "").lower()
+                        == "ready"):
+                    _forget_pairing(server_url, instance, credentials_path)
+            except TerminalFlowError:
+                pass
+        return status
     if isinstance(existing, dict):
         polled = poll_client_pairing(
             server_url, client_instance=instance,
