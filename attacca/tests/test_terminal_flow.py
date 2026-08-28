@@ -287,6 +287,33 @@ class ClientAuthorizationFlowTest(unittest.TestCase):
         self.assertIsNone(flow._pairing_record(
             stored, self.server, self.instance))
 
+    def test_silent_poll_accepts_server_pairing_credential_prefix(self):
+        request_token = "P" * 43
+        start = FakeTransport(flow.JsonResponse(201, {}, {
+            "status": "pending", "poll_secret": "secret_poll_12345",
+            "authorization_request": request_token,
+            "verification_uri_complete":
+                self.server + "/app#settings&authorization_request=" + request_token,
+            "interval": 5,
+        }))
+        flow.start_client_pairing(
+            self.server, client_instance=self.instance,
+            credentials_path=self.credentials, transport=start,
+            open_browser=False)
+        pairing_token = "atpair_" + "p" * 40
+        record = self.record()
+        record["token"] = pairing_token
+        approved = FakeTransport(flow.JsonResponse(200, {}, {
+            "status": "approved", "credential": record,
+        }))
+        result = flow.poll_client_pairing(
+            self.server, client_instance=self.instance,
+            credentials_path=self.credentials, transport=approved)
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(flow.load_client_api_key(
+            self.server, client_instance=self.instance,
+            credentials_path=self.credentials), pairing_token)
+
     def test_repeated_authorize_reuses_pending_request_without_overwrite(self):
         request_token = "C" * 43
         url = self.server + "/app#settings&authorization_request=" + request_token

@@ -2313,11 +2313,9 @@ def _watcher_api_token(entry):
     server_url = entry.get("server_url")
     runtime = str(entry.get("runtime") or "").strip().lower()
     project_id = str(entry.get("project_id") or "").strip()
-    actor_id = str(entry.get("canonical_actor_id") or "").strip()
     client_instance = str(
         entry.get("client_instance") or _client_instance_id(runtime)).strip()
-    if not server_url or not runtime or not project_id or not actor_id \
-            or not client_instance:
+    if not server_url or not runtime or not project_id or not client_instance:
         return None
     try:
         terminal = _terminal_flow_module()
@@ -2329,6 +2327,12 @@ def _watcher_api_token(entry):
         raise RuntimeError(
             "local client API key state is invalid: %s" %
             _trim(error, 160)) from None
+
+
+def _watcher_request_actor(entry):
+    """Use canonical identity when known, otherwise the runtime bootstrap hint."""
+    return (entry.get("canonical_actor_id") or entry.get("actor") or
+            entry.get("runtime") or "watcher")
 
 
 def _watcher_fetch_sync_snapshot(entry, transport=None):
@@ -2346,7 +2350,7 @@ def _watcher_fetch_sync_snapshot(entry, transport=None):
         "Accept": "application/json",
         "X-Attacca-Device-ID": (
             entry.get("device_id") or _local_device_id()),
-        "X-Attacca-Actor": entry.get("canonical_actor_id"),
+        "X-Attacca-Actor": _watcher_request_actor(entry),
         "X-Attacca-Actor-Type": "agent",
         "X-Attacca-Project": entry["project_id"],
         "X-Attacca-Client-Instance": (
@@ -2601,9 +2605,7 @@ def _watcher_request_headers(entry):
     token = _watcher_api_token(entry)
     headers = {
         "Accept": "application/json",
-        "X-Attacca-Actor": entry.get("canonical_actor_id") or
-                            entry.get("actor") or entry.get("runtime") or
-                            "watcher",
+        "X-Attacca-Actor": _watcher_request_actor(entry),
         "X-Attacca-Actor-Type": "agent",
         "X-Attacca-Project": entry["project_id"],
         "X-Attacca-Device": entry.get("device_id") or _local_device_id(),

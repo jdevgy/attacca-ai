@@ -2168,6 +2168,23 @@ def auth_client_pairing_poll(conn, poll_secret, client_instance,
         return {"status": "pending", "interval": 5}
     if row["status"] == "denied":
         return {"status": "denied"}
+    # Delivery is idempotent until the short-lived pairing request expires.
+    # The caller necessarily still possesses ``raw`` (verified by the stored
+    # hash above), so returning it again stores no recoverable plaintext and
+    # lets a client survive a crash or local validation failure after the
+    # first successful HTTP response.
+    if row["status"] == "consumed" and row["delivered_at"] \
+            and row["issued_token_id"]:
+        token_row = conn.execute(
+            "SELECT t.*,u.username FROM auth_tokens t JOIN auth_users u"
+            " ON u.user_id=t.user_id WHERE t.token_id=?",
+            (row["issued_token_id"],)).fetchone()
+        if not token_row or token_row["revoked_at"]:
+            raise AuthenticationError(
+                "client pairing credential is no longer available")
+        return {"status": "approved", "credential": {
+            "token": raw,
+            "record": auth_client_key_record(conn, token_row)}}
     if row["status"] != "approved" or row["delivered_at"]:
         raise AuthenticationError("client pairing credential already delivered")
     user = conn.execute(

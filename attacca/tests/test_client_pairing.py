@@ -75,10 +75,12 @@ class ClientPairingTest(unittest.TestCase):
             " WHERE token_id=?", (token_id,)).fetchone()["n"], 0)
         self.assertEqual(c.auth_token_project_bindings(
             self.conn, token_id), ["project"])
-        with self.assertRaisesRegex(c.AuthenticationError,
-                                    "already delivered"):
-            c.auth_client_pairing_poll(
-                self.conn, secret, "install-1", "device-1")
+        repeated = c.auth_client_pairing_poll(
+            self.conn, secret, "install-1", "device-1")
+        self.assertEqual(repeated, delivered)
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) AS n FROM auth_tokens"
+            " WHERE token_id=?", (token_id,)).fetchone()["n"], 1)
 
     def test_deny_and_install_binding_fail_closed(self):
         started = c.auth_client_pairing_start(

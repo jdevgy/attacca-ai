@@ -285,6 +285,14 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
             self.assertEqual(hook._watcher_api_token(dict(
                 base, canonical_actor_id="shared.director.claude")),
                 "atkey_tenant_a_install_a")
+            bootstrap = dict(base)
+            bootstrap.pop("canonical_actor_id")
+            self.assertEqual(hook._watcher_api_token(bootstrap),
+                             "atkey_tenant_a_install_a")
+            bootstrap_headers = hook._watcher_request_headers(bootstrap)
+            self.assertEqual(bootstrap_headers["Authorization"],
+                             "Bearer atkey_tenant_a_install_a")
+            self.assertEqual(bootstrap_headers["X-Attacca-Actor"], "codex")
             claude_headers = hook._watcher_request_headers(dict(
                 base, canonical_actor_id="shared.director.claude"))
             self.assertEqual(claude_headers["Authorization"],

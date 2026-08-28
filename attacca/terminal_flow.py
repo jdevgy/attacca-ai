@@ -556,8 +556,12 @@ def _validate_token(token):
     if not isinstance(token, str):
         raise TerminalFlowProtocolError("client API key is invalid")
     token = token.strip()
-    if not token.startswith("atkey_") or any(character.isspace()
-                                               for character in token):
+    # Client credentials historically used ``atkey_`` while browser pairing
+    # issues ``atpair_`` credentials.  Treat the prefix as an opaque server
+    # contract so independently deployed clients and servers remain
+    # compatible across that transition.
+    if not token.startswith(("atkey_", "atpair_")) or any(
+            character.isspace() for character in token):
         raise TerminalFlowProtocolError(
             "Attacca rejected this value: expected a client API key")
     if len(token.encode("utf-8")) > MAX_TOKEN_BYTES:
