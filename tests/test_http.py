@@ -315,6 +315,7 @@ class HttpTestCase(unittest.TestCase):
                          "kimi-skills/session/SKILL.md",
                          "hooks/hooks.json", "hooks/session_start.py",
                          "web/admin.html",
+                         "docs/assets/attacca-architecture.svg",
                          "plugin-mcp.json", "kimi.plugin.json",
                          "commands/brief.md",
                          "kimi-commands/setup.md",

@@ -1,62 +1,64 @@
-# Attacca — Local Project Continuity Layer
+# Attacca
 
-A local, zero-dependency implementation of the **Project Continuity Layer** from the
-Multi-Agent Developer SaaS blueprint (Phase 0 "dogfood protocol", §31 steps 1–8):
-the layer that makes AI sessions replaceable and projects resumable.
+**Durable project continuity for humans and AI coding tools.** Attacca keeps a
+project's operational memory on a shared hosted service so a Claude, Codex,
+Kimi, or generic MCP session can disappear without taking the project state
+with it.
 
-Point Claude Code, Kimi Code, Codex, Cline, GLM-backed CLIs, any MCP client, and
-humans at the same project, and they all share:
+> [!IMPORTANT]
+> Attacca is a pre-production dogfood prototype, not a finished public SaaS.
+> It demonstrates the complete continuity workflow and strong correctness
+> boundaries, but it does not provide TLS termination, SSO, MFA, encrypted
+> database storage, or hardened hostile-host isolation.
 
-- **Append-only event ledger** — hash-chained, per-project sequence numbers (blueprint §9.1)
-- **Project log** — curated, human-readable projection of meaningful events (§9.2)
-- **Handoff** — current-state snapshot so a fresh worker resumes cold, no rebrief (§9.3)
-- **Project Room** — structured human+AI messaging: chat, directive, claim, handoff,
-  challenge, decision, approval (§7)
-- **Tasks + work claims** — expiring leases, exactly-one-winner claiming, scope-overlap
-  warnings, evidence-based reports (§8). Claims are enforced: only the claimant can
-  report or release a task while its lease is active, finished tasks must be reopened
-  explicitly before re-reporting, and giving a task back clears the claimant.
-- **Decision records** — durable, out of chat history (§6.5, §9)
-- **Drift Guard lite** — context versions; stale workers get warned before writing (§11.3)
-- **Agent identities** — operational actor ids are
-  `workspace.role.runtime` (for example `analytics-engine.director.codex`).
-  The human **owner** is a separate event/agent field, never an actor prefix.
-  Runtime remains visible for audit, but authorization depends only on the
-  registered workspace role: Claude and Codex Directors are permission peers.
-  Legacy owner-prefixed ids are aliased without rewriting hashed ledger history.
-- **Per-agent inbox cursors** — `check_inbox` delivers every visible non-self
-  room message, with a persistent cursor per canonical actor. Mentions and
-  replies assign attention/expected response without hiding shared context;
-  untargeted chat and directives are everyone-broadcasts. Bridge participation
-  and access policy are the cross-workspace visibility boundary.
-- **AI roles + Lead Director** — setup assigns Director, Advisor, or Worker;
-  only Directors can update a governed workspace's shared handoff or issue a
-  binding directive from a master workspace. Multiple Directors are allowed,
-  the Lead Director breaks ties, and optimistic context-version checks reject
-  stale handoff overwrites instead of silently replacing another Director.
-- **Bridges** — link two projects' AI teams with a chosen relationship: **peers**,
-  **master/subordinate** (the boss project's messages arrive `[MASTER-DIRECTIVE]`,
-  the other side's arrive as `[SUGGESTION]`), or **advisor** (`[ADVICE]`). Messages
-  remain local unless `target_project` names one connected workspace, retaining
-  a labeled copy in both rooms. Routine local work never fans out implicitly;
-  cross-project content must match the bridge's human-defined purpose.
-- **Explore everything** — `search` across events/messages/tasks/decisions/handoffs,
-  `overview` one-screen tour, `handoff history`, `event show`, plus per-thing
-  list/show commands
+Claude Code, Codex CLI, Kimi Code, Cline, Cursor, Windsurf, GLM-backed clients,
+other MCP tools, and the browser Control Panel can coordinate through the same
+workspace:
 
-**Deliberately not in this build:** encryption/key hierarchy (blueprint §17–19), the
-Project Brain/context packs (§10–11), capability packs (§14). The protocol is designed so
-those layer on later — the server-side of this file is what would become the encrypted
-sync target.
+- **History that survives sessions** — a per-project, hash-chained event ledger
+  and a readable activity log preserve what changed, why, and who ran it.
+- **Cold-resume context** — shared Cloud Context, binding role-scoped Rules,
+  versioned handoffs, and startup briefs restore the state a new worker needs.
+- **Coordinated work** — rooms, persistent inbox cursors, tasks, expiring claims,
+  declared path scopes, immutable plan revisions, decisions, and evidence-based
+  completion keep parallel workers aligned.
+- **Separate identity and authority** — canonical AI actors use
+  `workspace.role.runtime`; the authenticated human operator, client
+  installation, Git revision, runtime, and role remain distinct audit fields.
+- **Purpose-limited collaboration** — peer, master/subordinate, and advisor
+  bridges move only explicit cross-workspace messages under participation and
+  routing policy.
+- **Continuity through outages** — the installed client can use only an exact,
+  integrity-verified, identity-scoped offline mirror. Cached reads are visibly
+  stale, eligible writes are fsynced to an idempotent outbox, and ambiguous or
+  unauthorized fallback fails closed.
+
+The runtime is Python 3.8+ standard library only. One hosted Attacca process
+serves many isolated workspaces from SQLite; projects do not receive their own
+hidden server or database.
+
+**Start here:** [Quickstart](#quickstart) ·
+[Hosted authentication](#hosted-authentication-prototype) ·
+[Agent protocol](#the-protocol-agents-follow) ·
+[MCP tools](#mcp-tools-39) · [Tests](#demos-and-tests)
+
+The broader design in [`docs/blueprint.txt`](docs/blueprint.txt) also describes
+future encryption, Project Brain/context packs, capability marketplaces, and
+commercial layers. Those features are not implemented merely because the
+blueprint discusses them.
 
 ## Architecture
+
+![Attacca architecture: native Claude, Codex, and Kimi sessions use lifecycle plugins before a stable stdio proxy; other supported MCP clients use that proxy directly, while a machine watcher maintains a verified local mirror and outbox for one hosted service.](docs/assets/attacca-architecture.svg)
 
 **The app hosts the server; tools are API clients.** `attacca.py serve` runs the
 attacca server — it owns the state and exposes two client surfaces:
 
 - **MCP over HTTP** at `/mcp` (streamable HTTP transport) — what Claude Code, Kimi
-  Code, Codex, GLM-backed CLIs and other MCP clients connect to. Client identity
-  comes from the `X-Attacca-Actor` header, project from `X-Attacca-Project`.
+  Code, Codex, GLM-backed CLIs and other MCP clients connect to. Requests select
+  the canonical actor and workspace with `X-Attacca-Actor` and
+  `X-Attacca-Project`; authentication separately identifies the human-owned
+  client installation.
 - **REST API** under `/v1/…` (blueprint §22.1 shape) — for curl, scripts, dashboards
   and anything that isn't an MCP client.
 
@@ -91,7 +93,7 @@ database is installed inside a user's project.
 **1. Host the server** (whoever runs the platform; once):
 
 ```bash
-cd attacca && python3 attacca.py serve     # http://127.0.0.1:8722
+python3 attacca.py serve                   # http://127.0.0.1:8722
 # bootstrap the owner, create per-install client keys, and enable auth in /app Settings
 # remote prototype: --host 0.0.0.0 (put TLS in front of it)
 ```
@@ -272,8 +274,8 @@ any remotely reachable instance.
 The native plugins bundle lifecycle continuity. Claude/Codex use `SessionStart`,
 `UserPromptSubmit`, and `Stop`; Kimi uses its manifest startup skill plus native
 `UserPromptSubmit` and `Stop` hooks. Once setup writes `.attacca/project.json`,
-each new session loads handoff, Project Rules, inbox, room, tasks, agents, and
-status. Setup also starts one machine-global background watcher. At the
+each new session loads Project Rules, Cloud Context, handoff, inbox, room, tasks,
+agents, and status. Setup also starts one machine-global background watcher. At the
 server-configured interval (one minute by default, configurable or disableable
 in `/app` Settings), it makes lightweight inbox and append-only event-feed
 checks even while coding clients are idle. A relevant change or pending local
@@ -282,6 +284,19 @@ receives a ten-minute safety refresh. The watcher deduplicates changes and
 queues a concise local notification. The next
 supported lifecycle boundary injects that queue into the AI's context. The user
 never has to type “check messages,” and there is no second project database.
+
+Claude additionally maintains one native session job equivalent to
+`/loop 1m /attacca:inbox`. Every Claude SessionStart asks the host's Cron tools
+to list existing jobs, create the job when absent, and remove only duplicate
+Attacca inbox jobs. This check repeats on startup, resume, clear, and compact
+because Claude loop jobs are session-scoped and recurring jobs expire after
+seven days; it never replaces the
+machine-global watcher, which continues transport and staging while no Claude
+generation is active. The native pulse runs only while Claude is open and idle,
+and each firing is a model turn that can consume credits even when prompt
+caching reduces its cost. Codex and Kimi do not receive the Claude-only Cron
+instruction. If the user has disabled Claude cron jobs, Attacca preserves that
+choice and continues with the watcher alone.
 
 Lifecycle startup compares the installed Attacca executable `VERSION` and the
 checkout's managed-law version/hash with the configured server. Only a newer
@@ -324,8 +339,8 @@ authoritative hosted content itself is never shortened or rewritten.
 
 | Shape | Who uses it | Project identity |
 |---|---|---|
-| `connect` stdio client | Claude plugin, Kimi Code, Codex, Cursor, Cline, Windsurf | explicit env → nearest `.attacca/project.json` → same-machine registered root; on transport outage only, the exact verified watcher identity activates its scoped mirror/outbox |
-| HTTP MCP (`/mcp`) | Gemini, VS Code, opencode, anything with native HTTP MCP | `X-Attacca-Project` header |
+| `connect` stdio client | Claude plugin, Kimi Code, Codex, Cursor, Cline, Windsurf, Gemini, VS Code, opencode | explicit env → nearest `.attacca/project.json` → same-machine registered root; on transport outage only, the exact verified watcher identity activates its scoped mirror/outbox |
+| HTTP MCP (`/mcp`) | Manually configured clients and integrations that deliberately use native HTTP transport | exact `X-Attacca-Project` + `X-Attacca-Actor` headers; authentication remains the separate browser/client-key access channel |
 | stdio direct (`mcp`) | explicit local/serverless development mode (`setup --stdio`) | cwd walk-up against the selected local DB; never an automatic hosted fallback |
 
 ### Two computers, one workspace
@@ -386,10 +401,14 @@ GET  /v1/projects/{id}/verify
 
 In legacy anonymous mode, actor identity uses `X-Attacca-Actor` /
 `X-Attacca-Actor-Type`. Once authenticated, browser/human writes derive an
-immutable `web.<username>` actor and owner from the account, while agent writes
-derive their exact project/actor/runtime from the token; spoofable identity
-headers are ignored or rejected. Writes return the same payloads (and warnings)
-as the MCP tools.
+immutable `web.<username>` actor and owner from the account; spoofable browser
+identity headers are ignored or rejected. Agent requests instead authenticate
+the human-owned client installation with its API key and independently select
+the exact project and already-registered actor with `X-Attacca-Project` and
+`X-Attacca-Actor`. The server validates account membership, key scope, actor
+ownership, and the actor's registered role. The client key never carries the
+AI actor, runtime, or role. Writes return the same payloads (and warnings) as
+the MCP tools.
 
 ## The protocol agents follow
 
@@ -417,15 +436,17 @@ Injected via the managed block and the MCP server's `instructions`:
 6. **Drift Guard** — responses carry `stale_context_warning` when the project moved
    after your briefing; re-run `get_handoff` before writing.
 
-## MCP tools (35)
+## MCP tools (39)
 
 `attacca_status`, `get_handoff`, `update_handoff`, `get_project_log`,
-`check_inbox`, `room_send`, `room_read`, `task_create`, `task_list`, `task_show`,
+`room_send`, `room_read`, `check_inbox`, `message_dispose`,
+`set_lead_director`, `bridge_add`, `bridge_update_access`, `bridge_list`,
+`bridge_remove`, `search`, `task_create`, `task_list`, `task_show`,
 `task_plan_get`, `task_plan_set`, `task_plan_submit`, `task_plan_review`,
-`task_claim`, `task_report`, `task_release`, `task_set_status`, `decision_propose`,
-`decision_resolve`, `decision_list`, `set_lead_director`, `bridge_add`,
-`bridge_update_access`, `bridge_remove`, `bridge_list`, `search`, `rule_list`,
-`rule_create`, `rule_update`, `agent_register`, `agent_list`, `list_projects`,
+`task_claim`, `task_report`, `task_release`, `task_set_status`,
+`decision_propose`, `decision_resolve`, `decision_list`, `rule_list`,
+`rule_create`, `rule_update`, `cloud_context_get`, `cloud_context_set`,
+`migration_directive`, `agent_register`, `agent_list`, `list_projects`,
 `append_event`, `check_freshness`.
 
 In Claude Code they appear as `mcp__attacca__<name>`. Every tool takes an optional

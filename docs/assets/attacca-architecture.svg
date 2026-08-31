@@ -1,0 +1,197 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900" role="img" aria-labelledby="attacca-architecture-title attacca-architecture-desc">
+  <title id="attacca-architecture-title">Attacca hosted continuity architecture</title>
+  <desc id="attacca-architecture-desc">Native Claude, Codex, and Kimi sessions use lifecycle plugins before a stable local standard-input-output connector. Other supported MCP clients use that connector directly. Both paths reach one hosted Attacca MCP and REST service. A browser uses the Control Panel. A machine-global watcher polls the hosted service and maintains an integrity-verified, identity-scoped local mirror plus durable outbox. That mirror is a fail-closed continuity cache, not another project database. The hosted domain layer owns authority and stores many isolated workspaces in SQLite.</desc>
+
+  <defs>
+    <linearGradient id="canvas" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#08111f"/>
+      <stop offset="0.55" stop-color="#0c1728"/>
+      <stop offset="1" stop-color="#111b31"/>
+    </linearGradient>
+    <linearGradient id="local-panel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#10233a" stop-opacity="0.96"/>
+      <stop offset="1" stop-color="#0b1728" stop-opacity="0.96"/>
+    </linearGradient>
+    <linearGradient id="server-panel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#17213e" stop-opacity="0.98"/>
+      <stop offset="1" stop-color="#10182c" stop-opacity="0.98"/>
+    </linearGradient>
+    <linearGradient id="teal-card" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#12384a"/>
+      <stop offset="1" stop-color="#10283a"/>
+    </linearGradient>
+    <linearGradient id="violet-card" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#292754"/>
+      <stop offset="1" stop-color="#1b2340"/>
+    </linearGradient>
+    <linearGradient id="amber-card" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3a2d20"/>
+      <stop offset="1" stop-color="#252535"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="13" flood-color="#020617" flood-opacity="0.34"/>
+    </filter>
+    <marker id="arrow-teal" viewBox="0 0 10 10" refX="8.4" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#59d8cf"/>
+    </marker>
+    <marker id="arrow-violet" viewBox="0 0 10 10" refX="8.4" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#a8a5ff"/>
+    </marker>
+    <style>
+      .label { font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+      .title { fill: #f8fafc; font-size: 28px; font-weight: 760; letter-spacing: -0.3px; }
+      .subtitle { fill: #a9b8cc; font-size: 15px; }
+      .boundary-title { fill: #f1f5f9; font-size: 18px; font-weight: 720; }
+      .boundary-note { fill: #8fa3bc; font-size: 12px; font-weight: 600; letter-spacing: 0.6px; text-transform: uppercase; }
+      .card-title { fill: #f8fafc; font-size: 17px; font-weight: 720; }
+      .card-copy { fill: #b7c5d8; font-size: 13px; }
+      .micro { fill: #93a6bd; font-size: 11.5px; font-weight: 560; }
+      .chip { fill: #d7fffb; font-size: 10.5px; font-weight: 760; letter-spacing: 0.65px; }
+      .line-label { fill: #b9c9dc; font-size: 10.5px; font-weight: 680; letter-spacing: 0.45px; }
+      .flow-teal { fill: none; stroke: #59d8cf; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrow-teal); }
+      .flow-violet { fill: none; stroke: #a8a5ff; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrow-violet); }
+      .flow-local { fill: none; stroke: #6e879f; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrow-teal); }
+      .flow-fallback { fill: none; stroke: #e7b96b; stroke-width: 1.8; stroke-dasharray: 7 6; stroke-linecap: round; marker-end: url(#arrow-violet); }
+    </style>
+  </defs>
+
+  <rect width="1440" height="900" rx="30" fill="url(#canvas)"/>
+  <circle cx="1290" cy="78" r="220" fill="#5b5ce2" opacity="0.055"/>
+  <circle cx="100" cy="820" r="220" fill="#23c9b8" opacity="0.045"/>
+
+  <g class="label">
+    <text class="title" x="48" y="54">One hosted project. Many replaceable clients.</text>
+    <text class="subtitle" x="48" y="80">Lifecycle context, coordination, attribution, and outage-safe continuity without a hidden per-project server.</text>
+
+    <!-- Trust and deployment boundaries -->
+    <rect x="36" y="108" width="664" height="704" rx="28" fill="url(#local-panel)" stroke="#2c5268" stroke-width="1.5" stroke-dasharray="8 7"/>
+    <rect x="740" y="108" width="664" height="704" rx="28" fill="url(#server-panel)" stroke="#53569a" stroke-width="1.5"/>
+
+    <text class="boundary-title" x="68" y="145">Client machine</text>
+    <text class="boundary-note" x="68" y="166">replaceable clients + scoped continuity cache</text>
+    <rect x="571" y="130" width="93" height="25" rx="12.5" fill="#15394a" stroke="#2e6973"/>
+    <text class="chip" x="590" y="147">LOCAL</text>
+
+    <text class="boundary-title" x="772" y="145">Hosted Attacca service</text>
+    <text class="boundary-note" x="772" y="166">cross-device source of truth</text>
+    <rect x="1262" y="130" width="106" height="25" rx="12.5" fill="#2a2956" stroke="#5d5fa5"/>
+    <text class="chip" x="1280" y="147">HOSTED</text>
+
+    <!-- Client-side cards -->
+    <g filter="url(#shadow)">
+      <rect x="72" y="202" width="252" height="124" rx="18" fill="#13283c" stroke="#31546c"/>
+      <rect x="364" y="202" width="292" height="124" rx="18" fill="url(#teal-card)" stroke="#27706f"/>
+      <rect x="72" y="374" width="252" height="116" rx="18" fill="#13283c" stroke="#31546c"/>
+      <rect x="364" y="374" width="292" height="116" rx="18" fill="#172d42" stroke="#37647b"/>
+      <rect x="72" y="536" width="252" height="116" rx="18" fill="#172d42" stroke="#37647b"/>
+      <rect x="364" y="536" width="292" height="116" rx="18" fill="url(#amber-card)" stroke="#755f49"/>
+      <rect x="72" y="696" width="584" height="86" rx="18" fill="#172d42" stroke="#37647b"/>
+    </g>
+
+    <rect x="92" y="220" width="74" height="22" rx="11" fill="#203b51"/>
+    <text class="chip" x="106" y="235">CLIENTS</text>
+    <text class="card-title" x="94" y="269">AI coding clients</text>
+    <text class="card-copy" x="94" y="295">Claude · Codex · Kimi</text>
+    <text class="card-copy" x="94" y="315">native plugin path</text>
+
+    <rect x="384" y="220" width="82" height="22" rx="11" fill="#16525a"/>
+    <text class="chip" x="399" y="235">NATIVE</text>
+    <text class="card-title" x="386" y="269">Plugin + lifecycle hooks</text>
+    <text class="card-copy" x="386" y="295">SessionStart · prompt · stop</text>
+    <text class="card-copy" x="386" y="315">rules · context · inbox injection</text>
+
+    <rect x="92" y="392" width="82" height="22" rx="11" fill="#203b51"/>
+    <text class="chip" x="107" y="407">STDIO</text>
+    <text class="card-title" x="94" y="441">Other MCP clients</text>
+    <text class="card-copy" x="94" y="466">Cline · Cursor · Windsurf</text>
+    <text class="micro" x="94" y="483">Gemini · VS Code · opencode</text>
+
+    <rect x="384" y="392" width="82" height="22" rx="11" fill="#203f55"/>
+    <text class="chip" x="398" y="407">STDIO</text>
+    <text class="card-title" x="386" y="441">Stable <tspan font-family="ui-monospace, SFMono-Regular, Menlo, monospace">connect</tspan> proxy</text>
+    <text class="card-copy" x="386" y="466">project + actor headers · MCP forwarding</text>
+
+    <rect x="92" y="554" width="88" height="22" rx="11" fill="#203f55"/>
+    <text class="chip" x="107" y="569">WATCHER</text>
+    <text class="card-title" x="94" y="603">Machine-global watcher</text>
+    <text class="card-copy" x="94" y="628">60s lightweight poll by default</text>
+    <text class="micro" x="94" y="645">stages deltas while clients are idle</text>
+
+    <rect x="384" y="554" width="88" height="22" rx="11" fill="#59452f"/>
+    <text class="chip" x="400" y="569">VERIFIED</text>
+    <text class="card-title" x="386" y="603">Local mirror + outbox</text>
+    <text class="card-copy" x="386" y="628">identity-scoped stale reads</text>
+    <text class="micro" x="386" y="645">fsynced allowlisted writes · fail closed</text>
+
+    <rect x="92" y="714" width="78" height="22" rx="11" fill="#203f55"/>
+    <text class="chip" x="108" y="729">HUMAN</text>
+    <text class="card-title" x="190" y="732">Browser Control Panel <tspan fill="#75ddd4" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">/app</tspan></text>
+    <text class="card-copy" x="190" y="758">sign-in · workspaces · activity · tasks · policy · settings</text>
+
+    <!-- Local flows -->
+    <path class="flow-local" d="M 324 264 L 364 264"/>
+    <path class="flow-local" d="M 324 432 L 364 432"/>
+    <path class="flow-local" d="M 510 326 L 510 374"/>
+    <path class="flow-fallback" d="M 510 490 L 510 536"/>
+    <text class="line-label" x="523" y="517" fill="#e7b96b">OUTAGE ONLY</text>
+    <path class="flow-local" d="M 324 594 L 364 594"/>
+
+    <!-- Hosted interface and domain cards -->
+    <g filter="url(#shadow)">
+      <rect x="790" y="202" width="274" height="250" rx="20" fill="#17213d" stroke="#55599a"/>
+      <rect x="1100" y="202" width="254" height="250" rx="20" fill="url(#violet-card)" stroke="#6869aa"/>
+      <rect x="930" y="514" width="292" height="138" rx="20" fill="#1f2945" stroke="#60679b"/>
+      <rect x="790" y="696" width="564" height="86" rx="18" fill="#161f36" stroke="#46517f"/>
+    </g>
+
+    <text class="card-title" x="814" y="235">Hosted interfaces</text>
+    <rect x="812" y="253" width="230" height="48" rx="12" fill="#202950" stroke="#555aa0"/>
+    <text class="card-title" x="830" y="282">MCP <tspan class="micro" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">/mcp</tspan></text>
+    <rect x="812" y="317" width="230" height="48" rx="12" fill="#202950" stroke="#555aa0"/>
+    <text class="card-title" x="830" y="346">REST <tspan class="micro" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">/v1/…</tspan></text>
+    <rect x="812" y="381" width="230" height="48" rx="12" fill="#202950" stroke="#555aa0"/>
+    <text class="card-title" x="830" y="410">Sync + event feed</text>
+
+    <rect x="1122" y="220" width="88" height="22" rx="11" fill="#3d3b78"/>
+    <text class="chip" x="1137" y="235">DOMAIN</text>
+    <text class="card-title" x="1122" y="274">Authority + operations</text>
+    <text class="card-copy" x="1122" y="305">identity · roles · attribution</text>
+    <text class="card-copy" x="1122" y="331">room · inbox · tasks · plans</text>
+    <text class="card-copy" x="1122" y="357">rules · context · handoffs</text>
+    <text class="card-copy" x="1122" y="383">ledger · search · export</text>
+    <text class="micro" x="1122" y="418">optimistic writes + policy checks</text>
+
+    <rect x="952" y="534" width="74" height="22" rx="11" fill="#353d6c"/>
+    <text class="chip" x="967" y="549">STATE</text>
+    <text class="card-title" x="952" y="586">SQLite source of truth</text>
+    <text class="card-copy" x="952" y="612">many isolated workspaces · WAL</text>
+    <text class="micro" x="952" y="634">append-only, hash-chained project ledger</text>
+
+    <rect x="812" y="714" width="104" height="22" rx="11" fill="#293456"/>
+    <text class="chip" x="828" y="729">DISTRIBUTION</text>
+    <text class="card-title" x="936" y="732">Server-owned client bundle</text>
+    <text class="card-copy" x="936" y="758">landing page · installer · native plugins · managed law</text>
+
+    <!-- Cross-boundary network flows -->
+    <path class="flow-teal" d="M 656 432 C 724 432 718 277 790 277"/>
+    <text class="line-label" x="679" y="346">MCP/HTTP</text>
+    <path class="flow-teal" d="M 656 606 C 730 606 718 405 790 405"/>
+    <text class="line-label" x="679" y="543">PULL / REPLAY</text>
+    <path class="flow-teal" d="M 656 739 C 724 739 716 341 790 341"/>
+    <text class="line-label" x="680" y="682">REST</text>
+
+    <!-- Server-side flows -->
+    <path class="flow-violet" d="M 1064 277 L 1100 277"/>
+    <path class="flow-violet" d="M 1064 341 L 1100 341"/>
+    <path class="flow-violet" d="M 1064 405 L 1100 405"/>
+    <path class="flow-violet" d="M 1227 452 C 1227 486 1164 494 1164 514"/>
+    <text class="line-label" x="1190" y="489">TRANSACTIONS</text>
+
+    <!-- Legend -->
+    <circle cx="48" cy="856" r="5" fill="#59d8cf"/>
+    <text class="micro" x="62" y="860">authenticated network flow</text>
+    <line x1="248" y1="856" x2="286" y2="856" stroke="#e7b96b" stroke-width="2" stroke-dasharray="7 6"/>
+    <text class="micro" x="298" y="860">verified transport-outage fallback only</text>
+    <text class="micro" x="1080" y="860">Not production-hardened · no built-in TLS</text>
+  </g>
+</svg>
