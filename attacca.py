@@ -394,14 +394,24 @@ def require_usable_terminal_credential(url, runtime=None, project_id=None,
             project_id=project_id, runtime=normalized_runtime,
             credentials_path=CREDENTIALS_FILE)
     except Exception as error:
-        raise AuthenticationError(
+        failure = AuthenticationError(
             "client_authorization_required: local client identity is "
-            "invalid (%s)" % error) from None
+            "invalid (%s)" % error)
+        failure.local_credential_present = True
+        failure.credential_status = "invalid_local_state"
+        raise failure from None
     state = str(status.get("status") or "invalid")
     if state not in ("ready", "authorization_required"):
-        raise AuthenticationError(
+        error = AuthenticationError(
             "client_authorization_required: local client API key is %s"
             % state)
+        # The connect proxy uses this non-secret diagnostic to distinguish a
+        # missing key (start browser approval) from a stored-but-unusable key
+        # (repair/replace it). It never treats local presence as if a bearer
+        # had actually been sent over HTTP.
+        error.local_credential_present = True
+        error.credential_status = state
+        raise error
     return status
 
 
@@ -10547,6 +10557,13 @@ LANDING_TEMPLATE = """<!doctype html>
     .alt h2 { margin:0 0 5px; font:600 26px/1.1 Georgia,serif; }
     .alt p { margin:0; color:var(--muted); }
     .mini { max-width:100%; padding:14px 16px; border-radius:8px; color:white; background:var(--ink); overflow-x:auto; }
+    .setup-guide { padding:28px 0 82px; border-top:1px solid var(--line); }
+    .setup-guide h2 { margin:0 0 12px; font:600 34px/1.05 Georgia,serif; }
+    .setup-guide > p { max-width:760px; margin:0 0 24px; color:var(--muted); }
+    .setup-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
+    .setup-card { padding:18px; border:1px solid var(--ink); border-radius:10px; background:#fffdf7; }
+    .setup-card h3 { margin:0 0 12px; font:800 11px/1 ui-monospace,monospace; text-transform:uppercase; }
+    .setup-card code { display:block; overflow-x:auto; font-size:12px; }
     footer { padding:30px 0; color:#bec7c1; background:var(--ink); font-size:12px; }
     .foot { display:flex; justify-content:space-between; gap:20px; }
     :focus-visible { outline:3px solid var(--lime); outline-offset:3px; }
@@ -10558,6 +10575,7 @@ LANDING_TEMPLATE = """<!doctype html>
       .step,.step + .step { min-height:0; padding:25px 0; border-right:0; border-bottom:1px solid var(--ink); }
       .num { margin-bottom:18px; }
       .alt-row { display:block; }
+      .setup-grid { grid-template-columns:1fr; }
       .mini { margin-top:22px; }
     }
     @media (max-width:600px) { .panel-link { display:none; } }
@@ -10622,6 +10640,16 @@ LANDING_TEMPLATE = """<!doctype html>
         <article class="step"><span class="num">01 — INSTALL</span><h3>Paste the line</h3><p>Attacca finds the coding tools already on your machine and connects them.</p></article>
         <article class="step"><span class="num">02 — RESTART</span><h3>Open your project</h3><p>Every detected tool loads the same shared Attacca connection.</p></article>
         <article class="step"><span class="num">03 — CONNECT</span><h3>Confirm the workspace</h3><p>Setup detects the Git remote, suggests a match, or lists existing workspaces plus Create new.</p></article>
+      </div>
+    </section>
+
+    <section class="wrap setup-guide" id="setup-guide">
+      <h2>Connect this project once.</h2>
+      <p>After installation, open the checkout in your coding client and run its setup command. Choose or create the hosted workspace, then approve this client in the browser if prompted. The stable MCP process hot-loads the approved private key on its next tool call—no MCP reconnect or key copy/paste.</p>
+      <div class="setup-grid">
+        <article class="setup-card"><h3>Codex</h3><code>$attacca:setup</code></article>
+        <article class="setup-card"><h3>Claude Code / Kimi</h3><code>/attacca:setup</code></article>
+        <article class="setup-card"><h3>Direct terminal fallback</h3><code>attacca setup --interactive</code></article>
       </div>
     </section>
 
@@ -14711,21 +14739,20 @@ def _offline_proxy_safe_unavailable(error):
 
 def run_connect_proxy(url=None, actor=None, actor_type=None, project=None,
                       stdin=None, stdout=None):
-    """`connect`: hosted MCP client with verified identity-scoped continuity.
+    """Stable local MCP control plane over authenticated hosted Attacca.
 
-    This is what the Claude Code plugin (and any stdio-only tool) spawns:
-    it normally forwards JSON-RPC lines to the server's /mcp endpoint. A
-    confirmed checkout link pins the workspace; otherwise a Git fingerprint
-    can find an existing match. On a real transport outage it may serve only
-    the exact watcher-verified identity mirror and fsync allowlisted writes to
-    that identity's outbox. If the server is local and down, it boots it in the
-    background (disable: ATTACCA_AUTOSTART=0).
+    Client hosts load this stdio process once.  It answers protocol discovery
+    locally, then lazily creates the hosted MCP session on the first operation
+    that needs project authority.  Credentials and the machine server URL are
+    re-read between requests, so browser approval and endpoint switching do
+    not require the host to reload its MCP registration.  Project operations
+    remain fail-closed on authentication errors and may use only an exact
+    verified identity-scoped mirror on a real transport outage.
     """
     import urllib.error
     import urllib.request as urlreq
-    # Explicit --url wins; otherwise use the machine source of truth before a
-    # possibly stale inherited client-manifest environment value.
-    url = configured_server_url(url)
+    explicit_url = url is not None
+    initial_url = configured_server_url(url)
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
     start = Path(os.environ.get("CLAUDE_PROJECT_DIR")
@@ -14743,13 +14770,22 @@ def run_connect_proxy(url=None, actor=None, actor_type=None, project=None,
     except (TypeError, ValueError):
         request_timeout = 5.0
     request_timeout = max(0.1, min(request_timeout, 120.0))
-    state = {"session": None, "ensured": False,
-             "project": configured_project or linked_project}
+    state = {
+        "url": initial_url,
+        "session": None,
+        "remote_initialized": False,
+        "initialize_params": None,
+        "client_initialized": False,
+        "ensured_url": None,
+        "project": configured_project or linked_project,
+        "link_project": linked_project,
+        "binding": None,
+    }
     actor_hint = actor or os.environ.get(ENV_ACTOR)
     runtime_hint = normalize_agent_runtime(actor=actor_hint)
     device_id = load_device_id()
     offline_session = OfflineProxySession(
-        url, lambda: state.get("project"), root, actor_hint, runtime_hint,
+        initial_url, lambda: state.get("project"), root, actor_hint, runtime_hint,
         device_id)
 
     def send_line(obj):
@@ -14757,58 +14793,110 @@ def run_connect_proxy(url=None, actor=None, actor_type=None, project=None,
         stdout.write("\n")
         stdout.flush()
 
-    def post(body, retry=True):
-        # Checkout links are intentionally replaceable by setup. Re-read the
-        # nearest link before every request so a long-running client can move
-        # from a missing/stale workspace to the user's confirmed selection
-        # without another restart. An explicit --project / ATTACCA_PROJECT
-        # remains authoritative and is never replaced here.
+    def reset_remote():
+        state["session"] = None
+        state["remote_initialized"] = False
+
+    def refresh_binding():
+        """Resolve one coherent URL/project/credential request generation."""
+        nonlocal offline_session
+        endpoint = initial_url if explicit_url else configured_server_url()
+        if endpoint != state["url"]:
+            state["url"] = endpoint
+            state["ensured_url"] = None
+            state["binding"] = None
+            reset_remote()
+            offline_session = OfflineProxySession(
+                endpoint, lambda: state.get("project"), root, actor_hint,
+                runtime_hint, device_id)
+
+        # Checkout links are replaceable by setup. Re-read the nearest link so
+        # a long-running host adopts a repaired workspace without reloading.
         if not configured_project:
             current_link = find_project_link(start)
-            state["project"] = (current_link or {}).get("project_id")
+            current_project = (current_link or {}).get("project_id")
+            if current_project is not None:
+                state["project"] = current_project
+            elif state.get("link_project") is not None:
+                # A previously linked checkout was deliberately unlinked.
+                state["project"] = None
+            state["link_project"] = current_project
+        owner = load_owner()
+        actor_id = qualify_actor(actor or os.environ.get(ENV_ACTOR),
+                                 owner=owner)
+        atype = actor_type or os.environ.get(ENV_ACTOR_TYPE)
+        resolved_runtime = normalize_agent_runtime(actor=actor_id)
+        require_usable_terminal_credential(
+            endpoint, runtime=resolved_runtime,
+            project_id=state["project"], actor_id=actor_id)
+        token = load_api_token(
+            endpoint, runtime=resolved_runtime,
+            project_id=state["project"], actor_id=actor_id)
+        current_device = load_device_id()
+        client_instance = load_client_instance_id(resolved_runtime)
+        token_fingerprint = hashlib.sha256(token.encode("utf-8")).hexdigest() \
+            if token else None
+        binding = (endpoint, state.get("project"), actor_id, atype,
+                   current_device, client_instance, token_fingerprint)
+        if state.get("binding") is not None and binding != state["binding"]:
+            reset_remote()
+        state["binding"] = binding
+        return {
+            "url": endpoint, "project": state.get("project"),
+            "owner": owner, "actor_id": actor_id, "actor_type": atype,
+            "runtime": resolved_runtime, "token": token,
+            "device_id": current_device,
+            "client_instance": client_instance,
+        }
+
+    def ensure_autostart(context):
+        endpoint = context["url"]
+        if state.get("ensured_url") == endpoint:
+            return
+        state["ensured_url"] = endpoint
+        if autostart and not server_alive(endpoint):
+            try:
+                ensure_server_running(
+                    endpoint, Path(os.environ.get(ENV_DB) or DEFAULT_DB))
+            except Exception as error:
+                sys.stderr.write(
+                    "attacca connect: autostart failed: %s\n" % error)
+
+    def post(message, context, include_session=True):
         headers = {"Content-Type": "application/json",
                    "Accept": "application/json"}
-        if state["project"]:
-            headers["X-Attacca-Project"] = state["project"]
+        if context["project"]:
+            headers["X-Attacca-Project"] = context["project"]
         else:
             headers["X-Attacca-Root"] = root
             if repository_fingerprint:
                 headers[REPOSITORY_FINGERPRINT_HEADER] = repository_fingerprint
-        owner = load_owner()
-        if owner:
-            headers["X-Attacca-Owner"] = owner
-        actor_id = qualify_actor(actor or os.environ.get(ENV_ACTOR),
-                                 owner=owner)
-        if actor_id:
-            headers["X-Attacca-Actor"] = actor_id
-        atype = actor_type or os.environ.get(ENV_ACTOR_TYPE)
-        if atype:
-            headers["X-Attacca-Actor-Type"] = atype
-        runtime_hint = normalize_agent_runtime(actor=actor_id)
-        require_usable_terminal_credential(
-            url, runtime=runtime_hint, project_id=state["project"],
-            actor_id=actor_id)
-        token = load_api_token(
-            url, runtime=runtime_hint, project_id=state["project"],
-            actor_id=actor_id)
-        if token:
-            headers["Authorization"] = "Bearer " + token
-        device_id = load_device_id()
-        if device_id:
-            headers[SYNC_DEVICE_HEADER] = device_id
-        client_instance = load_client_instance_id(runtime_hint)
-        if client_instance:
-            headers[CLIENT_INSTANCE_HEADER] = client_instance
+        if context["owner"]:
+            headers["X-Attacca-Owner"] = context["owner"]
+        if context["actor_id"]:
+            headers["X-Attacca-Actor"] = context["actor_id"]
+        if context["actor_type"]:
+            headers["X-Attacca-Actor-Type"] = context["actor_type"]
+        if context["token"]:
+            headers["Authorization"] = "Bearer " + context["token"]
+        if context["device_id"]:
+            headers[SYNC_DEVICE_HEADER] = context["device_id"]
+        if context["client_instance"]:
+            headers[CLIENT_INSTANCE_HEADER] = context["client_instance"]
         branch_name = git_branch(root)
         revision = git_head(root)
         if branch_name:
             headers[GIT_BRANCH_HEADER] = branch_name
         if revision:
             headers[GIT_REVISION_HEADER] = revision
-        if state["session"]:
+        if include_session and state["session"]:
             headers["Mcp-Session-Id"] = state["session"]
-        req = urlreq.Request(url + "/mcp", data=body, headers=headers,
-                             method="POST")
+        body = json.dumps(
+            message, separators=(",", ":"), ensure_ascii=False).encode(
+                "utf-8")
+        req = urlreq.Request(
+            context["url"] + "/mcp", data=body, headers=headers,
+            method="POST")
         try:
             with urlreq.urlopen(req, timeout=request_timeout) as resp:
                 sid = resp.headers.get("Mcp-Session-Id")
@@ -14819,12 +14907,242 @@ def run_connect_proxy(url=None, actor=None, actor_type=None, project=None,
                     state["project"] = resolved_project
                 return resp.status, resp.read()
         except urllib.error.HTTPError as err:
-            data = err.read()
-            if err.code == 404 and state["session"] and retry:
-                # Server restarted and lost our session: continue sessionless.
-                state["session"] = None
-                return post(body, retry=False)
-            return err.code, data
+            return err.code, err.read()
+
+    def response_error_text(status, data):
+        try:
+            payload = json.loads(data) if data else None
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict) and error.get("message"):
+                return str(error["message"])
+            if error:
+                return str(error)
+        return "hosted MCP returned HTTP %s" % status
+
+    def latch_auth(status):
+        reset_remote()
+        try:
+            offline_session.latch_auth_required(status)
+        except Exception:
+            pass
+
+    def protocol_error(message, text_value, status=None, category=None,
+                       credential_sent=None):
+        msg_id = message.get("id") if isinstance(message, dict) else None
+        # JSON-RPC notifications never receive responses, including when the
+        # hosted authority is unavailable or rejects the request.
+        if msg_id is None:
+            return None
+        data = {}
+        if status is not None:
+            data["http_status"] = status
+        if category:
+            data["category"] = category
+        if credential_sent is not None:
+            data["credential_sent"] = bool(credential_sent)
+        if isinstance(message, dict) and message.get("method") == "tools/call":
+            return {"jsonrpc": "2.0", "id": msg_id, "result": {
+                "content": [{"type": "text", "text": "error: %s" %
+                             text_value}],
+                "isError": True,
+                "_meta": data,
+            }}
+        return {"jsonrpc": "2.0", "id": msg_id, "error": {
+            "code": -32000, "message": text_value, "data": data}}
+
+    def authentication_response(message, context, status, detail):
+        sent = bool((context or {}).get("token"))
+        local_present = bool((context or {}).get(
+            "local_credential_present"))
+        credential_status = str((context or {}).get(
+            "credential_status") or "").strip()
+        if status == 403 and sent:
+            remedy = (
+                "the credential was accepted, but this workspace, actor, "
+                "role, or operation is not authorized; repair the selected "
+                "workspace/actor or its permissions")
+            category = "authorization_denied"
+        elif sent:
+            remedy = (
+                "a client credential was sent but the host rejected it; "
+                "reauthorize or replace that installation key")
+            category = "authentication_required"
+        elif local_present:
+            remedy = (
+                "a client credential exists locally but is unusable%s; "
+                "repair, remove, or replace that installation key" %
+                ((" (" + credential_status + ")")
+                 if credential_status else ""))
+            category = "local_credential_unusable"
+        else:
+            remedy = (
+                "no client credential was sent; complete browser approval "
+                "for this installation")
+            category = "authentication_required"
+        if category == "authorization_denied":
+            lead = "Attacca authorization denied"
+            retry = (
+                "The stable MCP connection remains loaded and will retry "
+                "the corrected workspace/actor selection or permissions on "
+                "its next tool call")
+        else:
+            lead = "Attacca authentication required"
+            retry = (
+                "The stable MCP connection remains loaded and will use the "
+                "repaired private key on its next tool call")
+        text_value = (
+            "%s: %s (%s). %s; do not open /mcp merely to reconnect. "
+            "Open %s/app for account/client settings." %
+            (lead, remedy, detail, retry, state["url"].rstrip("/")))
+        return protocol_error(
+            message, text_value, status=status,
+            category=category, credential_sent=sent)
+
+    def hosted_failure(message, context, status, data):
+        detail = response_error_text(status, data)
+        if status in (401, 403):
+            latch_auth(status)
+            return authentication_response(message, context, status, detail)
+        return protocol_error(
+            message, detail, status=status, category="hosted_http_error")
+
+    def ensure_remote_initialized(context):
+        if state["remote_initialized"]:
+            return None
+        reset_remote()
+        params = state.get("initialize_params") or {
+            "protocolVersion": MCP_DEFAULT_PROTOCOL,
+            "capabilities": {},
+            "clientInfo": {"name": "attacca-connect", "version": VERSION},
+        }
+        hidden = {"jsonrpc": "2.0", "id": "attacca-proxy-initialize",
+                  "method": "initialize", "params": params}
+        status, data = post(hidden, context, include_session=False)
+        if status < 200 or status >= 300:
+            return (status, data)
+        try:
+            payload = json.loads(data) if data else None
+        except (TypeError, ValueError):
+            return (500, b'{"error":"invalid hosted initialize response"}')
+        if not isinstance(payload, dict) or payload.get("error") \
+                or not isinstance(payload.get("result"), dict):
+            return (500, data or b'{"error":"hosted initialize failed"}')
+        state["remote_initialized"] = True
+        if state["client_initialized"]:
+            initialized = {"jsonrpc": "2.0",
+                           "method": "notifications/initialized"}
+            notify_status, notify_data = post(initialized, context)
+            if notify_status in (401, 403):
+                return (notify_status, notify_data)
+        return None
+
+    def local_initialize(message):
+        params = message.get("params") or {}
+        state["initialize_params"] = params if isinstance(params, dict) else {}
+        reset_remote()
+        requested = state["initialize_params"].get("protocolVersion")
+        selected = requested if requested in MCP_SUPPORTED_PROTOCOLS \
+            else MCP_DEFAULT_PROTOCOL
+        return {"jsonrpc": "2.0", "id": message.get("id"), "result": {
+            "protocolVersion": selected,
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "attacca", "version": VERSION},
+            "instructions": (
+                MCP_INSTRUCTIONS + "\nThe stable local Attacca connection "
+                "keeps protocol discovery available while hosted credentials "
+                "are repaired. Project reads and writes still require live "
+                "authenticated authority or an exact verified outage mirror."),
+        }}
+
+    def decode_hosted(message, context, status, data):
+        if status in (401, 403):
+            return hosted_failure(message, context, status, data)
+        if status == 202 or not data:
+            return None
+        try:
+            payload = json.loads(data)
+        except (TypeError, ValueError):
+            return protocol_error(
+                message, "invalid response from server (HTTP %d)" % status,
+                status=status, category="hosted_http_error")
+        if isinstance(payload, dict) and "jsonrpc" not in payload:
+            return hosted_failure(message, context, status, data)
+        if isinstance(payload, dict) and isinstance(
+                payload.get("error"), dict) and status >= 400:
+            error_data = payload["error"].setdefault("data", {})
+            if isinstance(error_data, dict):
+                error_data.setdefault("http_status", status)
+                error_data.setdefault("category", "hosted_http_error")
+        return payload
+
+    def process_one(message):
+        if not isinstance(message, dict):
+            return {"jsonrpc": "2.0", "id": None,
+                    "error": {"code": -32600,
+                              "message": "invalid request"}}
+        method = message.get("method")
+        msg_id = message.get("id")
+        if not method:
+            return {"jsonrpc": "2.0", "id": msg_id,
+                    "error": {"code": -32600,
+                              "message": "invalid request"}}
+        if method == "notifications/initialized":
+            state["client_initialized"] = True
+            return None
+        if method == "initialize":
+            return local_initialize(message) if msg_id is not None else None
+        if method == "tools/list":
+            return ({"jsonrpc": "2.0", "id": msg_id,
+                     "result": {"tools": MCP_TOOLS}}
+                    if msg_id is not None else None)
+        if method == "ping":
+            return ({"jsonrpc": "2.0", "id": msg_id, "result": {}}
+                    if msg_id is not None else None)
+
+        try:
+            context = refresh_binding()
+            ensure_autostart(context)
+            failure = ensure_remote_initialized(context)
+            if failure:
+                return hosted_failure(
+                    message, context, failure[0], failure[1])
+            had_session = bool(state["session"])
+            status, data = post(message, context)
+            if status == 404 and had_session:
+                # A hosted restart invalidates only its transient MCP session.
+                # Recreate it invisibly, then retry the request once. Session
+                # lookup happens before tool dispatch, so no mutation ran.
+                reset_remote()
+                failure = ensure_remote_initialized(context)
+                if failure:
+                    return hosted_failure(
+                        message, context, failure[0], failure[1])
+                status, data = post(message, context)
+            decoded = decode_hosted(message, context, status, data)
+            return decoded if msg_id is not None else None
+        except AuthenticationError as error:
+            latch_auth(401)
+            context = {
+                "local_credential_present": bool(getattr(
+                    error, "local_credential_present", False)),
+                "credential_status": getattr(
+                    error, "credential_status", None),
+            }
+            return authentication_response(
+                message, context, 401, str(error))
+        except Exception as error:
+            # The original tool request has not been sent when hidden
+            # initialization fails. Conservatively retain the existing
+            # ambiguity rules; only proven refusal/DNS failures can queue a
+            # write, while reads may use a verified exact mirror.
+            allow_queue = (not _offline_proxy_write_request(message)
+                           or _offline_proxy_safe_unavailable(error))
+            offline_response = offline_session.process_message(
+                message, error, allow_queue=allow_queue)
+            return offline_response if msg_id is not None else None
 
     while True:
         try:
@@ -14842,90 +15160,20 @@ def run_connect_proxy(url=None, actor=None, actor_type=None, project=None,
             send_line({"jsonrpc": "2.0", "id": None,
                        "error": {"code": -32700, "message": "parse error"}})
             continue
-        expects_reply = isinstance(msg, list) or \
-            (isinstance(msg, dict) and msg.get("id") is not None
-             and msg.get("method") is not None)
-        msg_id = msg.get("id") if isinstance(msg, dict) else None
-        if not state["ensured"]:
-            state["ensured"] = True
-            if autostart and not server_alive(url):
-                try:
-                    ensure_server_running(
-                        url, Path(os.environ.get(ENV_DB) or DEFAULT_DB))
-                except Exception as err:
-                    sys.stderr.write("attacca connect: autostart failed: "
-                                     "%s\n" % err)
-        try:
-            status, data = post(line.encode("utf-8"))
-        except AuthenticationError as err:
-            # Local proof that a modern credential is unusable is itself an
-            # authorization latch. Never reinterpret it as a transport outage
-            # and never open cached authority or queue a write.
-            try:
-                offline_session.latch_auth_required(401)
-            except Exception:
-                pass
-            if expects_reply:
-                send_line({"jsonrpc": "2.0", "id": msg_id, "error": {
-                    "code": -32000,
-                    "message": str(err),
-                    "data": {"http_status": 401,
-                             "category": "authentication_required"}}})
-            continue
-        except Exception as err:
-            # A verified mirror is authoritative only for this exact cached
-            # identity. Reads may always fall back after a transport failure;
-            # writes queue only when the failure proves the request never
-            # reached the host (for example connection refused / DNS failure).
-            # Timeouts/resets remain ambiguous and are never double-applied.
-            allow_queue = (not _offline_proxy_write_request(msg)
-                           or _offline_proxy_safe_unavailable(err))
-            fallback = offline_session.process_message(
-                msg, err, allow_queue=allow_queue)
-            if fallback is not None:
-                send_line(fallback)
-            continue
-        if status in (401, 403):
-            # Persist revocation before returning the hosted error. Otherwise a
-            # later connection outage in this or a new proxy process could
-            # reactivate a mirror whose authority the host already rejected.
-            try:
-                offline_session.latch_auth_required(status)
-            except Exception:
-                # The hosted auth failure still returns unchanged. Failure to
-                # find/write an exact watcher entry cannot authorize fallback.
-                pass
-        if status == 202 or not data:
-            continue  # notification accepted; nothing to forward
-        try:
-            payload = json.loads(data)
-        except json.JSONDecodeError:
-            if expects_reply:
-                send_line({"jsonrpc": "2.0", "id": msg_id, "error": {
-                    "code": -32603,
-                    "message": "invalid response from server (HTTP %d)" % status}})
-            continue
-        if isinstance(payload, dict) and "jsonrpc" not in payload:
-            # REST-style {"error": ...} from a non-MCP failure path.
-            if expects_reply:
-                send_line({"jsonrpc": "2.0", "id": msg_id, "error": {
-                    "code": -32000,
-                    "message": str(payload.get("error") or payload),
-                    "data": {
-                        "http_status": status,
-                        "category": ("authentication_required"
-                                     if status in (401, 403)
-                                     else "hosted_http_error"),
-                    }}})
-            continue
-        if isinstance(payload, dict) and isinstance(
-                payload.get("error"), dict) and status >= 400:
-            error_data = payload["error"].setdefault("data", {})
-            if isinstance(error_data, dict):
-                error_data.setdefault("http_status", status)
-                if status in (401, 403):
-                    error_data.setdefault(
-                        "category", "authentication_required")
+        if isinstance(msg, list):
+            if not msg:
+                payload = {"jsonrpc": "2.0", "id": None,
+                           "error": {"code": -32600,
+                                     "message": "invalid request: empty batch"}}
+            else:
+                responses = [process_one(item) for item in msg]
+                payload = [item for item in responses if item is not None]
+                if not payload:
+                    continue
+        else:
+            payload = process_one(msg)
+            if payload is None:
+                continue
         try:
             send_line(payload)
         except BrokenPipeError:
@@ -16399,15 +16647,19 @@ def mcp_http_config(actor, project_id, url, home=None):
     return {"type": "http", "url": url.rstrip("/") + "/mcp", "headers": headers}
 
 
-def mcp_connect_config(actor, url, home=None):
+def mcp_connect_config(actor, url, home=None, project_id=None):
     """Stdio-shaped config that is still a pure server client: the tool
     spawns `attacca.py connect`, which forwards to the server and resolves a
     confirmed checkout link or matching Git remote."""
+    environment = {
+        ENV_ACTOR: actor,
+        ENV_CLIENT_INSTANCE: _client_instance_for_runtime(actor, home),
+        "ATTACCA_URL": url.rstrip("/"),
+    }
+    if project_id:
+        environment[ENV_PROJECT] = project_id
     return {"command": "python3", "args": [script_path(), "connect"],
-            "env": {
-                ENV_ACTOR: actor,
-                ENV_CLIENT_INSTANCE: _client_instance_for_runtime(actor, home),
-                "ATTACCA_URL": url.rstrip("/")}}
+            "env": environment}
 
 
 def codex_http_toml(project_id, url):
@@ -17023,8 +17275,8 @@ def connect_tools(project_id, root, db_path, url=DEFAULT_URL, stdio=False,
     if "gemini" not in skip:
         if (home / ".gemini").is_dir() and root:
             value = stdio_cfg("gemini") if stdio else \
-                {"httpUrl": mcp_url,
-                 "headers": _http_headers("gemini", project_id, home=home)}
+                mcp_connect_config(
+                    "gemini", url, home=home, project_id=project_id)
             record("gemini", _merge_json_config(
                 Path(root) / ".gemini" / "settings.json", "mcpServers",
                 "attacca", value, backup=False))
@@ -17035,9 +17287,8 @@ def connect_tools(project_id, root, db_path, url=DEFAULT_URL, stdio=False,
         if root and ((home / ".vscode").is_dir()
                      or (Path(root) / ".vscode").is_dir()):
             value = {"type": "stdio", **stdio_cfg("vscode")} if stdio \
-                else {"type": "http", "url": mcp_url,
-                      "headers": _http_headers(
-                          "vscode", project_id, home=home)}
+                else {"type": "stdio", **mcp_connect_config(
+                    "vscode", url, home=home, project_id=project_id)}
             record("vscode", _merge_json_config(
                 Path(root) / ".vscode" / "mcp.json", "servers", "attacca",
                 value, backup=False))
@@ -17047,15 +17298,11 @@ def connect_tools(project_id, root, db_path, url=DEFAULT_URL, stdio=False,
     if "opencode" not in skip:
         if root and ((home / ".config" / "opencode").is_dir()
                      or (Path(root) / "opencode.json").exists()):
-            if stdio:
-                cfg = stdio_cfg("opencode")
-                value = {"type": "local",
-                         "command": [cfg["command"]] + cfg["args"],
-                         "environment": cfg["env"]}
-            else:
-                value = {"type": "remote", "url": mcp_url,
-                         "headers": _http_headers(
-                             "opencode", project_id, home=home)}
+            cfg = stdio_cfg("opencode") if stdio else mcp_connect_config(
+                "opencode", url, home=home, project_id=project_id)
+            value = {"type": "local",
+                     "command": [cfg["command"]] + cfg["args"],
+                     "environment": cfg["env"]}
             record("opencode", _merge_json_config(
                 Path(root) / "opencode.json", "mcp", "attacca", value,
                 backup=False))
@@ -17139,7 +17386,8 @@ def _configure_checkout(project_id, root, db_path, url, stdio,
     else:
         config = mcp_server_config(
             "claude", project_id, db_path, home=home) if stdio else \
-            mcp_http_config("claude", project_id, url, home=home)
+            mcp_connect_config(
+                "claude", url, home=home, project_id=project_id)
         mcp_json = write_mcp_json_file(root, config)
         claude_connection = "project_mcp"
     configured, not_detected = ([], [])
@@ -17645,6 +17893,10 @@ def setup_details_text(project_id, db_path, url=DEFAULT_URL, tools=None):
         return json.dumps({"mcpServers": {
             "attacca": mcp_server_config(actor, project_id, db_path)}}, indent=2)
 
+    def hosted_connect_json(actor):
+        return json.dumps({"mcpServers": {"attacca": mcp_connect_config(
+            actor, url, project_id=project_id)}}, indent=2)
+
     out.append("Attacca configuration reference")
     out.append("=" * 60)
     out.append("Script:   %s" % path)
@@ -17660,15 +17912,13 @@ def setup_details_text(project_id, db_path, url=DEFAULT_URL, tools=None):
                          "glm", "cli"]
 
     if "claude" in selected:
-        out.append("-- Claude Code (server mode, recommended) " + "-" * 18)
-        out.append("  claude mcp add --transport http attacca %s/mcp \\" % url.rstrip("/"))
-        out.append("    --header \"X-Attacca-Actor: claude\"%s"
-                   % (" \\\n    --header \"X-Attacca-Project: %s\"" % project_id
-                      if project_id else ""))
-        out.append("or merge into <project>/.mcp.json (run `setup` to do this for you):")
-        out.append(indent_block(json.dumps({"mcpServers": {"attacca":
-                   mcp_http_config("claude", project_id, url)}}, indent=2)))
-        out.append("-- Claude Code (stdio fallback, no server needed) " + "-" * 10)
+        out.append("-- Claude Code (hosted stable connection) " + "-" * 18)
+        out.append("Prefer the native plugin; otherwise merge this into "
+                   "<project>/.mcp.json (`setup` does it for you):")
+        out.append(indent_block(hosted_connect_json("claude")))
+        out.append("The stdio wrapper hot-reads repaired credentials and a "
+                   "machine server switch between tool calls.")
+        out.append("-- Explicit direct-database development mode " + "-" * 12)
         out.append(indent_block(stdio_config_json("claude")))
         out.append("")
 
@@ -17680,7 +17930,7 @@ def setup_details_text(project_id, db_path, url=DEFAULT_URL, tools=None):
         out.append("project; the checkout link selects the confirmed workspace):")
         out.append(indent_block(json.dumps({"mcpServers": {"attacca":
                    mcp_connect_config("kimi", url)}}, indent=2)))
-        out.append("Stdio fallback (no server):")
+        out.append("Explicit direct-database development mode:")
         out.append(indent_block(stdio_config_json("kimi")))
         out.append("")
 
@@ -17689,31 +17939,28 @@ def setup_details_text(project_id, db_path, url=DEFAULT_URL, tools=None):
         out.append("Global config (~/.codex/config.toml), works on every Codex")
         out.append("version; the checkout link selects the confirmed workspace:")
         out.append(indent_block(codex_connect_toml(url)))
-        out.append("Direct HTTP alternative (recent Codex; per-project header):")
-        out.append(indent_block(codex_http_toml(project_id, url)))
-        out.append("No-server stdio fallback:")
+        out.append("The stable connection hot-reads browser-approved keys and "
+                   "machine server switches; no MCP reconnect is required.")
+        out.append("Explicit direct-database development mode:")
         out.append(indent_block(codex_stdio_toml(project_id, db_path)))
         out.append("")
 
     if "gemini" in selected:
         out.append("-- Gemini CLI " + "-" * 46)
-        out.append("Merge into <project>/.gemini/settings.json (httpUrl = server mode):")
-        gem = {"mcpServers": {"attacca": {
-            "httpUrl": url.rstrip("/") + "/mcp",
-            "headers": {"X-Attacca-Actor": "gemini",
-                        **({"X-Attacca-Project": project_id} if project_id else {})}}}}
-        out.append(indent_block(json.dumps(gem, indent=2)))
-        out.append("Stdio fallback:")
+        out.append("Merge the hosted stable connection into "
+                   "<project>/.gemini/settings.json:")
+        out.append(indent_block(hosted_connect_json("gemini")))
+        out.append("Explicit direct-database development mode:")
         out.append(indent_block(stdio_config_json("gemini")))
         out.append("")
 
     if "opencode" in selected:
         out.append("-- opencode " + "-" * 48)
+        cfg = mcp_connect_config("opencode", url, project_id=project_id)
         oc = {"mcp": {"attacca": {
-            "type": "remote", "url": url.rstrip("/") + "/mcp",
-            "headers": {"X-Attacca-Actor": "opencode",
-                        **({"X-Attacca-Project": project_id} if project_id else {})}}}}
-        out.append("Merge into opencode.json (remote = server mode):")
+            "type": "local", "command": [cfg["command"]] + cfg["args"],
+            "environment": cfg["env"]}}}
+        out.append("Merge the hosted stable connection into opencode.json:")
         out.append(indent_block(json.dumps(oc, indent=2)))
         out.append("")
 
@@ -17727,13 +17974,13 @@ def setup_details_text(project_id, db_path, url=DEFAULT_URL, tools=None):
 
     if "cli" in selected:
         out.append("-- Any other MCP client (Grok, Zed, Cline, ...) " + "-" * 12)
-        out.append("HTTP (server mode):  url %s/mcp" % url.rstrip("/"))
-        out.append("  headers: X-Attacca-Actor: <name>, X-Attacca-Project: %s"
-                   % (project_id or "<project>"))
-        out.append("Stdio (no server):   command python3, args [\"%s\", \"mcp\"]" % path)
-        out.append("  env: %s=<name>, %s=%s, %s=%s"
-                   % (ENV_ACTOR, ENV_DB, db_path, ENV_PROJECT,
+        out.append("Hosted stable stdio: command python3, args [\"%s\", "
+                   "\"connect\"]" % path)
+        out.append("  env: %s=<name>, ATTACCA_URL=%s, %s=%s"
+                   % (ENV_ACTOR, url.rstrip("/"), ENV_PROJECT,
                       project_id or "<project>"))
+        out.append("Use direct HTTP only when the MCP host itself securely "
+                   "supplies and refreshes the private bearer credential.")
         out.append("REST API:  curl %s/v1/projects" % url.rstrip("/"))
         out.append("           curl %s/v1/projects/%s/handoff"
                    % (url.rstrip("/"), project_id or "<project>"))

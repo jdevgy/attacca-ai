@@ -26,7 +26,7 @@ if str(ROOT) not in sys.path:
 
 import offline_sync as offline  # noqa: E402
 import sync_client  # noqa: E402
-from attacca.tests.test_sync_http import (  # noqa: E402
+from tests.test_sync_http import (  # noqa: E402
     SyncHttpFixture,
     attacca,
     protocol,
@@ -259,7 +259,7 @@ class OfflineConnectProxyBlackBoxTests(unittest.TestCase):
         initialized = self._initialize(process)
         self.assertIn("result", initialized, label)
         ping = self._rpc(process, "ping", {}, request_id=8)
-        self.assertIn("error", ping, label)
+        self.assertEqual(ping.get("result"), {}, label)
         self.assertNotIn(
             "verified_local_mirror", self._serialized(ping), label)
         error = self._tool(
@@ -829,14 +829,23 @@ class OfflineConnectProxyBlackBoxTests(unittest.TestCase):
         # closed.  Bare unknown strings remain migration-compatible legacy
         # actor tokens until the owner explicitly activates authentication.
         process = self._start_proxy(token="atd_invalid-token")
-        denied = self._initialize(process)
-        self.assertIn("error", denied)
-        error_data = denied["error"].get("data") or {}
+        initialized = self._initialize(process)
+        self.assertIn("result", initialized)
+        listed = self._rpc(process, "tools/list", {}, request_id=2)
+        self.assertIn("tools", listed["result"])
+        denied = self._rpc(process, "tools/call", {
+            "name": "attacca_status", "arguments": {},
+        }, request_id=3)
+        self.assertTrue(denied["result"]["isError"], denied)
+        error_data = denied["result"].get("_meta") or {}
         self.assertEqual(error_data.get("http_status"), 401)
         self.assertEqual(
             error_data.get("category"), "authentication_required")
+        self.assertTrue(error_data.get("credential_sent"))
         serialized = self._serialized(denied).lower()
         self.assertRegex(serialized, r"(invalid|auth|token|login)")
+        self.assertIn("stable mcp connection remains loaded", serialized)
+        self.assertIn("next tool call", serialized)
         self.assertNotIn("verified_local_mirror", serialized)
         self._stop_process(process)
 
@@ -888,11 +897,15 @@ class OfflineConnectProxyBlackBoxTests(unittest.TestCase):
         thread.start()
         try:
             process = self._start_proxy()
-            denied = self._initialize(process)
-            self.assertIn("error", denied)
-            data = denied["error"].get("data") or {}
+            self.assertIn("result", self._initialize(process))
+            denied = self._rpc(process, "tools/call", {
+                "name": "attacca_status", "arguments": {},
+            }, request_id=2)
+            self.assertTrue(denied["result"]["isError"], denied)
+            data = denied["result"].get("_meta") or {}
             self.assertEqual(data.get("http_status"), 403)
-            self.assertEqual(data.get("category"), "authentication_required")
+            self.assertEqual(data.get("category"), "authorization_denied")
+            self.assertIn("workspace", self._serialized(denied).lower())
             self._stop_process(process)
         finally:
             server.shutdown()
@@ -1040,10 +1053,14 @@ class OfflineConnectProxyBlackBoxTests(unittest.TestCase):
             process = self._start_proxy(
                 project_client, token=False, url=origin + "/tenant-b")
             self.assertIn("result", self._initialize(process))
-            self._stop_process(process)
+            self._rpc(process, "tools/call", {
+                "name": "attacca_status", "arguments": {},
+            }, request_id=2)
             self.assertEqual(observed[-1]["path"], "/tenant-b/mcp")
             self.assertIsNone(observed[-1]["authorization"])
 
+            # The same long-running stdio process must hot-read a browser-
+            # repaired private key. The coding host does not reconnect MCP.
             write_credentials({
                 origin + "/tenant-a": {
                     "agent_tokens": {"proj": {
@@ -1064,9 +1081,9 @@ class OfflineConnectProxyBlackBoxTests(unittest.TestCase):
                     },
                 },
             })
-            process = self._start_proxy(
-                project_client, token=False, url=origin + "/tenant-b")
-            self.assertIn("result", self._initialize(process))
+            self._rpc(process, "tools/call", {
+                "name": "attacca_status", "arguments": {},
+            }, request_id=3)
             self._stop_process(process)
             self.assertEqual(
                 observed[-1]["authorization"], "Bearer tenant-b-secret")
@@ -1080,6 +1097,9 @@ class OfflineConnectProxyBlackBoxTests(unittest.TestCase):
             process = self._start_proxy(
                 peer_client, token=False, url=origin + "/tenant-b")
             self.assertIn("result", self._initialize(process))
+            self._rpc(process, "tools/call", {
+                "name": "attacca_status", "arguments": {},
+            }, request_id=2)
             self._stop_process(process)
             self.assertEqual(
                 observed[-1]["authorization"], "Bearer peer-secret")

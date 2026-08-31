@@ -78,6 +78,8 @@ class _HealthHandler(BaseHTTPRequestHandler):
 class _JsonResponse:
     def __init__(self, value):
         self.data = json.dumps(value).encode()
+        self.status = 200
+        self.headers = {}
 
     def __enter__(self):
         return self
@@ -410,9 +412,14 @@ class MachineServerSwitchTests(unittest.TestCase):
             captured.append(request.full_url)
             return _JsonResponse({"jsonrpc": "2.0", "id": 1, "result": {}})
 
-        initialize = io.StringIO(
+        request_stream = "\n".join([
             json.dumps({"jsonrpc": "2.0", "id": 1,
-                        "method": "initialize", "params": {}}) + "\n")
+                        "method": "initialize", "params": {}}),
+            json.dumps({"jsonrpc": "2.0", "id": 2,
+                        "method": "tools/call", "params": {
+                            "name": "attacca_status", "arguments": {}}}),
+        ]) + "\n"
+        initialize = io.StringIO(request_stream)
         with mock.patch.dict(os.environ, {
                 "HOME": str(self.home), "ATTACCA_URL": self.old_url,
                 "ATTACCA_AUTOSTART": "0"}, clear=False), \
@@ -421,7 +428,7 @@ class MachineServerSwitchTests(unittest.TestCase):
         self.assertEqual(captured[-1], self.new_url + "/mcp")
 
         captured.clear()
-        initialize.seek(0)
+        initialize = io.StringIO(request_stream)
         explicit = "http://explicit.test:4173"
         with mock.patch.dict(os.environ, {
                 "HOME": str(self.home), "ATTACCA_URL": self.old_url,
@@ -444,6 +451,78 @@ class MachineServerSwitchTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"HOME": str(self.home)}, clear=True), \
                 mock.patch.object(c, "_packaged_server_url", return_value=None):
             self.assertEqual(c.configured_server_url(), c.DEFAULT_URL)
+
+    def test_loaded_connect_process_hot_switches_machine_url(self):
+        config = c.machine_config_path(self.home)
+        self.write_json(config, {"version": 1, "server_url": self.old_url})
+        captured = []
+
+        def fake_open(request, timeout=None):
+            captured.append(request.full_url)
+            message = json.loads(request.data)
+            if message.get("method") == "initialize":
+                result = {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "switch-test", "version": "1"},
+                }
+            else:
+                result = {"content": [{"type": "text", "text": "{}"}],
+                          "isError": False}
+            return _JsonResponse({"jsonrpc": "2.0",
+                                  "id": message.get("id"),
+                                  "result": result})
+
+        lines = [
+            json.dumps({"jsonrpc": "2.0", "id": 1,
+                        "method": "initialize", "params": {}}) + "\n",
+            json.dumps({"jsonrpc": "2.0", "id": 2,
+                        "method": "tools/call", "params": {
+                            "name": "attacca_status", "arguments": {}}}) + "\n",
+            json.dumps({"jsonrpc": "2.0", "id": 3,
+                        "method": "tools/call", "params": {
+                            "name": "attacca_status", "arguments": {}}}) + "\n",
+        ]
+        outer = self
+
+        class SwitchingInput:
+            index = 0
+
+            def readline(self):
+                if self.index == 2:
+                    outer.write_json(
+                        config, {"version": 1,
+                                 "server_url": outer.new_url})
+                if self.index >= len(lines):
+                    return ""
+                value = lines[self.index]
+                self.index += 1
+                return value
+
+        credentials = self.home / ".attacca" / "credentials.json"
+        self.write_json(credentials, {"version": 1, "servers": {}})
+        credentials.chmod(0o600)
+        environment = {
+            "HOME": str(self.home),
+            "ATTACCA_AUTOSTART": "0",
+            "ATTACCA_ACTOR": "codex",
+            "ATTACCA_PROJECT": "alpha",
+            "ATTACCA_DEVICE_ID": "switch-device",
+            "ATTACCA_CLIENT_INSTANCE": "switch-client",
+        }
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, environment, clear=False), \
+                mock.patch.object(c, "CREDENTIALS_FILE", credentials), \
+                mock.patch("urllib.request.urlopen", side_effect=fake_open):
+            c.run_connect_proxy(
+                stdin=SwitchingInput(), stdout=output)
+
+        self.assertEqual(
+            captured[:2], [self.old_url + "/mcp"] * 2,
+            output.getvalue())
+        self.assertEqual(
+            captured[2:], [self.new_url + "/mcp"] * 2,
+            output.getvalue())
 
 
 if __name__ == "__main__":

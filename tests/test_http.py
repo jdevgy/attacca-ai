@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import re
+import select
 import subprocess
 import sys
 import tempfile
@@ -254,6 +255,10 @@ class HttpTestCase(unittest.TestCase):
             landing = resp.read().decode()
         self.assertIn(
             "curl -fsSL %s/install.sh | sh" % self.server.base, landing)
+        self.assertIn("$attacca:setup", landing)
+        self.assertIn("/attacca:setup", landing)
+        self.assertIn("attacca setup --interactive", landing)
+        self.assertIn("no MCP reconnect", landing)
         with rq.urlopen(self.server.base + "/install.sh", timeout=10) as resp:
             script = resp.read().decode()
         syntax = subprocess.run(["sh", "-n"], input=script, text=True,
@@ -1893,10 +1898,22 @@ class ConnectProxyTestCase(unittest.TestCase):
         proc = self._proxy(url="http://127.0.0.1:9")  # nothing listens there
         try:
             resp = self._rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "ping"})
-            self.assertIn("unreachable", resp["error"]["message"])
-            # proxy survives and answers again
-            resp = self._rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "ping"})
-            self.assertEqual(resp["id"], 2)
+            self.assertEqual(resp.get("result"), {})
+            listed = self._rpc(proc, {
+                "jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+            self.assertIn("tools", listed["result"])
+            # Protocol discovery stays alive; authority-bearing calls surface
+            # the hosted outage and the same proxy answers later requests.
+            status = self._rpc(proc, {
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "attacca_status", "arguments": {}}})
+            self.assertTrue(status["result"]["isError"])
+            self.assertRegex(
+                status["result"]["content"][0]["text"].lower(),
+                r"(unreachable|offline mode|offline continuity)")
+            again = self._rpc(proc, {
+                "jsonrpc": "2.0", "id": 4, "method": "ping"})
+            self.assertEqual(again.get("result"), {})
         finally:
             proc.stdin.close()
             self.assertEqual(proc.wait(timeout=10), 0)
@@ -1913,6 +1930,30 @@ class ConnectProxyTestCase(unittest.TestCase):
         finally:
             proc.stdin.close()
             proc.wait(timeout=10)
+            proc.stdout.close()
+            proc.stderr.close()
+
+    def test_proxy_local_notification_batch_has_no_response(self):
+        proc = self._proxy()
+        try:
+            notifications = [
+                {"jsonrpc": "2.0", "method": "initialize", "params": {}},
+                {"jsonrpc": "2.0", "method": "tools/list"},
+                {"jsonrpc": "2.0", "method": "ping"},
+                {"jsonrpc": "2.0",
+                 "method": "notifications/initialized"},
+            ]
+            proc.stdin.write(json.dumps(notifications) + "\n")
+            proc.stdin.flush()
+            readable, _, _ = select.select([proc.stdout], [], [], 0.25)
+            self.assertEqual(readable, [])
+            # The process remains usable after swallowing all notifications.
+            reply = self._rpc(proc, {
+                "jsonrpc": "2.0", "id": 9, "method": "ping"})
+            self.assertEqual(reply.get("result"), {})
+        finally:
+            proc.stdin.close()
+            self.assertEqual(proc.wait(timeout=10), 0)
             proc.stdout.close()
             proc.stderr.close()
 
@@ -2185,10 +2226,11 @@ class OneShotSetupTestCase(unittest.TestCase):
             merged = json.loads((proj / ".mcp.json").read_text())
             self.assertIn("other", merged["mcpServers"])
             entry = merged["mcpServers"]["attacca"]
-            self.assertEqual(entry["type"], "http")
-            self.assertTrue(entry["url"].endswith("/mcp"))
-            self.assertEqual(entry["headers"]["X-Attacca-Project"],
+            self.assertIn("connect", entry["args"])
+            self.assertEqual(entry["env"]["ATTACCA_PROJECT"],
                              info["project_id"])
+            self.assertEqual(entry["env"]["ATTACCA_URL"],
+                             c.DEFAULT_URL)
             link = json.loads((proj / ".attacca" / "project.json").read_text())
             self.assertEqual(link, {"schema_version": 1,
                                     "project_id": info["project_id"]})
@@ -2795,13 +2837,14 @@ class UniversalConnectTestCase(unittest.TestCase):
             (home / ".codeium" / "windsurf").mkdir(parents=True)
             (home / ".gemini").mkdir()
             (root / ".vscode").mkdir()
+            (home / ".config" / "opencode").mkdir(parents=True)
             configured, missing = c.connect_tools(
                 "proj", str(root), db, url="http://127.0.0.1:9999",
                 home=str(home))
             tools = {entry["tool"] for entry in configured}
             self.assertEqual(tools, {"codex", "cline", "cursor", "windsurf",
-                                     "gemini", "vscode"})
-            self.assertIn("opencode", missing)
+                                     "gemini", "vscode", "opencode"})
+            self.assertNotIn("opencode", missing)
             # codex: original content preserved, connect-proxy block appended,
             # backup kept — one GLOBAL config, project auto-detected per cwd
             codex = (home / ".codex" / "config.toml").read_text()
@@ -2832,7 +2875,18 @@ class UniversalConnectTestCase(unittest.TestCase):
             # gemini project settings written
             gemini = json.loads(
                 (root / ".gemini" / "settings.json").read_text())
-            self.assertIn("httpUrl", gemini["mcpServers"]["attacca"])
+            gemini_entry = gemini["mcpServers"]["attacca"]
+            self.assertIn("connect", gemini_entry["args"])
+            self.assertEqual(gemini_entry["env"]["ATTACCA_PROJECT"], "proj")
+            self.assertNotIn("httpUrl", gemini_entry)
+            self.assertEqual(vscode["servers"]["attacca"]["type"], "stdio")
+            self.assertIn("connect", vscode["servers"]["attacca"]["args"])
+            opencode = json.loads((root / "opencode.json").read_text())
+            opencode_entry = opencode["mcp"]["attacca"]
+            self.assertEqual(opencode_entry["type"], "local")
+            self.assertIn("connect", opencode_entry["command"])
+            self.assertEqual(
+                opencode_entry["environment"]["ATTACCA_PROJECT"], "proj")
             # skip filter respected
             configured, _ = c.connect_tools(
                 "proj", str(root), db, home=str(home),
