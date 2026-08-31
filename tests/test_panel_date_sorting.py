@@ -62,21 +62,24 @@ class PanelDateSortingTests(unittest.TestCase):
 
     def test_panel_exposes_persistent_sorting_and_distinct_log_view(self) -> None:
         for view in ("workspaces", "tasks", "decisions", "handoff", "rules",
-                     "agents", "network", "log"):
+                     "agents", "bridges", "log", "search", "clientKeys"):
             self.assertIn(f'sortControl("{view}")', self.source)
         self.assertIn('storageGet("attacca.admin.sorts"', self.source)
         self.assertIn('storageSet("attacca.admin.sorts"', self.source)
         self.assertIn('data-view="log"', self.source)
         self.assertIn("function renderLog()", self.source)
-        self.assertIn('log: pathFor("/log?limit=80")', self.source)
+        self.assertIn(
+            'log: pathFor(`/log${listQuery("log", { q: state.logSearch })}`)',
+            self.source)
         self.assertIn("Activity remains the complete raw event ledger", self.source)
         self.assertIn("Newest first", self.source)
         self.assertIn("Oldest first", self.source)
         self.assertIn('for (const warning of result?.warnings || [])',
                       self.source)
         self.assertIn('toast(warning, "warning")', self.source)
-        self.assertIn("Oldest first” sorts within this loaded window",
-                      self.source)
+        self.assertIn(
+            "Search and date order are applied to the complete authorized "
+            "log before each", self.source)
 
 
 if __name__ == "__main__":

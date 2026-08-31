@@ -121,14 +121,18 @@ class PanelRefreshPaginationTests(unittest.TestCase):
         self.assertIn('kind === "room" ? feed.scrollHeight : 0', self.source)
 
     def test_room_and_activity_have_explicit_pagination_and_larger_windows(self) -> None:
-        self.assertIn("const ROOM_HISTORY_LIMIT = 500", self.source)
-        self.assertIn("const ACTIVITY_HISTORY_LIMIT = 1000", self.source)
-        self.assertIn("const ROOM_PAGE_SIZE = 75", self.source)
-        self.assertIn("const ACTIVITY_PAGE_SIZE = 100", self.source)
+        # T-76 pages both feeds on the server with the product-wide cap.  The
+        # browser no longer downloads a 500/1000-row window and paginates it
+        # locally.
+        self.assertIn("const PANEL_PAGE_SIZE = 60", self.source)
+        self.assertIn("function feedQuery(kind, extra = {})", self.source)
+        self.assertIn('limit: String(PANEL_PAGE_SIZE)', self.source)
+        self.assertIn('offset: String(Math.max(0, feed.offset || 0))',
+                      self.source)
         self.assertIn('data-action="${kind}-older"', self.source)
         self.assertIn('data-action="${kind}-newer"', self.source)
-        self.assertIn("Latest ${allMessages.length} retained room messages loaded", self.source)
-        self.assertIn("Up to ${h(ACTIVITY_HISTORY_LIMIT)} events", self.source)
+        self.assertIn("messages returned by full-history query", self.source)
+        self.assertIn("raw events returned", self.source)
         self.assertRegex(
             self.source,
             r"\.room-feed, \.history-feed \{[^}]*min-height: clamp\(520px, 64vh, 760px\);"
@@ -146,16 +150,23 @@ class PanelRefreshPaginationTests(unittest.TestCase):
         self.assertIn('resetFeed("room")', conversation_handler.group("body"))
         self.assertIn("await loadProjectData({ quiet: true })", conversation_handler.group("body"))
 
-        filter_handler = re.search(
-            r'if \(event\.target\.id === "activity-search"\) \{(?P<body>.*?)\n\s*\}',
-            self.source,
-            flags=re.DOTALL,
-        )
-        self.assertIsNotNone(filter_handler)
-        self.assertIn('resetFeed("activity")', filter_handler.group("body"))
-        self.assertIn('feedTransition: "activity"', filter_handler.group("body"))
-        self.assertIn('const roomScope = `${state.projectId}:${state.roomConversation}`', self.source)
-        self.assertIn('const activityScope = `${state.projectId}:${query}`', self.source)
+        # Search fields share one debounced server-query path. Feed filters
+        # reset offset before requesting the complete authorized result set.
+        self.assertIn(
+            '"activity-search": ["activityFilter", "activity", true]',
+            self.source)
+        self.assertIn(
+            '"room-search": ["roomFilter", "room", true]', self.source)
+        self.assertIn('invalidatePagedView(view, { feed })', self.source)
+        self.assertIn(
+            'refreshPagedView(view, { feedTransition: feed ? view : null })',
+            self.source)
+        self.assertIn(
+            'const roomScope = `${state.projectId}:${requestedConversation}:'
+            '${state.roomFilter}`', self.source)
+        self.assertIn(
+            'const activityScope = `${state.projectId}:${state.activityFilter}`',
+            self.source)
 
     def test_feeds_and_controls_are_keyboard_and_screen_reader_accessible(self) -> None:
         self.assertGreaterEqual(self.source.count('role="log"'), 2)
@@ -163,7 +174,8 @@ class PanelRefreshPaginationTests(unittest.TestCase):
         self.assertIn('role="navigation" aria-label="${h(identityPart(title))} history pages"', self.source)
         self.assertIn('class="button quiet small new-items"', self.source)
         self.assertIn('aria-live="polite"', self.source)
-        self.assertIn('empty("No matching events"', self.source)
+        self.assertIn('state.activityFilter ? "No matching events"',
+                      self.source)
         self.assertIn("state.errors.events ? errorNotice", self.source)
         self.assertIn("conversationDenied ? empty", self.source)
 

@@ -147,24 +147,28 @@ class ConcurrencyTestCase(unittest.TestCase):
         self.assertEqual(task["claimed_by"], "claimant-%d" % wins[0][1])
         conn.close()
 
-    def test_parallel_directors_have_one_optimistic_handoff_winner(self):
+    def test_parallel_identities_have_one_project_context_guard_winner(self):
         conn = c.connect(self.db)
         for actor in ("director-a", "director-b"):
             c.agent_register(conn, "stress", actor, "agent",
                              role="director", runtime="concurrency-test")
         c.set_lead_director(
             conn, "stress", "admin", "human", "director-a")
-        seed_expected = c.get_handoff(conn, "stress")["context_version"]
+        seed_expected = c.get_handoff(
+            conn, "stress", actor_id="director-a",
+            actor_type="agent")["context_version"]
         c.update_handoff(
             conn, "stress", "director-a", "agent",
             {"objective": "shared objective", "notes": "seed is preserved"},
             expected_context_version=seed_expected)
-        expected = c.get_handoff(conn, "stress")["context_version"]
+        expected = c.get_handoff(
+            conn, "stress", actor_id="director-a",
+            actor_type="agent")["context_version"]
         baseline_seq = conn.execute(
             "SELECT COALESCE(MAX(seq), 0) AS seq FROM events "
             "WHERE project_id='stress'").fetchone()["seq"]
         baseline_handoffs = conn.execute(
-            "SELECT COUNT(*) AS n FROM handoffs "
+            "SELECT COUNT(*) AS n FROM identity_handoffs "
             "WHERE project_id='stress'").fetchone()["n"]
         conn.close()
 
@@ -205,22 +209,33 @@ class ConcurrencyTestCase(unittest.TestCase):
         self.assertEqual(winner["context_version"], expected + 1)
 
         conn = c.connect(self.db)
-        final = c.get_handoff(conn, "stress")
+        final = c.get_handoff(
+            conn, "stress", actor_id=winner["actor"],
+            actor_type="agent")
         self.assertEqual(final["context_version"], expected + 1)
+        self.assertEqual(final["handoff_actor"], winner["actor"])
         self.assertEqual(final["handoff_updated_by"], winner["actor"])
         self.assertEqual(final["handoff"]["what_changed"], winner["value"])
-        self.assertEqual(final["handoff"]["objective"], "shared objective")
-        self.assertEqual(final["handoff"]["notes"], "seed is preserved")
+        if winner["actor"] == "director-a":
+            self.assertEqual(final["handoff"]["objective"],
+                             "shared objective")
+            self.assertEqual(final["handoff"]["notes"],
+                             "seed is preserved")
+        else:
+            # Exact identities never inherit or overwrite another actor's
+            # handoff fields merely because they won a project-context race.
+            self.assertIsNone(final["handoff"]["objective"])
+            self.assertIsNone(final["handoff"]["notes"])
         self.assertNotEqual(final["handoff"]["what_changed"],
                             conflicts[0]["value"])
         handoff_count = conn.execute(
-            "SELECT COUNT(*) AS n FROM handoffs "
+            "SELECT COUNT(*) AS n FROM identity_handoffs "
             "WHERE project_id='stress'").fetchone()["n"]
         self.assertEqual(handoff_count, baseline_handoffs + 1)
         events = conn.execute(
             "SELECT actor_id, payload FROM events "
             "WHERE project_id='stress' AND seq>? "
-            "AND event_type='handoff.updated' ORDER BY seq",
+            "AND event_type='identity_handoff.updated' ORDER BY seq",
             (baseline_seq,)).fetchall()
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["actor_id"], winner["actor"])

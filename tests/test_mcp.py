@@ -289,30 +289,50 @@ class McpTestCase(unittest.TestCase):
         _, _, handoff = alice.call_tool("update_handoff", {"what_changed": "solo"})
         self.assertNotIn("stale_context_warning", handoff)
 
-    def test_stale_writer_stays_stale_until_rebrief(self):
+    def test_exact_identity_revision_stays_stale_until_rebrief(self):
         alice = self.client(actor="alice")
         alice.initialize()
         alice.call_tool("get_handoff", {})
         bob = self.client(actor="bob")
         bob.initialize()
-        bob.call_tool("update_handoff", {"objective": "bob's new direction"})
-        # A stale Director must never silently overwrite another handoff.
-        is_err, first, _ = alice.call_tool(
+        is_err, _, bob_write = bob.call_tool(
+            "update_handoff", {"objective": "bob's new direction"})
+        self.assertFalse(is_err)
+
+        # Bob's independent handoff version does not stale Alice's v0.
+        is_err, _, first = alice.call_tool(
             "update_handoff", {"risks": "some risk"})
-        self.assertTrue(is_err)
-        self.assertIn("handoff conflict", first)
-        is_err, second, _ = alice.call_tool(
+        self.assertFalse(is_err)
+        self.assertEqual(first["handoff_version"], 1)
+        self.assertNotEqual(first["handoff_actor"],
+                            bob_write["handoff_actor"])
+
+        # Two processes intentionally selecting Alice's exact actor share its
+        # version. A peer briefed at v1 must conflict after Alice advances v2.
+        alice_peer = self.client(actor="alice")
+        alice_peer.initialize()
+        _, _, peer_brief = alice_peer.call_tool("get_handoff", {})
+        self.assertEqual(peer_brief["handoff_version"], 1)
+        is_err, _, second = alice.call_tool(
             "update_handoff", {"blockers": "none"})
+        self.assertFalse(is_err)
+        self.assertEqual(second["handoff_version"], 2)
+        is_err, stale, _ = alice_peer.call_tool(
+            "update_handoff", {"notes": "stale peer"})
         self.assertTrue(is_err)
-        self.assertIn("handoff conflict", second)
+        self.assertIn("identity handoff conflict", stale)
+        is_err, stale_again, _ = alice_peer.call_tool(
+            "update_handoff", {"notes": "still stale"})
+        self.assertTrue(is_err)
+        self.assertIn("identity handoff conflict", stale_again)
         # Re-briefing supplies the new expected version and permits the write.
-        alice.call_tool("get_handoff", {})
-        is_err, _, third = alice.call_tool(
+        alice_peer.call_tool("get_handoff", {})
+        is_err, _, third = alice_peer.call_tool(
             "update_handoff", {"notes": "ok"})
         self.assertFalse(is_err)
         self.assertEqual(third["updated_fields"], ["notes"])
 
-    def test_governed_handoff_rejects_worker_over_mcp(self):
+    def test_worker_owns_an_exact_handoff_over_mcp(self):
         conn = c.connect(self.db)
         try:
             c.agent_register(conn, "proj", "director", "agent",
@@ -326,12 +346,16 @@ class McpTestCase(unittest.TestCase):
         worker = self.client(actor="worker")
         worker.initialize()
         _, _, brief = worker.call_tool("get_handoff", {})
-        is_err, text, _ = worker.call_tool(
+        is_err, _, written = worker.call_tool(
             "update_handoff",
-            {"notes": "worker should not replace the project brief",
-             "expected_context_version": brief["context_version"]})
-        self.assertTrue(is_err)
-        self.assertIn("director-only", text)
+            {"notes": "worker exact continuity",
+             "expected_handoff_version": brief["handoff_version"]})
+        self.assertFalse(is_err)
+        self.assertEqual(written["handoff_actor"], brief["handoff_actor"])
+        self.assertEqual(written["handoff_version"], 1)
+        _, _, current = worker.call_tool("get_handoff", {})
+        self.assertEqual(current["handoff"]["notes"],
+                         "worker exact continuity")
 
     def test_batch_request_gets_array_response(self):
         client = self.client(actor="batcher")

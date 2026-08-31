@@ -51,12 +51,21 @@ class BridgePanelSourceContractTests(unittest.TestCase):
             "const conversationDenied = Boolean(activeBridge && "
             "activeBridge.can_participate === false);", self.panel)
         self.assertIn("Conversation access denied", self.panel)
-        self.assertIn("Sending is disabled for this identity", self.panel)
+        self.assertIn("Sending is disabled for this conversation", self.panel)
         self.assertIn("The relationship remains connected", self.panel)
 
     def test_project_rules_management_uses_versioned_server_apis(self):
         self.assertIn("Project Rules / Directives", self.panel)
-        self.assertIn("/rules?include_all=1&include_disabled=1", self.panel)
+        # T-76 builds one full-data rule query so search, sort and pagination
+        # are applied by the server alongside management visibility flags.
+        self.assertIn('rules: pathFor(`/rules${listQuery("rules", {',
+                      self.panel)
+        self.assertIn(
+            "include_all: canManageProjectRules() ? 1 : undefined",
+            self.panel)
+        self.assertIn(
+            "include_disabled: canManageProjectRules() ? 1 : undefined",
+            self.panel)
         self.assertIn("These rules are server-side startup law", self.panel)
         self.assertIn("watcher checks for changes every 60 seconds", self.panel)
         self.assertIn("They sit above static managed AGENTS instructions",

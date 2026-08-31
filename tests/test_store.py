@@ -31,6 +31,11 @@ class StoreTestCase(unittest.TestCase):
         self.conn.close()
         self.tmp.cleanup()
 
+    def _register_handoff_actor(self, actor, role="worker", runtime="store"):
+        """Register one exact fixture identity before it owns continuity."""
+        return c.agent_register(
+            self.conn, "p1", actor, "agent", role=role, runtime=runtime)
+
     # -- events / ledger ----------------------------------------------------
 
     def test_event_seq_and_chain(self):
@@ -142,24 +147,42 @@ class StoreTestCase(unittest.TestCase):
     # -- handoff / context version / freshness ------------------------------
 
     def test_handoff_partial_merge_and_versions(self):
-        c.update_handoff(self.conn, "p1", "a", "agent",
-                         {"objective": "obj1", "risks": "r1"})
-        second = c.update_handoff(self.conn, "p1", "b", "agent",
-                                  {"objective": "obj2"})
-        handoff = c.get_handoff(self.conn, "p1")
+        self._register_handoff_actor("a")
+        self._register_handoff_actor("b")
+        c.update_handoff(
+            self.conn, "p1", "a", "agent",
+            {"objective": "obj1", "risks": "r1"}, expected_version=0)
+        second = c.update_handoff(
+            self.conn, "p1", "a", "agent", {"objective": "obj2"},
+            expected_version=1)
+        handoff = c.get_handoff(
+            self.conn, "p1", actor_id="a", actor_type="agent")
         self.assertEqual(handoff["handoff"]["objective"], "obj2")
         self.assertEqual(handoff["handoff"]["risks"], "r1")  # preserved
-        self.assertEqual(handoff["handoff_updated_by"], "b")
+        self.assertEqual(handoff["handoff_updated_by"], "a")
+        self.assertEqual(handoff["handoff_version"], 2)
         self.assertEqual(handoff["context_version"], second["context_version"])
         count = self.conn.execute(
-            "SELECT COUNT(*) AS n FROM handoffs WHERE project_id='p1'").fetchone()["n"]
+            "SELECT COUNT(*) AS n FROM identity_handoffs"
+            " WHERE project_id='p1' AND actor_id='a'").fetchone()["n"]
         self.assertEqual(count, 2)  # history preserved
+
+        c.update_handoff(
+            self.conn, "p1", "b", "agent", {"objective": "b's own"},
+            expected_version=0)
+        other = c.get_handoff(
+            self.conn, "p1", actor_id="b", actor_type="agent")
+        self.assertEqual(other["handoff"]["objective"], "b's own")
+        self.assertIsNone(other["handoff"]["risks"])
+        self.assertEqual(c.get_handoff(
+            self.conn, "p1", actor_id="a", actor_type="agent"
+        )["handoff"]["objective"], "obj2")
 
     def test_handoff_requires_a_field(self):
         with self.assertRaises(c.AttaccaError):
             c.update_handoff(self.conn, "p1", "a", "agent", {})
 
-    def test_governed_handoff_is_director_only_and_version_checked(self):
+    def test_exact_identity_handoffs_are_role_independent_and_version_checked(self):
         for agent_id, role in (("director-a", "director"),
                                ("director-b", "director"),
                                ("advisor", "advisor"),
@@ -168,7 +191,8 @@ class StoreTestCase(unittest.TestCase):
                              role=role, runtime="test")
         c.set_lead_director(
             self.conn, "p1", "admin", "human", "director-a")
-        brief = c.get_handoff(self.conn, "p1")
+        brief = c.get_handoff(
+            self.conn, "p1", actor_id="director-a", actor_type="agent")
         expected = brief["context_version"]
         written = c.update_handoff(
             self.conn, "p1", "director-a", "agent",
@@ -180,20 +204,33 @@ class StoreTestCase(unittest.TestCase):
                 {"what_changed": "stale director B overwrite"},
                 expected_context_version=expected)
         self.assertEqual(
-            c.get_handoff(self.conn, "p1")["handoff"]["what_changed"],
+            c.get_handoff(
+                self.conn, "p1", actor_id="director-a",
+                actor_type="agent")["handoff"]["what_changed"],
             "director A wrote first")
+        current_context = written["context_version"]
         for agent_id in ("advisor", "worker"):
-            with self.assertRaisesRegex(c.AttaccaError, "director-only"):
-                c.update_handoff(
-                    self.conn, "p1", agent_id, "agent",
-                    {"notes": "not allowed"},
-                    expected_context_version=written["context_version"])
-        # Humans retain the explicit prototype override.
+            own = c.update_handoff(
+                self.conn, "p1", agent_id, "agent",
+                {"notes": "%s continuity" % agent_id},
+                expected_context_version=current_context,
+                expected_version=0)
+            current_context = own["context_version"]
+            self.assertEqual(c.get_handoff(
+                self.conn, "p1", actor_id=agent_id,
+                actor_type="agent")["handoff"]["notes"],
+                "%s continuity" % agent_id)
+            self.assertIsNone(c.get_handoff(
+                self.conn, "p1", actor_id=agent_id,
+                actor_type="agent")["handoff"]["what_changed"])
+        # Human identities own an independent exact handoff too.
         human = c.update_handoff(
             self.conn, "p1", "owner", "human", {"notes": "reviewed"},
-            expected_context_version=written["context_version"])
-        self.assertGreater(human["context_version"],
-                           written["context_version"])
+            expected_context_version=current_context, expected_version=0)
+        self.assertGreater(human["context_version"], current_context)
+        self.assertEqual(c.get_handoff(
+            self.conn, "p1", actor_id="owner",
+            actor_type="human")["handoff"]["notes"], "reviewed")
 
     def test_lead_director_cannot_be_registered_as_non_director(self):
         c.agent_register(self.conn, "p1", "worker", "agent",
@@ -212,6 +249,7 @@ class StoreTestCase(unittest.TestCase):
                              role="advisor", runtime="test")
 
     def test_freshness(self):
+        self._register_handoff_actor("a")
         v0 = c.get_project(self.conn, "p1")["context_version"]
         fresh = c.check_freshness(self.conn, "p1", v0)
         self.assertFalse(fresh["stale"])
@@ -365,13 +403,18 @@ class StoreTestCase(unittest.TestCase):
             c.agent_register(self.conn, "p1", "new-codex", "agent",
                              role="boss")
 
-    def test_worker_only_governance_still_blocks_handoff_and_master_orders(self):
+    def test_worker_owns_handoff_but_cannot_issue_master_orders(self):
         subordinate = self._second_project("worker-subordinate")
         c.agent_register(self.conn, "p1", "only-worker", "agent",
                          role="worker", runtime="codex")
-        with self.assertRaisesRegex(c.AttaccaError, "director-only"):
-            c.update_handoff(self.conn, "p1", "only-worker", "agent",
-                             {"what_changed": "must not land"})
+        own = c.update_handoff(
+            self.conn, "p1", "only-worker", "agent",
+            {"what_changed": "worker continuity"}, expected_version=0)
+        self.assertEqual(own["handoff_actor"], "only-worker")
+        self.assertEqual(c.get_handoff(
+            self.conn, "p1", actor_id="only-worker",
+            actor_type="agent")["handoff"]["what_changed"],
+            "worker continuity")
         c.bridge_add(self.conn, "p1", "admin", "human", subordinate,
                      boss="p1")
         with self.assertRaisesRegex(c.AttaccaError, "only a Director"):
@@ -538,7 +581,9 @@ class StoreTestCase(unittest.TestCase):
         self.assertIn("context_version", result)
         self.assertEqual(
             c.get_project(self.conn, "p1")["lead_director"], "claude_director")
-        handoff = c.get_handoff(self.conn, "p1")
+        handoff = c.get_handoff(
+            self.conn, "p1", actor_id="claude_director",
+            actor_type="agent")
         self.assertEqual(handoff["lead_director"], "claude_director")
         with self.assertRaises(c.AttaccaError):  # no-op set rejected
             c.set_lead_director(self.conn, "p1", "boss", "human",
@@ -656,10 +701,12 @@ class StoreTestCase(unittest.TestCase):
         self.assertEqual(master_side[0]["authority"], "master-directive")
         upstream = c.room_read(self.conn, "p1", limit=100)["messages"]
         self.assertEqual(upstream[-1]["authority"], "suggestion")
-        gov = c.get_handoff(self.conn, p2)["governance"]
+        gov = c.get_handoff(
+            self.conn, p2, actor_id="owner", actor_type="human")["governance"]
         self.assertEqual(gov["follows"], ["p1"])
-        self.assertEqual(c.get_handoff(self.conn, "p1")["governance"]["rules_over"],
-                         [p2])
+        self.assertEqual(c.get_handoff(
+            self.conn, "p1", actor_id="owner",
+            actor_type="human")["governance"]["rules_over"], [p2])
         # advisor relation
         p3 = self._second_project("consultants")
         c.bridge_add(self.conn, "p1", "owner", "human", p3, advisor=p3)
@@ -781,7 +828,7 @@ class StoreTestCase(unittest.TestCase):
         finally:
             c.set_current_owner(None)
 
-    def test_director_permission_is_role_based_not_runtime_or_lead_name(self):
+    def test_handoff_ownership_is_exact_while_governance_is_role_based(self):
         claude = "p1.director.claude"
         codex = "p1.director.codex"
         c.agent_register(self.conn, "p1", claude, "agent",
@@ -797,15 +844,32 @@ class StoreTestCase(unittest.TestCase):
             self.conn, "p1", codex, "agent", {"what_changed": "from Codex"},
             expected_context_version=first["context_version"])
         self.assertGreater(second["context_version"], first["context_version"])
-        # Lead status alone is not authority if its registry role is corrupt or
-        # stale; only the current workspace role grants the write.
+        self.assertEqual(c.get_handoff(
+            self.conn, "p1", actor_id=claude,
+            actor_type="agent")["handoff"]["objective"], "from Claude")
+        self.assertIsNone(c.get_handoff(
+            self.conn, "p1", actor_id=claude,
+            actor_type="agent")["handoff"]["what_changed"])
+        self.assertEqual(c.get_handoff(
+            self.conn, "p1", actor_id=codex,
+            actor_type="agent")["handoff"]["what_changed"], "from Codex")
+
+        # Every registered role still owns its handoff. Lead status does not
+        # preserve Director governance authority after the registry role is
+        # changed or corrupted.
         self.conn.execute(
             "UPDATE agents SET role='worker' WHERE project_id='p1'"
             " AND agent_id=?", (claude,))
-        with self.assertRaisesRegex(c.AttaccaError, "director-only"):
-            c.update_handoff(
-                self.conn, "p1", claude, "agent", {"risks": "must fail"},
-                expected_context_version=second["context_version"])
+        third = c.update_handoff(
+            self.conn, "p1", claude, "agent", {"risks": "worker-owned"},
+            expected_context_version=second["context_version"],
+            expected_version=1)
+        self.assertEqual(third["handoff_actor"], claude)
+        with self.assertRaisesRegex(
+                c.AttaccaError, "human or registered Director"):
+            c.role_scope_set(
+                self.conn, "p1", claude, "agent", "worker",
+                "must not govern shared role context", expected_version=0)
 
     def test_canonical_identity_conflicting_roles_require_explicit_choice(self):
         director = "jack.codex_director"
@@ -840,6 +904,7 @@ class StoreTestCase(unittest.TestCase):
             {(director, "director"), ("p1.worker.codex", "worker")})
 
     def test_search_everything(self):
+        self._register_handoff_actor("a")
         c.room_send(self.conn, "p1", "a", "agent", "the flux capacitor broke",
                     msg_type="challenge")
         c.task_create(self.conn, "p1", "a", "agent", "Repair flux capacitor")
@@ -890,11 +955,27 @@ class StoreTestCase(unittest.TestCase):
                             for event in messages))
 
     def test_handoff_history_and_event_show(self):
-        c.update_handoff(self.conn, "p1", "a", "agent", {"objective": "one"})
-        c.update_handoff(self.conn, "p1", "b", "agent", {"objective": "two"})
-        history = c.handoff_history(self.conn, "p1")
-        self.assertEqual([v["content"]["objective"] for v in history["versions"]],
-                         ["two", "one"])
+        self._register_handoff_actor("a")
+        self._register_handoff_actor("b")
+        c.update_handoff(
+            self.conn, "p1", "a", "agent", {"objective": "one"},
+            expected_version=0)
+        c.update_handoff(
+            self.conn, "p1", "a", "agent", {"objective": "a two"},
+            expected_version=1)
+        c.update_handoff(
+            self.conn, "p1", "b", "agent", {"objective": "b one"},
+            expected_version=0)
+        history_a = c.handoff_history(
+            self.conn, "p1", actor_id="a", actor_type="agent")
+        history_b = c.handoff_history(
+            self.conn, "p1", actor_id="b", actor_type="agent")
+        self.assertEqual(
+            [v["content"]["objective"] for v in history_a["versions"]],
+            ["a two", "one"])
+        self.assertEqual(
+            [v["content"]["objective"] for v in history_b["versions"]],
+            ["b one"])
         event = c.event_show(self.conn, "p1", 1)
         self.assertEqual(event["event_type"], "project.created")
         self.assertIsInstance(event["payload"], dict)
@@ -943,8 +1024,10 @@ class StoreTestCase(unittest.TestCase):
         self.assertIn("Git branch and revision", text1)
         self.assertIn("Tasks — owned, trackable work", text1)
         self.assertIn("Decisions — durable choices", text1)
-        self.assertIn("Director-only", text1)
-        self.assertIn("workspace.role.runtime", text1)
+        self.assertIn("Identity handoff and Role Scope", text1)
+        self.assertIn("every exact registered identity", text1)
+        self.assertIn("workspace.role.runtime.persona", text1)
+        self.assertIn("legacy three-part", text1)
         self.assertIn("human and AI identities", text1)
         self.assertIn("identical permissions", text1)
         self.assertIn("another Attacca database/store", text1)

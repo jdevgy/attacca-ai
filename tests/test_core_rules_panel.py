@@ -43,8 +43,14 @@ class CoreRulesPanelTests(unittest.TestCase):
         )
         self.assertIn('rules: renderRules', self.panel)
         self.assertIn('location.hash.slice(1)', self.panel)
-        self.assertIn('ruleBadge.textContent = String(rules.length)', self.panel)
-        self.assertIn('`${enabledRules} enabled of ${rules.length} loaded rules`', self.panel)
+        # The badge is exact even when the current rule page contains only 60
+        # rows: totals come from the server response, never rules.length.
+        self.assertIn(
+            'ruleBadge.textContent = Number(ruleTotal).toLocaleString()',
+            self.panel)
+        self.assertIn(
+            '`${enabledTotal} enabled of ${ruleTotal} workspace rules`',
+            self.panel)
 
     def test_single_rules_manager_is_not_duplicated_in_ai_network(self) -> None:
         self.assertEqual(self.panel.count("function renderRules()"), 1)
@@ -79,7 +85,14 @@ class CoreRulesPanelTests(unittest.TestCase):
             self.assertIn(text, rules)
         self.assertIn('data-action="toggle-rule"', rules)
         self.assertIn('data-version="${h(rule.version)}"', rules)
-        self.assertIn('/rules?include_all=1&include_disabled=1', self.panel)
+        self.assertIn('rules: pathFor(`/rules${listQuery("rules", {',
+                      self.panel)
+        self.assertIn(
+            "include_all: canManageProjectRules() ? 1 : undefined",
+            self.panel)
+        self.assertIn(
+            "include_disabled: canManageProjectRules() ? 1 : undefined",
+            self.panel)
         self.assertIn('pathFor("/rules")', self.panel)
         self.assertIn('expected_version: Number(button.dataset.version)', self.panel)
 
@@ -108,7 +121,11 @@ class CoreRulesPanelTests(unittest.TestCase):
     def test_filter_and_selected_project_survive_refreshes(self) -> None:
         self.assertIn('ruleFilter: ""', self.panel)
         self.assertIn('id="rule-search"', self.panel)
-        self.assertIn('state.ruleFilter = event.target.value', self.panel)
+        self.assertIn(
+            '"rule-search": ["ruleFilter", "rules", false]', self.panel)
+        self.assertIn('state[stateKey] = event.target.value', self.panel)
+        self.assertIn(
+            'queueFilterRefresh(event.target, view, { feed })', self.panel)
         self.assertIn('value="${h(state.ruleFilter)}"', self.panel)
         select_start = self.panel.index("async function selectProject")
         select_end = self.panel.index('document.addEventListener("click"', select_start)

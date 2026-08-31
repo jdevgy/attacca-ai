@@ -16,18 +16,25 @@ class HandoffHistoryTestCase(unittest.TestCase):
                        project_id="p1", name="P1")
         c.agent_register(self.conn, "p1", "p1.director.claude", "agent",
                          role="director", runtime="claude")
+        self.actor = "p1.director.claude"
 
     def tearDown(self):
         self.conn.close(); self.tmp.cleanup()
 
     def _update(self, obj):
-        c.update_handoff(self.conn, "p1", "p1.director.claude", "agent", obj)
+        c.update_handoff(self.conn, "p1", self.actor, "agent", obj)
+
+    def _history(self, limit):
+        return c.handoff_history(
+            self.conn, "p1", limit=limit, actor_id=self.actor,
+            actor_type="agent")
 
     def test_history_returns_all_versions_newest_first(self):
         self._update({"objective": "v1 goal"})
         self._update({"objective": "v2 goal"})
         self._update({"what_changed": "did stuff"})
-        h = c.handoff_history(self.conn, "p1", limit=10)
+        h = self._history(10)
+        self.assertEqual(h["handoff_actor"], self.actor)
         self.assertGreaterEqual(len(h["versions"]), 3)
         self.assertGreater(h["versions"][0]["version"],
                            h["versions"][-1]["version"])
@@ -37,7 +44,7 @@ class HandoffHistoryTestCase(unittest.TestCase):
     def test_limit_respected(self):
         for i in range(5):
             self._update({"objective": "goal %d" % i})
-        self.assertLessEqual(len(c.handoff_history(self.conn, "p1", limit=2)["versions"]), 2)
+        self.assertLessEqual(len(self._history(2)["versions"]), 2)
 
 
 if __name__ == "__main__":

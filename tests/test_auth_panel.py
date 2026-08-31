@@ -43,7 +43,10 @@ class AuthPanelTestCase(unittest.TestCase):
         end = self.script.index("async function loadProjects()", start)
         bootstrap = self.script[start:end]
         auth = bootstrap.index('api("/v1/auth/status")')
-        projects = bootstrap.index('api("/v1/projects")')
+        # T-76 uses the complete, authorization-filtered options directory
+        # for the workspace switcher.  It is still fetched only after the
+        # public authentication status has admitted the session.
+        projects = bootstrap.index('api("/v1/projects?options=1")')
         settings = bootstrap.index('api("/v1/settings")')
         self.assertLess(auth, projects)
         self.assertLess(auth, settings)
