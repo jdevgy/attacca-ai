@@ -4,6 +4,7 @@ import contextlib
 import json
 import os
 import stat
+import sys
 import tempfile
 import threading
 import unittest
@@ -11,7 +12,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from attacca import terminal_flow as flow
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import terminal_flow as flow  # noqa: E402
 
 
 class FakeTransport:

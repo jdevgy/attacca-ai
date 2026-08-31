@@ -2,17 +2,22 @@
 
 import json
 import sqlite3
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from attacca import offline_sync as offline
-from attacca import sync_client as client_module
-from attacca import sync_protocol as protocol
-from attacca import sync_server as server_module
-from attacca.tests.test_offline_sync import FakeRemote, identity
-from attacca.tests.test_sync_server import Harness
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import offline_sync as offline  # noqa: E402
+import sync_client as client_module  # noqa: E402
+import sync_protocol as protocol  # noqa: E402
+import sync_server as server_module  # noqa: E402
+from tests.test_offline_sync import FakeRemote, identity
+from tests.test_sync_server import Harness
 
 
 def projection(scope, *, cloud=False, dispositions=False):

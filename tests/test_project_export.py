@@ -57,7 +57,7 @@ class ProjectExportTestCase(unittest.TestCase):
         task = c.task_create(
             self.conn, "p1", "director", "agent", "Portable export",
             description="Keep every durable project record",
-            expected_scope=["attacca/**"], dependencies=[],
+            expected_scope=["**"], dependencies=[],
             risk_level="medium", plan_required=True)
         self.task_id = task["task_id"]
         c.task_plan_set(
@@ -77,7 +77,7 @@ class ProjectExportTestCase(unittest.TestCase):
             note="Export fixture plan approved.")
         c.task_claim(
             self.conn, "p1", "director", "agent", self.task_id,
-            expected_scope=["attacca/project_export.py"])
+            expected_scope=["project_export.py"])
         c.task_report(
             self.conn, "p1", "director", "agent", self.task_id,
             "Implementation ready", evidence=[

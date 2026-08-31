@@ -16,8 +16,8 @@ import offline_sync as offline  # noqa: E402
 import sync_client as client_module  # noqa: E402
 import sync_protocol as protocol  # noqa: E402
 try:  # Package-qualified run.
-    from attacca.tests.test_offline_sync import FakeRemote, identity  # noqa: E402
-except ModuleNotFoundError:  # ``unittest discover -s attacca/tests``.
+    from tests.test_offline_sync import FakeRemote, identity  # noqa: E402
+except ModuleNotFoundError:  # ``unittest discover -s tests``.
     from test_offline_sync import FakeRemote, identity  # noqa: E402
 
 

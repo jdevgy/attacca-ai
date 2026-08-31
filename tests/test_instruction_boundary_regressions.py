@@ -14,7 +14,7 @@ from pathlib import Path
 os.environ["ATTACCA_OWNER"] = ""
 
 ROOT = Path(__file__).resolve().parent.parent
-WORKSPACE = ROOT.parent
+WORKSPACE = ROOT
 HOOK = ROOT / "hooks" / "session_start.py"
 spec = importlib.util.spec_from_file_location(
     "attacca_instruction_boundary_under_test", ROOT / "attacca.py")

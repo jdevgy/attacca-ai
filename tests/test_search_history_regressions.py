@@ -6,8 +6,8 @@ import unittest
 import urllib.parse
 from pathlib import Path
 
-from attacca.tests.test_http import ServerFixture
-from attacca.tests.test_mcp import McpClient
+from tests.test_http import ServerFixture
+from tests.test_mcp import McpClient
 
 
 # Keep event attribution independent from the developer machine running tests.

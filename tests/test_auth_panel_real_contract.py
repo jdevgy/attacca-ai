@@ -9,17 +9,21 @@ import http.client
 import http.cookies
 import importlib.util
 import json
+import sys
 import tempfile
 import threading
 import unittest
 import urllib.parse
 from pathlib import Path
 
-from attacca import offline_sync
-from attacca import terminal_flow
-
-
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import offline_sync  # noqa: E402
+import terminal_flow  # noqa: E402
+
+
 SPEC = importlib.util.spec_from_file_location(
     "attacca_client_auth_e2e_core", ROOT / "attacca.py")
 core = importlib.util.module_from_spec(SPEC)

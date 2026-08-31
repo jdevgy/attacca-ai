@@ -7,16 +7,20 @@ import importlib.util
 import json
 import sqlite3
 import stat
+import sys
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from attacca import terminal_flow as flow
-
-
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import terminal_flow as flow  # noqa: E402
+
+
 SPEC = importlib.util.spec_from_file_location(
     "attacca_d17_security_core", ROOT / "attacca.py")
 c = importlib.util.module_from_spec(SPEC)

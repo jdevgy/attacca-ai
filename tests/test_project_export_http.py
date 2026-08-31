@@ -112,7 +112,7 @@ class ProjectExportHttpTestCase(unittest.TestCase):
             task = c.task_create(
                 conn, "backup", "backup.director.codex", "agent",
                 "Ship full backup", description="Exercise export contents",
-                expected_scope=["attacca/project_export.py"],
+                expected_scope=["project_export.py"],
                 plan_required=True)
             c.task_plan_set(
                 conn, "backup", task["task_id"], "web.owner", "human",

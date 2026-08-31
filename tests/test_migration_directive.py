@@ -58,7 +58,7 @@ class MigrationDirectiveHttpTestCase(unittest.TestCase):
     """Served token-free over REST for setup clients."""
 
     def setUp(self):
-        from attacca.tests.test_http import ServerFixture
+        from tests.test_http import ServerFixture
         self.tmp = tempfile.TemporaryDirectory()
         self.db = Path(self.tmp.name) / "test.db"
         c.connect(self.db).close()

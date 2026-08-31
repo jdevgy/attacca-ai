@@ -14,7 +14,7 @@ from pathlib import Path
 # Keep ledger attribution independent from the machine running the suite.
 os.environ["ATTACCA_OWNER"] = ""
 
-from attacca.tests.test_http import ServerFixture  # noqa: E402
+from tests.test_http import ServerFixture  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parent.parent

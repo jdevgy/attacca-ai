@@ -15,7 +15,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# ``unittest discover -s attacca/tests`` places ``attacca/`` on sys.path, so
+# ``unittest discover -s tests`` places the repository root on sys.path, so
 # the application file ``attacca.py`` shadows the namespace package.  Load the
 # two pure modules by path just as the protocol suite does; registering them is
 # also required by dataclasses and the server's direct-module fallback import.
