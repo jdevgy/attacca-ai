@@ -5252,6 +5252,32 @@ def _mcp_snapshot(status, plugin_root, config, mark_inbox_read=True):
         if not isinstance(first_page, dict):
             raise RuntimeError("rule_list returned an invalid first page")
         rows = first_page.get("rules")
+        pagination_keys = ("total", "limit", "offset", "has_more")
+        metadata_present = [key in first_page for key in pagination_keys]
+        if not any(metadata_present):
+            # Pre-pagination servers returned the complete applicable rule
+            # directory in one response and did not expose page metadata.
+            # Accept that all-or-none legacy shape so client and server do
+            # not have to upgrade in lockstep. A partially populated shape is
+            # never legacy and remains a fail-closed protocol error below.
+            if not isinstance(rows, list):
+                raise RuntimeError("rule_list returned an invalid legacy page")
+            legacy = dict(first_page)
+            legacy.update({
+                "total": len(rows),
+                "unfiltered_total": first_page.get(
+                    "unfiltered_total", len(rows)),
+                "enabled_total": first_page.get(
+                    "enabled_total", sum(
+                        bool(row.get("enabled", True))
+                        for row in rows if isinstance(row, dict))),
+                "limit": max(1, len(rows)), "offset": 0,
+                "has_more": False, "legacy_unpaged": True,
+            })
+            return legacy
+        if not all(metadata_present):
+            raise RuntimeError(
+                "rule_list pagination metadata is missing or invalid")
         try:
             total = int(first_page["total"])
             limit = int(first_page["limit"])

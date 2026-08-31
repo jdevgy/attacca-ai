@@ -135,6 +135,22 @@ class HookRulePaginationTests(unittest.TestCase):
                     self.status, ROOT, self.config, mark_inbox_read=False)
         self.assertEqual(run.call_count, 1)
 
+    def test_startup_accepts_complete_legacy_unpaged_rule_directory(self):
+        responses = self.initial_responses()
+        responses = [
+            success(4, {"rules": self.rules}) if item.get("id") == 4
+            else item for item in responses]
+        with mock.patch.object(
+                hook.subprocess, "run",
+                return_value=self.completed(responses)) as run:
+            snapshot = hook._mcp_snapshot(
+                self.status, ROOT, self.config, mark_inbox_read=False)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(len(snapshot["rules"]["rules"]), len(self.rules))
+        self.assertEqual(snapshot["rules"]["total"], len(self.rules))
+        self.assertFalse(snapshot["rules"]["has_more"])
+        self.assertTrue(snapshot["rules"]["legacy_unpaged"])
+
 
 if __name__ == "__main__":
     unittest.main()

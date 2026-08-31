@@ -548,6 +548,9 @@ class StoreTestCase(unittest.TestCase):
     # -- inbox / lead / bridges / identity / search --------------------------
 
     def test_inbox_mentions_replies_and_cursor(self):
+        c.agent_register(
+            self.conn, "p1", "admin", "human", agent_id="bob",
+            display_name="Bob", role="worker", runtime="bob")
         c.room_send(self.conn, "p1", "alice", "agent", "hey bob",
                     mentions=["bob"])
         sent = c.room_send(self.conn, "p1", "bob", "agent", "what's up?")
@@ -610,6 +613,9 @@ class StoreTestCase(unittest.TestCase):
         self.assertEqual(len(p2_msgs), 1)
         self.assertEqual(p2_msgs[0]["origin_project"], "p1")
         # mentions land in the bridged inbox
+        c.agent_register(
+            self.conn, p2, "admin", "human", agent_id="adm",
+            display_name="Admin worker", role="worker", runtime="adm")
         c.room_send(self.conn, "p1", "eng_director", "agent",
                     "adm, please review", mentions=["adm"],
                     target_project=p2)
@@ -676,6 +682,9 @@ class StoreTestCase(unittest.TestCase):
         p3 = self._second_project("local-only-master")
         c.bridge_add(self.conn, "p1", "owner", "human", p2)
         c.bridge_add(self.conn, "p1", "owner", "human", p3, boss="p1")
+        c.agent_register(
+            self.conn, "p1", "owner", "human", agent_id="local-worker",
+            display_name="Local worker", role="worker", runtime="local")
         sent = c.room_send(
             self.conn, "p1", "director", "agent", "stay here",
             msg_type="directive", mentions=["local-worker"],
