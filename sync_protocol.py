@@ -82,9 +82,17 @@ _IDENTITY_PROJECTION_REQUIRED = {
 }
 _IDENTITY_PROJECTION_OPTIONAL = {
     "task_plans", "full_log", "actor_aliases", "cloud_context",
-    "message_dispositions",
+    "message_dispositions", "identity_handoffs", "role_scopes",
 }
-_PROJECTION_V2_RESOURCES = {"cloud_context", "message_dispositions"}
+# Projection schema v2 is explicitly resource-negotiated.  Adding these two
+# resources does not relabel an already verified v2 mirror: the negotiated
+# resource list is part of both its visibility fingerprint and storage key.
+# An older v2 client continues to offer its smaller list and never receives
+# fields it does not understand.
+_PROJECTION_V2_RESOURCES = {
+    "cloud_context", "message_dispositions", "identity_handoffs",
+    "role_scopes",
+}
 _PROJECTION_RESOURCE_INTRODUCED = {
     key: LEGACY_PROJECTION_SCHEMA_VERSION
     for key in (_IDENTITY_PROJECTION_REQUIRED |
@@ -448,12 +456,15 @@ def validate_scope(scope, expected_scope=None):
     if not isinstance(value["role"], str) or value["role"] not in _ROLES:
         _error("invalid_role", "scope.role is invalid")
     if value["actor_type"] == "agent":
-        prefix = "%s.%s." % (value["project_id"], value["role"])
-        if not value["actor_id"].startswith(prefix) \
-                or not value["actor_id"][len(prefix):]:
+        parts = value["actor_id"].split(".")
+        if len(parts) not in (3, 4) \
+                or parts[0] != value["project_id"] \
+                or parts[1] != value["role"] \
+                or any(not part for part in parts):
             _error(
                 "noncanonical_actor",
-                "agent actor_id must be <project>.<role>.<runtime>",
+                "agent actor_id must be "
+                "<project>.<role>.<runtime>[.<persona>]",
             )
     if expected_scope is not None:
         expected = validate_scope(expected_scope)
@@ -674,9 +685,10 @@ def validate_identity_projection(projection, scope, partial=False):
         if not isinstance(project, dict) \
                 or project.get("project_id") != scope["project_id"]:
             _error("cross_project_projection", "projection project does not match scope")
-    for key in ("handoffs", "rules", "tasks", "decisions", "room_messages",
-                "agents", "bridges", "task_plans", "full_log",
-                "actor_aliases", "message_dispositions"):
+    for key in ("handoffs", "identity_handoffs", "role_scopes", "rules",
+                "tasks", "decisions", "room_messages", "agents",
+                "bridges", "task_plans", "full_log", "actor_aliases",
+                "message_dispositions"):
         if key in value and not isinstance(value[key], list):
             _error("invalid_projection", "projection.%s must be an array" % key)
         if key in value and key != "full_log":
@@ -707,6 +719,185 @@ def validate_identity_projection(projection, scope, partial=False):
     return value
 
 
+def _validate_identity_handoff_rows(rows, scope, label):
+    """Validate an exact-actor handoff history, including attribution.
+
+    Project-global handoff rows intentionally do not pass this contract.  A
+    negotiated identity mirror may cache only the authenticated actor's own
+    history; another actor's handoff remains a hosted coordination read.
+    """
+    previous_version = None
+    for index, row in enumerate(rows):
+        path = "projection.%s[%d]" % (label, index)
+        required = {
+            "project_id", "actor_id", "version", "content", "updated_by",
+            "updated_owner", "updated_at", "event_id",
+        }
+        if not isinstance(row, dict) or not required <= set(row):
+            _error(
+                "invalid_identity_handoff",
+                "%s must contain exact identity, version, content, and "
+                "attribution" % path)
+        if row.get("project_id") != scope["project_id"]:
+            _error(
+                "cross_project_projection",
+                "%s belongs to another project" % path)
+        if row.get("actor_id") != scope["actor_id"]:
+            _error(
+                "cross_actor_handoff",
+                "%s belongs to another actor" % path)
+        version = row.get("version")
+        if not _is_int(version) or version <= 0:
+            _error(
+                "invalid_identity_handoff",
+                "%s.version must be a positive integer" % path)
+        if previous_version is not None and version <= previous_version:
+            _error(
+                "invalid_identity_handoff",
+                "projection.%s must be ordered by increasing unique version"
+                % label)
+        previous_version = version
+        if not isinstance(row.get("content"), dict):
+            _error(
+                "invalid_identity_handoff",
+                "%s.content must be an object" % path)
+        if row.get("updated_by") != scope["actor_id"]:
+            _error(
+                "cross_actor_handoff",
+                "%s attribution does not match its identity" % path)
+        owner = row.get("updated_owner")
+        if owner is not None and not isinstance(owner, str):
+            _error(
+                "invalid_identity_handoff",
+                "%s.updated_owner must be a string or null" % path)
+        if not isinstance(row.get("updated_at"), str) \
+                or not row["updated_at"].strip():
+            _error(
+                "invalid_identity_handoff",
+                "%s.updated_at must be a non-empty string" % path)
+        event_id = row.get("event_id")
+        if event_id is not None and not isinstance(event_id, str):
+            _error(
+                "invalid_identity_handoff",
+                "%s.event_id must be a string or null" % path)
+        legacy_version = row.get("legacy_source_version")
+        if legacy_version is not None \
+                and (not _is_int(legacy_version) or legacy_version <= 0):
+            _error(
+                "invalid_identity_handoff",
+                "%s.legacy_source_version must be positive or null" % path)
+
+
+def _applicable_role_scope_names(scope, project):
+    if scope["actor_type"] == "human":
+        return {"director", "advisor", "worker", "lead_director"}
+    allowed = set()
+    if scope["role"] in {"director", "advisor", "worker"}:
+        allowed.add(scope["role"])
+    if scope["role"] == "director" \
+            and isinstance(project, dict) \
+            and project.get("lead_director") == scope["actor_id"]:
+        allowed.add("lead_director")
+    return allowed
+
+
+def _validate_role_scope_rows(rows, scope, project):
+    allowed = _applicable_role_scope_names(scope, project)
+    seen = set()
+    for index, row in enumerate(rows):
+        path = "projection.role_scopes[%d]" % index
+        required = {
+            "project_id", "role", "version", "content", "updated_by",
+            "updated_owner", "updated_at", "event_id",
+        }
+        if not isinstance(row, dict) or not required <= set(row):
+            _error(
+                "invalid_role_scope",
+                "%s must contain role, version, content, and attribution" %
+                path)
+        if row.get("project_id") != scope["project_id"]:
+            _error(
+                "cross_project_projection",
+                "%s belongs to another project" % path)
+        role = row.get("role")
+        if role not in allowed:
+            _error(
+                "cross_role_scope",
+                "%s is not applicable to this identity" % path)
+        if role in seen:
+            _error(
+                "invalid_role_scope",
+                "projection.role_scopes contains duplicate role %s" % role)
+        seen.add(role)
+        version = row.get("version")
+        if not _is_int(version) or version < 0:
+            _error(
+                "invalid_role_scope",
+                "%s.version must be a non-negative integer" % path)
+        if not isinstance(row.get("content"), str):
+            _error(
+                "invalid_role_scope",
+                "%s.content must be a string" % path)
+        # Version zero is a useful explicit empty scope.  It has no writer or
+        # ledger event yet.  Every durable revision retains its author and
+        # separate human operator attribution.
+        if version == 0:
+            if any(row.get(key) is not None for key in (
+                    "updated_by", "updated_owner", "updated_at", "event_id")):
+                _error(
+                    "invalid_role_scope",
+                    "%s version zero must not invent attribution" % path)
+        else:
+            if not isinstance(row.get("updated_by"), str) \
+                    or not row["updated_by"].strip():
+                _error(
+                    "invalid_role_scope",
+                    "%s.updated_by must retain its writer" % path)
+            owner = row.get("updated_owner")
+            if owner is not None and not isinstance(owner, str):
+                _error(
+                    "invalid_role_scope",
+                    "%s.updated_owner must be a string or null" % path)
+            if not isinstance(row.get("updated_at"), str) \
+                    or not row["updated_at"].strip():
+                _error(
+                    "invalid_role_scope",
+                    "%s.updated_at must be a non-empty string" % path)
+            event_id = row.get("event_id")
+            if event_id is not None and not isinstance(event_id, str):
+                _error(
+                    "invalid_role_scope",
+                    "%s.event_id must be a string or null" % path)
+
+
+def _validate_negotiated_identity_resources(value, scope, selected,
+                                              partial=False):
+    resources = set(selected["resources"])
+    if "identity_handoffs" in resources:
+        if "identity_handoffs" in value:
+            _validate_identity_handoff_rows(
+                value["identity_handoffs"], scope, "identity_handoffs")
+        # ``handoffs`` remains a schema-v1 compatibility resource, but on a
+        # current identity mirror it is an exact alias, never the retired
+        # project-global archive.
+        if "handoffs" in value:
+            _validate_identity_handoff_rows(value["handoffs"], scope,
+                                            "handoffs")
+        # The resource stays optional so a newly upgraded client can still
+        # consume an older server's negotiated subset.  When a current server
+        # supplies it, both views must agree exactly.  A retired non-empty
+        # global handoff still fails above because it has no exact actor.
+        if not partial and "identity_handoffs" in value \
+                and value.get("handoffs") != value["identity_handoffs"]:
+            _error(
+                "invalid_projection",
+                "handoffs must alias the exact identity_handoffs history")
+    if "role_scopes" in resources:
+        if "role_scopes" in value:
+            _validate_role_scope_rows(
+                value["role_scopes"], scope, value.get("project"))
+
+
 def validate_projection_for_capabilities(projection, scope, capabilities,
                                          partial=False):
     """Validate both projection content and its negotiated resource shape."""
@@ -718,6 +909,8 @@ def validate_projection_for_capabilities(projection, scope, capabilities,
             "unnegotiated_projection_resource",
             "projection contains unnegotiated resource(s): %s" %
             ", ".join(sorted(unexpected)))
+    _validate_negotiated_identity_resources(
+        value, scope, selected, partial=partial)
     return value
 
 

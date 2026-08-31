@@ -20,7 +20,8 @@ from tests.test_offline_sync import FakeRemote, identity
 from tests.test_sync_server import Harness
 
 
-def projection(scope, *, cloud=False, dispositions=False):
+def projection(scope, *, cloud=False, dispositions=False,
+               identity_resources=False):
     value = {
         "project": {
             "project_id": scope["project_id"], "name": "Agentg",
@@ -43,6 +44,9 @@ def projection(scope, *, cloud=False, dispositions=False):
             "project_id": scope["project_id"],
             "event_id": "evt_0001", "disposition": "acknowledged",
         }]
+    if identity_resources:
+        value["identity_handoffs"] = []
+        value["role_scopes"] = []
     return value
 
 
@@ -53,7 +57,9 @@ def empty_snapshot(scope, capabilities, *, cloud=False, dispositions=False):
         scope, protocol.visibility_fingerprint(scope, policy),
         protocol.make_cursor(0, protocol.GENESIS_HASH, 0),
         projection(
-            scope, cloud=cloud, dispositions=dispositions), [])
+            scope, cloud=cloud, dispositions=dispositions,
+            identity_resources=(
+                "identity_handoffs" in capabilities["resources"])), [])
 
 
 class RecordingTransport:
@@ -125,6 +131,8 @@ class ServerNegotiationTests(unittest.TestCase):
                     "event_id": "evt_0001",
                     "disposition": "acknowledged",
                 }]
+                result["projection"]["identity_handoffs"] = []
+                result["projection"]["role_scopes"] = []
             return result
 
         self.harness.visibility_projector = projector

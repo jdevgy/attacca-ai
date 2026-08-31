@@ -90,6 +90,22 @@ class ProjectExportTestCase(unittest.TestCase):
         c.update_handoff(
             self.conn, "p1", "owner", "human",
             {"what_changed": "Added deterministic ZIP output"})
+        c.update_handoff(
+            self.conn, "p1", "director", "agent",
+            {"objective": "Direct the portable export"})
+        c.update_handoff(
+            self.conn, "p1", "worker", "agent",
+            {"objective": "Verify the portable export"})
+        c.role_scope_set(
+            self.conn, "p1", "owner", "human", "director",
+            "Directors preserve release and governance context.")
+        c.role_scope_set(
+            self.conn, "p1", "owner", "human", "director",
+            "Directors preserve release, governance, and QA context.",
+            expected_version=1)
+        c.role_scope_set(
+            self.conn, "p1", "owner", "human", "worker",
+            "Workers preserve implementation and verification context.")
         decision = c.decision_propose(
             self.conn, "p1", "director", "agent",
             "Keep exact payload JSON", rationale="Preserve ledger hashes")
@@ -189,7 +205,28 @@ class ProjectExportTestCase(unittest.TestCase):
         self.assertEqual(
             [plan["version"] for plan in task["plan_revisions"]], [1, 2])
         self.assertIsInstance(task["plan_revisions"][1]["sections"], list)
-        self.assertEqual(len(first["handoffs"]), 2)
+        self.assertEqual(first["handoffs"], [])
+        self.assertEqual(first["legacy_handoffs"], first["handoffs"])
+        self.assertEqual(
+            first["manifest"]["compatibility"]["handoffs"]["kind"],
+            "retired_project_global_archive")
+        self.assertEqual(len(first["identity_handoffs"]), 4)
+        self.assertEqual(
+            [(row["actor_id"], row["version"])
+             for row in first["identity_handoffs"]],
+            [("director", 1), ("owner", 1), ("owner", 2), ("worker", 1)])
+        self.assertEqual(
+            first["identity_handoffs"][0]["updated_by"], "director")
+        self.assertIsInstance(
+            first["identity_handoffs"][0]["content"], dict)
+        self.assertEqual(
+            [(row["role"], row["version"])
+             for row in first["role_scope_revisions"]],
+            [("director", 1), ("director", 2), ("worker", 1)])
+        self.assertEqual(
+            first["manifest"]["counts"]["identity_handoffs"], 4)
+        self.assertEqual(
+            first["manifest"]["counts"]["role_scope_revisions"], 3)
         self.assertEqual(len(first["decisions"]), 1)
         self.assertEqual(len(first["rules"]), 1)
         self.assertEqual(len(first["agents"]), 2)

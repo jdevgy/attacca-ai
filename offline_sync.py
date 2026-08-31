@@ -83,6 +83,9 @@ _RESERVED_ATTRIBUTION_KEYS = {
 }
 _RESOURCE_ALIASES = {
     "handoffs": "handoffs", "handoff": "handoffs",
+    "identity_handoffs": "identity_handoffs",
+    "identity_handoff": "identity_handoffs",
+    "role_scopes": "role_scopes", "role_scope": "role_scopes",
     "rules": "rules", "rule": "rules",
     "tasks": "tasks", "task": "tasks",
     "decisions": "decisions", "decision": "decisions",
@@ -600,9 +603,6 @@ class OfflineProjectSync:
                 snapshot = protocol.validate_snapshot(
                     wrapper["snapshot"], expected_scope=scope,
                     expected_visibility=visibility)
-                protocol.validate_projection_for_capabilities(
-                    snapshot["projection"], scope,
-                    self.projection_capabilities)
                 if wrapper["mirror_key"] != legacy_key \
                         or wrapper["scope_fingerprint"] != \
                         protocol.scope_fingerprint(scope) \
@@ -615,6 +615,32 @@ class OfflineProjectSync:
                 if wrapper["reset_reason"] is not None \
                         and not isinstance(wrapper["reset_reason"], str):
                     return False
+
+                # A pre-capability mirror may contain the retired global
+                # ``handoffs`` shape.  Never reinterpret or clone those rows
+                # as this actor's history.  An empty archive is safely
+                # upgradeable; a non-empty history is upgradeable only when
+                # every row already proves the exact actor and current
+                # attribution contract.  Role scopes cannot be inferred and
+                # therefore begin empty until the mandatory hosted refresh.
+                upgraded_projection = _json_copy(snapshot["projection"])
+                legacy_handoffs = upgraded_projection.get("handoffs") or []
+                if not isinstance(legacy_handoffs, list):
+                    return False
+                if any(not isinstance(row, dict)
+                       or row.get("actor_id") != scope["actor_id"]
+                       for row in legacy_handoffs):
+                    return False
+                upgraded_projection["identity_handoffs"] = _json_copy(
+                    legacy_handoffs)
+                upgraded_projection["role_scopes"] = []
+                protocol.validate_projection_for_capabilities(
+                    upgraded_projection, scope,
+                    self.projection_capabilities)
+                snapshot = protocol.make_snapshot(
+                    scope, visibility, snapshot["cursor"],
+                    upgraded_projection, snapshot["records"],
+                    generated_at=snapshot["generated_at"])
             except (OfflineSyncError, protocol.SyncProtocolError):
                 return False
 
@@ -1955,7 +1981,8 @@ class OfflineProjectSync:
                 raise OfflineMirrorError(
                     "unknown identity mirror section %r" % section)
             value = projection.get(resource)
-            if resource == "handoffs" and name == "handoff":
+            if resource in {"handoffs", "identity_handoffs"} \
+                    and name in {"handoff", "identity_handoff"}:
                 value = value[-1] if value else None
         copied = _json_copy(value)
         if not include_pending:

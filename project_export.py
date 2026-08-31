@@ -329,12 +329,29 @@ def build_project_export(conn, project_id, log_renderer=None):
         for task in tasks:
             task["plan_revisions"] = plans_by_task.get(task.get("task_id"), [])
 
+        # ``handoffs`` is the retired project-global archive.  Preserve it
+        # row-for-row for administrative recovery, but never use it as an
+        # identity mirror or clone it into the new per-actor history.
         raw_handoffs = _optional_rows(
             conn, tables, "handoffs",
             "SELECT * FROM handoffs WHERE project_id=? ORDER BY version",
             (project_id,),
         )
-        handoffs = _decode_columns(raw_handoffs, ("content",))
+        legacy_handoffs = _decode_columns(raw_handoffs, ("content",))
+        raw_identity_handoffs = _optional_rows(
+            conn, tables, "identity_handoffs",
+            "SELECT * FROM identity_handoffs WHERE project_id=? "
+            "ORDER BY actor_id, version",
+            (project_id,),
+        )
+        identity_handoffs = _decode_columns(
+            raw_identity_handoffs, ("content",))
+        role_scope_revisions = _optional_rows(
+            conn, tables, "role_scope_revisions",
+            "SELECT * FROM role_scope_revisions WHERE project_id=? "
+            "ORDER BY role, version",
+            (project_id,),
+        )
         decisions = _optional_rows(
             conn, tables, "decisions",
             "SELECT * FROM decisions WHERE project_id=? "
@@ -404,7 +421,13 @@ def build_project_export(conn, project_id, log_renderer=None):
         "room_messages": len(room_messages),
         "tasks": len(tasks),
         "task_plan_revisions": len(plans),
-        "handoffs": len(handoffs),
+        # ``handoffs`` remains the schema-v1 compatibility name for the same
+        # explicitly labelled legacy archive.  It is intentionally not a
+        # count of current identity handoffs.
+        "handoffs": len(legacy_handoffs),
+        "legacy_handoffs": len(legacy_handoffs),
+        "identity_handoffs": len(identity_handoffs),
+        "role_scope_revisions": len(role_scope_revisions),
         "decisions": len(decisions),
         "rules": len(rules),
         "agents": len(agents),
@@ -416,8 +439,9 @@ def build_project_export(conn, project_id, log_renderer=None):
         "cloud_context": 1 if cloud_context is not None else 0,
     }
     snapshot_at = _snapshot_at([
-        [project], raw_events, raw_tasks, raw_plans, raw_handoffs, decisions,
-        rules, agents, aliases, raw_bridges, cursors, clients, dispositions,
+        [project], raw_events, raw_tasks, raw_plans, raw_handoffs,
+        raw_identity_handoffs, role_scope_revisions, decisions, rules,
+        agents, aliases, raw_bridges, cursors, clients, dispositions,
         cloud_context_rows,
     ])
     export_body = {
@@ -426,7 +450,12 @@ def build_project_export(conn, project_id, log_renderer=None):
         "full_log": full_log,
         "room_messages": room_messages,
         "tasks": tasks,
-        "handoffs": handoffs,
+        # Keep the historical key for export-v1 readers while making its
+        # archive status unmistakable to current readers.
+        "handoffs": legacy_handoffs,
+        "legacy_handoffs": legacy_handoffs,
+        "identity_handoffs": identity_handoffs,
+        "role_scope_revisions": role_scope_revisions,
         "decisions": decisions,
         "rules": rules,
         "agents": agents,
@@ -449,6 +478,13 @@ def build_project_export(conn, project_id, log_renderer=None):
         },
         "counts": counts,
         "integrity": {"ledger": verification},
+        "compatibility": {
+            "handoffs": {
+                "canonical_section": "legacy_handoffs",
+                "kind": "retired_project_global_archive",
+                "read_only": True,
+            },
+        },
         "content_sha256": _sha256(_json_bytes(export_body, pretty=False)),
         "artifacts": {
             "ledger.ndjson": {
@@ -509,6 +545,68 @@ def validate_project_export(project_export, require_valid_ledger=True):
         raise ProjectExportError("project export full_log must be an array of strings")
     if len(lines) != len(events):
         raise ProjectExportError("full_log must contain one record per event")
+
+    collection_sections = (
+        "room_messages", "tasks", "handoffs", "legacy_handoffs",
+        "identity_handoffs", "role_scope_revisions", "decisions", "rules",
+        "agents", "actor_aliases", "bridges", "inbox_cursors",
+        "agent_clients", "message_dispositions",
+    )
+    for section in collection_sections:
+        if section in project_export \
+                and not isinstance(project_export.get(section), list):
+            raise ProjectExportError(
+                "project export %s must be an array" % section)
+    if "legacy_handoffs" in project_export:
+        if project_export.get("handoffs") != \
+                project_export.get("legacy_handoffs"):
+            raise ProjectExportError(
+                "handoffs compatibility section must exactly alias the "
+                "legacy_handoffs archive")
+        compatibility = manifest.get("compatibility") or {}
+        marker = compatibility.get("handoffs") \
+            if isinstance(compatibility, dict) else None
+        if not isinstance(marker, dict) \
+                or marker.get("canonical_section") != "legacy_handoffs" \
+                or marker.get("kind") != "retired_project_global_archive" \
+                or marker.get("read_only") is not True:
+            raise ProjectExportError(
+                "legacy handoff archive is missing its compatibility label")
+    for section in ("identity_handoffs", "role_scope_revisions"):
+        for row in project_export.get(section) or []:
+            if not isinstance(row, dict) \
+                    or row.get("project_id") != project_id:
+                raise ProjectExportError(
+                    "%s contains a row outside project %s" %
+                    (section, project_id))
+            if section == "identity_handoffs" \
+                    and (not isinstance(row.get("actor_id"), str)
+                         or not row.get("actor_id")):
+                raise ProjectExportError(
+                    "identity_handoffs row is missing its exact actor")
+            if section == "role_scope_revisions" \
+                    and (not isinstance(row.get("role"), str)
+                         or not row.get("role")):
+                raise ProjectExportError(
+                    "role_scope_revisions row is missing its role")
+            if not isinstance(row.get("version"), int) \
+                    or isinstance(row.get("version"), bool) \
+                    or row.get("version") <= 0:
+                raise ProjectExportError(
+                    "%s row has an invalid version" % section)
+            if not isinstance(row.get("updated_by"), str) \
+                    or not row.get("updated_by"):
+                raise ProjectExportError(
+                    "%s row is missing writer attribution" % section)
+
+    counts = manifest.get("counts") or {}
+    if not isinstance(counts, dict):
+        raise ProjectExportError("manifest counts must be an object")
+    for section in collection_sections:
+        if section in project_export and section in counts \
+                and counts[section] != len(project_export[section]):
+            raise ProjectExportError(
+                "manifest count does not match %s" % section)
 
     verification = verify_exported_ledger(events, project_id=project_id)
     if ledger.get("verification") != verification \

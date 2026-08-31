@@ -115,15 +115,35 @@ class FakeRemote:
 
     def projection(self):
         role = self.scope["role"]
+        identity_handoffs = [{
+            "project_id": "agentg",
+            "actor_id": self.scope["actor_id"],
+            "version": 1,
+            "content": {"objective": "Continue offline safely"},
+            "updated_by": self.scope["actor_id"],
+            "updated_owner": self.scope["principal_id"],
+            "updated_at": "2026-08-24T00:00:00.000Z",
+            "event_id": "ev_handoff_0001",
+            "legacy_source_version": None,
+        }]
+        role_scopes = []
+        if role in {"director", "advisor", "worker"}:
+            role_scopes.append({
+                "project_id": "agentg", "role": role, "version": 1,
+                "content": "%s continuity scope" % role,
+                "updated_by": self.scope["actor_id"],
+                "updated_owner": self.scope["principal_id"],
+                "updated_at": "2026-08-24T00:00:00.000Z",
+                "event_id": "ev_role_scope_0001",
+            })
         return {
             "project": {
                 "project_id": "agentg", "name": "Agentg",
                 "context_version": self.head()["context_version"],
             },
-            "handoffs": [{
-                "project_id": "agentg", "version": 1,
-                "content": {"objective": "Continue offline safely"},
-            }],
+            "handoffs": list(identity_handoffs),
+            "identity_handoffs": list(identity_handoffs),
+            "role_scopes": role_scopes,
             "rules": [{
                 "project_id": "agentg", "rule_id": "R-everyone",
                 "scope": "everyone", "enabled": 1, "priority": 1,

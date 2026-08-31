@@ -340,6 +340,16 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
         return value
 
     def snapshot(self):
+        identity_handoffs = [{
+            "project_id": "shared", "actor_id": "shared.director.codex",
+            "version": 9,
+            "content": {"objective": "Continue from local state"},
+            "updated_by": "shared.director.codex",
+            "updated_owner": "jack",
+            "updated_at": "2026-08-24T06:00:00.000Z",
+            "event_id": "ev_handoff_0009",
+            "legacy_source_version": None,
+        }]
         projection = {
             "project": {"project_id": "shared", "name": "Shared"},
             "rules": [
@@ -352,8 +362,16 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
                  "body": "Review releases.", "scope": "director",
                  "enabled": 1, "priority": 2},
             ],
-            "handoffs": [{"project_id": "shared", "version": 9, "content": {
-                "objective": "Continue from local state"}}],
+            "handoffs": list(identity_handoffs),
+            "identity_handoffs": list(identity_handoffs),
+            "role_scopes": [{
+                "project_id": "shared", "role": "director", "version": 2,
+                "content": "Direct the current project continuity.",
+                "updated_by": "shared.director.codex",
+                "updated_owner": "jack",
+                "updated_at": "2026-08-24T06:00:00.000Z",
+                "event_id": "ev_role_scope_0002",
+            }],
             "tasks": [{"project_id": "shared", "task_id": "T-7",
                        "title": "Offline work",
                        "status": "claimed"}],

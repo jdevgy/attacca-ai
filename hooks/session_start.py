@@ -2452,14 +2452,14 @@ def _watcher_install_sync_snapshot(key, entry, snapshot):
     capabilities = protocol.validate_projection_capabilities(
         entry.get("sync_projection_capabilities") or
         protocol.current_projection_capabilities())
-    protocol.validate_projection_for_capabilities(
-        checked["projection"], scope, capabilities)
     if scope["project_id"] != entry.get("project_id") \
             or scope["actor_id"] != entry.get("canonical_actor_id") \
             or scope["role"] != entry.get("actor_role") \
             or scope["actor_type"] != "agent":
         raise RuntimeError(
             "refusing to install a snapshot outside the MCP-verified AI scope")
+    protocol.validate_projection_for_capabilities(
+        checked["projection"], scope, capabilities)
     previous_scope = entry.get("sync_scope")
     previous_visibility = entry.get("sync_visibility_fingerprint")
     if isinstance(previous_scope, dict):

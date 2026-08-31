@@ -135,6 +135,7 @@ GENESIS_HASH = "0" * 64
 MSG_TYPES = ["chat", "directive", "claim", "handoff", "challenge",
              "decision", "approval", "status", "system"]
 TASK_STATUSES = ["queued", "claimed", "blocked", "review", "done", "cancelled"]
+DECISION_STATUSES = ["proposed", "accepted", "rejected", "superseded"]
 RISK_LEVELS = ["low", "medium", "high"]
 TASK_PLAN_STATUSES = ["draft", "in_review", "changes_requested", "approved"]
 TASK_PLAN_REVIEW_TYPES = ["approval", "suggestion"]
@@ -2134,6 +2135,7 @@ def auth_client_key_record(conn, row):
         "last_used_at": row["last_used_at"],
         "expires_at": row["expires_at"],
         "revoked_at": row["revoked_at"],
+        "revoked": bool(row["revoked_at"]),
     }
 
 
@@ -4500,7 +4502,8 @@ def role_scope_set(conn, project_id, actor_id, actor_type, role, content,
 
 
 def role_scope_history(conn, project_id, role, limit=20, actor_id=None,
-                       actor_type="agent"):
+                       actor_type="agent", query=None, offset=None,
+                       sort=None):
     get_project(conn, project_id)
     role = _role_scope_name(role)
     if actor_type == "agent":
@@ -4511,12 +4514,21 @@ def role_scope_history(conn, project_id, role, limit=20, actor_id=None,
                 (actor_id, actual or "unassigned"))
     elif actor_type != "human":
         raise AttaccaError("role scope history requires a project identity")
+    paged = offset is not None or query is not None or sort is not None
     rows = conn.execute(
         "SELECT * FROM role_scope_revisions WHERE project_id=? AND role=?"
-        " ORDER BY version DESC LIMIT ?",
-        (project_id, role, max(1, min(int(limit or 20), 200)))).fetchall()
-    return {"project": project_id, "role": role,
-            "versions": [_role_scope_dict(row) for row in rows]}
+        " ORDER BY version DESC",
+        (project_id, role)).fetchall()
+    versions = [_role_scope_dict(row) for row in rows]
+    if not paged:
+        versions = versions[:max(1, min(int(limit or 20), 200))]
+        return {"project": project_id, "role": role, "versions": versions}
+    result = _collection_page(
+        versions, "versions", query=query, limit=limit,
+        offset=offset or 0, sort=sort, date_fields=("updated_at",),
+        id_fields=("version",))
+    result.update({"project": project_id, "role": role})
+    return result
 
 
 def _event_visible_to_actor(conn, project_id, row, actor_id=None,
@@ -5504,24 +5516,24 @@ def inbox_read(conn, project_id, actor_id, mark_read=True, limit=50,
         (project_id, actor_id)).fetchone()
     cursor = row["last_read_seq"] if row else 0
     messages = []
+    unread_total = 0
     counts = {"addressed": 0, "direct": 0, "everyone": 0,
               "group_context": 0}
-    # Scan raw ledger pages until either one complete *visible* inbox page plus
-    # a look-ahead row is found or history is exhausted. A raw SQL LIMIT made
-    # self/bridge-hidden rows saturate non-mutating peeks, so poll_status and
-    # get_handoff could report no mail even though a visible message sat just
-    # behind them. Cursor advancement still stops at the last returned visible
-    # row when another visible row remains, so nothing can be skipped.
+    # Scan the complete unread tail so counters describe the whole authorized
+    # inbox, not merely this page.  This is what lets a panel badge say 137
+    # instead of silently maxing out at the page size.  Cursor advancement
+    # still stops at the last returned visible row while another visible row
+    # remains, so a consuming client cannot skip mail it has not received.
     scan_cursor = cursor
+    page_cursor = cursor
     batch_size = max(100, min(1000, limit * 2))
-    while len(messages) <= limit:
+    while True:
         rows = conn.execute(
             "SELECT * FROM events WHERE project_id=? AND seq>?"
             " AND event_type='room.message' ORDER BY seq ASC LIMIT ?",
             (project_id, scan_cursor, batch_size)).fetchall()
         if not rows:
             break
-        stop_after_page = False
         candidate_rows = [r for r in rows if r["actor_id"] not in actor_ids]
         policy_payloads = _room_policy_payloads(
             conn, project_id, candidate_rows)
@@ -5537,36 +5549,34 @@ def inbox_read(conn, project_id, actor_id, mark_read=True, limit=50,
                     conn, project_id, payload, actor_id, actor_type):
                 continue
             attention = _inbox_message_attention(conn, actor_ids, payload)
-            message = _room_message_dict(r, payload)
-            message.update(attention)
-            if message.get("mirrored_to") and actor_id is not None:
-                message["mirrored_to"] = _visible_bridge_peers(
-                    conn, project_id, message, actor_id, actor_type)
-            identity_project = message.get("origin_project") or project_id
-            attribution = immutable_event_attribution(
-                conn, identity_project, message["actor"],
-                message["actor_type"], message.get("owner"))
-            message["ledger_actor"] = message["actor"]
-            message["actor"] = attribution["actor_id"]
-            message["identity"] = attribution["identity"]
-            message["attribution"] = attribution
-            messages.append(message)
-            if len(messages) > limit:
-                stop_after_page = True
-                break
-        if stop_after_page or len(rows) < batch_size:
+            unread_total += 1
+            counts["addressed"] += int(attention["addressed_to_you"])
+            counts["direct"] += int(attention["directed_to_you"])
+            counts["everyone"] += int(attention["broadcast_to_everyone"])
+            counts["group_context"] += int(attention["group_context"])
+            if len(messages) < limit:
+                message = _room_message_dict(r, payload)
+                message.update(attention)
+                if message.get("mirrored_to") and actor_id is not None:
+                    message["mirrored_to"] = _visible_bridge_peers(
+                        conn, project_id, message, actor_id, actor_type)
+                identity_project = message.get("origin_project") or project_id
+                attribution = immutable_event_attribution(
+                    conn, identity_project, message["actor"],
+                    message["actor_type"], message.get("owner"))
+                message["ledger_actor"] = message["actor"]
+                message["actor"] = attribution["actor_id"]
+                message["identity"] = attribution["identity"]
+                message["attribution"] = attribution
+                messages.append(message)
+                page_cursor = r["seq"]
+        if len(rows) < batch_size:
             break
-    may_have_more = len(messages) > limit
-    messages = messages[:limit]
+    may_have_more = unread_total > len(messages)
     if may_have_more and messages:
-        new_cursor = messages[-1]["seq"]
+        new_cursor = page_cursor
     else:
         new_cursor = scan_cursor
-    for message in messages:
-        counts["addressed"] += int(message["addressed_to_you"])
-        counts["direct"] += int(message["directed_to_you"])
-        counts["everyone"] += int(message["broadcast_to_everyone"])
-        counts["group_context"] += int(message["group_context"])
     if mark_read and new_cursor > cursor:
         with write_tx(conn):
             conn.execute(
@@ -5583,7 +5593,11 @@ def inbox_read(conn, project_id, actor_id, mark_read=True, limit=50,
         "actor": actor_id,
         "messages": messages,
         "messages_include_all_visible": True,
-        "unread_total": len(messages),
+        "unread_total": unread_total,
+        "total": unread_total,
+        "page_unread_total": len(messages),
+        "limit": limit,
+        "offset": 0,
         "unread_addressed": counts["addressed"],
         "unread_direct": counts["direct"],
         "unread_everyone": counts["everyone"],
@@ -5592,6 +5606,7 @@ def inbox_read(conn, project_id, actor_id, mark_read=True, limit=50,
         # must use unread_total rather than adding this field to len(messages).
         "unread_broadcasts": counts["group_context"],
         "may_have_more": may_have_more,
+        "has_more": may_have_more,
         "read_cursor": new_cursor if mark_read else cursor,
         "scanned_through_seq": new_cursor,
         "pending_dispositions": disposition_state["pending"],
@@ -5795,6 +5810,8 @@ def _bridge_rows(conn, project_id, actor_id=None, actor_type="agent"):
         peer_access = _bridge_side_participation(row, other)
         item = {"with": other, "relation": row["relation"] or "peer",
                 "principal": row["principal"],
+                "created_by": row["created_by"],
+                "created_at": row["created_at"],
                 "participation": local_access["preset"],
                 "allowed_agents": local_access["agents"],
                 "peer_participation": peer_access["preset"],
@@ -6044,11 +6061,19 @@ def bridge_remove(conn, project_id, actor_id, actor_type, other_project):
             "context_version": context_version}
 
 
-def bridge_list(conn, project_id, actor_id=None, actor_type="agent"):
+def bridge_list(conn, project_id, actor_id=None, actor_type="agent",
+                query=None, limit=None, offset=0, sort=None, options=False):
     get_project(conn, project_id)
-    return {"project": project_id,
-            "bridges": _bridge_rows(
-                conn, project_id, actor_id=actor_id, actor_type=actor_type)}
+    rows = _bridge_rows(
+        conn, project_id, actor_id=actor_id, actor_type=actor_type)
+    if limit is None and not options and query is None and sort is None:
+        return {"project": project_id, "bridges": rows}
+    result = _collection_page(
+        rows, "bridges", query=query, limit=limit, offset=offset,
+        sort=sort, date_fields=("created_at",), id_fields=("with",),
+        options=options)
+    result["project"] = project_id
+    return result
 
 
 def set_lead_director(conn, project_id, actor_id, actor_type, lead_id):
@@ -7034,8 +7059,15 @@ def _decision_dict(row, event_rows, conn, project_id):
     return decision
 
 
-def decision_list(conn, project_id, status=None):
+def decision_list(conn, project_id, status=None, query=None, limit=None,
+                  offset=0, sort=None):
     get_project(conn, project_id)
+    status = str(status or "").strip().lower() or None
+    if status == "all":
+        status = None
+    if status and status not in DECISION_STATUSES:
+        raise AttaccaError("decision status must be one of all, %s" %
+                           ", ".join(DECISION_STATUSES))
     if status:
         rows = conn.execute(
             "SELECT * FROM decisions WHERE project_id=? AND status=?"
@@ -7056,10 +7088,24 @@ def decision_list(conn, project_id, status=None):
         decision_id = payload.get("decision_id")
         if decision_id:
             by_decision.setdefault(decision_id, []).append(event)
-    return {"project": project_id,
-            "decisions": [_decision_dict(
-                row, by_decision.get(row["decision_id"], []), conn, project_id)
-                for row in rows]}
+    decisions = [_decision_dict(
+        row, by_decision.get(row["decision_id"], []), conn, project_id)
+        for row in rows]
+    if limit is None and query is None and sort is None:
+        return {"project": project_id, "decisions": decisions}
+    # unfiltered_total is the complete authorized decision collection, while
+    # status and q both narrow the displayed result set.
+    all_rows = conn.execute(
+        "SELECT * FROM decisions WHERE project_id=?",
+        (project_id,)).fetchall()
+    unfiltered_total = len(all_rows)
+    result = _collection_page(
+        decisions, "decisions", query=query, limit=limit, offset=offset,
+        sort=sort, date_fields=("resolved_at", "created_at"),
+        id_fields=("decision_id",))
+    result["unfiltered_total"] = unfiltered_total
+    result["project"] = project_id
+    return result
 
 
 # --- project rules ---------------------------------------------------------
@@ -7126,7 +7172,8 @@ def _rule_scope(value):
 
 
 def rule_list(conn, project_id, actor_id=None, actor_type="agent",
-              include_disabled=False, include_all=False):
+              include_disabled=False, include_all=False, query=None,
+              limit=None, offset=0, sort=None, status=None):
     """List the rules applicable to the caller's registered role.
 
     Callers cannot claim a different role. Humans see all scopes. A Director
@@ -7158,10 +7205,29 @@ def rule_list(conn, project_id, actor_id=None, actor_type="agent",
         "SELECT * FROM project_rules WHERE %s"
         " ORDER BY priority, CAST(SUBSTR(rule_id,3) AS INTEGER)"
         % " AND ".join(clauses), params).fetchall()
-    return {"project": project_id, "actor_role": role,
-            "applicable_scopes": RULE_SCOPES if actor_type == "human" or include_all
-            else (["everyone", role] if role in AGENT_ROLES else ["everyone"]),
-            "rules": [_rule_dict(row) for row in rows]}
+    applicable_scopes = RULE_SCOPES if actor_type == "human" or include_all \
+        else (["everyone", role] if role in AGENT_ROLES else ["everyone"])
+    rules = [_rule_dict(row) for row in rows]
+    unfiltered_total = len(rules)
+    status = str(status or "").strip().lower() or None
+    if status == "all":
+        status = None
+    if status not in (None, "enabled", "disabled"):
+        raise AttaccaError("rule status must be all, enabled, or disabled")
+    if status == "enabled":
+        rules = [rule for rule in rules if rule["enabled"]]
+    elif status == "disabled":
+        rules = [rule for rule in rules if not rule["enabled"]]
+    if limit is None and query is None and sort is None and status is None:
+        return {"project": project_id, "actor_role": role,
+                "applicable_scopes": applicable_scopes, "rules": rules}
+    result = _collection_page(
+        rules, "rules", query=query, limit=limit, offset=offset, sort=sort,
+        date_fields=("updated_at", "created_at"), id_fields=("rule_id",))
+    result["unfiltered_total"] = unfiltered_total
+    result.update({"project": project_id, "actor_role": role,
+                   "applicable_scopes": applicable_scopes})
+    return result
 
 
 def rule_create(conn, project_id, actor_id, actor_type, title, body,
@@ -7768,7 +7834,8 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
     return result
 
 
-def agent_list(conn, project_id):
+def agent_list(conn, project_id, query=None, limit=None, offset=0, sort=None,
+               options=False):
     get_project(conn, project_id)
     rows = conn.execute(
         "SELECT * FROM agents WHERE project_id=? ORDER BY registered_at",
@@ -7791,7 +7858,18 @@ def agent_list(conn, project_id):
         agent["operational_actor_id"] = (agent.get("agent_id") if parsed else
             canonical_agent_id(project_id, agent.get("role"), runtime))
         agents.append(agent)
-    return {"project": project_id, "agents": agents}
+    if limit is None and query is None and sort is None and not options:
+        return {"project": project_id, "agents": agents}
+    if options:
+        agents = [{key: agent.get(key) for key in (
+            "agent_id", "display_name", "role", "runtime")}
+            for agent in agents]
+    result = _collection_page(
+        agents, "agents", query=query, limit=limit, offset=offset, sort=sort,
+        date_fields=("registered_at",),
+        id_fields=("agent_id",), options=options)
+    result["project"] = project_id
+    return result
 
 
 def project_actor_identity(conn, project_id, actor_id, actor_type="agent",
@@ -7983,9 +8061,15 @@ def render_log_line(row):
         return "%s  %s set lead director: %s -> %s" % (
             at, actor, payload.get("from") or "(none)",
             payload.get("to") or "(none)")
-    if etype == "handoff.updated":
-        return "%s  %s updated handoff (%s) -> context v%s" % (
-            at, actor, ", ".join(payload.get("fields", [])), row["context_version"])
+    if etype in ("handoff.updated", "identity_handoff.updated"):
+        identity = payload.get("actor_id") or row["actor_id"]
+        return "%s  %s updated %s handoff (%s) -> context v%s" % (
+            at, actor, identity, ", ".join(payload.get("fields", [])),
+            row["context_version"])
+    if etype == "role_scope.updated":
+        return "%s  %s updated %s role scope to v%s -> context v%s" % (
+            at, actor, payload.get("role"), payload.get("version"),
+            row["context_version"])
     if etype == "git.commit":
         return "%s  git commit %s on %s: %s" % (
             at, payload.get("sha", "?")[:10], payload.get("branch", "?"),
@@ -7998,17 +8082,49 @@ def render_log_line(row):
 
 
 def project_log(conn, project_id, limit=40, actor_id=None,
-                actor_type="agent"):
+                actor_type="agent", query=None, offset=None, sort=None):
     get_project(conn, project_id)
-    limit = max(1, min(int(limit or 40), 1000))
-    return {"project": project_id, "log": _significant_events(
-        conn, project_id, after_seq=0, limit=limit,
-        actor_id=actor_id, actor_type=actor_type)}
+    paged = offset is not None or query is not None or sort is not None
+    if not paged:
+        limit = max(1, min(int(limit or 40), 1000))
+        return {"project": project_id, "log": _significant_events(
+            conn, project_id, after_seq=0, limit=limit,
+            actor_id=actor_id, actor_type=actor_type)}
+    rows = conn.execute(
+        "SELECT * FROM events WHERE project_id=? ORDER BY seq ASC",
+        (project_id,)).fetchall()
+    visibility = _event_visibility_flags(
+        conn, project_id, rows, actor_id, actor_type)
+    entries = []
+    for row, visible in zip(rows, visibility):
+        if not visible:
+            continue
+        line = render_log_line(row)
+        if not line:
+            continue
+        entries.append({
+            "seq": row["seq"], "event_id": row["event_id"],
+            "event_type": row["event_type"], "task_id": row["task_id"],
+            "actor_id": row["actor_id"], "owner": row["owner"],
+            "created_at": row["created_at"], "line": line,
+            # Search covers the complete durable payload, even when the
+            # concise renderer intentionally omits some fields.
+            "search_payload": json.loads(row["payload"] or "{}"),
+        })
+    result = _collection_page(
+        entries, "entries", query=query, limit=limit, offset=offset or 0,
+        sort=sort, date_fields=("created_at",), id_fields=("seq",))
+    for entry in result["entries"]:
+        entry.pop("search_payload", None)
+    result["log"] = [entry["line"] for entry in result["entries"]]
+    result["project"] = project_id
+    return result
 
 
 def project_status(conn, project_id, actor_id, actor_type, db_path):
     project = get_project(conn, project_id)
-    handoff_row = _latest_handoff(conn, project_id)
+    handoff_row = _latest_identity_handoff(
+        conn, project_id, actor_id) if actor_id else None
     counts = conn.execute(
         "SELECT"
         " (SELECT COUNT(*) FROM events WHERE project_id=:p) AS events,"
@@ -8094,6 +8210,78 @@ def _search_predicate(columns, terms):
         "%%%s%%" % term for term in terms]
 
 
+PANEL_COLLECTION_LIMIT = 60
+
+
+def _natural_value(value):
+    """Return a deterministic natural-sort key for human-facing ids."""
+    return tuple(int(part) if part.isdigit() else part.casefold()
+                 for part in re.split(r"(\d+)", str(value or "")))
+
+
+def _collection_page(rows, key, query=None, limit=60, offset=0,
+                     sort="newest", date_fields=None, id_fields=None,
+                     options=False):
+    """Filter and paginate an already-authorized collection.
+
+    Authorization/visibility must happen before this helper is called.  That
+    ordering is deliberate: neither totals nor option directories may reveal
+    records the caller cannot inspect.
+    """
+    authorized = [dict(row) for row in (rows or [])]
+    unfiltered_total = len(authorized)
+    terms = _search_query_terms(query)
+    filtered = authorized
+    if terms:
+        filtered = [row for row in authorized if all(
+            term in canonical_json(row).casefold() for term in terms)]
+    total = len(filtered)
+    date_fields = list(date_fields or (
+        "updated_at", "resolved_at", "created_at", "registered_at",
+        "last_seen_at", "at"))
+    id_fields = list(id_fields or (
+        "task_id", "decision_id", "rule_id", "project_id", "agent_id",
+        "with", "token_id", "version", "seq"))
+
+    def dated(row):
+        return next((str(row.get(field)) for field in date_fields
+                     if row.get(field)), "")
+
+    def identifier(row):
+        return next((row.get(field) for field in id_fields
+                     if row.get(field) is not None), "")
+
+    newest = str(sort or "newest").strip().lower() != "oldest"
+    present = [row for row in filtered if dated(row)]
+    missing = [row for row in filtered if not dated(row)]
+    present.sort(key=lambda row: (dated(row), _natural_value(identifier(row))),
+                 reverse=newest)
+    missing.sort(key=lambda row: _natural_value(identifier(row)),
+                 reverse=newest)
+    filtered = present + missing
+
+    if options:
+        selected = filtered
+        page_limit = max(1, len(selected))
+        page_offset = 0
+    else:
+        try:
+            page_limit = max(1, min(int(limit or PANEL_COLLECTION_LIMIT),
+                                    PANEL_COLLECTION_LIMIT))
+            page_offset = max(0, int(offset or 0))
+        except (TypeError, ValueError):
+            raise AttaccaError("limit and offset must be integers")
+        selected = filtered[page_offset:page_offset + page_limit]
+    return {
+        key: selected,
+        "total": total,
+        "unfiltered_total": unfiltered_total,
+        "limit": page_limit,
+        "offset": page_offset,
+        "has_more": False if options else page_offset + len(selected) < total,
+    }
+
+
 def _search_room_line(row, payload):
     origin = payload.get("origin_project")
     origin_txt = " from %s" % origin if origin else ""
@@ -8106,7 +8294,7 @@ def _search_room_line(row, payload):
 
 
 def search_project(conn, project_id, query, limit=20, actor_id=None,
-                   actor_type="agent"):
+                   actor_type="agent", offset=0, sort="newest"):
     """Token-aware AND search across all durable project history.
 
     Search results are useful records rather than log-renderer side effects:
@@ -8119,7 +8307,8 @@ def search_project(conn, project_id, query, limit=20, actor_id=None,
     terms = _search_query_terms(query)
     if not terms:
         raise AttaccaError("search query needs at least one letter or number")
-    limit = max(1, min(int(limit or 20), 100))
+    limit = max(1, min(int(limit or 20), PANEL_COLLECTION_LIMIT))
+    offset = max(0, int(offset or 0))
 
     event_where, event_params = _search_predicate(
         ["payload", "actor_id", "event_type", "task_id"], terms)
@@ -8178,16 +8367,14 @@ def search_project(conn, project_id, query, limit=20, actor_id=None,
         else:
             result["payload"] = payload
         events.append(result)
-        if len(events) >= limit:
-            break
 
     task_where, task_params = _search_predicate(
         ["title", "description", "last_report"], terms)
     tasks = []
     for row in conn.execute(
             "SELECT * FROM tasks WHERE project_id=? AND " + task_where +
-            " ORDER BY updated_at DESC LIMIT ?",
-            [project_id] + task_params + [limit]):
+            " ORDER BY updated_at DESC",
+            [project_id] + task_params):
         report = json.loads(row["last_report"]) if row["last_report"] else None
         tasks.append({"task_id": row["task_id"], "title": row["title"],
                       "description": row["description"],
@@ -8204,54 +8391,129 @@ def search_project(conn, project_id, query, limit=20, actor_id=None,
         for row in conn.execute(
             "SELECT * FROM decisions WHERE project_id=? AND " +
             decision_where +
-            " ORDER BY COALESCE(resolved_at, created_at) DESC LIMIT ?",
-            [project_id] + decision_params + [limit])]
+            " ORDER BY COALESCE(resolved_at, created_at) DESC",
+            [project_id] + decision_params)]
 
-    rule_where, rule_params = _search_predicate(["title", "body"], terms)
-    rules = [
-        {"rule_id": row["rule_id"], "title": row["title"],
-         "body": row["body"], "scope": row["scope"],
-         "enabled": bool(row["enabled"]), "version": row["version"]}
-        for row in conn.execute(
-            "SELECT * FROM project_rules WHERE project_id=? AND " +
-            rule_where + " ORDER BY priority,"
-            " CAST(SUBSTR(rule_id,3) AS INTEGER) LIMIT ?",
-            [project_id] + rule_params + [limit])]
+    # Rules are searched only after applying the caller's role visibility.
+    visible_rules = rule_list(
+        conn, project_id, actor_id=actor_id, actor_type=actor_type)["rules"]
+    rules = [rule for rule in visible_rules if all(
+        term in canonical_json(rule).casefold() for term in terms)]
 
-    handoff_where, handoff_params = _search_predicate(
-        ["content", "updated_by"], terms)
-    handoffs = [
-        {"version": row["version"], "updated_by": row["updated_by"],
-         "updated_at": row["updated_at"],
-         "content": json.loads(row["content"])}
+    handoffs = []
+    for row in conn.execute(
+            "SELECT * FROM identity_handoffs WHERE project_id=?"
+            " ORDER BY updated_at DESC, actor_id, version DESC",
+            (project_id,)).fetchall():
+        value = _identity_handoff_dict(row)
+        if all(term in canonical_json(value).casefold() for term in terms):
+            handoffs.append(value)
+
+    # Search only role scopes the caller may read. Directors and humans may
+    # inspect every role; ordinary AIs get their effective role (+ lead
+    # overlay when they are the designated lead).
+    actual_role = _registered_actor_role(conn, project_id, actor_id) \
+        if actor_type == "agent" and actor_id else None
+    if actor_type == "human" or actual_role == "director":
+        searchable_roles = set(ROLE_SCOPE_NAMES)
+    else:
+        searchable_roles = {actual_role} if actual_role in AGENT_ROLES else set()
+        if get_project(conn, project_id).get("lead_director") == actor_id:
+            searchable_roles.add("lead_director")
+    role_scopes = []
+    if searchable_roles:
+        placeholders = ",".join("?" for _ in searchable_roles)
         for row in conn.execute(
-            "SELECT * FROM handoffs WHERE project_id=? AND " +
-            handoff_where + " ORDER BY version DESC LIMIT ?",
-            [project_id] + handoff_params + [limit])]
-    return {
+                "SELECT * FROM role_scope_revisions WHERE project_id=?"
+                " AND role IN (%s) ORDER BY updated_at DESC" % placeholders,
+                [project_id] + sorted(searchable_roles)).fetchall():
+            value = _role_scope_dict(row)
+            if all(term in canonical_json(value).casefold() for term in terms):
+                role_scopes.append(value)
+
+    unified = []
+    unified.extend({
+        "kind": "event", "id": "#%s" % item["seq"],
+        "text": item.get("line") or item.get("body") or item["event_type"],
+        "updated_at": item["at"], "seq": item["seq"], "data": item,
+    } for item in events)
+    unified.extend({
+        "kind": "task", "id": item["task_id"],
+        "text": "%s · %s" % (item["title"], item["status"]),
+        "updated_at": item.get("updated_at"), "data": item,
+    } for item in tasks)
+    unified.extend({
+        "kind": "decision", "id": item["decision_id"],
+        "text": "%s · %s" % (item["title"], item["status"]),
+        "updated_at": item.get("updated_at"), "data": item,
+    } for item in decisions)
+    unified.extend({
+        "kind": "rule", "id": item["rule_id"], "text": item["title"],
+        "updated_at": item.get("updated_at") or item.get("created_at"),
+        "data": item,
+    } for item in rules)
+    unified.extend({
+        "kind": "handoff", "id": "%s:v%s" % (
+            item.get("actor_id") or "identity", item["version"]),
+        "text": "Identity handoff updated by %s" % item["updated_by"],
+        "updated_at": item.get("updated_at"), "data": item,
+    } for item in handoffs)
+    unified.extend({
+        "kind": "role_scope", "id": "%s:v%s" % (
+            item["role"], item["version"]),
+        "text": "%s role scope" % item["role"],
+        "updated_at": item.get("updated_at"), "data": item,
+    } for item in role_scopes)
+    page = _collection_page(
+        unified, "results", limit=limit, offset=offset, sort=sort,
+        date_fields=("updated_at",), id_fields=("id",))
+    # q defines membership in this aggregate. There is no separate secondary
+    # filter, so both exact counters intentionally match.
+    page["unfiltered_total"] = page["total"]
+    selected_by_kind = {}
+    for item in page["results"]:
+        selected_by_kind.setdefault(item["kind"], []).append(item["data"])
+    result = {
         "project": project_id, "query": str(query), "query_terms": terms,
-        "term_semantics": "AND", "events": events, "tasks": tasks,
-        "decisions": decisions, "rules": rules,
-        "handoff_versions": handoffs,
-        "total_hits": (len(events) + len(tasks) + len(decisions) +
-                       len(rules) + len(handoffs)),
+        "term_semantics": "AND",
+        # Compatibility category views now reflect the same one global page;
+        # they can no longer multiply the response cap per category.
+        "events": selected_by_kind.get("event", []),
+        "tasks": selected_by_kind.get("task", []),
+        "decisions": selected_by_kind.get("decision", []),
+        "rules": selected_by_kind.get("rule", []),
+        "handoff_versions": selected_by_kind.get("handoff", []),
+        "role_scope_versions": selected_by_kind.get("role_scope", []),
+        "total_hits": len(unified),
         "hint": ("Punctuation and spacing are ignored between terms; every "
                  "returned record contains all query terms."),
     }
+    result.update(page)
+    return result
 
 
 def handoff_history(conn, project_id, limit=20, actor_id=None,
-                    actor_type="agent", target_actor_id=None):
+                    actor_type="agent", target_actor_id=None, query=None,
+                    offset=None, sort=None):
     get_project(conn, project_id)
     handoff_actor = _handoff_read_actor(
         conn, project_id, actor_id, actor_type, target_actor_id)
+    paged = offset is not None or query is not None or sort is not None
     rows = conn.execute(
         "SELECT * FROM identity_handoffs WHERE project_id=? AND actor_id=?"
-        " ORDER BY version DESC LIMIT ?",
-        (project_id, handoff_actor,
-         max(1, min(int(limit or 20), 200)))).fetchall()
-    return {"project": project_id, "handoff_actor": handoff_actor,
-            "versions": [_identity_handoff_dict(row) for row in rows]}
+        " ORDER BY version DESC", (project_id, handoff_actor)).fetchall()
+    versions = [_identity_handoff_dict(row) for row in rows]
+    if not paged:
+        versions = versions[:max(1, min(int(limit or 20), 200))]
+        return {"project": project_id, "handoff_actor": handoff_actor,
+                "versions": versions}
+    result = _collection_page(
+        versions, "versions", query=query, limit=limit,
+        offset=offset or 0, sort=sort, date_fields=("updated_at",),
+        id_fields=("version",))
+    result.update({"project": project_id,
+                   "handoff_actor": handoff_actor})
+    return result
 
 
 def event_show(conn, project_id, seq):
@@ -9555,17 +9817,43 @@ class McpSession:
         if name == "agent_register":
             project, actor = self._project_actor(args)
             identity_mode = str(args.get("identity_mode") or "").lower()
-            return agent_register(conn, project, actor, atype,
-                                  agent_id=args.get("agent_id"),
-                                  display_name=args.get("display_name"),
-                                  role=args.get("role"),
-                                  runtime=args.get("runtime"),
-                                  persona=args.get("persona"),
-                                  allocate_persona=identity_mode in (
-                                      "new", "temporary"),
-                                  distinct_identity=identity_mode in (
-                                      "new", "temporary"),
-                                  canonical_identity=atype == "agent")
+            if identity_mode and identity_mode not in (
+                    "reuse", "new", "temporary"):
+                raise AttaccaError(
+                    "identity mode must be reuse, new, or temporary")
+            principal = self._authenticated_principal_context()
+            registration_username = principal.get("username") \
+                if principal else None
+            authorized_owner_labels = auth_principal_owner_labels(
+                conn, principal) if principal and principal.get("user_id") \
+                else []
+            result = agent_register(
+                conn, project, actor, atype,
+                agent_id=args.get("agent_id"),
+                display_name=args.get("display_name"),
+                role=args.get("role"), runtime=args.get("runtime"),
+                persona=args.get("persona"),
+                allocate_persona=identity_mode in ("new", "temporary"),
+                distinct_identity=identity_mode in ("new", "temporary"),
+                canonical_identity=atype == "agent",
+                registration_username=registration_username,
+                authorized_owner_labels=authorized_owner_labels)
+            if identity_mode:
+                # This is the server-side half of the explicit setup choice.
+                # A connect proxy mirrors the selected id into either its
+                # process-only override or durable machine binding after the
+                # successful response. Direct stdio MCP keeps it in this
+                # session object and never keys it to a host conversation id.
+                self.actor = result["agent_id"]
+                self.actor_type = "agent"
+                self.preserve_actor_identity = True
+                self._registered = set()
+                result.update({
+                    "identity_mode": identity_mode,
+                    "temporary": identity_mode == "temporary",
+                    "current_mcp_process_selected": True,
+                })
+            return result
 
         if name == "agent_list":
             project, actor = self._project_actor(args)
@@ -10247,8 +10535,10 @@ def _sync_authenticated_scope(handler, project_id):
                 "workspace '%s'" % (principal.get("username"), project_id))
         role = "human"
         actor_type = "human"
-        actor = "%s.human.%s" % (
-            slugify(project_id), slugify(principal.get("username")) or "user")
+        # Use the same durable human actor written by REST/MCP mutations.
+        # A synthetic ``project.human.user`` id would be a second identity and
+        # could never retrieve the browser actor's exact handoff history.
+        actor = "web.%s" % (slugify(principal.get("username")) or "user")
     return {
         "server_id": _sync_server_id(conn),
         "project_id": project_id,
@@ -10415,9 +10705,24 @@ def _sync_projection(conn, scope):
     rules = rule_list(
         conn, scope["project_id"], actor_id=scope["actor_id"],
         actor_type=scope["actor_type"])["rules"]
+    identity_handoffs = [
+        _identity_handoff_dict(row) for row in conn.execute(
+            "SELECT * FROM identity_handoffs WHERE project_id=?"
+            " AND actor_id=? ORDER BY version",
+            (scope["project_id"], scope["actor_id"])).fetchall()
+    ]
+    role_scopes = role_scope_get(
+        conn, scope["project_id"], actor_id=scope["actor_id"],
+        actor_type=scope["actor_type"],
+        include_all=scope["actor_type"] == "human")["scopes"]
     projection = {
         "project": snapshot["project"],
-        "handoffs": snapshot["handoffs"],
+        # ``handoffs`` remains the schema-v1 compatibility resource name, but
+        # an offline mirror always binds it to this exact actor.  The retired
+        # project-global archive exists only in administrative exports.
+        "handoffs": identity_handoffs,
+        "identity_handoffs": identity_handoffs,
+        "role_scopes": role_scopes,
         "rules": rules,
         "cloud_context": cloud_context_get(
             conn, scope["project_id"])["cloud_context"],
@@ -13216,9 +13521,30 @@ def _r_auth_invitations(h, m, q):
 
 def _r_auth_client_keys(h, m, q):
     principal = _require_auth_session(h)
-    h._reply_json(200, {
-        "client_keys": auth_client_key_list(h._conn(), principal)},
-        {"Cache-Control": "no-store"})
+    rows = auth_client_key_list(h._conn(), principal)
+    unfiltered_total = len(rows)
+    status = str(q.get("status") or "").strip().lower()
+    if status in ("", "all"):
+        pass
+    elif status == "revoked":
+        rows = [row for row in rows if row.get("revoked_at")]
+    elif status == "active":
+        rows = [row for row in rows if not row.get("revoked_at") and (
+            not row.get("expires_at") or row["expires_at"] > now_iso())]
+    elif status == "expired":
+        rows = [row for row in rows if not row.get("revoked_at") and
+                row.get("expires_at") and row["expires_at"] <= now_iso()]
+    else:
+        raise AttaccaError(
+            "client key status must be all, active, revoked, or expired")
+    result = _collection_page(
+        rows, "client_keys",
+        query=q.get("q"), limit=q.get("limit") or PANEL_COLLECTION_LIMIT,
+        offset=q.get("offset") or 0, sort=q.get("sort") or "newest",
+        date_fields=("last_used_at", "created_at"),
+        id_fields=("token_id",))
+    result["unfiltered_total"] = unfiltered_total
+    h._reply_json(200, result, {"Cache-Control": "no-store"})
 
 
 def _r_auth_client_key_create(h, m, q):
@@ -13409,7 +13735,18 @@ def _r_projects_list(h, m, q):
     if allowed is not None:
         result["projects"] = [project for project in result["projects"]
                               if project["project_id"] in allowed]
-    h._reply_json(200, result)
+    options = str(q.get("options", "0")).lower() in ("1", "true", "yes")
+    if options:
+        result["projects"] = [{key: project.get(key) for key in (
+            "project_id", "name")}
+            for project in result["projects"]]
+    page = _collection_page(
+        result["projects"], "projects", query=q.get("q"),
+        limit=q.get("limit") or PANEL_COLLECTION_LIMIT,
+        offset=q.get("offset") or 0, sort=q.get("sort") or "newest",
+        date_fields=("created_at",), id_fields=("project_id",),
+        options=options)
+    h._reply_json(200, page)
 
 
 def _r_projects_create(h, m, q):
@@ -13735,8 +14072,12 @@ def _r_lead_set(h, m, q):
 
 def _r_bridges_list(h, m, q):
     actor, atype = h._actor()
+    options = str(q.get("options", "0")).lower() in ("1", "true", "yes")
     h._reply_json(200, bridge_list(
-        h._conn(), m.group(1), actor_id=actor, actor_type=atype))
+        h._conn(), m.group(1), actor_id=actor, actor_type=atype,
+        query=q.get("q"), limit=q.get("limit") or PANEL_COLLECTION_LIMIT,
+        offset=q.get("offset") or 0, sort=q.get("sort") or "newest",
+        options=options))
 
 
 def _r_bridges_add(h, m, q):
@@ -13809,11 +14150,13 @@ def _r_handoff_get(h, m, q):
 
 def _r_handoff_history(h, m, q):
     actor, atype = h._actor()
-    limit = q.get("limit") or 20
+    limit = q.get("limit") or PANEL_COLLECTION_LIMIT
     h._reply_json(200, handoff_history(
         h._conn(), m.group(1), limit=limit, actor_id=actor,
         actor_type=atype,
-        target_actor_id=(q.get("target_actor_id") or q.get("actor_id"))))
+        target_actor_id=(q.get("target_actor_id") or q.get("actor_id")),
+        query=q.get("q"), offset=q.get("offset") or 0,
+        sort=q.get("sort") or "newest"))
 
 
 def _r_inbox_get(h, m, q):
@@ -13836,7 +14179,8 @@ def _r_inbox_get(h, m, q):
         mark_read = False
     h._reply_json(200, inbox_read(
         h._conn(), m.group(1), actor, mark_read=mark_read,
-        limit=int(q.get("limit") or 50), actor_type=atype))
+        limit=min(int(q.get("limit") or PANEL_COLLECTION_LIMIT),
+                  PANEL_COLLECTION_LIMIT), actor_type=atype))
 
 
 def _r_message_dispose(h, m, q):
@@ -13882,14 +14226,17 @@ def _r_role_scope_history(h, m, q):
     actor, atype = h._actor()
     h._reply_json(200, role_scope_history(
         h._conn(), m.group(1), role=m.group(2),
-        limit=q.get("limit") or 20, actor_id=actor, actor_type=atype))
+        limit=q.get("limit") or PANEL_COLLECTION_LIMIT, actor_id=actor,
+        actor_type=atype, query=q.get("q"), offset=q.get("offset") or 0,
+        sort=q.get("sort") or "newest"))
 
 
 def _r_log(h, m, q):
     actor, atype = h._actor()
     h._reply_json(200, project_log(
-        h._conn(), m.group(1), limit=int(q.get("limit") or 40),
-        actor_id=actor, actor_type=atype))
+        h._conn(), m.group(1), limit=q.get("limit") or PANEL_COLLECTION_LIMIT,
+        actor_id=actor, actor_type=atype, query=q.get("q"),
+        offset=q.get("offset") or 0, sort=q.get("sort") or "newest"))
 
 
 def _r_events_sync(h, m, q):
@@ -14077,8 +14424,10 @@ def _r_task_status(h, m, q):
 
 
 def _r_decisions_list(h, m, q):
-    h._reply_json(200, decision_list(h._conn(), m.group(1),
-                                     status=q.get("status")))
+    h._reply_json(200, decision_list(
+        h._conn(), m.group(1), status=q.get("status"), query=q.get("q"),
+        limit=q.get("limit") or PANEL_COLLECTION_LIMIT,
+        offset=q.get("offset") or 0, sort=q.get("sort") or "newest"))
 
 
 def _r_decision_propose(h, m, q):
@@ -14105,7 +14454,10 @@ def _r_rules_list(h, m, q):
         "1", "true", "yes")
     h._reply_json(200, rule_list(
         h._conn(), m.group(1), actor_id=actor, actor_type=atype,
-        include_disabled=include_disabled, include_all=include_all))
+        include_disabled=include_disabled, include_all=include_all,
+        query=q.get("q"), limit=q.get("limit") or PANEL_COLLECTION_LIMIT,
+        offset=q.get("offset") or 0, sort=q.get("sort") or "newest",
+        status=q.get("status")))
 
 
 def _r_rule_create(h, m, q):
@@ -14184,7 +14536,12 @@ def _r_poll_status(h, m, q):
 
 
 def _r_agents_list(h, m, q):
-    h._reply_json(200, agent_list(h._conn(), m.group(1)))
+    options = str(q.get("options", "0")).lower() in ("1", "true", "yes")
+    h._reply_json(200, agent_list(
+        h._conn(), m.group(1), query=q.get("q"),
+        limit=q.get("limit") or PANEL_COLLECTION_LIMIT,
+        offset=q.get("offset") or 0, sort=q.get("sort") or "newest",
+        options=options))
 
 
 def _r_agent_register(h, m, q):
@@ -14235,8 +14592,9 @@ def _r_search(h, m, q):
     actor, atype = h._actor()
     h._reply_json(200, search_project(
         h._conn(), m.group(1), q.get("q"),
-        limit=int(q.get("limit") or 20), actor_id=actor,
-        actor_type=atype))
+        limit=q.get("limit") or PANEL_COLLECTION_LIMIT, actor_id=actor,
+        actor_type=atype, offset=q.get("offset") or 0,
+        sort=q.get("sort") or "newest"))
 
 
 def _r_verify(h, m, q):
@@ -15886,6 +16244,57 @@ def run_connect_proxy(url=None, actor=None, actor_type=None, project=None,
                 error_data.setdefault("category", "hosted_http_error")
         return payload
 
+    def apply_identity_selection(message, decoded, context):
+        """Adopt an explicit setup identity in this one connect process.
+
+        The hosted tool performs the authorized registry mutation.  Only after
+        that success does the local proxy either save a permanent binding or
+        keep a temporary in-memory override.  A different Codex/Claude host
+        process therefore cannot inherit a temporary selection.
+        """
+        if not isinstance(message, dict) \
+                or message.get("method") != "tools/call":
+            return
+        params = message.get("params") or {}
+        if params.get("name") != "agent_register":
+            return
+        arguments = params.get("arguments") or {}
+        mode = str(arguments.get("identity_mode") or "").strip().lower()
+        if mode not in ("reuse", "new", "temporary"):
+            return
+        if not isinstance(decoded, dict):
+            return
+        rpc_result = decoded.get("result")
+        if not isinstance(rpc_result, dict) or rpc_result.get("isError"):
+            return
+        selected = None
+        for item in rpc_result.get("content") or []:
+            if not isinstance(item, dict) or item.get("type") != "text":
+                continue
+            try:
+                body = json.loads(item.get("text") or "")
+            except (TypeError, ValueError):
+                continue
+            if isinstance(body, dict) and body.get("agent_id"):
+                selected = str(body["agent_id"]).strip()
+                break
+        parsed = parse_canonical_agent_id(selected, context.get("project")) \
+            if selected else None
+        if not parsed:
+            return
+        selected_project = context.get("project") or parsed["workspace"]
+        state["project"] = selected_project
+        if mode == "temporary":
+            state["temporary_actor"] = selected
+        else:
+            machine_actor_binding_set(
+                context["url"], selected_project, context["runtime"],
+                selected, client_instance=context.get("client_instance"))
+            state["temporary_actor"] = None
+        # The hosted session was initialized under the prior request actor.
+        # Recreate it lazily under the selected exact identity next call.
+        reset_remote()
+
     def process_one(message):
         if not isinstance(message, dict):
             return {"jsonrpc": "2.0", "id": None,
@@ -15930,6 +16339,7 @@ def run_connect_proxy(url=None, actor=None, actor_type=None, project=None,
                         message, context, failure[0], failure[1])
                 status, data = post(message, context)
             decoded = decode_hosted(message, context, status, data)
+            apply_identity_selection(message, decoded, context)
             return decoded if msg_id is not None else None
         except AuthenticationError as error:
             latch_auth(401)
