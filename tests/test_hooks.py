@@ -49,7 +49,8 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
         return actor
 
     def _hook(self, cwd, data_dir, home, url=None, runtime="codex",
-              event="SessionStart", stop_hook_active=False):
+              event="SessionStart", stop_hook_active=False,
+              session_id=None, session_crons=None):
         env = dict(os.environ)
         if runtime == "codex":
             env["PLUGIN_ROOT"] = str(ROOT)
@@ -85,6 +86,10 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             payload["source"] = "startup"
         if event == "Stop":
             payload["stop_hook_active"] = stop_hook_active
+        if session_id is not None:
+            payload["session_id"] = session_id
+        if session_crons is not None:
+            payload["session_crons"] = session_crons
         return subprocess.run(
             [sys.executable, str(HOOK)], cwd=str(cwd), env=env,
             input=json.dumps(payload),
@@ -315,6 +320,105 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                     hook_module._runtime_actor(config, "shared")["runtime"],
                     "claude")
 
+    def test_claude_session_start_requires_one_native_minute_inbox_loop(self):
+        with mock.patch.dict(os.environ, {
+                "CLAUDE_PLUGIN_ROOT": str(ROOT),
+                "ATTACCA_RUNTIME": "claude",
+        }, clear=True):
+            notice = hook_module._claude_session_loop_notice(
+                {"project_id": "shared"}, 60)
+        self.assertEqual(
+            notice["system_message"],
+            "Attacca Claude one-minute inbox loop required")
+        context = notice["context"]
+        self.assertIn("CronList", context)
+        self.assertIn("CronCreate", context)
+        self.assertIn("CronDelete", context)
+        self.assertIn("`* * * * *`", context)
+        self.assertIn(
+            "`/attacca:inbox [ATTACCA_MANAGED_INBOX_LOOP_V1:shared]`",
+            context)
+        self.assertIn("exactly one", context)
+        self.assertIn("every startup/resume/clear/compact", context)
+
+    def test_claude_minute_loop_notice_is_runtime_scoped_and_respects_disable(self):
+        for runtime in ("codex", "kimi"):
+            with self.subTest(runtime=runtime), mock.patch.dict(
+                    os.environ, {"ATTACCA_RUNTIME": runtime}, clear=True):
+                self.assertIsNone(
+                    hook_module._claude_session_loop_notice(
+                        {"project_id": "shared"}, 60))
+        with mock.patch.dict(os.environ, {
+                "ATTACCA_RUNTIME": "claude",
+                "CLAUDE_CODE_DISABLE_CRON": "1",
+        }, clear=True):
+            notice = hook_module._claude_session_loop_notice(
+                {"project_id": "shared"}, 60)
+        self.assertIn("DISABLED", notice["context"])
+        self.assertIn("machine-global Attacca watcher", notice["context"])
+        self.assertNotIn("CronCreate", notice["context"])
+
+    def test_claude_loop_accepts_equivalent_schedule_and_preserves_unrelated(self):
+        status = {"project_id": "shared"}
+        exact = {
+            "id": "owned", "schedule": "*/1 * * * *",
+            "prompt": "/attacca:inbox "
+                      "[ATTACCA_MANAGED_INBOX_LOOP_V1:shared]",
+            "recurring": True,
+        }
+        unrelated = {
+            "id": "other", "cron": "0 9 * * *", "prompt": "daily report",
+            "recurring": True,
+        }
+        payload = {"session_crons": [unrelated, exact]}
+        with mock.patch.dict(
+                os.environ, {"ATTACCA_RUNTIME": "claude"}, clear=True):
+            state = hook_module._claude_loop_status(payload, "shared")
+            notice = hook_module._claude_session_loop_notice(
+                status, 60, payload=payload)
+        self.assertTrue(state["healthy"])
+        self.assertEqual(state["managed"], [exact])
+        self.assertIsNone(notice)
+
+    def test_claude_stop_repairs_missing_loop_once_per_session(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+                os.environ, {"ATTACCA_RUNTIME": "claude"}, clear=True):
+            status = {
+                "project_id": "shared",
+                "state_path": str(Path(tmp) / "hook-state.json"),
+            }
+            payload = {"session_id": "session-a", "session_crons": [{
+                "id": "other", "cron": "0 9 * * *",
+                "prompt": "unrelated job",
+            }]}
+            first = hook_module._claude_stop_loop_notice(
+                status, payload, 60)
+            repeated = hook_module._claude_stop_loop_notice(
+                status, payload, 60)
+            new_session = hook_module._claude_stop_loop_notice(
+                status, {**payload, "session_id": "session-b"}, 60)
+        self.assertIn("CronCreate", first["context"])
+        self.assertIsNone(repeated)
+        self.assertIn("CronCreate", new_session["context"])
+        self.assertIn("never unrelated jobs", first["context"])
+
+    def test_claude_stop_loop_missing_payload_and_disabled_polling_fail_soft(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+                os.environ, {"ATTACCA_RUNTIME": "claude"}, clear=True):
+            status = {
+                "project_id": "shared",
+                "state_path": str(Path(tmp) / "hook-state.json"),
+            }
+            self.assertIsNone(hook_module._claude_stop_loop_notice(
+                status, {"session_id": "session-a"}, 60))
+            self.assertIsNone(hook_module._claude_stop_loop_notice(
+                status, {"session_id": "session-a", "session_crons": []},
+                0))
+            disabled = hook_module._claude_session_loop_notice(
+                status, 0, payload={"session_crons": []})
+        self.assertIn("background polling is Off", disabled["context"])
+        self.assertNotIn("CronCreate", disabled["context"])
+
     def test_kimi_native_manifest_runtime_and_hook_output_contract(self):
         manifest = json.loads((ROOT / "kimi.plugin.json").read_text())
         self.assertEqual(manifest["commands"], "./kimi-commands/")
@@ -329,9 +433,12 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             self.assertEqual(hook["command"],
                              "python3 ./hooks/session_start.py")
 
-        with mock.patch.dict(os.environ, {
-                "KIMI_PLUGIN_ROOT": str(ROOT),
-                "CLAUDE_PLUGIN_ROOT": "/ignored/claude/plugin"}, clear=True):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+                os.environ, {
+                    "HOME": tmp,
+                    "KIMI_PLUGIN_ROOT": str(ROOT),
+                    "CLAUDE_PLUGIN_ROOT": "/ignored/claude/plugin",
+                }, clear=True):
             plugin_root, config = hook_module._plugin_and_config()
             self.assertEqual(plugin_root, ROOT.resolve())
             self.assertEqual(config["actor"], "kimi")
@@ -496,6 +603,7 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             self.assertIn("through the configured MCP connection", context)
             self.assertIn("ship the panel", context)
             self.assertIn("please check this", context)
+            self.assertNotIn("ATTACCA CLAUDE SESSION LOOP", context)
             brief = json.loads(context.rsplit("\n\n", 1)[1])
             self.assertEqual(brief["actor"], "shared.worker.codex")
             self.assertEqual(brief["project_rules"][0]["title"],
@@ -507,6 +615,10 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             self.assertEqual(claude_brief["actor"],
                              "shared.director.claude")
             self.assertIn("please check this", claude_context)
+            self.assertEqual(
+                claude_context.count("ATTACCA CLAUDE SESSION LOOP"), 1)
+            self.assertIn("`/loop 1m /attacca:inbox`", claude_context)
+            self.assertIn("CronList", claude_context)
 
     def test_newer_server_prompts_without_replacing_brief_and_persists_choice(self):
         with tempfile.TemporaryDirectory() as tmp:

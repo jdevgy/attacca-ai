@@ -341,6 +341,13 @@ class HttpTestCase(unittest.TestCase):
             self.assertIn("task_list", setup_text)
             self.assertIn("task_create", setup_text)
             self.assertIn("Never silently", setup_text)
+        self.assertIn("ATTACCA_MANAGED_INBOX_LOOP_V1:", codex_setup)
+        claude_inbox = archive.read("commands/inbox.md").decode()
+        self.assertIn("ATTACCA_MANAGED_INBOX_LOOP_V1:", claude_inbox)
+        self.assertIn("ATTACCA_CHANGED=false", claude_inbox)
+        packaged_hook = archive.read("hooks/session_start.py").decode()
+        self.assertIn("ATTACCA_MANAGED_INBOX_LOOP_V1:", packaged_hook)
+        self.assertIn("CronCreate", packaged_hook)
         hook_manifest = json.loads(archive.read("hooks/hooks.json"))
         self.assertEqual(set(hook_manifest["hooks"]),
                          {"SessionStart", "UserPromptSubmit", "Stop"})

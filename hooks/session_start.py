@@ -5696,7 +5696,150 @@ The authoritative startup snapshot has already been loaded:
         % status["project_id"], context)
 
 
-def _active_output(status, offline_adapter=None, offline_factory=None):
+CLAUDE_INBOX_LOOP_MARKER_PREFIX = "ATTACCA_MANAGED_INBOX_LOOP_V1:"
+CLAUDE_INBOX_LOOP_CRONS = {"* * * * *", "*/1 * * * *"}
+
+
+def _claude_inbox_loop_marker(project_id):
+    return "%s%s" % (CLAUDE_INBOX_LOOP_MARKER_PREFIX, project_id)
+
+
+def _claude_inbox_loop_prompt(project_id):
+    return "/attacca:inbox [%s]" % _claude_inbox_loop_marker(project_id)
+
+
+def _claude_loop_status(payload, project_id):
+    """Classify Claude-owned cron rows without touching unrelated jobs."""
+    rows = (payload or {}).get("session_crons")
+    if not isinstance(rows, list):
+        return None
+    marker = _claude_inbox_loop_marker(project_id)
+    prompt = _claude_inbox_loop_prompt(project_id)
+    managed = []
+    exact = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_prompt = str(row.get("prompt") or "")
+        if CLAUDE_INBOX_LOOP_MARKER_PREFIX not in row_prompt:
+            continue
+        managed.append(row)
+        schedule = str(row.get("cron") or row.get("schedule") or "").strip()
+        recurring = row.get("recurring") is not False
+        if marker in row_prompt and row_prompt.strip() == prompt \
+                and schedule in CLAUDE_INBOX_LOOP_CRONS and recurring:
+            exact.append(row)
+    return {"rows": rows, "managed": managed, "exact": exact,
+            "healthy": len(managed) == 1 and len(exact) == 1}
+
+
+def _claude_loop_disabled():
+    return str(os.environ.get("CLAUDE_CODE_DISABLE_CRON") or "").strip() \
+        .lower() in ("1", "true", "yes", "on")
+
+
+def _claude_session_loop_notice(status, interval, payload=None):
+    """Ask real Claude sessions to maintain one native one-minute inbox job.
+
+    Claude's ``/loop`` jobs live inside the current coding session, unlike
+    Attacca's machine-global watcher.  A lifecycle hook cannot call Claude's
+    host-owned Cron tools itself, so every fresh/resumed SessionStart injects
+    an idempotent agent instruction: inspect existing jobs, create the missing
+    one, and remove only duplicate Attacca-managed jobs.  Codex deliberately
+    also exports ``CLAUDE_PLUGIN_ROOT`` for hook compatibility; runtime
+    detection keeps this contract out of Codex and Kimi sessions.
+    """
+    if _runtime_name() != "claude":
+        return None
+    project_id = status["project_id"]
+    loop_status = _claude_loop_status(payload, project_id)
+    disabled = _claude_loop_disabled() or interval == 0
+    if disabled:
+        reason = "CLAUDE_CODE_DISABLE_CRON is set" \
+            if _claude_loop_disabled() else "Attacca background polling is Off"
+        return {
+            "system_message": "Attacca Claude one-minute loop disabled by host",
+            "context": (
+                "ATTACCA CLAUDE SESSION LOOP DISABLED: %s. Do not change that "
+                "user choice. If CronList remains available, use CronDelete "
+                "to remove only jobs whose prompt "
+                "contains `%s`; leave every unrelated job untouched. The "
+                "machine-global Attacca watcher remains the independent "
+                "continuity "
+                "path when polling is enabled; an inactive Claude session "
+                "cannot be forced to generate a turn." %
+                (reason, CLAUDE_INBOX_LOOP_MARKER_PREFIX)),
+        }
+    if loop_status and loop_status["healthy"]:
+        return None
+    prompt = _claude_inbox_loop_prompt(project_id)
+    return {
+        "system_message": "Attacca Claude one-minute inbox loop required",
+        "context": (
+            "ATTACCA CLAUDE SESSION LOOP — ESTABLISH NOW: Before continuing "
+            "with the user's work, use Claude's CronList tool and ensure "
+            "exactly one recurring session job exists with cron expression "
+            "`* * * * *` whose exact prompt is `%s`. Delete only stale or "
+            "duplicate jobs containing `%s` with CronDelete, never unrelated "
+            "jobs. If the "
+            "current job is absent, create it with CronCreate using "
+            "recurring=true and durable=true when the host accepts durable "
+            "jobs; otherwise create the session-only recurring job. Do not "
+            "ask the user to run the command. This is the managed equivalent "
+            "of `/loop 1m /attacca:inbox`. Claude "
+            "jobs are session-scoped, so this check is intentionally repeated "
+            "on every startup/resume/clear/compact. If those Cron tools are "
+            "unavailable, state that once and rely on the already-running "
+            "machine-global Attacca watcher; never claim the Claude loop was "
+            "created without tool confirmation." %
+            (prompt, CLAUDE_INBOX_LOOP_MARKER_PREFIX)),
+    }
+
+
+def _claude_stop_loop_notice(status, payload, interval):
+    """Block one Stop per session when Claude reports a missing managed job."""
+    if _runtime_name() != "claude" or _claude_loop_disabled() or interval == 0:
+        return None
+    loop_status = _claude_loop_status(payload, status["project_id"])
+    session_id = str((payload or {}).get("session_id") or "").strip()
+    if loop_status is None or not session_id:
+        return None
+    key = "%s:%s" % (status["project_id"], session_id)
+    state_path = Path(status["state_path"])
+    if loop_status["healthy"]:
+        def clear_attempt(state):
+            attempts = state.get("claude_loop_attempts") or {}
+            attempts.pop(key, None)
+            if attempts:
+                state["claude_loop_attempts"] = attempts
+            else:
+                state.pop("claude_loop_attempts", None)
+        _mutate_state(state_path, clear_attempt)
+        return None
+    already_attempted = bool(
+        (_read_state(state_path).get("claude_loop_attempts") or {}).get(key))
+    if already_attempted:
+        return None
+
+    def record_attempt(state):
+        attempts = state.setdefault("claude_loop_attempts", {})
+        attempts[key] = {
+            "attempted_at": datetime.now(timezone.utc).isoformat(),
+            "project_id": status["project_id"],
+        }
+        if len(attempts) > 64:
+            for stale_key in sorted(
+                    attempts,
+                    key=lambda item: str(
+                        (attempts.get(item) or {}).get("attempted_at") or ""))[
+                            :-64]:
+                attempts.pop(stale_key, None)
+    _mutate_state(state_path, record_attempt)
+    return _claude_session_loop_notice(status, interval, payload={})
+
+
+def _active_output(status, offline_adapter=None, offline_factory=None,
+                   hook_payload=None):
     plugin_root, config = _plugin_and_config()
     interval = DEFAULT_UPDATE_INTERVAL_SECONDS
     watcher_notice = None
@@ -5730,6 +5873,8 @@ def _active_output(status, offline_adapter=None, offline_factory=None):
                         "The immediate SessionStart sync still runs; repair "
                         "the watcher so idle checks resume." % _trim(err, 240)),
         }
+    claude_loop_notice = _claude_session_loop_notice(
+        status, interval, payload=hook_payload)
     pending_notice = _watcher_pending_notice(status, config)
     offline_key, offline_entry = _watcher_subscription_entry(status, config)
     inbox_check_notice = None
@@ -5801,6 +5946,7 @@ handoff before further writes.
         output = _append_notice(
             output, update_notice)
         output = _append_notice(output, watcher_notice)
+        output = _append_notice(output, claude_loop_notice)
         output = _append_notice(output, terminal_notice)
         output = _append_notice(output, inbox_check_notice)
         # Append last: _insert_after_rules_banner places the newest notice
@@ -5814,8 +5960,8 @@ handoff before further writes.
         output = _hook_output(status, recovery_reason=str(err))
         return _append_notices(
             output, "SessionStart",
-            (update_notice, watcher_notice, terminal_notice, pending_notice,
-             inbox_check_notice))
+            (update_notice, watcher_notice, claude_loop_notice,
+             terminal_notice, pending_notice, inbox_check_notice))
     except Exception as err:
         auth_blocked = _authentication_required_error(err) or bool(
             isinstance(offline_entry, dict) and
@@ -5842,8 +5988,11 @@ handoff before further writes.
             if output is None:
                 output = _failure_output(status, config, "SessionStart", err)
             trailing_notices = (
-                pending_notice, update_notice, watcher_notice, terminal_notice,
-                inbox_check_notice, attention_notice)
+                pending_notice, update_notice, watcher_notice,
+                claude_loop_notice, terminal_notice, inbox_check_notice,
+                attention_notice)
+        if auth_blocked:
+            trailing_notices = trailing_notices + (claude_loop_notice,)
         return _append_notices(
             output, "SessionStart",
             trailing_notices)
@@ -5976,7 +6125,7 @@ def _change_summary(status, previous, current, snapshot, interval):
 
 
 def _periodic_output(status, event_name, offline_adapter=None,
-                     offline_factory=None):
+                     offline_factory=None, hook_payload=None):
     plugin_root, config = _plugin_and_config()
     watcher_notice = None
     watcher_healthy = False
@@ -6008,6 +6157,9 @@ def _periodic_output(status, event_name, offline_adapter=None,
     polling_disabled = bool(
         (offline_entry or {}).get("interval_seconds") == 0 or
         (early_poll_entry or {}).get("interval_seconds") == 0)
+    interval = _settings_interval(config, entry=offline_entry)
+    claude_loop_notice = _claude_stop_loop_notice(
+        status, hook_payload, interval) if event_name == "Stop" else None
     inbox_check_notice = None
     if not polling_disabled:
         try:
@@ -6046,7 +6198,7 @@ def _periodic_output(status, event_name, offline_adapter=None,
     if not is_kimi_prompt:
         update_notice = None
     notices = (pending_notice, watcher_notice, update_notice, terminal_notice,
-               inbox_check_notice, attention_notice)
+               inbox_check_notice, claude_loop_notice, attention_notice)
     # A healthy daemon is the primary periodic path. Queued changes bypass the
     # old hook throttle and are delivered immediately; otherwise this boundary
     # stays quiet and leaves network polling to the autonomous watcher.
@@ -6073,7 +6225,6 @@ def _periodic_output(status, event_name, offline_adapter=None,
         notices = notices[:-1] + (
             _watcher_attention_notice(status, config),)
         return _append_notices(banner_output, event_name, notices)
-    interval = _settings_interval(config, entry=offline_entry)
     identity, entry = _poll_entry(status, config)
     cached_rules_output = None
     # Same rule as above: the banner is a UserPromptSubmit-only silent injection,
@@ -6307,8 +6458,9 @@ def main(argv=None):
             print(json.dumps(output))
     elif result["status"] == "linked" and event_name in (
             "SessionStart", "UserPromptSubmit", "Stop"):
-        output = _active_output(result) if event_name == "SessionStart" \
-            else _periodic_output(result, event_name)
+        output = _active_output(
+            result, hook_payload=payload) if event_name == "SessionStart" \
+            else _periodic_output(result, event_name, hook_payload=payload)
         if output:
             output = _with_migration_notice(output, migration)
             print(json.dumps(output))
