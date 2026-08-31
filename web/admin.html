@@ -544,10 +544,8 @@
       ];
       const RULE_SCOPES = ["everyone", "director", "advisor", "worker"];
       const DEFAULT_PREFS = { actor: "web.admin", actorType: "human", owner: "", autoRefresh: true, refreshSeconds: 15 };
-      const ROOM_HISTORY_LIMIT = 500;
-      const ACTIVITY_HISTORY_LIMIT = 1000;
-      const ROOM_PAGE_SIZE = 75;
-      const ACTIVITY_PAGE_SIZE = 100;
+      const PANEL_PAGE_SIZE = 60;
+      const FILTER_DEBOUNCE_MS = 250;
       const NEWEST_EDGE_PX = 72;
 
       // TESTABLE_FEED_HELPERS:BEGIN
@@ -621,7 +619,89 @@
       // TESTABLE_SORT_HELPERS:END
 
       function newFeedState() {
-        return { page: 0, pageCount: 1, followNewest: true, newCount: 0, newestSeq: 0, scopeKey: "", resetPending: true };
+        return { offset: 0, total: 0, hasMore: false, followNewest: true,
+          newCount: 0, newestSeq: 0, scopeKey: "", resetPending: true };
+      }
+
+      function newListPage() { return { offset: 0 }; }
+
+      function responseRows(response, key) {
+        return Array.isArray(response?.[key]) ? response[key] : [];
+      }
+
+      function responsePage(response, key, fallbackOffset = 0) {
+        const rows = responseRows(response, key);
+        const pagination = response?.pagination || {};
+        const number = (value, fallback) => Number.isFinite(Number(value))
+          ? Number(value) : fallback;
+        const total = number(response?.total, number(pagination.total, rows.length));
+        const unfilteredTotal = number(response?.unfiltered_total,
+          number(pagination.unfiltered_total, total));
+        const limit = Math.max(1, number(response?.limit,
+          number(pagination.limit, PANEL_PAGE_SIZE)));
+        const offset = Math.max(0, number(response?.offset,
+          number(pagination.offset, fallbackOffset)));
+        const hasMore = typeof response?.has_more === "boolean" ? response.has_more
+          : typeof pagination.has_more === "boolean" ? pagination.has_more
+          : offset + rows.length < total;
+        return { rows, total, unfilteredTotal, limit, offset, hasMore,
+          rangeStart: rows.length ? offset + 1 : 0,
+          rangeEnd: rows.length ? offset + rows.length : 0 };
+      }
+
+      function listPage(view) {
+        if (!state.listPages[view]) state.listPages[view] = newListPage();
+        return state.listPages[view];
+      }
+
+      function resetListPage(view) { listPage(view).offset = 0; }
+
+      function resetProjectPages() {
+        ["tasks", "decisions", "rules", "agents", "bridges", "handoff",
+          "log", "search"].forEach(resetListPage);
+      }
+
+      function listQuery(view, extra = {}) {
+        const params = new URLSearchParams({
+          limit: String(PANEL_PAGE_SIZE),
+          offset: String(Math.max(0, listPage(view).offset || 0)),
+          sort: sortDirection(view),
+        });
+        Object.entries(extra).forEach(([key, value]) => {
+          if (value !== undefined && value !== null && String(value) !== "") {
+            params.set(key, String(value));
+          }
+        });
+        return `?${params.toString()}`;
+      }
+
+      function feedQuery(kind, extra = {}) {
+        const feed = state[`${kind}Feed`] || newFeedState();
+        const params = new URLSearchParams({
+          limit: String(PANEL_PAGE_SIZE),
+          offset: String(Math.max(0, feed.offset || 0)),
+          sort: "newest",
+        });
+        Object.entries(extra).forEach(([key, value]) => {
+          if (value !== undefined && value !== null && String(value) !== "") {
+            params.set(key, String(value));
+          }
+        });
+        return `?${params.toString()}`;
+      }
+
+      function pageToolbar(view, response, key, noun) {
+        const page = responsePage(response, key, listPage(view).offset);
+        listPage(view).offset = page.offset;
+        const shown = page.total === page.unfilteredTotal
+          ? `${page.total} ${noun}`
+          : `${page.total} matching of ${page.unfilteredTotal} ${noun}`;
+        const range = page.rows.length
+          ? `${page.rangeStart}–${page.rangeEnd} of ${page.total}`
+          : page.offset > 0 && page.total > 0
+          ? `No results at offset ${page.offset} · ${page.total} total`
+          : `0 of ${page.total}`;
+        return `<div class="feed-toolbar"><div class="feed-pagination" role="navigation" aria-label="${h(identityPart(noun))} pages"><button class="button quiet small" type="button" data-action="list-previous" data-list-page="${h(view)}" ${page.offset <= 0 ? "disabled" : ""}>Previous</button><span class="feed-range">${h(range)}</span><button class="button quiet small" type="button" data-action="list-next" data-list-page="${h(view)}" ${page.hasMore ? "" : "disabled"}>Next</button></div><span class="faint small">${h(shown)} · ${h(page.limit)} per page</span></div>`;
       }
 
       // Some privacy modes and embedded/forwarded browser surfaces expose
@@ -742,13 +822,28 @@
         data: {},
         errors: {},
         loading: true,
+        workspaceSearch: "",
         taskFilter: "active",
         taskSearch: "",
         taskPlan: { taskId: "", data: null, error: "", loading: false, edit: false, selectedVersion: null },
         roomConversation: "local",
+        roomFilter: "",
         activityFilter: "",
         ruleFilter: "",
+        decisionFilter: "",
+        decisionSearch: "",
+        agentSearch: "",
+        bridgeSearch: "",
+        handoffSearch: "",
+        logSearch: "",
+        clientKeySearch: "",
         listSort: readListSorts(),
+        listPages: {
+          workspaces: newListPage(), tasks: newListPage(), decisions: newListPage(),
+          rules: newListPage(), agents: newListPage(), bridges: newListPage(),
+          handoff: newListPage(), log: newListPage(), search: newListPage(),
+          clientKeys: newListPage()
+        },
         roomFeed: newFeedState(),
         activityFeed: newFeedState(),
         searchQuery: "",
@@ -756,6 +851,8 @@
         prefs: readPrefs(),
         poller: null,
         authRecovery: null,
+        filterTimer: null,
+        restoreFocus: null,
         loadSerial: 0,
         renderedKey: null,
         renderedHtml: null,
@@ -771,7 +868,8 @@
         return {
           supported: false,
           capabilities: { client_keys: false, activation: false },
-          client_keys: []
+          client_keys: [], total: 0, unfiltered_total: 0,
+          limit: PANEL_PAGE_SIZE, offset: 0, has_more: false
         };
       }
       // TESTABLE_EMPTY_CREDENTIAL_ACCESS:END
@@ -815,7 +913,8 @@
           const workspace = state.projects.find(project => project.project_id === workspaceId)?.name || workspaceId;
           return [workspace, role, runtime].map(identityPart).join(" · ");
         }
-        const registered = state.data.agents?.agents?.find(agent => agent.agent_id === raw);
+        const registered = (state.data.agentOptions?.agents ||
+          state.data.agents?.agents || []).find(agent => agent.agent_id === raw);
         if (registered?.operational_actor_id && registered.operational_actor_id !== raw) {
           return actorDisplay(registered.operational_actor_id);
         }
@@ -866,7 +965,8 @@
       }
 
       function panelAgentRecord() {
-        return (state.data.agents?.agents || []).find(agent =>
+        return (state.data.agentOptions?.agents ||
+          state.data.agents?.agents || []).find(agent =>
           agent.agent_id === state.prefs.actor ||
           agent.operational_actor_id === state.prefs.actor) || null;
       }
@@ -1016,14 +1116,23 @@
       function normalizeCredentialAccess(payload) {
         const fallback = emptyCredentialAccess();
         const source = payload && typeof payload === "object" ? payload : {};
+        const keys = Array.isArray(source.client_keys) ? source.client_keys : [];
         return {
+          ...source,
           supported: Array.isArray(source.client_keys),
           capabilities: {
             ...fallback.capabilities,
             client_keys: Array.isArray(source.client_keys),
             activation: true
           },
-          client_keys: Array.isArray(source.client_keys) ? source.client_keys : []
+          client_keys: keys,
+          total: Number.isFinite(Number(source.total)) ? Number(source.total) : keys.length,
+          unfiltered_total: Number.isFinite(Number(source.unfiltered_total))
+            ? Number(source.unfiltered_total) : Number.isFinite(Number(source.total))
+            ? Number(source.total) : keys.length,
+          limit: Number.isFinite(Number(source.limit)) ? Number(source.limit) : PANEL_PAGE_SIZE,
+          offset: Number.isFinite(Number(source.offset)) ? Number(source.offset) : 0,
+          has_more: typeof source.has_more === "boolean" ? source.has_more : false
         };
       }
 
@@ -1053,7 +1162,8 @@
       async function loadCredentialAccess() {
         if (!state.auth?.authenticated) return emptyCredentialAccess();
         try {
-          return normalizeCredentialAccess(await api("/v1/auth/client-keys"));
+          return normalizeCredentialAccess(await api(
+            `/v1/auth/client-keys${listQuery("clientKeys", { q: state.clientKeySearch })}`));
         } catch (error) {
           if (![404, 405].includes(error.status)) throw error;
           return emptyCredentialAccess();
@@ -1085,7 +1195,7 @@
         }
         const entries = await Promise.all((projects || []).map(async project => {
           try {
-            const result = await api(`/v1/projects/${encodeURIComponent(project.project_id)}/agents`);
+            const result = await api(`/v1/projects/${encodeURIComponent(project.project_id)}/agents?options=1`);
             return [project.project_id, result?.agents || [], null];
           } catch (error) {
             return [project.project_id, [], error.message || String(error)];
@@ -1213,12 +1323,17 @@
         const unread = inboxUnreadTotal(state.data.inbox || {});
         const unreadBadge = $("#nav-unread");
         unreadBadge.hidden = !unread;
-        unreadBadge.textContent = unread ? String(unread) : "";
+        unreadBadge.textContent = unread ? Number(unread).toLocaleString() : "";
         const ruleBadge = $("#nav-rules");
-        const rules = state.data.rules?.rules || [];
+        const ruleResponse = state.data.rules || {};
+        const rules = ruleResponse.rules || [];
         const enabledRules = rules.filter(rule => rule.enabled).length;
-        ruleBadge.textContent = String(rules.length);
-        ruleBadge.title = `${enabledRules} enabled of ${rules.length} loaded rules`;
+        const rulePage = responsePage(ruleResponse, "rules", listPage("rules").offset);
+        const ruleTotal = rulePage.unfilteredTotal;
+        const enabledTotal = Number.isFinite(Number(ruleResponse.enabled_total))
+          ? Number(ruleResponse.enabled_total) : enabledRules;
+        ruleBadge.textContent = Number(ruleTotal).toLocaleString();
+        ruleBadge.title = `${enabledTotal} enabled of ${ruleTotal} workspace rules`;
       }
 
       function renderAuth() {
@@ -1278,7 +1393,7 @@
         }
         let projectsResult;
         try {
-          const requests = [api("/healthz"), api("/v1/projects"), api("/v1/settings")];
+          const requests = [api("/healthz"), api("/v1/projects?options=1"), api("/v1/settings")];
           if (state.auth.authenticated) {
             requests.push(api("/v1/auth/tokens"));
             requests.push(loadCredentialAccess());
@@ -1301,7 +1416,7 @@
           }
           state.health = { ok: false, error: error.message };
           try { state.serverSettings = await api("/v1/settings"); } catch (_) { /* server may predate the panel settings route */ }
-          try { projectsResult = await api("/v1/projects"); }
+          try { projectsResult = await api("/v1/projects?options=1"); }
           catch (projectError) {
             state.loading = false;
             updateChrome();
@@ -1317,12 +1432,16 @@
         state.loading = false;
         updateChrome();
         if (state.projectId) await loadProjectData();
-        else { state.view = "workspaces"; render(); busy(false); }
+        else {
+          state.view = "workspaces";
+          await loadProjectPage();
+          busy(false);
+        }
         startPoller();
       }
 
       async function loadProjects() {
-        const result = await api("/v1/projects");
+        const result = await api("/v1/projects?options=1");
         state.projects = result.projects || [];
         updateChrome();
       }
@@ -1334,7 +1453,7 @@
       function feedNearNewest(kind, feed) {
         if (!feed) return true;
         const feedState = state[`${kind}Feed`] || newFeedState();
-        if (!isNewestFeedPage(feedState.page, feedState.pageCount)) return false;
+        if ((Number(feedState.offset) || 0) > 0) return false;
         return kind === "room"
           ? feed.scrollHeight - feed.scrollTop - feed.clientHeight <= NEWEST_EDGE_PX
           : feed.scrollTop <= NEWEST_EDGE_PX;
@@ -1362,18 +1481,23 @@
         return (rows || []).reduce((latest, row) => Math.max(latest, Number(row?.seq) || 0), 0);
       }
 
-      function prepareFeedPage(kind, rows, scopeKey, pageSize) {
+      function prepareServerFeed(kind, response, key, scopeKey) {
         const stateKey = `${kind}Feed`;
         let feed = state[stateKey] || newFeedState();
         const context = state.renderContext || {};
         const viewport = context.viewport;
+        const page = responsePage(response, key, feed.offset);
+        const rows = page.rows;
         const latest = newestSequence(rows);
         const reset = feed.resetPending || feed.scopeKey !== scopeKey;
         if (reset) {
-          feed = { ...newFeedState(), scopeKey, newestSeq: latest, resetPending: false };
+          feed = { ...newFeedState(), scopeKey, newestSeq: latest,
+            offset: page.offset, total: page.total, hasMore: page.hasMore,
+            resetPending: false };
           context.feedResetApplied = kind;
         } else {
-          const added = (rows || []).filter(row => (Number(row?.seq) || 0) > (Number(feed.newestSeq) || 0)).length;
+          const added = Number(response?.new_count) || (rows || []).filter(
+            row => (Number(row?.seq) || 0) > (Number(feed.newestSeq) || 0)).length;
           const preserveNavigation = context.feedTransition === kind;
           const nearNewest = !preserveNavigation && viewport?.kind === kind && viewport.scopeKey === scopeKey
             ? viewport.nearNewest
@@ -1381,9 +1505,10 @@
           feed = reduceFeedRefresh(feed, latest, added, nearNewest);
           if (preserveNavigation) context.feedResetApplied = kind;
         }
-        const page = paginateFeed(rows, pageSize, feed.page, feed.followNewest);
-        feed.page = page.page;
-        feed.pageCount = page.pageCount;
+        feed.offset = page.offset;
+        feed.total = page.total;
+        feed.hasMore = page.hasMore;
+        feed.followNewest = page.offset === 0 && feed.followNewest;
         if (feed.followNewest) feed.newCount = 0;
         state[stateKey] = feed;
         return page;
@@ -1393,7 +1518,12 @@
         const feed = state[`${kind}Feed`];
         const title = kind === "room" ? "conversation" : "activity";
         const newLabel = `${feed.newCount} new ${kind === "room" ? `message${feed.newCount === 1 ? "" : "s"}` : `event${feed.newCount === 1 ? "" : "s"}`}`;
-        return `<div class="feed-toolbar"><div class="feed-pagination" role="navigation" aria-label="${h(identityPart(title))} history pages"><button class="button quiet small" type="button" data-action="${kind}-older" ${page.page <= 0 ? "disabled" : ""}>Older</button><span class="feed-range">${h(page.rangeStart)}–${h(page.rangeEnd)} of ${h(page.total)} · page ${h(page.page + 1)}/${h(page.pageCount)}</span><button class="button quiet small" type="button" data-action="${kind}-newer" ${page.page >= page.pageCount - 1 ? "disabled" : ""}>Newer</button></div><button class="button quiet small new-items" type="button" data-action="${kind}-newest" aria-live="polite" ${feed.newCount ? "" : "hidden"}>${h(newLabel)} · View newest</button><span class="faint small">${h(loadedLabel)}</span></div>`;
+        const range = page.rows.length
+          ? `${page.rangeStart}–${page.rangeEnd} of ${page.total}`
+          : page.offset > 0 && page.total > 0
+          ? `No results at offset ${page.offset} · ${page.total} total`
+          : `0 of ${page.total}`;
+        return `<div class="feed-toolbar"><div class="feed-pagination" role="navigation" aria-label="${h(identityPart(title))} history pages"><button class="button quiet small" type="button" data-action="${kind}-older" ${page.hasMore ? "" : "disabled"}>Older</button><span class="feed-range">${h(range)}</span><button class="button quiet small" type="button" data-action="${kind}-newer" ${page.offset > 0 ? "" : "disabled"}>Newer</button></div><button class="button quiet small new-items" type="button" data-action="${kind}-newest" aria-live="polite" ${feed.newCount ? "" : "hidden"}>${h(newLabel)} · View newest</button><span class="faint small">${h(loadedLabel)} · ${h(page.limit)} per page</span></div>`;
       }
 
       function restoreFeedViewport(snapshot, transition, resetApplied) {
@@ -1427,14 +1557,112 @@
 
       function navigateFeed(kind, direction) {
         const feed = state[`${kind}Feed`];
-        const pageCount = Math.max(1, Number(feed.pageCount) || 1);
-        feed.page = direction === "newest" ? pageCount - 1 : clampFeedPage(feed.page + direction, pageCount);
-        feed.followNewest = feed.page === pageCount - 1;
+        if (direction === "newest") feed.offset = 0;
+        else if (direction < 0) feed.offset = Math.min(
+          Math.max(0, feed.total - 1), feed.offset + PANEL_PAGE_SIZE);
+        else feed.offset = Math.max(0, feed.offset - PANEL_PAGE_SIZE);
+        feed.followNewest = feed.offset === 0;
         if (feed.followNewest) feed.newCount = 0;
-        render({ force: true, feedTransition: kind });
+        loadProjectData({ quiet: true, feedTransition: kind });
       }
 
-      async function loadProjectData({ quiet = false } = {}) {
+      function rememberControlFocus(target) {
+        state.restoreFocus = target?.id ? {
+          id: target.id,
+          start: Number.isFinite(target.selectionStart) ? target.selectionStart : null,
+          end: Number.isFinite(target.selectionEnd) ? target.selectionEnd : null
+        } : null;
+      }
+
+      function restoreControlFocus() {
+        const snapshot = state.restoreFocus;
+        state.restoreFocus = null;
+        if (!snapshot) return;
+        requestAnimationFrame(() => {
+          const target = document.getElementById(snapshot.id);
+          if (!target) return;
+          target.focus({ preventScroll: true });
+          if (snapshot.start != null && typeof target.setSelectionRange === "function") {
+            target.setSelectionRange(snapshot.start, snapshot.end ?? snapshot.start);
+          }
+        });
+      }
+
+      async function loadProjectPage({ quiet = true } = {}) {
+        if (!quiet) busy(true);
+        try {
+          state.data.projectPage = await api(
+            `/v1/projects${listQuery("workspaces", { q: state.workspaceSearch })}`);
+          delete state.errors.projectPage;
+        } catch (error) {
+          delete state.data.projectPage;
+          state.errors.projectPage = error.message || String(error);
+        } finally {
+          if (!quiet) busy(false);
+        }
+        render({ force: true });
+      }
+
+      async function loadProjectSearch({ quiet = true } = {}) {
+        if (!state.projectId || !state.searchQuery) {
+          state.searchResults = null;
+          render({ force: true });
+          return;
+        }
+        if (!quiet) busy(true);
+        try {
+          state.searchResults = await api(pathFor(
+            `/search${listQuery("search", { q: state.searchQuery })}`));
+          delete state.errors.search;
+        } catch (error) {
+          state.searchResults = null;
+          state.errors.search = error.message || String(error);
+        } finally {
+          if (!quiet) busy(false);
+        }
+        render({ force: true });
+      }
+
+      async function reloadCredentialAccess({ quiet = true } = {}) {
+        if (!quiet) busy(true);
+        try {
+          state.credentialAccess = await loadCredentialAccess();
+          delete state.errors.clientKeys;
+        } catch (error) {
+          state.credentialAccess = emptyCredentialAccess();
+          state.errors.clientKeys = error.message || String(error);
+        } finally {
+          if (!quiet) busy(false);
+        }
+        render({ force: true });
+      }
+
+      async function refreshPagedView(view, { feedTransition = null } = {}) {
+        if (view === "clientKeys") return reloadCredentialAccess();
+        if (view === "search") return loadProjectSearch();
+        if (view === "workspaces" && !state.projectId) return loadProjectPage();
+        return loadProjectData({ quiet: true, feedTransition });
+      }
+
+      function navigateList(view, direction) {
+        const page = listPage(view);
+        page.offset = Math.max(0, page.offset + direction * PANEL_PAGE_SIZE);
+        refreshPagedView(view);
+      }
+
+      function queueFilterRefresh(target, view, { feed = false } = {}) {
+        rememberControlFocus(target);
+        if (feed) resetFeed(view);
+        else resetListPage(view);
+        clearTimeout(state.filterTimer);
+        state.filterTimer = setTimeout(() => {
+          state.filterTimer = null;
+          refreshPagedView(feed ? state.view : view,
+            { feedTransition: feed ? view : null });
+        }, FILTER_DEBOUNCE_MS);
+      }
+
+      async function loadProjectData({ quiet = false, feedTransition = null } = {}) {
         if (!state.projectId) return;
         const projectAtStart = state.projectId;
         const loadSerial = ++state.loadSerial;
@@ -1442,18 +1670,34 @@
         if (!quiet) busy(true);
         try {
           const endpoints = {
+            projectPage: `/v1/projects${listQuery("workspaces", { q: state.workspaceSearch })}`,
             handoff: pathFor("/handoff"),
-            handoffHistory: pathFor("/handoff/history?limit=20"),
+            handoffHistory: pathFor(`/handoff/history${listQuery("handoff", { q: state.handoffSearch })}`),
             status: pathFor("/status"),
-            bridges: pathFor("/bridges"),
-            tasks: pathFor("/tasks"),
-            inbox: pathFor("/inbox?mark_read=0&limit=100"),
-            room: pathFor(`/room?limit=${ROOM_HISTORY_LIMIT}`),
-            decisions: pathFor("/decisions"),
+            bridges: pathFor(`/bridges${listQuery("bridges", { q: state.bridgeSearch })}`),
+            bridgeOptions: pathFor("/bridges?options=1"),
+            tasks: pathFor(`/tasks${listQuery("tasks", { q: state.taskSearch, status: state.taskFilter })}`),
+            inbox: pathFor(`/inbox?mark_read=0&limit=${PANEL_PAGE_SIZE}`),
+            room: pathFor(`/room/history${feedQuery("room", {
+              conversation: state.roomConversation, q: state.roomFilter
+            })}`),
+            decisions: pathFor(`/decisions${listQuery("decisions", {
+              q: state.decisionSearch, status: state.decisionFilter
+            })}`),
             cloudContext: pathFor("/cloud-context"),
-            events: pathFor("/events?after=0&limit=1"),
-            agents: pathFor("/agents"),
-            log: pathFor("/log?limit=80"),
+            events: pathFor(`/activity${feedQuery("activity", { q: state.activityFilter })}`),
+            agents: pathFor(`/agents${listQuery("agents", { q: state.agentSearch })}`),
+            agentOptions: pathFor("/agents?options=1"),
+            log: pathFor(`/log${listQuery("log", { q: state.logSearch })}`),
+            overviewTasks: pathFor(`/tasks?limit=7&offset=0&sort=newest&status=active`),
+            overviewDecisions: pathFor(`/decisions?limit=1&offset=0&sort=newest`),
+            overviewAgents: pathFor(`/agents?limit=7&offset=0&sort=newest`),
+            overviewLog: pathFor(`/log?limit=7&offset=0&sort=newest`),
+            rules: pathFor(`/rules${listQuery("rules", {
+              q: state.ruleFilter,
+              include_all: canManageProjectRules() ? 1 : undefined,
+              include_disabled: canManageProjectRules() ? 1 : undefined
+            })}`),
             verify: pathFor("/verify")
           };
           if (state.taskPlan.taskId) {
@@ -1471,37 +1715,18 @@
               if (result.status === "fulfilled") {
                 state.taskPlan.data = result.value;
                 state.taskPlan.error = "";
-              } else state.taskPlan.error = result.reason.message;
+              } else {
+                state.taskPlan.data = null;
+                state.taskPlan.error = result.reason.message;
+              }
               return;
             }
             if (result.status === "fulfilled") state.data[key] = result.value;
-            else state.errors[key] = result.reason.message;
-          });
-          if (!state.errors.events) {
-            const latest = Number(state.data.events?.latest_seq) || 0;
-            const after = Math.max(0, latest - ACTIVITY_HISTORY_LIMIT);
-            try {
-              const activityWindow = await api(pathFor(`/events?after=${after}&limit=${ACTIVITY_HISTORY_LIMIT}`));
-              if (!requestIsCurrent()) return;
-              state.data.events = activityWindow;
-            } catch (error) {
-              if (!requestIsCurrent()) return;
-              state.errors.events = error.message;
+            else {
+              delete state.data[key];
+              state.errors[key] = result.reason.message;
             }
-          }
-          const rulesQuery = canManageProjectRules()
-            ? "/rules?include_all=1&include_disabled=1"
-            : "/rules";
-          try {
-            const rules = await api(pathFor(rulesQuery));
-            if (!requestIsCurrent()) return;
-            state.data.rules = rules;
-          }
-          catch (error) {
-            if (!requestIsCurrent()) return;
-            delete state.data.rules;
-            state.errors.rules = error.message;
-          }
+          });
           const contextVersion = state.data.handoff?.context_version;
           try {
             const freshness = await api(pathFor(`/freshness${contextVersion == null ? "" : `?context_version=${encodeURIComponent(contextVersion)}`}`));
@@ -1509,12 +1734,13 @@
             state.data.freshness = freshness;
           } catch (error) {
             if (!requestIsCurrent()) return;
+            delete state.data.freshness;
             state.errors.freshness = error.message;
           }
           try { await loadProjects(); } catch (_) { /* selected workspace data can still render */ }
           if (!requestIsCurrent()) return;
           updateChrome();
-          render();
+          render({ feedTransition });
         } finally {
           if (!quiet) busy(false);
         }
@@ -1575,13 +1801,17 @@
         try {
           const html = renderer();
           const key = `${state.projectId || "none"}:${state.view}`;
-          if (!shouldReplaceRender(state.renderedKey, state.renderedHtml, key, html, force)) return false;
+          if (!shouldReplaceRender(state.renderedKey, state.renderedHtml, key, html, force)) {
+            restoreControlFocus();
+            return false;
+          }
           content.innerHTML = html;
           if (state.view === "settings") applyCredentialCapabilityGates();
           state.renderedKey = key;
           state.renderedHtml = html;
           updateChrome();
           restoreFeedViewport(viewport, feedTransition, context.feedResetApplied);
+          restoreControlFocus();
           return true;
         } finally {
           state.renderContext = null;
@@ -1590,16 +1820,20 @@
 
       function renderOverview() {
         const project = currentProject() || {};
-        const tasks = state.data.tasks?.tasks || [];
-        const decisions = state.data.decisions?.decisions || [];
-        const agents = state.data.agents?.agents || [];
+        const tasks = state.data.overviewTasks?.tasks || [];
+        const decisionsResponse = state.data.overviewDecisions || {};
+        const agents = state.data.overviewAgents?.agents || [];
         const handoff = state.data.handoff || {};
         const status = state.data.status || {};
         const counts = status.counts || {};
         const openTasks = tasks.filter(task => !["done", "cancelled"].includes(task.status));
         const claimed = tasks.filter(task => task.status === "claimed").length;
-        const proposed = decisions.filter(decision => decision.status === "proposed").length;
-        const recent = (state.data.log?.log || []).slice(-7).reverse();
+        const proposed = Number(counts.open_decisions) || 0;
+        const decisionsTotal = responsePage(decisionsResponse, "decisions", 0).unfilteredTotal;
+        const recentResponse = state.data.overviewLog || {};
+        const recentKey = Array.isArray(recentResponse.entries) ? "entries" : "log";
+        const recent = responseRows(recentResponse, recentKey);
+        const logLine = entry => typeof entry === "string" ? entry : entry?.line || "";
         const verify = state.data.verify;
         const freshness = state.data.freshness;
         return pageHead("Project pulse", project.name || project.project_id, "One screen for the current state, active work, and what changed.", `<button class="button" data-view="room">Message room</button><button class="button primary" data-view="tasks">Create task</button>`) +
@@ -1607,7 +1841,7 @@
           `<div class="grid metrics">
             <section class="card metric"><div class="label">Ledger events</div><div class="value">${Number(counts.events ?? project.events ?? state.data.events?.events?.length ?? 0).toLocaleString()}</div><div class="sub">${verify?.ok ? "Chain verified" : verify ? "Verification needs attention" : "Verification unavailable"}</div></section>
             <section class="card metric"><div class="label">Open tasks</div><div class="value">${h(counts.open_tasks ?? openTasks.length)}</div><div class="sub">${h(counts.claimed_tasks ?? claimed)} currently claimed</div></section>
-            <section class="card metric"><div class="label">Open decisions</div><div class="value">${h(counts.open_decisions ?? proposed)}</div><div class="sub">${decisions.length} total records</div></section>
+            <section class="card metric"><div class="label">Open decisions</div><div class="value">${h(counts.open_decisions ?? proposed)}</div><div class="sub">${h(decisionsTotal)} total records</div></section>
             <section class="card metric"><div class="label">Known workers</div><div class="value">${h(counts.agents ?? agents.length)}</div><div class="sub">Context version ${h(status.context_version ?? handoff.context_version ?? project.context_version ?? "—")}</div></section>
           </div>
           <div class="card handoff-hero section-gap">
@@ -1620,7 +1854,7 @@
               ${openTasks.length ? `<div class="list">${openTasks.slice(0, 7).map(task => `<div class="list-row"><div><div class="list-title">${h(task.task_id)} · ${h(task.title)}</div><div class="list-meta"><span>${h(taskClaimantText(task))}</span><span>${h(task.expected_scope?.length ? `${task.expected_scope.length} scoped path${task.expected_scope.length === 1 ? "" : "s"}` : "scope not set")}</span></div></div><div>${statusBadge(task.status)}</div></div>`).join("")}</div>` : empty("The board is clear", "Create a task when there is work to coordinate.", `<button class="button small primary" data-view="tasks">Create task</button>`) }
             </div></section>
             <section class="card"><div class="card-head"><h2>Recent activity</h2><button class="button quiet small" data-view="activity">Full ledger</button></div><div class="card-body">
-              ${recent.length ? `<div class="timeline">${recent.map(line => `<div class="timeline-row"><div class="timeline-line">${h(line)}</div></div>`).join("")}</div>` : empty("No activity yet", "Events will appear as people and agents work.")}
+              ${recent.length ? `<div class="timeline">${recent.map(entry => `<div class="timeline-row"><div class="timeline-line">${h(logLine(entry))}</div></div>`).join("")}</div>` : empty("No activity yet", "Events will appear as people and agents work.")}
             </div></section>
           </div>
           <div class="grid two section-gap">
@@ -1637,16 +1871,19 @@
       }
 
       function renderWorkspaces() {
-        const projects = sortDatedRows(state.projects, { direction: sortDirection("workspaces"), dateFields: ["created_at"], idFields: ["project_id"] });
+        const response = state.data.projectPage || { projects: state.projects };
+        const projects = responseRows(response, "projects");
         return pageHead("Server workspaces", "Workspaces", "Create a logical project or switch which one this panel manages.") +
+          (state.errors.projectPage ? errorNotice(state.errors.projectPage) : "") +
           `<div class="grid main-side">
             <section><div class="grid two">
-              <div class="filterbar">${sortControl("workspaces")}</div>${projects.length ? projects.map(project => `<article class="card workspace-card ${project.project_id === state.projectId ? "selected" : ""}">
+              <div class="filterbar" style="grid-column:1/-1"><input id="workspace-search" type="search" value="${h(state.workspaceSearch)}" placeholder="Search all workspaces…" aria-label="Search workspaces">${sortControl("workspaces")}</div>${projects.length ? projects.map(project => `<article class="card workspace-card ${project.project_id === state.projectId ? "selected" : ""}">
                 <div class="workspace-top"><div><div class="cluster"><h2 class="workspace-title">${h(project.name || project.project_id)}</h2>${project.project_id === state.projectId ? `<span class="badge accepted">Selected</span>` : ""}</div><div class="faint mono small" style="margin-top:5px">${h(project.project_id)}</div></div><button class="button small ${project.project_id === state.projectId ? "quiet" : ""}" data-action="select-project" data-project="${h(project.project_id)}" ${project.project_id === state.projectId ? "disabled" : ""}>${project.project_id === state.projectId ? "Active" : "Open"}</button></div>
                 <div class="workspace-stats"><div class="workspace-stat"><strong>${Number(project.events || 0).toLocaleString()}</strong><span>Events</span></div><div class="workspace-stat"><strong>${Number(project.open_tasks || 0).toLocaleString()}</strong><span>Open tasks</span></div></div>
                 <div class="list-meta"><span>Context v${h(project.context_version)}</span><span>Created ${h(fmtTime(project.created_at))}</span></div>
                 ${project.repository_fingerprint ? `<div class="truncate faint mono small" title="${h(project.repository_fingerprint)}" style="margin-top:10px">${h(project.repository_fingerprint)}</div>` : `<div class="faint small" style="margin-top:10px">No Git identity recorded</div>`}
-              </article>`).join("") : `<div class="card" style="grid-column:1/-1">${empty("No workspaces yet", "Create the first workspace using the form.")}</div>`}
+              </article>`).join("") : `<div class="card" style="grid-column:1/-1">${empty(state.workspaceSearch ? "No matching workspaces" : "No workspaces yet", state.workspaceSearch ? "Change or clear the search." : "Create the first workspace using the form.")}</div>`}
+              <div style="grid-column:1/-1">${pageToolbar("workspaces", response, "projects", "workspaces")}</div>
             </div></section>
             <aside class="card"><div class="card-head"><h2>Create workspace</h2></div><div class="card-body">
               <form data-form="create-workspace">
@@ -1661,19 +1898,15 @@
       }
 
       function renderTasks() {
-        const tasks = state.data.tasks?.tasks || [];
-        const query = state.taskSearch.toLowerCase();
-        const filtered = sortDatedRows(tasks.filter(task => {
-          const matchesFilter = state.taskFilter === "all" || (state.taskFilter === "active" ? !["done", "cancelled"].includes(task.status) : task.status === state.taskFilter);
-          const haystack = `${task.task_id} ${task.title} ${task.description || ""} ${(task.expected_scope || []).join(" ")}`.toLowerCase();
-          return matchesFilter && (!query || haystack.includes(query));
-        }), { direction: sortDirection("tasks"), dateFields: ["updated_at", "created_at"], idFields: ["task_id"] });
+        const response = state.data.tasks || {};
+        const tasks = responseRows(response, "tasks");
         return pageHead("Shared task board", "Tasks", "Claim work explicitly, coordinate overlapping paths, and attach evidence when reporting.") +
           (state.errors.tasks ? errorNotice(state.errors.tasks) : "") +
           `<div class="grid main-side">
             <section>
-              <div class="filterbar"><input id="task-search" type="search" value="${h(state.taskSearch)}" placeholder="Search tasks…" aria-label="Search tasks"><select id="task-filter" aria-label="Filter task status">${["active","all","queued","claimed","blocked","review","done","cancelled"].map(option => `<option value="${option}" ${option === state.taskFilter ? "selected" : ""}>${option[0].toUpperCase() + option.slice(1)}</option>`).join("")}</select>${sortControl("tasks")}<span class="faint small">${filtered.length} of ${tasks.length}</span></div>
-              <div class="stack">${filtered.length ? filtered.map(renderTaskCard).join("") : `<div class="card">${empty("No matching tasks", "Change the filter or create a new task.")}</div>`}</div>
+              <div class="filterbar"><input id="task-search" type="search" value="${h(state.taskSearch)}" placeholder="Search all tasks…" aria-label="Search tasks"><select id="task-filter" aria-label="Filter task status">${["active","all","queued","claimed","blocked","review","done","cancelled"].map(option => `<option value="${option}" ${option === state.taskFilter ? "selected" : ""}>${option[0].toUpperCase() + option.slice(1)}</option>`).join("")}</select>${sortControl("tasks")}</div>
+              <div class="stack">${tasks.length ? tasks.map(renderTaskCard).join("") : `<div class="card">${empty("No matching tasks", "Change the filter or create a new task.")}</div>`}</div>
+              ${pageToolbar("tasks", response, "tasks", "tasks")}
             </section>
             <aside class="card"><div class="card-head"><h2>Create task</h2></div><div class="card-body">
               <form data-form="create-task">
@@ -1762,11 +1995,10 @@
       }
 
       function renderRoom() {
-        const allMessages = state.data.room?.messages || [];
+        const roomResponse = state.data.room || {};
         const inbox = state.data.inbox || {};
-        const inboxMessages = inbox.messages || [];
         const unreadTotal = inboxUnreadTotal(inbox);
-        const bridges = state.data.bridges?.bridges || [];
+        const bridges = state.data.bridgeOptions?.bridges || state.data.bridges?.bridges || [];
         const project = currentProject() || {};
         const friendlyName = value => {
           const raw = String(value || "Workspace");
@@ -1775,19 +2007,23 @@
         };
         const projectName = id => friendlyName(state.projects.find(item => item.project_id === id)?.name || id);
         const sourceName = projectName(state.projectId);
-        const bridgeIds = new Set(bridges.map(bridge => bridge.with));
-        if (state.roomConversation !== "local" && !bridgeIds.has(state.roomConversation)) state.roomConversation = "local";
-        const activeBridge = bridges.find(bridge => bridge.with === state.roomConversation) || null;
-        const localConversation = !activeBridge;
+        const requestedConversation = state.roomConversation || "local";
+        const localConversation = requestedConversation === "local";
+        const activeBridge = localConversation ? null
+          : bridges.find(bridge => bridge.with === requestedConversation) || {
+            with: requestedConversation, relation: "connected",
+            participation: "unknown", metadata_unavailable: true
+          };
         const conversationDenied = Boolean(activeBridge && activeBridge.can_participate === false);
-        const messages = allMessages.filter(message => {
-          if (conversationDenied) return false;
-          if (localConversation) return !message.origin_project && !(message.mirrored_to || []).length;
-          return message.origin_project === activeBridge.with || (message.mirrored_to || []).includes(activeBridge.with);
-        }).sort((left, right) => (Number(left.seq) || 0) - (Number(right.seq) || 0));
-        const roomScope = `${state.projectId}:${state.roomConversation}`;
-        const roomPage = prepareFeedPage("room", messages, roomScope, ROOM_PAGE_SIZE);
-        const pagedMessages = roomPage.rows;
+        const conversationMetadataUnavailable = Boolean(activeBridge?.metadata_unavailable);
+        const echoedConversation = roomResponse.conversation;
+        const scopeMismatch = echoedConversation != null &&
+          String(echoedConversation) !== requestedConversation;
+        const roomScope = `${state.projectId}:${requestedConversation}:${state.roomFilter}`;
+        const roomPage = prepareServerFeed("room", roomResponse, "messages", roomScope);
+        const pagedMessages = conversationDenied || scopeMismatch ? [] : [...roomPage.rows].sort(
+          (left, right) => (Number(left.seq) || 0) - (Number(right.seq) || 0));
+        const messages = pagedMessages;
         const conversationTitle = localConversation
           ? `Local workspace room · ${sourceName}`
           : `${sourceName} ↔ ${projectName(activeBridge.with)}`;
@@ -1796,14 +2032,18 @@
         const inboxEmptyText = `There are no unread group-room messages for ${inboxActor}. Every participation-visible non-self message appears here; mentions and replies only assign attention.`;
         const feedAction = `<button class="button small" type="button" data-action="review-room-feed">Review conversation feed</button>`;
         return pageHead("Human + AI channel", `${sourceName} room`, "Choose the source workspace, then open its Local room or one named inter-project conversation. These feeds never mix.", `<button class="button" data-view="network">Manage AI Network</button>`) +
-          (state.errors.room || state.errors.inbox ? errorNotice([state.errors.room, state.errors.inbox].filter(Boolean).join(" · ")) : "") +
-          `<section class="card"><div class="card-body"><div class="form-grid"><div class="field"><label for="room-workspace">Source workspace</label><select id="room-workspace">${state.projects.map(item => `<option value="${h(item.project_id)}" ${item.project_id === state.projectId ? "selected" : ""}>${h(projectName(item.project_id))} · ${h(item.project_id)}</option>`).join("")}</select><span class="help">Every conversation below is read from this workspace's retained room events.</span></div><div class="field"><label for="room-conversation">Conversation</label><select id="room-conversation"><optgroup label="Local"><option value="local" ${localConversation ? "selected" : ""}>Local workspace room · ${h(sourceName)}</option></optgroup>${bridges.length ? `<optgroup label="Inter-project">${bridges.map(bridge => `<option value="${h(bridge.with)}" ${state.roomConversation === bridge.with ? "selected" : ""}>${h(sourceName)} ↔ ${h(projectName(bridge.with))} · ${h(bridge.relation)}${bridge.can_participate === false ? " · access denied" : ""}</option>`).join("")}</optgroup>` : ""}</select><span class="help">Local excludes bridge traffic. Each inter-project choice shows only that workspace pair, including an explicit denied state when this panel identity cannot participate.</span></div></div>${activeBridge ? `<div class="form-actions"><button class="button quiet small" type="button" data-action="swap-room-workspace" data-project="${h(activeBridge.with)}" data-conversation="${h(state.projectId)}">View this pair from ${h(projectName(activeBridge.with))}</button></div>` : ""}<div class="notice ${conversationDenied ? "error" : ""} section-gap"><span>${localConversation ? "L" : conversationDenied ? "!" : "↔"}</span><div><strong>${h(conversationTitle)}</strong><br>${localConversation ? "Local workspace messages only; incoming and outgoing bridge traffic is excluded." : conversationDenied ? `${h(attributionText(state.prefs.actor, state.prefs.actorType, state.prefs.owner))} is denied by ${h(sourceName)}'s ${h(bridgeParticipationLabel(activeBridge.participation))} participation policy. The ${h(activeBridge.relation)} relationship still exists; a human or registered Director can change access in AI Network without deleting it.` : `Inter-project messages retained in ${h(sourceName)} only; unrelated origins and local-only messages are excluded.`}</div></div></div></section>` +
+          (state.errors.room || state.errors.inbox || state.errors.bridgeOptions || scopeMismatch
+            ? errorNotice([state.errors.room, state.errors.inbox,
+              state.errors.bridgeOptions,
+              scopeMismatch ? "The room response did not match the requested conversation; no messages were rendered." : ""
+            ].filter(Boolean).join(" · ")) : "") +
+          `<section class="card"><div class="card-body"><div class="form-grid"><div class="field"><label for="room-workspace">Source workspace</label><select id="room-workspace">${state.projects.map(item => `<option value="${h(item.project_id)}" ${item.project_id === state.projectId ? "selected" : ""}>${h(projectName(item.project_id))} · ${h(item.project_id)}</option>`).join("")}</select><span class="help">Every conversation below is read from this workspace's retained room events.</span></div><div class="field"><label for="room-conversation">Conversation</label><select id="room-conversation"><optgroup label="Local"><option value="local" ${localConversation ? "selected" : ""}>Local workspace room · ${h(sourceName)}</option></optgroup>${bridges.length ? `<optgroup label="Inter-project">${bridges.map(bridge => `<option value="${h(bridge.with)}" ${requestedConversation === bridge.with ? "selected" : ""}>${h(sourceName)} ↔ ${h(projectName(bridge.with))} · ${h(bridge.relation)}${bridge.can_participate === false ? " · access denied" : ""}</option>`).join("")}</optgroup>` : ""}${conversationMetadataUnavailable ? `<optgroup label="Unavailable"><option value="${h(requestedConversation)}" selected disabled>${h(sourceName)} ↔ ${h(projectName(requestedConversation))} · metadata unavailable</option></optgroup>` : ""}</select><span class="help">The server filters this exact conversation before applying the 60-message page.</span></div><div class="field wide"><label for="room-search">Search this full conversation</label><input id="room-search" type="search" value="${h(state.roomFilter)}" placeholder="Search message body, actor, type, or task…"><span class="help">Search runs over the authorized conversation history, not only this page.</span></div></div>${activeBridge && !conversationMetadataUnavailable ? `<div class="form-actions"><button class="button quiet small" type="button" data-action="swap-room-workspace" data-project="${h(activeBridge.with)}" data-conversation="${h(state.projectId)}">View this pair from ${h(projectName(activeBridge.with))}</button></div>` : ""}<div class="notice ${conversationDenied || conversationMetadataUnavailable ? "error" : ""} section-gap"><span>${localConversation ? "L" : conversationDenied || conversationMetadataUnavailable ? "!" : "↔"}</span><div><strong>${h(conversationTitle)}</strong><br>${localConversation ? "Local workspace messages only; incoming and outgoing bridge traffic is excluded." : conversationDenied ? `${h(attributionText(state.prefs.actor, state.prefs.actorType, state.prefs.owner))} is denied by ${h(sourceName)}'s ${h(bridgeParticipationLabel(activeBridge.participation))} participation policy. The ${h(activeBridge.relation)} relationship still exists; a human or registered Director can change access in AI Network without deleting it.` : conversationMetadataUnavailable ? "The exact requested inter-project scope is preserved, but bridge metadata could not be loaded. Sending stays disabled until it is verified." : `Inter-project messages retained in ${h(sourceName)} only; unrelated origins and local-only messages are excluded.`}</div></div></div></section>` +
           `<div class="grid main-side section-gap">
-            <section class="card" id="room-conversation-feed"><div class="card-head"><div><h2>${h(conversationTitle)}</h2><span class="faint small">${conversationDenied ? `Messages are hidden by ${h(sourceName)}'s participation policy` : `${h(messages.length)} conversation messages from ${h(allMessages.length)} latest retained in ${h(sourceName)}`}</span></div>${unreadTotal ? `<button class="button quiet small" type="button" data-action="mark-inbox-read">Mark group room read · ${h(unreadTotal)} unread</button>` : `<span class="badge fresh">caught up</span>`}<span class="badge ${conversationDenied ? "error" : localConversation ? "fresh" : "accepted"}">${conversationDenied ? "Access denied" : localConversation ? "Local" : "Inter-project"}</span></div><div class="card-body">
-              ${conversationDenied ? empty("Conversation access denied", `${attributionText(state.prefs.actor, state.prefs.actorType, state.prefs.owner)} cannot read or send in this inter-project conversation. The relationship remains connected; change its participation policy in AI Network.`) : messages.length ? `${feedToolbar("room", roomPage, `Latest ${allMessages.length} retained room messages loaded`)}<div class="room-feed" id="room-feed" role="log" aria-label="${h(conversationTitle)} message history" aria-live="off" tabindex="0" data-feed-scope="${h(roomScope)}">${pagedMessages.map(message => `<article class="message" data-feed-key="${h(message.seq)}"><div class="message-head"><span class="message-actor" title="Ledger actor: ${h(message.ledger_actor || message.actor)}">${h(attributionText(message.actor, message.actor_type, message.owner, message.attribution))}</span>${statusBadge(message.msg_type)}${message.broadcast_to_everyone ? `<span class="chip">to everyone</span>` : message.addressed_to_you ? `<span class="chip">your attention</span>` : message.group_context ? `<span class="chip">group context</span>` : ""}${message.origin_project ? `<span class="chip">from ${h(projectName(message.origin_project))}</span>` : (message.mirrored_to || []).length ? `<span class="chip">to ${h(message.mirrored_to.map(projectName).join(", "))}</span>` : `<span class="chip">local · ${h(sourceName)}</span>`}${message.authority ? `<span class="badge">${h(message.authority)}</span>` : ""}</div><div class="message-body">${h(message.body)}</div><div class="message-foot"><span>#${h(message.seq)}</span><span>${h(fmtTime(message.at))}</span>${message.task_id ? `<span>${h(message.task_id)}</span>` : ""}${message.mentions?.length ? `<span>expected responder: ${h(message.mentions.map(actorDisplay).join(", "))}</span>` : ""}${message.reply_to ? `<span>reply ${h(String(message.reply_to).slice(0, 16))}</span>` : ""}</div></article>`).join("")}</div>` : empty(localConversation ? "No local workspace messages" : "No retained messages for this workspace pair", localConversation ? "Send the first local-only message." : "Send the first message across this workspace bridge.")}
+            <section class="card" id="room-conversation-feed"><div class="card-head"><div><h2>${h(conversationTitle)}</h2><span class="faint small">${conversationDenied ? `Messages are hidden by ${h(sourceName)}'s participation policy` : `${h(roomPage.total)} authorized conversation messages`}</span></div>${unreadTotal ? `<button class="button quiet small" type="button" data-action="mark-inbox-read">Mark group room read · ${h(Number(unreadTotal).toLocaleString())} unread</button>` : `<span class="badge fresh">caught up</span>`}<span class="badge ${conversationDenied ? "error" : localConversation ? "fresh" : "accepted"}">${conversationDenied ? "Access denied" : localConversation ? "Local" : "Inter-project"}</span></div><div class="card-body">
+              ${conversationDenied ? empty("Conversation access denied", `${attributionText(state.prefs.actor, state.prefs.actorType, state.prefs.owner)} cannot read or send in this inter-project conversation. The relationship remains connected; change its participation policy in AI Network.`) : scopeMismatch ? empty("Conversation response rejected", "Refresh after the server can prove the exact requested conversation scope.") : `${roomPage.total || roomPage.offset ? feedToolbar("room", roomPage, `${pagedMessages.length} messages returned by full-history query`) : ""}${pagedMessages.length ? `<div class="room-feed" id="room-feed" role="log" aria-label="${h(conversationTitle)} message history" aria-live="off" tabindex="0" data-feed-scope="${h(roomScope)}">${pagedMessages.map(message => `<article class="message" data-feed-key="${h(message.seq)}"><div class="message-head"><span class="message-actor" title="Ledger actor: ${h(message.ledger_actor || message.actor)}">${h(attributionText(message.actor, message.actor_type, message.owner, message.attribution))}</span>${statusBadge(message.msg_type)}${message.broadcast_to_everyone ? `<span class="chip">to everyone</span>` : message.addressed_to_you ? `<span class="chip">your attention</span>` : message.group_context ? `<span class="chip">group context</span>` : ""}${message.origin_project ? `<span class="chip">from ${h(projectName(message.origin_project))}</span>` : (message.mirrored_to || []).length ? `<span class="chip">to ${h(message.mirrored_to.map(projectName).join(", "))}</span>` : `<span class="chip">local · ${h(sourceName)}</span>`}${message.authority ? `<span class="badge">${h(message.authority)}</span>` : ""}</div><div class="message-body">${h(message.body)}</div><div class="message-foot"><span>#${h(message.seq)}</span><span>${h(fmtTime(message.at))}</span>${message.task_id ? `<span>${h(message.task_id)}</span>` : ""}${message.mentions?.length ? `<span>expected responder: ${h(message.mentions.map(actorDisplay).join(", "))}</span>` : ""}${message.reply_to ? `<span>reply ${h(String(message.reply_to).slice(0, 16))}</span>` : ""}</div></article>`).join("")}</div>` : empty(state.roomFilter ? "No matching conversation messages" : roomPage.offset ? "No messages at this offset" : localConversation ? "No local workspace messages" : "No retained messages for this workspace pair", state.roomFilter ? "Change or clear the full-history search." : roomPage.offset ? "Use Newer to return to an available page." : localConversation ? "Send the first local-only message." : "Send the first message across this workspace bridge.")}`}
             </div></section>
             <aside class="card"><div class="card-head"><h2>Send message</h2></div><div class="card-body">
-              ${conversationDenied ? `<div class="notice error"><span>!</span><div><strong>Sending is disabled for this identity.</strong><br>Participation is an access policy, not a relationship state. Ask a human or registered Director to update access in AI Network; do not delete the bridge just to grant access.</div></div>` : `<form data-form="send-room">
+              ${conversationDenied || conversationMetadataUnavailable ? `<div class="notice error"><span>!</span><div><strong>Sending is disabled for this conversation.</strong><br>${conversationMetadataUnavailable ? "Bridge metadata must load successfully before the panel can prove the destination." : "Participation is an access policy, not a relationship state. Ask a human or registered Director to update access in AI Network; do not delete the bridge just to grant access."}</div></div>` : `<form data-form="send-room">
                 <div class="field"><label for="room-body">Message</label><textarea id="room-body" name="body" required placeholder="Tell the project what matters…"></textarea></div>
                 <div class="field section-gap"><label for="room-destination">Destination</label><select id="room-destination" name="target_project"><optgroup label="Local"><option value="${h(state.projectId)}" ${localConversation ? "selected" : ""}>Local workspace room · ${h(sourceName)}</option></optgroup>${bridges.length ? `<optgroup label="Inter-project">${bridges.map(bridge => `<option value="${h(bridge.with)}" ${state.roomConversation === bridge.with ? "selected" : ""} ${bridge.can_participate === false ? "disabled" : ""}>${h(sourceName)} ↔ ${h(projectName(bridge.with))} · ${h(bridge.relation)}${bridge.can_participate === false ? " · access denied" : ""}</option>`).join("")}</optgroup>` : ""}</select><span class="help">A bridge destination is retained on both workspace rooms; Local stays only in ${h(sourceName)}. Denied destinations cannot be selected.</span></div>
                 <div class="form-grid section-gap"><div class="field"><label for="room-type">Type</label><select id="room-type" name="msg_type">${["chat","directive","claim","handoff","challenge","decision","approval","status","system"].map(type => `<option>${type}</option>`).join("")}</select></div><div class="field"><label for="room-task">Task ID</label><input id="room-task" name="task_id" placeholder="T-13"></div><div class="field"><label for="room-mentions">Mention</label><input id="room-mentions" name="mentions" placeholder="workspace.role.runtime"></div><div class="field"><label for="room-reply">Reply to message</label><select id="room-reply" name="reply_to"><option value="">No reply</option>${messages.filter(message => message.event_id).map(message => `<option value="${h(message.event_id)}">#${h(message.seq)} · ${h(actorDisplay(message.actor))} · ${h(String(message.body || "").slice(0, 34))}</option>`).join("")}</select></div></div>
@@ -1815,62 +2055,76 @@
       }
 
       function renderDecisions() {
-        const decisions = sortDatedRows(state.data.decisions?.decisions || [], { direction: sortDirection("decisions"), dateFields: ["created_at"], idFields: ["decision_id"] });
+        const response = state.data.decisions || {};
+        const decisions = responseRows(response, "decisions");
         return pageHead("Durable choices", "Decisions", "Capture the choice, why it exists, and whether the project accepted it.") +
           (state.errors.decisions ? errorNotice(state.errors.decisions) : "") +
-          `<div class="grid main-side"><section><div class="filterbar">${sortControl("decisions")}</div><div class="stack">
+          `<div class="grid main-side"><section><div class="filterbar"><input id="decision-search" type="search" value="${h(state.decisionSearch)}" placeholder="Search all decisions…" aria-label="Search decisions"><select id="decision-filter" aria-label="Filter decision status">${["","proposed","accepted","rejected","superseded"].map(option => `<option value="${option}" ${option === state.decisionFilter ? "selected" : ""}>${option ? identityPart(option) : "All statuses"}</option>`).join("")}</select>${sortControl("decisions")}</div><div class="stack">
             ${decisions.length ? decisions.map(decision => `<article class="card decision-card"><div class="decision-top"><div><div class="cluster"><span class="mono muted">${h(decision.decision_id)}</span>${statusBadge(decision.status)}</div><h2 class="decision-title" style="margin-top:10px">${h(decision.title)}</h2></div><span class="faint small">${h(fmtTime(decision.created_at))}</span></div>${decision.detail ? `<p class="decision-detail">${h(decision.detail)}</p>` : ""}${decision.rationale ? `<div class="notice section-gap"><div><strong>Rationale</strong><br><span class="prose">${h(decision.rationale)}</span></div></div>` : ""}${decision.status === "proposed" ? `<div class="task-actions">${["accepted","rejected","superseded"].map(resolution => `<button class="button small ${resolution === "accepted" ? "primary" : resolution === "rejected" ? "danger" : "quiet"}" data-action="resolve-decision" data-decision="${h(decision.decision_id)}" data-resolution="${resolution}">${resolution[0].toUpperCase() + resolution.slice(1)}</button>`).join("")}</div>` : `<div class="list-meta"><span>Resolved by ${h(actorDisplay(decision.resolved_by || "unknown"))}</span><span>${h(fmtTime(decision.resolved_at))}</span></div>`}</article>`).join("") : `<div class="card">${empty("No decisions yet", "Propose the first durable project choice.")}</div>`}
-          </div></section><aside class="card"><div class="card-head"><h2>Propose decision</h2></div><div class="card-body"><form data-form="propose-decision"><div class="field"><label for="decision-title">Title</label><input id="decision-title" name="title" required placeholder="Adopt stable workspace IDs"></div><div class="field section-gap"><label for="decision-detail">Detail</label><textarea id="decision-detail" name="detail" placeholder="What exactly are we choosing?"></textarea></div><div class="field section-gap"><label for="decision-rationale">Rationale</label><textarea id="decision-rationale" name="rationale" placeholder="Why is this the right tradeoff?"></textarea></div><div class="form-actions"><button class="button primary" type="submit">Propose decision</button></div></form></div></aside></div>`;
+          </div>${pageToolbar("decisions", response, "decisions", "decisions")}</section><aside class="card"><div class="card-head"><h2>Propose decision</h2></div><div class="card-body"><form data-form="propose-decision"><div class="field"><label for="decision-title">Title</label><input id="decision-title" name="title" required placeholder="Adopt stable workspace IDs"></div><div class="field section-gap"><label for="decision-detail">Detail</label><textarea id="decision-detail" name="detail" placeholder="What exactly are we choosing?"></textarea></div><div class="field section-gap"><label for="decision-rationale">Rationale</label><textarea id="decision-rationale" name="rationale" placeholder="Why is this the right tradeoff?"></textarea></div><div class="form-actions"><button class="button primary" type="submit">Propose decision</button></div></form></div></aside></div>`;
       }
 
       function renderHandoff() {
         const response = state.data.handoff || {};
         const handoff = response.handoff || {};
-        const agents = state.data.agents?.agents || [];
+        const agents = state.data.agentOptions?.agents || state.data.agents?.agents || [];
         const effectiveActor = state.prefs.actor;
         const actorRecord = agents.find(agent => agent.agent_id === effectiveActor);
         const governed = Boolean(response.lead_director || agents.some(agent => agent.role === "director"));
         const canWrite = state.prefs.actorType !== "agent" || !governed || actorRecord?.role === "director";
         const labels = { objective: "Objective", what_changed: "What changed", active_work: "Active work", blockers: "Blockers", risks: "Risks", next_actions: "Next actions", notes: "Notes" };
         return pageHead("Cold-start brief", "Handoff", "Edit the current project brief so the next worker can resume without a rebrief.") +
-          (state.errors.handoff ? errorNotice(state.errors.handoff) : "") +
+          (state.errors.handoff || state.errors.handoffHistory
+            ? errorNotice([state.errors.handoff, state.errors.handoffHistory].filter(Boolean).join(" · ")) : "") +
           `<div class="grid main-side"><section class="card"><div class="card-head"><h2>Current handoff · context v${h(response.context_version ?? "—")}</h2><span class="faint small">${h(actorDisplay(response.handoff_updated_by || "not written"))} · ${h(fmtTime(response.handoff_updated_at))}</span></div><div class="card-body">${canWrite ? "" : `<div class="notice error"><span>!</span><div><strong>Director-only handoff.</strong><br>${h(actorDisplay(effectiveActor))} is ${h(actorRecord?.role || "not registered as a Director")}. ${state.prefs.owner ? `Owner ${h(state.prefs.owner)} is separate attribution and does not change the actor ID or role.` : ""} Use tasks and Room / Inbox to report work.</div></div>`}<form data-form="update-handoff" class="${canWrite ? "" : "section-gap"}"><div class="form-grid">${HANDOFF_FIELDS.map((field, index) => `<div class="field ${field === "objective" || field === "notes" ? "wide" : ""}"><label for="handoff-${field}">${h(labels[field])}</label><textarea id="handoff-${field}" name="${field}" ${index === 0 ? "required" : ""} ${canWrite ? "" : "disabled"} placeholder="${field === "blockers" ? "None" : "Write a concise, durable update…"}">${h(handoff[field] || "")}</textarea></div>`).join("")}</div><div class="form-actions"><button class="button primary" type="submit" ${canWrite ? "" : "disabled"}>Update handoff</button></div></form></div></section>
-          <aside class="stack"><div class="card pad"><div class="eyebrow">Repository snapshot</div><div class="list section-gap"><div class="list-row"><span class="muted">Branch</span><code>${h(response.git?.branch || "—")}</code></div><div class="list-row"><span class="muted">Revision</span><code>${h(response.git?.head || "—")}</code></div><div class="list-row"><span class="muted">Open tasks</span><strong>${h(response.open_tasks?.length || 0)}</strong></div><div class="list-row"><span class="muted">Live decisions</span><strong>${h(response.decisions?.length || 0)}</strong></div></div></div><div class="notice"><span>i</span><div><strong>Context versioning</strong><br>Updating the handoff advances project context. Workers with older briefs should re-read it before writing.</div></div></aside></div>${(() => { const versions = sortDatedRows(state.data.handoffHistory?.versions || [], { direction: sortDirection("handoff"), dateFields: ["updated_at"], idFields: ["version"] }); return versions.length > 1 ? `<section class="card section-gap"><div class="card-head"><h2>Handoff history</h2>${sortControl("handoff")}<span class="faint small">${h(versions.length)} versions</span></div><div class="card-body"><div class="list">${versions.map(v => `<details class="list-row" style="display:block"><summary><span class="list-title">v${h(v.version)}</span> <span class="faint small">${h(actorDisplay(v.updated_by || "unknown"))} · ${h(fmtTime(v.updated_at))}</span></summary><div class="message-body section-gap">${HANDOFF_FIELDS.map(f => (v.content && v.content[f]) ? `<div><strong>${h(labels[f])}:</strong> ${h(v.content[f])}</div>` : "").join("")}</div></details>`).join("")}</div></div></section>` : ""; })()}`;
+          <aside class="stack"><div class="card pad"><div class="eyebrow">Repository snapshot</div><div class="list section-gap"><div class="list-row"><span class="muted">Branch</span><code>${h(response.git?.branch || "—")}</code></div><div class="list-row"><span class="muted">Revision</span><code>${h(response.git?.head || "—")}</code></div><div class="list-row"><span class="muted">Open tasks</span><strong>${h(response.open_tasks?.length || 0)}</strong></div><div class="list-row"><span class="muted">Live decisions</span><strong>${h(response.decisions?.length || 0)}</strong></div></div></div><div class="notice"><span>i</span><div><strong>Context versioning</strong><br>Updating the handoff advances project context. Workers with older briefs should re-read it before writing.</div></div></aside></div>${(() => { const history = state.data.handoffHistory || {}; const versions = responseRows(history, "versions"); return `<section class="card section-gap"><div class="card-head"><h2>Handoff history</h2><span class="faint small">Full identity history</span></div><div class="card-body"><div class="filterbar"><input id="handoff-search" type="search" value="${h(state.handoffSearch)}" placeholder="Search all handoff versions…" aria-label="Search handoff history">${sortControl("handoff")}</div><div class="list">${versions.length ? versions.map(v => `<details class="list-row" style="display:block"><summary><span class="list-title">v${h(v.version)}</span> <span class="faint small">${h(actorDisplay(v.updated_by || "unknown"))} · ${h(fmtTime(v.updated_at))}</span></summary><div class="message-body section-gap">${HANDOFF_FIELDS.map(f => (v.content && v.content[f]) ? `<div><strong>${h(labels[f])}:</strong> ${h(v.content[f])}</div>` : "").join("")}</div></details>`).join("") : empty(state.handoffSearch ? "No matching handoff versions" : listPage("handoff").offset ? "No handoff versions at this offset" : "No handoff history yet", state.handoffSearch ? "Change or clear the full-history search." : listPage("handoff").offset ? "Use Previous to return to an available page." : "Identity handoff revisions will appear here after the first update.")}</div>${pageToolbar("handoff", history, "versions", "handoff versions")}</div></section>`; })()}`;
       }
 
       function renderLog() {
-        const lines = [...(state.data.log?.log || [])];
-        if (sortDirection("log") === "newest") lines.reverse();
+        const response = state.data.log || {};
+        const key = Array.isArray(response.entries) ? "entries" : "log";
+        const entries = responseRows(response, key);
+        const lineText = entry => typeof entry === "string" ? entry : entry?.line || "";
         return pageHead("Curated cloud history", "Project Log", "Review meaningful task, decision, handoff, directive, and report milestones. Activity remains the complete raw event ledger.") +
           (state.errors.log ? errorNotice(state.errors.log) : "") +
-          `<section class="card"><div class="card-head"><h2>${h(lines.length)} significant entries</h2>${sortControl("log")}</div><div class="card-body"><div class="faint small">Showing up to the latest 80 significant entries; “Oldest first” sorts within this loaded window.</div>${lines.length ? `<div class="timeline section-gap">${lines.map(line => `<div class="timeline-row"><div class="timeline-line prose">${h(line)}</div></div>`).join("")}</div>` : empty("No project log entries", "Meaningful project milestones will appear here.")}</div></section>`;
+          `<section class="card"><div class="card-head"><h2>Significant project history</h2></div><div class="card-body"><div class="filterbar"><input id="log-search" type="search" value="${h(state.logSearch)}" placeholder="Search the full project log…" aria-label="Search project log">${sortControl("log")}</div><div class="faint small">Search and date order are applied to the complete authorized log before each ${h(PANEL_PAGE_SIZE)}-entry page.</div>${entries.length ? `<div class="timeline section-gap">${entries.map(entry => `<div class="timeline-row"${entry?.seq ? ` data-feed-key="${h(entry.seq)}"` : ""}><div class="timeline-line prose">${h(lineText(entry))}</div></div>`).join("")}</div>` : empty(state.logSearch ? "No matching project log entries" : "No project log entries", state.logSearch ? "Change or clear the full-history search." : "Meaningful project milestones will appear here.")}${pageToolbar("log", response, key, "significant entries")}</div></section>`;
       }
 
       function renderSearchResults(result) {
         if (!result) return `<div class="muted small section-gap">Search spans events, tasks, decisions, and saved handoffs.</div>`;
-        const rows = [
+        const legacyRows = [
           ...(result.events || []).map(item => ({ kind: "event", id: `#${item.seq}`, text: item.line })),
           ...(result.tasks || []).map(item => ({ kind: "task", id: item.task_id, text: `${item.title} · ${item.status}` })),
           ...(result.decisions || []).map(item => ({ kind: "decision", id: item.decision_id, text: `${item.title} · ${item.status}` })),
           ...(result.handoff_versions || []).map(item => ({ kind: "handoff", id: `v${item.version}`, text: `Updated by ${actorDisplay(item.updated_by)} · ${fmtTime(item.updated_at)}` }))
         ];
-        return rows.length ? `<div class="list section-gap">${rows.map(item => `<div class="list-row"><div><div class="cluster">${statusBadge(item.kind)}<span class="mono small">${h(item.id)}</span></div><div class="small section-gap">${h(item.text)}</div></div></div>`).join("")}</div>` : empty("No project matches", `Nothing matched “${result.query}”.`);
+        const rows = (Array.isArray(result.results) ? result.results : legacyRows)
+          .map(item => ({
+            kind: item.kind || item.type || "result",
+            id: item.id || item.task_id || item.decision_id ||
+              (item.seq != null ? `#${item.seq}` : item.version != null ? `v${item.version}` : ""),
+            text: item.text || item.line || item.title || item.body || ""
+          }));
+        const paged = {
+          ...result,
+          results: rows,
+          total: result.total ?? result.total_hits ?? rows.length,
+          unfiltered_total: result.unfiltered_total ?? result.total_hits ?? rows.length
+        };
+        return `${state.errors.search ? errorNotice(state.errors.search) : ""}${rows.length ? `<div class="list section-gap">${rows.map(item => `<div class="list-row"><div><div class="cluster">${statusBadge(item.kind)}<span class="mono small">${h(item.id)}</span></div><div class="small section-gap">${h(item.text)}</div></div></div>`).join("")}</div>` : empty(listPage("search").offset ? "No matches at this offset" : "No project matches", listPage("search").offset ? "Use Previous to return to an available page." : `Nothing matched “${result.query || state.searchQuery}”.`)}${pageToolbar("search", paged, "results", "project-memory matches")}`;
       }
 
       function renderActivity() {
-        const events = [...(state.data.events?.events || [])]
-          .sort((left, right) => (Number(left.seq) || 0) - (Number(right.seq) || 0));
-        const query = state.activityFilter.toLowerCase();
-        const filtered = events.filter(event => !query || `${event.seq} ${event.event_type} ${event.actor_id} ${event.operational_actor_id || ""} ${event.owner || ""} ${event.task_id || ""} ${JSON.stringify(event.payload)}`.toLowerCase().includes(query));
-        const activityScope = `${state.projectId}:${query}`;
-        const activityPage = prepareFeedPage("activity", filtered, activityScope, ACTIVITY_PAGE_SIZE);
-        const pagedEvents = [...activityPage.rows].reverse();
+        const response = state.data.events || {};
+        const activityScope = `${state.projectId}:${state.activityFilter}`;
+        const activityPage = prepareServerFeed("activity", response, "events", activityScope);
+        const pagedEvents = activityPage.rows;
         const verify = state.data.verify;
         return pageHead("Append-only record", "Activity & ledger", "Inspect raw events, append a custom event, and verify the local hash chain.", `<button class="button" data-action="verify-ledger">Verify ledger</button>`) +
           `<div class="notice"><span>i</span><div><strong>Attribution is recorded literally.</strong><br>Canonical AI actor IDs are <code>&lt;workspace&gt;.&lt;role&gt;.&lt;runtime&gt;</code> and are displayed as <strong>Workspace · Role · Runtime</strong>. <strong>Run by user</strong> is the separate authenticated human responsible for that AI action. Browser identity headers cannot override the signed-in human account. Legacy <code>jack.vscode</code> rows marked human/tool came from the <code>vscode</code> shell account; they are not evidence that the VS Code AI performed that work.</div></div>` +
           (state.errors.events ? errorNotice(state.errors.events) : "") +
-          `<div class="grid main-side"><section class="card"><div class="card-head"><h2>${filtered.length} matching events</h2>${verify ? statusBadge(verify.ok ? "ok" : "error") : ""}</div><div class="card-body"><div class="filterbar"><input id="activity-search" type="search" value="${h(state.activityFilter)}" placeholder="Filter by type, actor, task, user, or payload…" aria-label="Filter activity history"><span class="faint small">Up to ${h(ACTIVITY_HISTORY_LIMIT)} events from the latest sequence window</span></div>${filtered.length ? `${feedToolbar("activity", activityPage, `${events.length} events loaded`)}<div class="history-feed" id="activity-feed" role="log" aria-label="Activity event history" aria-live="off" tabindex="0" data-feed-scope="${h(activityScope)}">${pagedEvents.map(event => { const operational = event.operational_actor_id || event.actor_id; return `<details class="event-row" data-feed-key="${h(event.seq)}"><summary><span class="mono faint">#${h(event.seq)}</span><span class="truncate">${statusBadge(event.event_type)}</span><span class="event-actor truncate muted" title="Ledger actor: ${h(event.actor_id)}">${h(attributionText(operational, event.actor_type, event.owner, event.attribution))}</span><span class="faint small">${h(fmtTime(event.created_at, false))}</span></summary><pre class="event-payload">${j(event.payload)}</pre></details>`; }).join("")}</div>` : empty("No matching events", "Change the filter or append a custom event.")}</div></section>
-          <aside class="stack"><div class="card"><div class="card-head"><h2>Search project memory</h2>${state.searchResults ? `<span class="badge accepted">${h(state.searchResults.total_hits)} hits</span>` : ""}</div><div class="card-body"><form data-form="search-project"><div class="field"><label for="project-memory-search">Query</label><input id="project-memory-search" type="search" name="query" required value="${h(state.searchQuery)}" placeholder="decision, filename, message…"></div><div class="form-actions"><button class="button primary small" type="submit">Search everything</button></div></form>${renderSearchResults(state.searchResults)}</div></div>
+          `<div class="grid main-side"><section class="card"><div class="card-head"><h2>${h(activityPage.total)} matching events</h2>${verify ? statusBadge(verify.ok ? "ok" : "error") : ""}</div><div class="card-body"><div class="filterbar"><input id="activity-search" type="search" value="${h(state.activityFilter)}" placeholder="Search full ledger by type, actor, task, user, or payload…" aria-label="Filter activity history"><span class="faint small">Raw Activity semantics are unchanged; the server searches the complete authorized ledger before paging.</span></div>${activityPage.total || activityPage.offset ? feedToolbar("activity", activityPage, `${pagedEvents.length} raw events returned`) : ""}${pagedEvents.length ? `<div class="history-feed" id="activity-feed" role="log" aria-label="Activity event history" aria-live="off" tabindex="0" data-feed-scope="${h(activityScope)}">${pagedEvents.map(event => { const operational = event.operational_actor_id || event.actor_id; return `<details class="event-row" data-feed-key="${h(event.seq)}"><summary><span class="mono faint">#${h(event.seq)}</span><span class="truncate">${statusBadge(event.event_type)}</span><span class="event-actor truncate muted" title="Ledger actor: ${h(event.actor_id)}">${h(attributionText(operational, event.actor_type, event.owner, event.attribution))}</span><span class="faint small">${h(fmtTime(event.created_at, false))}</span></summary><pre class="event-payload">${j(event.payload)}</pre></details>`; }).join("")}</div>` : empty(state.activityFilter ? "No matching events" : activityPage.offset ? "No events at this offset" : "No events yet", state.activityFilter ? "Change or clear the full-ledger search." : activityPage.offset ? "Use Newer to return to an available page." : "Append a custom event or wait for project activity.")}</div></section>
+          <aside class="stack"><div class="card"><div class="card-head"><h2>Search project memory</h2>${state.searchResults ? `<span class="badge accepted">${h(state.searchResults.total ?? state.searchResults.total_hits ?? 0)} hits</span>` : ""}</div><div class="card-body"><form data-form="search-project"><div class="field"><label for="project-memory-search">Query</label><input id="project-memory-search" type="search" name="query" required value="${h(state.searchQuery)}" placeholder="decision, filename, message…"></div><div class="form-actions"><button class="button primary small" type="submit">Search everything</button></div></form>${renderSearchResults(state.searchResults)}</div></div>
           <div class="card"><div class="card-head"><h2>Ledger integrity</h2></div><div class="card-body">${verify ? `<div class="notice ${verify.ok ? "ok" : "error"}"><span>${verify.ok ? "✓" : "!"}</span><div><strong>${verify.ok ? "Hash chain verified" : "Verification failed"}</strong><br>${h(verify.events)} events checked${verify.problems?.length ? `<br>${h(verify.problems.join(" · "))}` : ""}</div></div>` : `<div class="muted">Verification unavailable.</div>`}<div class="form-actions"><button class="button small" data-action="verify-ledger">Run again</button></div></div></div>
           <div class="card"><div class="card-head"><h2>Append custom event</h2></div><div class="card-body"><form data-form="append-event"><div class="field"><label for="event-type">Event type</label><input id="event-type" name="event_type" required placeholder="prototype.note"></div><div class="field section-gap"><label for="event-payload">Payload JSON object</label><textarea id="event-payload" class="mono" name="payload" required placeholder='{"note":"Panel reviewed"}'>{}</textarea></div><div class="field section-gap"><label for="event-task">Task ID <span class="faint">optional</span></label><input id="event-task" name="task_id" placeholder="T-13"></div><div class="form-actions"><button class="button primary" type="submit">Append event</button></div></form></div></div></aside></div>`;
       }
@@ -1893,13 +2147,12 @@
       }
 
       function renderRules() {
-        const rules = state.data.rules?.rules || [];
+        const response = state.data.rules || {};
+        const rules = responseRows(response, "rules");
+        const rulePage = responsePage(response, "rules", listPage("rules").offset);
         const canManageRules = canManageProjectRules();
-        const query = state.ruleFilter.trim().toLowerCase();
-        const visibleRules = sortDatedRows(rules.filter(rule => !query ||
-          `${rule.rule_id} ${rule.title} ${rule.body} ${rule.scope} ${rule.priority} ${rule.enabled ? "enabled" : "disabled"}`
-            .toLowerCase().includes(query)), { direction: sortDirection("rules"), dateFields: ["updated_at", "created_at"], idFields: ["rule_id"] });
-        const enabledRules = rules.filter(rule => rule.enabled).length;
+        const enabledRules = Number.isFinite(Number(response.enabled_total))
+          ? Number(response.enabled_total) : rules.filter(rule => rule.enabled).length;
         const permission = canManageRules ? "Human / Director management enabled" : "Read only for this identity";
         return pageHead(
           "Binding workspace directives",
@@ -1909,34 +2162,39 @@
         ) +
           `<div class="notice"><span>!</span><div><strong>These rules are server-side startup law.</strong><br>Project Rules / Directives are managed here as Core Rules. Every enabled rule scoped to <code>everyone</code> or an AI's registered role is loaded at startup, resume, and lifecycle refresh. The watcher checks for changes every 60 seconds by default, so home and office checkouts receive the same current directives. They sit above static managed AGENTS instructions; do not edit the managed block by hand.</div></div>` +
           (state.errors.rules ? errorNotice(state.errors.rules) : "") +
-          `<section class="card section-gap" id="core-rules-manager"><div class="card-head"><div><h2>Workspace rules</h2><span class="faint small">${h(rules.length)} loaded · ${h(enabledRules)} enabled · ${h(permission)}</span></div>${canManageRules ? `<span class="badge accepted">management enabled</span>` : `<span class="badge blocked">read only</span>`}</div><div class="card-body">
+          `<section class="card section-gap" id="core-rules-manager"><div class="card-head"><div><h2>Workspace rules</h2><span class="faint small">${h(rulePage.total)} matching · ${h(rulePage.unfilteredTotal)} total · ${h(enabledRules)} enabled · ${h(permission)}</span></div>${canManageRules ? `<span class="badge accepted">management enabled</span>` : `<span class="badge blocked">read only</span>`}</div><div class="card-body">
             ${canManageRules ? "" : `<div class="notice error"><span>i</span><div><strong>Human or registered Director management only.</strong><br>${h(attributionText(state.prefs.actor, state.prefs.actorType, state.prefs.owner))} may read applicable enabled rules but cannot create, edit, enable, or disable them.</div></div>`}
-            <div class="filterbar ${canManageRules ? "" : "section-gap"}"><input id="rule-search" type="search" value="${h(state.ruleFilter)}" placeholder="Filter by title, body, scope, status, or rule ID…" aria-label="Filter Core Rules">${sortControl("rules")}<span class="faint small">${h(visibleRules.length)} shown of ${h(rules.length)}</span></div>
-            <div class="grid main-side"><section class="stack" aria-label="Core Rules list">${visibleRules.length ? visibleRules.map(rule => `<article class="bridge-panel" data-rule-card="${h(rule.rule_id)}"><div class="bridge-panel-head"><div><div class="cluster"><span class="mono muted">${h(rule.rule_id)}</span><span class="badge ${rule.enabled ? "accepted" : "done"}">${rule.enabled ? "enabled" : "disabled"}</span><span class="chip">${h(rule.scope)}</span><span class="chip">priority ${h(rule.priority)}</span></div><div class="list-meta"><span>version ${h(rule.version)}</span><span>updated ${h(fmtTime(rule.updated_at))}</span><span>by ${h(actorDisplay(rule.updated_by || "unknown"))}</span>${rule.updated_owner ? ownerChip(rule.updated_owner) : ""}</div></div>${canManageRules ? `<button class="button ${rule.enabled ? "danger" : "primary"} small" type="button" data-action="toggle-rule" data-rule="${h(rule.rule_id)}" data-version="${h(rule.version)}" data-enabled="${rule.enabled ? "true" : "false"}">${rule.enabled ? "Disable rule" : "Enable rule"}</button>` : ""}</div><form data-form="update-rule" data-rule="${h(rule.rule_id)}" class="section-gap"><input type="hidden" name="expected_version" value="${h(rule.version)}"><div class="form-grid"><div class="field"><label>Title</label><input name="title" required value="${h(rule.title)}" ${canManageRules ? "" : "disabled"}></div><div class="field"><label>Scope</label><select name="scope" ${canManageRules ? "" : "disabled"}>${RULE_SCOPES.map(scope => `<option value="${scope}" ${rule.scope === scope ? "selected" : ""}>${h(scope)}</option>`).join("")}</select></div><div class="field"><label>Priority</label><input name="priority" type="number" min="0" max="1000" required value="${h(rule.priority)}" ${canManageRules ? "" : "disabled"}><span class="help">Lower numbers load first.</span></div><div class="field wide"><label>Directive body</label><textarea name="body" required ${canManageRules ? "" : "disabled"}>${h(rule.body)}</textarea></div></div>${canManageRules ? `<div class="form-actions"><button class="button primary small" type="submit">Save rule changes</button></div>` : ""}</form></article>`).join("") : `<div class="bridge-panel">${empty(rules.length ? "No matching Core Rules" : "No Core Rules", rules.length ? "Change or clear the filter." : canManageRules ? "Create the first live workspace directive." : "No enabled rule applies to this panel identity.")}</div>`}</section>
+            <div class="filterbar ${canManageRules ? "" : "section-gap"}"><input id="rule-search" type="search" value="${h(state.ruleFilter)}" placeholder="Search all rules by title, body, scope, status, or ID…" aria-label="Filter Core Rules">${sortControl("rules")}</div>
+            <div class="grid main-side"><section class="stack" aria-label="Core Rules list">${rules.length ? rules.map(rule => `<article class="bridge-panel" data-rule-card="${h(rule.rule_id)}"><div class="bridge-panel-head"><div><div class="cluster"><span class="mono muted">${h(rule.rule_id)}</span><span class="badge ${rule.enabled ? "accepted" : "done"}">${rule.enabled ? "enabled" : "disabled"}</span><span class="chip">${h(rule.scope)}</span><span class="chip">priority ${h(rule.priority)}</span></div><div class="list-meta"><span>version ${h(rule.version)}</span><span>updated ${h(fmtTime(rule.updated_at))}</span><span>by ${h(actorDisplay(rule.updated_by || "unknown"))}</span>${rule.updated_owner ? ownerChip(rule.updated_owner) : ""}</div></div>${canManageRules ? `<button class="button ${rule.enabled ? "danger" : "primary"} small" type="button" data-action="toggle-rule" data-rule="${h(rule.rule_id)}" data-version="${h(rule.version)}" data-enabled="${rule.enabled ? "true" : "false"}">${rule.enabled ? "Disable rule" : "Enable rule"}</button>` : ""}</div><form data-form="update-rule" data-rule="${h(rule.rule_id)}" class="section-gap"><input type="hidden" name="expected_version" value="${h(rule.version)}"><div class="form-grid"><div class="field"><label>Title</label><input name="title" required value="${h(rule.title)}" ${canManageRules ? "" : "disabled"}></div><div class="field"><label>Scope</label><select name="scope" ${canManageRules ? "" : "disabled"}>${RULE_SCOPES.map(scope => `<option value="${scope}" ${rule.scope === scope ? "selected" : ""}>${h(scope)}</option>`).join("")}</select></div><div class="field"><label>Priority</label><input name="priority" type="number" min="0" max="1000" required value="${h(rule.priority)}" ${canManageRules ? "" : "disabled"}><span class="help">Lower numbers load first.</span></div><div class="field wide"><label>Directive body</label><textarea name="body" required ${canManageRules ? "" : "disabled"}>${h(rule.body)}</textarea></div></div>${canManageRules ? `<div class="form-actions"><button class="button primary small" type="submit">Save rule changes</button></div>` : ""}</form></article>`).join("") : `<div class="bridge-panel">${empty(state.ruleFilter ? "No matching Core Rules" : "No Core Rules", state.ruleFilter ? "Change or clear the full-history search." : canManageRules ? "Create the first live workspace directive." : "No enabled rule applies to this panel identity.")}</div>`}</section>
               <aside class="card"><div class="card-head"><h3>Create Core Rule</h3></div><div class="card-body">${canManageRules ? `<form data-form="create-rule"><div class="field"><label for="rule-title">Title</label><input id="rule-title" name="title" required placeholder="Protect the v2 API boundary"></div><div class="field section-gap"><label for="rule-body">Directive body</label><textarea id="rule-body" name="body" required placeholder="State the durable instruction every applicable AI must follow."></textarea></div><div class="form-grid section-gap"><div class="field"><label for="rule-scope">Scope</label><select id="rule-scope" name="scope">${RULE_SCOPES.map(scope => `<option value="${scope}">${h(scope)}</option>`).join("")}</select></div><div class="field"><label for="rule-priority">Priority</label><input id="rule-priority" name="priority" type="number" min="0" max="1000" value="100" required><span class="help">0–1000; lower loads first.</span></div></div><div class="form-actions"><button class="button primary" type="submit">Create Core Rule</button></div></form>` : `<div class="muted">Switch the panel identity to a human or registered Director to manage Core Rules.</div>`}</div></aside>
             </div>
+            ${pageToolbar("rules", response, "rules", "rules")}
           </div></section>`;
       }
 
       function renderNetwork() {
-        const agents = sortDatedRows(state.data.agents?.agents || [], { direction: sortDirection("agents"), dateFields: ["last_seen_at", "registered_at"], idFields: ["agent_id"] });
-        const directors = agents.filter(agent => agent.role === "director");
-        const bridges = state.data.bridges?.bridges || [];
+        const agentResponse = state.data.agents || {};
+        const agents = responseRows(agentResponse, "agents");
+        const agentOptions = state.data.agentOptions?.agents || agents;
+        const directors = agentOptions.filter(agent => agent.role === "director");
+        const bridgeResponse = state.data.bridges || {};
+        const bridges = responseRows(bridgeResponse, "bridges");
         const status = state.data.status || {};
         const inbox = state.data.inbox?.messages || [];
         const relationshipInbox = sortDatedRows(inbox.filter(message => message.origin_project || message.authority), { direction: sortDirection("network"), dateFields: ["at", "created_at"], idFields: ["seq"] });
         const otherProjects = state.projects.filter(project => project.project_id !== state.projectId);
         return pageHead("Cross-workspace coordination", "AI Network", "Manage workspace authority relationships and room participation as separate controls.", `<button class="button" data-view="room">Open Room / Inbox</button>`) +
-          (state.errors.bridges ? errorNotice(state.errors.bridges) : "") +
+          (state.errors.bridges || state.errors.agents
+            ? errorNotice([state.errors.bridges, state.errors.agents].filter(Boolean).join(" · ")) : "") +
           `<div class="notice"><span>i</span><div><strong>Relationship and participation answer different questions.</strong><br>Peer / Master / Advisor defines authority between workspaces. Participation defines which AIs may enter that one inter-project conversation. Changing participation never deletes the relationship; deleting the relationship disconnects the workspace rooms entirely. Roles still follow the workspace, not the app window.</div></div>
           <div class="grid two section-gap">
-            <section class="card"><div class="card-head"><h2>Directors & workers</h2>${sortControl("agents")}<span class="faint small">${agents.length} registered</span></div><div class="card-body">
+            <section class="card"><div class="card-head"><h2>Directors & workers</h2><span class="faint small">${h(responsePage(agentResponse, "agents", listPage("agents").offset).unfilteredTotal)} registered</span></div><div class="card-body"><div class="filterbar"><input id="agent-search" type="search" value="${h(state.agentSearch)}" placeholder="Search all registered identities…" aria-label="Search registered identities">${sortControl("agents")}</div>
               <form data-form="set-lead"><div class="field"><label for="lead-agent">Lead Director</label><select id="lead-agent" name="agent_id"><option value="">No lead director</option>${directors.map(agent => `<option value="${h(agent.agent_id)}" ${status.lead_director === agent.agent_id ? "selected" : ""}>${h(agent.display_name || actorDisplay(agent.agent_id))}</option>`).join("")}</select><span class="help">Only registered Directors can lead. The choice persists across Claude, Codex, Kimi, and other clients in this workspace.</span></div><div class="form-actions"><button class="button primary" type="submit">Save lead</button></div></form>
-              <div class="list section-gap">${agents.length ? agents.map(agent => `<div class="list-row"><div><div class="list-title">${h(agent.display_name || actorDisplay(agent.agent_id))}</div><div class="list-meta"><span title="${h(agent.agent_id)}">${h(actorDisplay(agent.agent_id))}</span>${ownerChip(agent.owner)}<span>${h(agent.role || "role not assigned")}</span><span>${h(agent.runtime || "runtime unknown")}</span><span>seen ${h(fmtTime(agent.last_seen_at || agent.registered_at))}</span></div></div>${agent.agent_id === status.lead_director ? `<span class="badge accepted">lead</span>` : statusBadge(agent.role || "unassigned")}</div>`).join("") : `<div class="muted">No AIs registered yet. Guided setup asks for the first AI's role and recommends Director.</div>`}</div>
+              <div class="list section-gap">${agents.length ? agents.map(agent => `<div class="list-row"><div><div class="list-title">${h(agent.display_name || actorDisplay(agent.agent_id))}</div><div class="list-meta"><span title="${h(agent.agent_id)}">${h(actorDisplay(agent.agent_id))}</span>${ownerChip(agent.owner)}<span>${h(agent.role || "role not assigned")}</span><span>${h(agent.runtime || "runtime unknown")}</span><span>seen ${h(fmtTime(agent.last_seen_at || agent.registered_at))}</span></div></div>${agent.agent_id === status.lead_director ? `<span class="badge accepted">lead</span>` : statusBadge(agent.role || "unassigned")}</div>`).join("") : `<div class="muted">${h(state.agentSearch ? "No registered identities match this full-directory search." : listPage("agents").offset ? "No identities are available at this offset." : "No AIs registered yet. Guided setup asks for the first AI's role and recommends Director.")}</div>`}</div>${pageToolbar("agents", agentResponse, "agents", "registered identities")}
             </div></section>
-            <section class="card"><div class="card-head"><h2>Register or change an AI role</h2></div><div class="card-body"><form data-form="register-agent"><div class="form-grid"><div class="field"><label for="agent-pick">AI agent</label><select id="agent-pick" name="agent_id" data-agent-pick>${agents.map(agent => `<option value="${h(agent.agent_id)}">${h(agent.display_name || actorDisplay(agent.agent_id))} · ${h(agent.role || "unassigned")}</option>`).join("")}<option value="__new__">+ Register a new actor…</option></select><span class="help">Pick an existing AI to change its role, or choose "Register a new actor".</span></div><div class="field" data-new-actor ${agents.length ? "hidden" : ""}><label for="agent-id-new">New canonical actor ID</label><input id="agent-id-new" name="agent_id_new" placeholder="analytics-admin.director.codex"><span class="help">&lt;workspace&gt;.&lt;role&gt;.&lt;runtime&gt; — do not add the owner's name.</span></div><div class="field"><label for="agent-name">Display name</label><input id="agent-name" name="display_name" placeholder="Analytics Admin · Director · Codex"></div><div class="field"><label for="agent-role">Role</label><select id="agent-role" name="role"><option value="director">Director · may write handoff</option><option value="advisor">Advisor · no handoff writes</option><option value="worker">Worker · no handoff writes</option></select></div><div class="field" data-new-actor ${agents.length ? "hidden" : ""}><label for="agent-runtime">Runtime</label><input id="agent-runtime" name="runtime" placeholder="codex"></div></div><div class="form-actions"><button class="button primary" type="submit">Save AI role</button></div></form></div></section>
+            <section class="card"><div class="card-head"><h2>Register or change an AI role</h2></div><div class="card-body"><form data-form="register-agent"><div class="form-grid"><div class="field"><label for="agent-pick">AI agent</label><select id="agent-pick" name="agent_id" data-agent-pick>${agentOptions.map(agent => `<option value="${h(agent.agent_id)}">${h(agent.display_name || actorDisplay(agent.agent_id))} · ${h(agent.role || "unassigned")}</option>`).join("")}<option value="__new__">+ Register a new actor…</option></select><span class="help">Pick an existing AI to change its role, or choose "Register a new actor".</span></div><div class="field" data-new-actor ${agentOptions.length ? "hidden" : ""}><label for="agent-id-new">New canonical actor ID</label><input id="agent-id-new" name="agent_id_new" placeholder="analytics-admin.director.codex"><span class="help">&lt;workspace&gt;.&lt;role&gt;.&lt;runtime&gt; — do not add the owner's name.</span></div><div class="field"><label for="agent-name">Display name</label><input id="agent-name" name="display_name" placeholder="Analytics Admin · Director · Codex"></div><div class="field"><label for="agent-role">Role</label><select id="agent-role" name="role"><option value="director">Director · may write handoff</option><option value="advisor">Advisor · no handoff writes</option><option value="worker">Worker · no handoff writes</option></select></div><div class="field" data-new-actor ${agentOptions.length ? "hidden" : ""}><label for="agent-runtime">Runtime</label><input id="agent-runtime" name="runtime" placeholder="codex"></div></div><div class="form-actions"><button class="button primary" type="submit">Save AI role</button></div></form></div></section>
             <section class="card" style="grid-column:1/-1"><div class="card-head"><h2>Connect workspace rooms</h2><span class="faint small">default relationship: master</span></div><div class="card-body"><form data-form="add-bridge"><div class="field"><label for="bridge-project">Connected workspace</label><select id="bridge-project" name="other_project" required ${otherProjects.length ? "" : "disabled"}><option value="">Choose workspace…</option>${otherProjects.map(project => `<option value="${h(project.project_id)}">${h(project.name)} · ${h(project.project_id)}</option>`).join("")}</select></div><div class="bridge-relationship section-gap"><div class="eyebrow">Authority relationship</div><div class="form-grid section-gap"><div class="field"><label for="bridge-relation">Relationship</label><select id="bridge-relation" name="relation"><option value="master">Master / subordinate (default)</option><option value="peer">Peer</option><option value="advisor">Advisor</option></select></div><div class="field"><label for="bridge-principal">Who is master/advisor?</label><select id="bridge-principal" name="principal_side"><option value="other">Connected workspace (default)</option><option value="current">This workspace</option></select></div></div></div><div class="bridge-relationship section-gap"><div class="eyebrow">Initial room participation</div><p class="muted small">Set access atomically when creating the relationship. This policy does not change which workspace is master, advisor, or peer.</p><div class="form-grid section-gap">${bridgeParticipationFields("new", "local", state.projectId)}${bridgeParticipationFields("new", "peer", "Connected workspace")}</div></div><div class="form-actions"><button class="button primary" type="submit" ${otherProjects.length ? "" : "disabled"}>Create relationship</button></div></form><div class="notice section-gap"><span>i</span><div>Master directives are binding; advisor messages are advice; peers are equal. Participation independently limits who may read, send, or mutate the named inter-project conversation.</div></div></div></section>
-            <section class="card" style="grid-column:1/-1"><div class="card-head"><h2>Connected rooms</h2><span class="faint small">${bridges.length} relationship${bridges.length === 1 ? "" : "s"}</span></div><div class="card-body">${bridges.length ? bridges.map(bridge => `<article class="bridge-panel"><div class="bridge-panel-head"><div><h3>${h(projectName(state.projectId))} ↔ ${h(projectName(bridge.with))}</h3><div class="list-meta"><span>${h(bridge.relation)} relationship</span>${bridge.principal ? `<span>${h(projectName(bridge.principal))} is ${h(bridge.relation === "master" ? "master" : "advisor")}</span>` : `<span>equal authority</span>`}<span>${h(projectName(state.projectId))}: ${h(bridgeParticipationLabel(bridge.participation))}</span><span>${h(projectName(bridge.with))}: ${h(bridgeParticipationLabel(bridge.peer_participation))}</span></div></div><div class="cluster">${bridge.can_participate === false ? `<span class="badge error">panel identity denied</span>` : bridge.can_participate === true ? `<span class="badge accepted">panel identity allowed</span>` : ""}</div></div><div class="grid two section-gap"><div class="bridge-relationship"><div class="eyebrow">Authority relationship</div><p class="muted small"><strong>${h(identityPart(bridge.relation))}</strong> controls authority only. Delete this relationship only when the workspace rooms should be disconnected.</p><div class="cluster section-gap"><button class="button small" data-action="open-connected-room" data-project="${h(bridge.with)}">View conversation</button><button class="button danger small" data-action="remove-bridge" data-project="${h(bridge.with)}">Delete relationship</button></div></div><div class="bridge-relationship"><div class="eyebrow">Room participation</div><form data-form="update-bridge-participation" data-project="${h(bridge.with)}"><div class="form-grid section-gap">${bridgeParticipationFields(bridge.with, "local", state.projectId, bridge.participation, bridge.allowed_agents)}${bridgeParticipationFields(bridge.with, "peer", bridge.with, bridge.peer_participation, bridge.peer_allowed_agents)}</div><div class="form-actions"><button class="button primary small" type="submit">Save participation</button></div></form><span class="help">Saving here changes access only. It never removes or changes the ${h(bridge.relation)} relationship.</span></div></div></article>`).join("") : `<div class="muted">No connected workspace rooms yet.</div>`}</div></section>
+            <section class="card" style="grid-column:1/-1"><div class="card-head"><h2>Connected rooms</h2><span class="faint small">${h(responsePage(bridgeResponse, "bridges", listPage("bridges").offset).unfilteredTotal)} relationship${responsePage(bridgeResponse, "bridges", listPage("bridges").offset).unfilteredTotal === 1 ? "" : "s"}</span></div><div class="card-body"><div class="filterbar"><input id="bridge-search" type="search" value="${h(state.bridgeSearch)}" placeholder="Search all workspace relationships…" aria-label="Search connected workspace rooms">${sortControl("bridges")}</div>${bridges.length ? bridges.map(bridge => `<article class="bridge-panel"><div class="bridge-panel-head"><div><h3>${h(projectName(state.projectId))} ↔ ${h(projectName(bridge.with))}</h3><div class="list-meta"><span>${h(bridge.relation)} relationship</span>${bridge.principal ? `<span>${h(projectName(bridge.principal))} is ${h(bridge.relation === "master" ? "master" : "advisor")}</span>` : `<span>equal authority</span>`}<span>${h(projectName(state.projectId))}: ${h(bridgeParticipationLabel(bridge.participation))}</span><span>${h(projectName(bridge.with))}: ${h(bridgeParticipationLabel(bridge.peer_participation))}</span></div></div><div class="cluster">${bridge.can_participate === false ? `<span class="badge error">panel identity denied</span>` : bridge.can_participate === true ? `<span class="badge accepted">panel identity allowed</span>` : ""}</div></div><div class="grid two section-gap"><div class="bridge-relationship"><div class="eyebrow">Authority relationship</div><p class="muted small"><strong>${h(identityPart(bridge.relation))}</strong> controls authority only. Delete this relationship only when the workspace rooms should be disconnected.</p><div class="cluster section-gap"><button class="button small" data-action="open-connected-room" data-project="${h(bridge.with)}">View conversation</button><button class="button danger small" data-action="remove-bridge" data-project="${h(bridge.with)}">Delete relationship</button></div></div><div class="bridge-relationship"><div class="eyebrow">Room participation</div><form data-form="update-bridge-participation" data-project="${h(bridge.with)}"><div class="form-grid section-gap">${bridgeParticipationFields(bridge.with, "local", state.projectId, bridge.participation, bridge.allowed_agents)}${bridgeParticipationFields(bridge.with, "peer", bridge.with, bridge.peer_participation, bridge.peer_allowed_agents)}</div><div class="form-actions"><button class="button primary small" type="submit">Save participation</button></div></form><span class="help">Saving here changes access only. It never removes or changes the ${h(bridge.relation)} relationship.</span></div></div></article>`).join("") : `<div class="muted">${h(state.bridgeSearch ? "No workspace relationships match this full-network search." : listPage("bridges").offset ? "No relationships are available at this offset." : "No connected workspace rooms yet.")}</div>`}${pageToolbar("bridges", bridgeResponse, "bridges", "workspace relationships")}</div></section>
             <section class="card" style="grid-column:1/-1"><div class="card-head"><h2>Relationship inbox evidence</h2>${sortControl("network")}<span class="faint small">read-only setup signal</span></div><div class="card-body">${relationshipInbox.length ? `<div class="list">${relationshipInbox.slice(0, 10).map(message => `<div class="list-row"><div><div class="cluster"><span class="list-title" title="Ledger actor: ${h(message.ledger_actor || message.actor)}">${h(attributionText(message.actor, message.actor_type, message.owner, message.attribution))}</span><span class="chip">from ${h(projectName(message.origin_project || "connected"))}</span>${message.authority ? `<span class="badge">${h(message.authority)}</span>` : ""}</div><div class="message-body">${h(message.body)}</div></div><span class="faint small">${h(fmtTime(message.at || message.created_at))} · #${h(message.seq)}</span></div>`).join("")}</div>` : `<div class="muted">No cross-workspace messages are addressed to panel actor ${h(actorDisplay(state.prefs.actor))}. This says nothing about other actors' inboxes; open Room / Inbox to read every named inter-project conversation.</div>`}</div></section>
           </div>`;
       }
@@ -1993,6 +2251,7 @@
         const access = state.credentialAccess || emptyCredentialAccess();
         const eligibility = activationEligibility(access, account);
         const keys = access.client_keys || [];
+        const keyPage = responsePage(access, "client_keys", listPage("clientKeys").offset);
         const keyRows = keys.length
           ? keys.map(key => renderClientKeyRow(key, account)).join("")
           : `<div class="muted">No client API keys yet.</div>`;
@@ -2008,7 +2267,7 @@
             ${renderPendingClientAuthorization()}
             <section class="card"><div class="card-head"><h2>Human account</h2><span class="badge accepted">${account.is_owner ? "server owner" : account.is_admin ? "admin" : "user"}</span></div><div class="card-body"><div class="list"><div class="list-row"><span class="muted">Account name</span><strong>@${h(account.username)}</strong></div><div class="list-row"><span class="muted">Authentication authority</span><strong>${account.is_owner ? "Owner toggle available" : "Read only · server owner required"}</strong></div></div><div class="form-actions"><button class="button danger" type="button" data-action="auth-logout">Sign out</button></div></div></section>
             <section class="card"><div class="card-head"><h2>Authentication enforcement</h2>${statusBadge(eligibility.enabled ? "enabled" : "off")}</div><div class="card-body"><p class="muted">${h(activationText)}</p>${eligibility.reasons.length ? `<div class="notice section-gap"><span>i</span><div>${h(eligibility.reasons.join(" "))}</div></div>` : ""}<div class="form-actions"><button class="button ${eligibility.enabled ? "danger" : "primary"}" type="button" data-action="toggle-authentication" ${eligibility.allowed ? "" : "disabled"} data-enabled="${eligibility.enabled ? "false" : "true"}">${h(activationButton)}</button></div></div></section>
-            <section class="card" style="grid-column:1/-1"><div class="card-head"><div><h2>Client API keys</h2><span class="faint small">one human-owned key per authorized client</span></div><span class="badge">${h(keys.length)} key${keys.length === 1 ? "" : "s"}</span></div><div class="card-body"><div class="notice"><span>i</span><div><strong>Client authorization and AI identity are separate.</strong><br>New installations open a short-lived authorization request here. Review the client and scope, then explicitly authorize or deny it. The browser never displays or asks you to copy an API key.</div></div>${access.supported ? "" : `<div class="notice error section-gap"><span>!</span><div><strong>Client API key management is unavailable.</strong><br>Upgrade the hosted Attacca service before enabling authentication.</div></div>`}<div class="list section-gap">${keyRows}</div></div></section>
+            <section class="card" style="grid-column:1/-1"><div class="card-head"><div><h2>Client API keys</h2><span class="faint small">one human-owned key per authorized client</span></div><span class="badge">${h(keyPage.unfilteredTotal)} key${keyPage.unfilteredTotal === 1 ? "" : "s"}</span></div><div class="card-body"><div class="notice"><span>i</span><div><strong>Client authorization and AI identity are separate.</strong><br>New installations open a short-lived authorization request here. Review the client and scope, then explicitly authorize or deny it. The browser never displays or asks you to copy an API key.</div></div>${access.supported ? "" : `<div class="notice error section-gap"><span>!</span><div><strong>Client API key management is unavailable.</strong><br>Upgrade the hosted Attacca service before enabling authentication.</div></div>`}${state.errors.clientKeys ? errorNotice(state.errors.clientKeys) : ""}<div class="filterbar section-gap"><input id="client-key-search" type="search" value="${h(state.clientKeySearch)}" placeholder="Search all client keys by label, installation, owner, status, or scope…" aria-label="Search client API keys">${sortControl("clientKeys")}</div><div class="list section-gap">${keyRows}</div>${pageToolbar("clientKeys", access, "client_keys", "client API keys")}</div></section>
             <section class="card"><div class="card-head"><h2>Browser refresh</h2></div><div class="card-body"><form data-form="save-panel-behavior"><div class="form-grid"><div class="field"><label for="settings-refresh">Refresh interval</label><input id="settings-refresh" name="refreshSeconds" type="number" min="5" max="300" value="${h(state.prefs.refreshSeconds)}"></div><div class="field"><label for="settings-auto">Live refresh</label><select id="settings-auto" name="autoRefresh"><option value="true" ${state.prefs.autoRefresh ? "selected" : ""}>On</option><option value="false" ${!state.prefs.autoRefresh ? "selected" : ""}>Off</option></select></div></div><div class="form-actions"><button class="button primary" type="submit">Save browser settings</button></div></form></div></section>
             <section class="card"><div class="card-head"><h2>Server runtime</h2>${statusBadge(state.health?.ok ? "ok" : "error")}</div><div class="card-body"><form data-form="save-runtime"><div class="form-grid"><div class="field wide"><label for="runtime-default">Default workspace</label><select id="runtime-default" name="default_project"><option value="">No server default</option>${state.projects.map(project => `<option value="${h(project.project_id)}" ${settings.default_project === project.project_id ? "selected" : ""}>${h(project.name)} · ${h(project.project_id)}</option>`).join("")}</select></div><div class="field"><label for="runtime-update-interval">AI update checks</label><select id="runtime-update-interval" name="update_interval_seconds">${[[0,"Off"],[60,"Every minute (default)"],[300,"Every 5 minutes"],[600,"Every 10 minutes"],[1800,"Every 30 minutes"],[3600,"Every hour"]].map(([seconds,label]) => `<option value="${seconds}" ${Number(settings.update_interval_seconds) === seconds ? "selected" : ""}>${label}</option>`).join("")}</select></div><div class="field"><label for="runtime-verbose">Request logging</label><select id="runtime-verbose" name="verbose"><option value="false" ${!settings.verbose ? "selected" : ""}>Quiet</option><option value="true" ${settings.verbose ? "selected" : ""}>Verbose</option></select></div></div><div class="form-actions"><button class="button primary" type="submit">Save watcher settings</button></div></form><div class="notice section-gap"><span>↗</span><div><strong>Connection changes stay local to each client installation.</strong><br>The active AI opens sign-in and secure key collection itself; this panel never asks a human to run a shell command.</div></div></div></section>
             <section class="card" style="grid-column:1/-1"><div class="card-head"><h2>Download all workspace data</h2></div><div class="card-body"><p class="muted">Download a deterministic snapshot of the selected workspace, including the ledger and full logs. Authentication secrets are excluded. This is a private human backup, not the agent sync mirror; a failed download stays visible and no empty placeholder file is saved.</p><div class="form-actions" style="justify-content:flex-start"><button class="button primary" type="button" data-action="download-export" data-format="zip" ${state.projectId ? "" : "disabled"}>ZIP</button><button class="button" type="button" data-action="download-export" data-format="json" ${state.projectId ? "" : "disabled"}>Full JSON</button><button class="button" type="button" data-action="download-export" data-format="ledger.ndjson" ${state.projectId ? "" : "disabled"}>Ledger NDJSON</button><button class="button" data-action="download-export" data-format="full-log.txt" ${state.projectId ? "" : "disabled"}>Full log</button></div></div></section>
@@ -2049,8 +2308,11 @@
       }
 
       async function selectProject(projectId, roomConversation = "local") {
+        clearTimeout(state.filterTimer);
+        state.filterTimer = null;
         state.projectId = projectId;
         state.roomConversation = roomConversation;
+        resetProjectPages();
         resetFeed("room");
         resetFeed("activity");
         storageSet("attacca.admin.project", projectId);
@@ -2074,6 +2336,12 @@
         if (!button || button.disabled) return;
         const action = button.dataset.action;
         try {
+          if (action === "list-previous") {
+            navigateList(button.dataset.listPage, -1);
+          }
+          if (action === "list-next") {
+            navigateList(button.dataset.listPage, 1);
+          }
           if (action === "auth-logout") {
             await api("/v1/auth/logout", { method: "POST", body: {} });
             state.auth = null;
@@ -2233,9 +2501,10 @@
           if (action === "open-connected-room") {
             state.roomConversation = button.dataset.project;
             resetFeed("room");
+            delete state.data.room;
             state.view = "room";
             history.replaceState(null, "", "#room");
-            render({ force: true, feedTransition: "room" });
+            await loadProjectData({ quiet: true, feedTransition: "room" });
             content.focus({ preventScroll: true });
           }
           if (action === "swap-room-workspace") {
@@ -2274,6 +2543,7 @@
           if (event.target.id === "room-conversation") {
             state.roomConversation = event.target.value;
             resetFeed("room");
+            delete state.data.room;
             await loadProjectData({ quiet: true });
           }
           if (event.target.matches("[data-participation-select]")) {
@@ -2296,7 +2566,8 @@
             const newId = form.querySelector('[name="agent_id_new"]');
             if (newId) { newId.required = isNew; if (isNew) newId.focus(); }
             if (!isNew) {
-              const agent = (state.data.agents?.agents || []).find(a => a.agent_id === event.target.value);
+              const agent = (state.data.agentOptions?.agents ||
+                state.data.agents?.agents || []).find(a => a.agent_id === event.target.value);
               if (agent) {
                 const roleSel = form.querySelector('[name="role"]');
                 if (roleSel && agent.role) roleSel.value = agent.role;
@@ -2305,11 +2576,22 @@
               }
             }
           }
-          if (event.target.id === "task-filter") { state.taskFilter = event.target.value; render(); }
+          if (event.target.id === "task-filter") {
+            state.taskFilter = event.target.value;
+            resetListPage("tasks");
+            await loadProjectData({ quiet: true });
+          }
+          if (event.target.id === "decision-filter") {
+            state.decisionFilter = event.target.value;
+            resetListPage("decisions");
+            await loadProjectData({ quiet: true });
+          }
           if (event.target.matches("[data-list-sort]")) {
-            state.listSort[event.target.dataset.listSort] = event.target.value;
+            const view = event.target.dataset.listSort;
+            state.listSort[view] = event.target.value;
             storageSet("attacca.admin.sorts", JSON.stringify(state.listSort));
-            render({ force: true });
+            resetListPage(view);
+            await refreshPagedView(view);
           }
           if (event.target.matches("[data-plan-version]") && event.target.value) {
             await openTaskPlan(
