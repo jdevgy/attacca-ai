@@ -570,6 +570,11 @@ def qualify_actor(actor, owner=None):
 
 
 AGENT_ROLES = ("director", "advisor", "worker")
+AGENT_PERSONA_COLORS = (
+    "red", "blue", "green", "yellow", "purple", "orange", "pink",
+    "cyan", "teal", "indigo", "violet", "amber", "lime", "coral",
+    "navy", "mint", "rose", "gold", "silver",
+)
 _KNOWN_RUNTIMES = (
     "claude", "codex", "kimi", "cline", "cursor", "windsurf", "gemini",
     "vscode", "opencode", "glm",
@@ -625,6 +630,49 @@ def canonical_agent_id(project_id, role, runtime, persona=None):
         slugify(project_id), role, normalize_agent_runtime(runtime))
     persona = normalize_agent_persona(persona)
     return "%s.%s" % (base, persona) if persona else base
+
+
+def next_agent_persona(agents_or_conn, project_id, role, runtime):
+    """Return the next deterministic collision-free color persona.
+
+    Callers that create the actor must hold the same database write
+    transaction while selecting and inserting it.  Accepting either a
+    connection or an already-read record list keeps setup discovery pure while
+    allowing ``agent_register`` to make allocation atomic.
+    """
+    role = str(role or "").strip().lower()
+    if role not in AGENT_ROLES:
+        raise AttaccaError("agent role must be director, advisor, or worker")
+    runtime = normalize_agent_runtime(runtime)
+    if hasattr(agents_or_conn, "execute"):
+        records = [dict(row) for row in agents_or_conn.execute(
+            "SELECT * FROM agents WHERE project_id=?", (project_id,))]
+    else:
+        records = [dict(row) for row in (agents_or_conn or [])]
+    used = set()
+    for record in records:
+        parsed = parse_canonical_agent_id(
+            record.get("agent_id"), project_id)
+        if not parsed or parsed.get("role") != role \
+                or parsed.get("runtime") != runtime:
+            continue
+        if parsed.get("persona"):
+            used.add(parsed["persona"])
+    for color in AGENT_PERSONA_COLORS:
+        if color not in used:
+            return color
+    generation = 2
+    while True:
+        for color in AGENT_PERSONA_COLORS:
+            candidate = "%s-%d" % (color, generation)
+            if candidate not in used:
+                return candidate
+        generation += 1
+
+
+def allocate_agent_persona(conn, project_id, role, runtime):
+    """Compatibility name for the product's deterministic color allocator."""
+    return next_agent_persona(conn, project_id, role, runtime)
 
 
 def parse_canonical_agent_id(actor_id, project_id=None):
@@ -1494,6 +1542,9 @@ def connect(db_path):
             " WHERE h.version=(SELECT MAX(h2.version) FROM handoffs h2"
             " WHERE h2.project_id=h.project_id)").fetchall()
         for legacy in legacy_rows:
+            if not parse_canonical_agent_id(
+                    legacy["updated_by"], legacy["project_id"]):
+                continue
             event = conn.execute(
                 "SELECT event_id,owner FROM events WHERE project_id=?"
                 " AND event_type='handoff.updated' AND context_version=?"
@@ -4311,9 +4362,12 @@ def _handoff_read_actor(conn, project_id, actor_id, actor_type,
         registered = conn.execute(
             "SELECT 1 FROM agents WHERE project_id=? AND agent_id=?",
             (project_id, target)).fetchone()
-        if not registered:
+        known_handoff = conn.execute(
+            "SELECT 1 FROM identity_handoffs WHERE project_id=?"
+            " AND actor_id=? LIMIT 1", (project_id, target)).fetchone()
+        if not registered and not known_handoff:
             raise AttaccaError(
-                "handoff identity '%s' is not registered in workspace '%s'"
+                "handoff identity '%s' is unknown in workspace '%s'"
                 % (target, project_id))
     return target
 
@@ -4445,9 +4499,18 @@ def role_scope_set(conn, project_id, actor_id, actor_type, role, content,
             "context_version": context_version, "event": event}
 
 
-def role_scope_history(conn, project_id, role, limit=20):
+def role_scope_history(conn, project_id, role, limit=20, actor_id=None,
+                       actor_type="agent"):
     get_project(conn, project_id)
     role = _role_scope_name(role)
+    if actor_type == "agent":
+        actual = _registered_actor_role(conn, project_id, actor_id)
+        if actual != "director" and role != actual:
+            raise AttaccaError(
+                "agent '%s' may only read its own %s role scope history" %
+                (actor_id, actual or "unassigned"))
+    elif actor_type != "human":
+        raise AttaccaError("role scope history requires a project identity")
     rows = conn.execute(
         "SELECT * FROM role_scope_revisions WHERE project_id=? AND role=?"
         " ORDER BY version DESC LIMIT ?",
@@ -4721,6 +4784,12 @@ def update_handoff(conn, project_id, actor_id, actor_type, updates,
             raise AttaccaError(
                 "identity handoff writes require an authenticated human or "
                 "registered AI identity")
+        elif conn.execute(
+                "SELECT 1 FROM agents WHERE project_id=? AND agent_id=?",
+                (project_id, actor_id)).fetchone():
+            raise AttaccaError(
+                "registered AI identity '%s' cannot be written through a "
+                "human actor type" % actor_id)
         if expected_context_version is not None:
             try:
                 expected = int(expected_context_version)
@@ -7414,6 +7483,7 @@ def _migrate_actor_references_in_tx(conn, project_id, aliases, canonical_id,
 def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
                    display_name=None, role=None, runtime=None,
                    persona=None,
+                   allocate_persona=False, distinct_identity=False,
                    canonical_identity=False, registration_username=None,
                    allow_foreign_owner=False,
                    authorized_owner_labels=None):
@@ -7487,27 +7557,44 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
                         "changed" % (runtime, project_id, ", ".join(
                             identity["conflict_roles"])))
                 role = identity["role"]
-            if identity.get("conflict_actors") and persona is None:
+            if identity.get("conflict_actors") and persona is None \
+                    and not allocate_persona:
                 raise AttaccaError(
                     "AI runtime '%s' has multiple %s identities in workspace "
                     "'%s': %s. Select an exact existing identity or choose a "
                     "new persona; no identity was changed" %
                     (runtime, role or "unassigned", project_id,
                      ", ".join(identity["conflict_actors"])))
+            if allocate_persona:
+                if persona is not None and str(persona).strip():
+                    raise AttaccaError(
+                        "choose either automatic color allocation or an "
+                        "explicit persona, not both")
+                if role not in AGENT_ROLES:
+                    raise AttaccaError(
+                        "automatic color allocation requires an explicit "
+                        "director, advisor, or worker role")
+                persona = next_agent_persona(
+                    records, project_id, role, runtime)
+                # A new installation identity is deliberately independent.
+                # Never migrate the currently selected actor's inbox, claims,
+                # handoff, aliases, or lead pointer into the new color.
+                distinct_identity = True
             persona = normalize_agent_persona(
                 persona if persona is not None else
                 ((requested_parts or {}).get("persona") or
                  identity.get("persona")))
             agent_id = canonical_agent_id(
                 project_id, role, runtime, persona)
-            matching = [record["agent_id"] for record in records
-                        if _matching_runtime(record, runtime)
-                        and (record.get("role") in (None, role)
-                             or not explicit_role)
-                        and not parse_canonical_agent_id(
-                            record.get("agent_id"), project_id)
-                        and record["agent_id"] != agent_id]
-            if explicit_role:
+            matching = [] if distinct_identity else [
+                record["agent_id"] for record in records
+                if _matching_runtime(record, runtime)
+                and (record.get("role") in (None, role)
+                     or not explicit_role)
+                and not parse_canonical_agent_id(
+                    record.get("agent_id"), project_id)
+                and record["agent_id"] != agent_id]
+            if explicit_role and not distinct_identity:
                 # Some older sessions claimed tasks or wrote events without
                 # ever creating an agents row.  A confirmed role choice must
                 # still migrate those exact role-marked pointers/aliases, or
@@ -7531,11 +7618,12 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
                     and legacy_actor_role_hint(row["legacy_id"]) == role
                     and normalize_agent_runtime(
                         actor=row["legacy_id"]) == runtime)
-            if requested_id != agent_id:
+            if requested_id != agent_id and not distinct_identity:
                 matching.append(requested_id)
             # Resolve mentions/cursors written by the owner-prefixed scheme
             # used before canonical workspace identities.
-            if current_owner() and requested_id != agent_id:
+            if current_owner() and requested_id != agent_id \
+                    and not distinct_identity:
                 matching.append("%s.%s" % (
                     slugify(current_owner()), requested_id))
             affected_ids = set(matching) | {agent_id}
@@ -7617,6 +7705,9 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
                                    "persona": persona,
                                    "owner": effective_owner},
                       "migration": migration}
+            if allocate_persona:
+                result["persona_allocated"] = persona
+                result["distinct_identity"] = True
             # MCP startup may have discovered this actor before guided setup
             # assigned its authority. Record the later explicit role choice as
             # a durable governance event, while keeping identical setup reruns
@@ -7669,6 +7760,9 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
                            "runtime": runtime, "persona": persona,
                            "owner": owner},
               "migration": migration}
+    if allocate_persona:
+        result["persona_allocated"] = persona
+        result["distinct_identity"] = True
     if context_version is not None:
         result["context_version"] = context_version
     return result
@@ -8146,15 +8240,18 @@ def search_project(conn, project_id, query, limit=20, actor_id=None,
     }
 
 
-def handoff_history(conn, project_id, limit=20):
+def handoff_history(conn, project_id, limit=20, actor_id=None,
+                    actor_type="agent", target_actor_id=None):
     get_project(conn, project_id)
+    handoff_actor = _handoff_read_actor(
+        conn, project_id, actor_id, actor_type, target_actor_id)
     rows = conn.execute(
-        "SELECT * FROM handoffs WHERE project_id=? ORDER BY version DESC LIMIT ?",
-        (project_id, max(1, min(int(limit or 20), 200)))).fetchall()
-    return {"project": project_id, "versions": [
-        {"version": r["version"], "updated_by": r["updated_by"],
-         "updated_at": r["updated_at"], "content": json.loads(r["content"])}
-        for r in rows]}
+        "SELECT * FROM identity_handoffs WHERE project_id=? AND actor_id=?"
+        " ORDER BY version DESC LIMIT ?",
+        (project_id, handoff_actor,
+         max(1, min(int(limit or 20), 200)))).fetchall()
+    return {"project": project_id, "handoff_actor": handoff_actor,
+            "versions": [_identity_handoff_dict(row) for row in rows]}
 
 
 def event_show(conn, project_id, seq):
@@ -8241,23 +8338,24 @@ MCP_TOOLS = [
     },
     {
         "name": "get_handoff",
-        "description": "CALL THIS FIRST in every session. Returns the project's current "
-                       "handoff (objective, what changed, active work, blockers, risks, "
+        "description": "Read the current exact identity's versioned handoff "
+                       "(objective, what changed, active work, blockers, risks, "
                        "next actions), mandatory rules applicable to your registered role, "
                        "open tasks, standing decisions, recent activity and "
-                       "the current context_version. This replaces re-discovering the "
-                       "project or relying on stale chat memory.",
-        "inputSchema": {"type": "object", "properties": {"project": PROJECT_PROP}},
+                       "the current context_version. A target_actor_id performs a "
+                       "coordination read without changing the reader's authority.",
+        "inputSchema": {"type": "object", "properties": {
+            "project": PROJECT_PROP,
+            "target_actor_id": _s("Optional exact identity whose handoff to read."),
+        }},
     },
     {
         "name": "update_handoff",
-        "description": "Update the current-state handoff for the next worker (any tool, any "
-                       "model). Pass only the fields that changed; others are preserved. "
-                       "On a role-governed workspace, only registered Directors may write "
-                       "this shared document (humans retain override authority). The Lead "
-                       "Director breaks ties but other Directors can write. Stale writes "
-                       "are rejected by context version; other roles report through tasks "
-                       "and room. Call at a meaningful transition or session end.",
+        "description": "Update only this exact identity's handoff. Pass only changed "
+                       "fields; others are preserved. Every registered AI role and each "
+                       "human identity owns independent history. A persona-qualified actor "
+                       "can never overwrite another persona. Use the handoff version for "
+                       "optimistic conflict checking at a meaningful transition.",
         "inputSchema": {"type": "object", "properties": {
             "project": PROJECT_PROP,
             "objective": _s("Current objective of the project/phase."),
@@ -8268,8 +8366,42 @@ MCP_TOOLS = [
             "next_actions": _s("Concrete next actions for the next worker."),
             "notes": _s("Anything else the next worker must know."),
             "expected_context_version": _i(
-                "Version returned by get_handoff; stale values are rejected."),
+                "Deprecated project-wide freshness guard."),
+            "expected_handoff_version": _i(
+                "Exact identity handoff version returned by get_handoff."),
         }},
+    },
+    {
+        "name": "role_scope_get",
+        "description": "Read durable background shared by this identity's actual role, "
+                       "plus the lead_director overlay when applicable. Humans and "
+                       "Directors may request a management view.",
+        "inputSchema": {"type": "object", "properties": {
+            "project": PROJECT_PROP,
+            "role": _s("Specific role scope (management or own-role read)."),
+            "include_all": _b("Return every role scope (human/Director only)."),
+        }},
+    },
+    {
+        "name": "role_scope_set",
+        "description": "Replace one versioned Role Scope. Only humans and registered "
+                       "Directors may edit; stale versions are rejected.",
+        "inputSchema": {"type": "object", "properties": {
+            "project": PROJECT_PROP,
+            "role": _s("director | advisor | worker | lead_director."),
+            "content": _s("Full replacement Role Scope text."),
+            "expected_version": _i("Current Role Scope version."),
+        }, "required": ["role", "content"]},
+    },
+    {
+        "name": "role_scope_history",
+        "description": "Read immutable revisions for an applicable Role Scope. "
+                       "Humans and Directors may inspect every role.",
+        "inputSchema": {"type": "object", "properties": {
+            "project": PROJECT_PROP,
+            "role": _s("Role Scope whose revisions to read."),
+            "limit": _i("Max versions (default 20)."),
+        }, "required": ["role"]},
     },
     {
         "name": "get_project_log",
@@ -8699,6 +8831,10 @@ MCP_TOOLS = [
             "display_name": _s("Human-friendly name, e.g. 'Backend Director'."),
             "role": _s("e.g. director, backend, frontend, security_review."),
             "runtime": _s("e.g. claude-code, codex-cli, glm, human."),
+            "persona": _s("Exact existing persona when reusing an identity."),
+            "identity_mode": _s(
+                "reuse | new | temporary. New/temporary allocate the next "
+                "collision-free color; guided setup only."),
             "project": PROJECT_PROP,
         }},
     },
@@ -8807,6 +8943,7 @@ class McpSession:
         self.authorized_project = authorized_project
         self.preserve_actor_identity = bool(preserve_actor_identity)
         self.briefed_versions = {}   # project_id -> context_version at last get_handoff
+        self.briefed_handoff_versions = {}  # (project_id, actor_id) -> version
         self._registered = set()     # (project, actor) auto-registered pairs
         self.stdin = stdin or sys.stdin
         self.stdout = stdout or sys.stdout
@@ -9119,7 +9256,7 @@ class McpSession:
                 "owner": self.owner,
                 "identity_pending": atype == "agent",
                 "hint": ("workspace and role are selected during setup; the "
-                         "final actor is workspace.role.runtime"
+                         "final actor is workspace.role.runtime[.persona]"
                          if atype == "agent" else None),
             }
             return result
@@ -9131,8 +9268,12 @@ class McpSession:
         if name == "get_handoff":
             project, actor = self._project_actor(args)
             result = get_handoff(conn, project, actor_id=actor,
-                                 actor_type=atype)
+                                 actor_type=atype,
+                                 target_actor_id=args.get("target_actor_id"))
             self.briefed_versions[project] = result["context_version"]
+            if result.get("handoff_actor") == actor:
+                self.briefed_handoff_versions[(project, actor)] = \
+                    result.get("handoff_version", 0)
             return result
 
         if name == "check_inbox":
@@ -9198,15 +9339,43 @@ class McpSession:
 
         if name == "update_handoff":
             project, actor = self._project_actor(args)
+            if args.get("target_actor_id"):
+                raise AttaccaError(
+                    "update_handoff cannot target another identity; only the "
+                    "authenticated exact identity may mutate its handoff")
             updates = {k: args.get(k) for k in HANDOFF_FIELDS}
-            expected = args.get("expected_context_version")
-            if expected is None:
-                expected = self.briefed_versions.get(project)
+            expected_handoff = args.get("expected_handoff_version")
+            if expected_handoff is None:
+                expected_handoff = self.briefed_handoff_versions.get(
+                    (project, actor))
             result = update_handoff(
                 conn, project, actor, atype, updates,
-                expected_context_version=expected)
+                expected_context_version=args.get("expected_context_version"),
+                expected_version=expected_handoff)
             self.briefed_versions[project] = result["context_version"]
+            self.briefed_handoff_versions[(project, actor)] = \
+                result["handoff_version"]
             return result
+
+        if name == "role_scope_get":
+            project, actor = self._project_actor(args)
+            return role_scope_get(
+                conn, project, actor_id=actor, actor_type=atype,
+                role=args.get("role"), include_all=bool(args.get("include_all")))
+
+        if name == "role_scope_set":
+            project, actor = self._project_actor(args)
+            return self._guarded_write(project, lambda: role_scope_set(
+                conn, project, actor, atype, role=args.get("role"),
+                content=args.get("content"),
+                expected_version=args.get("expected_version")))
+
+        if name == "role_scope_history":
+            project, actor = self._project_actor(args)
+            return role_scope_history(
+                conn, project, role=args.get("role"),
+                limit=args.get("limit") or 20, actor_id=actor,
+                actor_type=atype)
 
         if name == "get_project_log":
             project, actor = self._project_actor(args)
@@ -9385,11 +9554,17 @@ class McpSession:
 
         if name == "agent_register":
             project, actor = self._project_actor(args)
+            identity_mode = str(args.get("identity_mode") or "").lower()
             return agent_register(conn, project, actor, atype,
                                   agent_id=args.get("agent_id"),
                                   display_name=args.get("display_name"),
                                   role=args.get("role"),
                                   runtime=args.get("runtime"),
+                                  persona=args.get("persona"),
+                                  allocate_persona=identity_mode in (
+                                      "new", "temporary"),
+                                  distinct_identity=identity_mode in (
+                                      "new", "temporary"),
                                   canonical_identity=atype == "agent")
 
         if name == "agent_list":
@@ -13628,12 +13803,17 @@ def _r_bridges_remove(h, m, q):
 def _r_handoff_get(h, m, q):
     actor, atype = h._actor()
     h._reply_json(200, get_handoff(
-        h._conn(), m.group(1), actor_id=actor, actor_type=atype))
+        h._conn(), m.group(1), actor_id=actor, actor_type=atype,
+        target_actor_id=(q.get("target_actor_id") or q.get("actor_id"))))
 
 
 def _r_handoff_history(h, m, q):
+    actor, atype = h._actor()
     limit = q.get("limit") or 20
-    h._reply_json(200, handoff_history(h._conn(), m.group(1), limit=limit))
+    h._reply_json(200, handoff_history(
+        h._conn(), m.group(1), limit=limit, actor_id=actor,
+        actor_type=atype,
+        target_actor_id=(q.get("target_actor_id") or q.get("actor_id"))))
 
 
 def _r_inbox_get(h, m, q):
@@ -13671,10 +13851,38 @@ def _r_message_dispose(h, m, q):
 def _r_handoff_set(h, m, q):
     actor, atype = h._actor()
     body = h._body_json()
+    if body.get("target_actor_id"):
+        raise AttaccaError(
+            "identity handoff updates cannot target another identity")
     updates = {k: body.get(k) for k in HANDOFF_FIELDS}
     h._reply_json(200, update_handoff(
         h._conn(), m.group(1), actor, atype, updates,
-        expected_context_version=body.get("expected_context_version")))
+        expected_context_version=body.get("expected_context_version"),
+        expected_version=body.get("expected_handoff_version")))
+
+
+def _r_role_scope_get(h, m, q):
+    actor, atype = h._actor()
+    h._reply_json(200, role_scope_get(
+        h._conn(), m.group(1), actor_id=actor, actor_type=atype,
+        role=q.get("role"), include_all=str(q.get("include_all", "0")).lower()
+        in ("1", "true", "yes")))
+
+
+def _r_role_scope_set(h, m, q):
+    actor, atype = h._actor()
+    body = h._body_json()
+    h._reply_json(200, role_scope_set(
+        h._conn(), m.group(1), actor, atype, role=m.group(2),
+        content=body.get("content"),
+        expected_version=body.get("expected_version")))
+
+
+def _r_role_scope_history(h, m, q):
+    actor, atype = h._actor()
+    h._reply_json(200, role_scope_history(
+        h._conn(), m.group(1), role=m.group(2),
+        limit=q.get("limit") or 20, actor_id=actor, actor_type=atype))
 
 
 def _r_log(h, m, q):
@@ -13996,7 +14204,11 @@ def _r_agent_register(h, m, q):
     result = agent_register(
         h._conn(), m.group(1), actor, atype, agent_id=body.get("agent_id"),
         display_name=body.get("display_name"), role=body.get("role"),
-        runtime=body.get("runtime"),
+        runtime=body.get("runtime"), persona=body.get("persona"),
+        allocate_persona=(body.get("allocate_persona") is True or
+                          body.get("identity_mode") in ("new", "temporary")),
+        distinct_identity=(body.get("distinct_identity") is True or
+                           body.get("identity_mode") in ("new", "temporary")),
         canonical_identity=(atype == "agent" or
                             bool(principal and
                                  principal.get("token_kind") == "client") or
@@ -14105,6 +14317,12 @@ ROUTES = [
     (*_route_def("GET", "/v1/projects/%s/handoff/history" % _PID), _r_handoff_history),
     (*_route_def("POST", "/v1/projects/%s/handoff" % _PID), _r_handoff_set),
     (*_route_def("PUT", "/v1/projects/%s/handoff" % _PID), _r_handoff_set),
+    (*_route_def("GET", "/v1/projects/%s/role-scopes" % _PID),
+     _r_role_scope_get),
+    (*_route_def("GET", "/v1/projects/%s/role-scopes/%s/history" %
+                 (_PID, _PID)), _r_role_scope_history),
+    (*_route_def("PUT", "/v1/projects/%s/role-scopes/%s" % (_PID, _PID)),
+     _r_role_scope_set),
     (*_route_def("GET", "/v1/projects/%s/log" % _PID), _r_log),
     (*_route_def("GET", "/v1/projects/%s/events" % _PID), _r_events_sync),
     (*_route_def("GET", "/v1/projects/%s/activity" % _PID),
@@ -15350,6 +15568,8 @@ def run_connect_proxy(url=None, actor=None, actor_type=None, project=None,
         "project": configured_project or linked_project,
         "link_project": linked_project,
         "binding": None,
+        "temporary_actor": None,
+        "offline_identity": None,
     }
     actor_hint = actor or os.environ.get(ENV_ACTOR)
     runtime_hint = normalize_agent_runtime(actor=actor_hint)
@@ -15392,18 +15612,28 @@ def run_connect_proxy(url=None, actor=None, actor_type=None, project=None,
                 state["project"] = None
             state["link_project"] = current_project
         owner = load_owner()
-        actor_id = qualify_actor(actor or os.environ.get(ENV_ACTOR),
-                                 owner=owner)
+        requested_actor = actor or os.environ.get(ENV_ACTOR)
+        resolved_runtime = normalize_agent_runtime(
+            actor=requested_actor or actor_hint)
+        current_device = load_device_id()
+        client_instance = load_client_instance_id(resolved_runtime)
+        saved_actor = None
+        if state.get("project"):
+            saved = machine_actor_binding_get(
+                endpoint, state["project"], resolved_runtime,
+                client_instance=client_instance)
+            saved_actor = saved.get("actor_id") if saved else None
+        actor_id = (state.get("temporary_actor") or saved_actor or
+                    qualify_actor(requested_actor, owner=owner))
         atype = actor_type or os.environ.get(ENV_ACTOR_TYPE)
-        resolved_runtime = normalize_agent_runtime(actor=actor_id)
+        resolved_runtime = normalize_agent_runtime(
+            resolved_runtime, actor_id)
         require_usable_terminal_credential(
             endpoint, runtime=resolved_runtime,
             project_id=state["project"], actor_id=actor_id)
         token = load_api_token(
             endpoint, runtime=resolved_runtime,
             project_id=state["project"], actor_id=actor_id)
-        current_device = load_device_id()
-        client_instance = load_client_instance_id(resolved_runtime)
         token_fingerprint = hashlib.sha256(token.encode("utf-8")).hexdigest() \
             if token else None
         binding = (endpoint, state.get("project"), actor_id, atype,
@@ -15411,6 +15641,14 @@ def run_connect_proxy(url=None, actor=None, actor_type=None, project=None,
         if state.get("binding") is not None and binding != state["binding"]:
             reset_remote()
         state["binding"] = binding
+        offline_identity = (
+            endpoint, state.get("project"), actor_id, resolved_runtime,
+            current_device)
+        if state.get("offline_identity") != offline_identity:
+            state["offline_identity"] = offline_identity
+            offline_session = OfflineProxySession(
+                endpoint, lambda: state.get("project"), root, actor_id,
+                resolved_runtime, current_device)
         return {
             "url": endpoint, "project": state.get("project"),
             "owner": owner, "actor_id": actor_id, "actor_type": atype,
@@ -16007,6 +16245,108 @@ def _exclusive_config_lock(path):
         if fcntl is not None:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         lock.close()
+
+
+def _machine_actor_binding_key(server_url, project_id, runtime,
+                               client_instance):
+    values = [
+        _normalize_hosted_server_url(server_url),
+        str(project_id or "").strip(),
+        normalize_agent_runtime(runtime),
+        str(client_instance or "").strip(),
+    ]
+    if not values[1]:
+        raise AttaccaError("actor binding requires a workspace")
+    if not values[3] or len(values[3]) > 120:
+        raise AttaccaError(
+            "actor binding requires a valid client installation ID")
+    return hashlib.sha256(canonical_json(values).encode("utf-8")).hexdigest(), \
+        values
+
+
+def _binding_client_instance(runtime, client_instance=None, home=None):
+    selected = str(client_instance or "").strip()
+    if selected:
+        return selected
+    if home is None:
+        return load_client_instance_id(runtime)
+    return _client_instance_for_runtime(runtime, home=home)
+
+
+def machine_actor_binding_get(server_url, project_id, runtime,
+                              client_instance=None, home=None):
+    """Read the exact non-secret actor selected for one client install.
+
+    A Codex/Claude conversation id is intentionally absent from this key.
+    Sessions sharing the same config home and stable client installation reuse
+    the same actor; another container/home has a different installation id and
+    therefore no implicit claim on it.
+    """
+    runtime = normalize_agent_runtime(runtime)
+    client_instance = _binding_client_instance(
+        runtime, client_instance=client_instance, home=home)
+    key, values = _machine_actor_binding_key(
+        server_url, project_id, runtime, client_instance)
+    machine, path = _read_machine_config(home)
+    raw = (machine.get("actor_bindings") or {}).get(key)
+    if not isinstance(raw, dict):
+        return None
+    expected = {
+        "server_url": values[0], "project_id": values[1],
+        "runtime": values[2], "client_instance": values[3],
+    }
+    if any(str(raw.get(field) or "") != value
+           for field, value in expected.items()):
+        raise AttaccaError(
+            "machine actor binding scope does not match its integrity key")
+    actor_id = str(raw.get("actor_id") or "").strip()
+    parsed = parse_canonical_agent_id(actor_id, project_id)
+    if not parsed or parsed["runtime"] != runtime:
+        raise AttaccaError(
+            "machine actor binding selects an invalid workspace/runtime actor")
+    result = dict(raw)
+    result.update({"binding_key": key, "config_path": str(path)})
+    return result
+
+
+def machine_actor_binding_set(server_url, project_id, runtime, actor_id,
+                              client_instance=None, home=None):
+    """Atomically persist one exact actor selection for normal lifecycle use."""
+    runtime = normalize_agent_runtime(runtime)
+    parsed = parse_canonical_agent_id(actor_id, project_id)
+    if not parsed or parsed["runtime"] != runtime:
+        raise AttaccaError(
+            "actor binding must select an exact canonical actor for this "
+            "workspace and runtime")
+    client_instance = _binding_client_instance(
+        runtime, client_instance=client_instance, home=home)
+    key, values = _machine_actor_binding_key(
+        server_url, project_id, runtime, client_instance)
+    path = machine_config_path(home)
+    lock_path = path.with_name(".%s.lock" % path.name)
+    with _MACHINE_CONFIG_THREAD_LOCK, _exclusive_config_lock(lock_path):
+        machine, _ = _read_machine_config(home)
+        bindings = machine.setdefault("actor_bindings", {})
+        if not isinstance(bindings, dict):
+            raise AttaccaError(
+                "machine Attacca config actor_bindings must be an object")
+        previous = bindings.get(key) if isinstance(bindings.get(key), dict) \
+            else None
+        nowi = now_iso()
+        record = {
+            "server_url": values[0], "project_id": values[1],
+            "runtime": values[2], "client_instance": values[3],
+            "actor_id": str(actor_id),
+            "created_at": (previous or {}).get("created_at") or nowi,
+            "updated_at": nowi,
+        }
+        bindings[key] = record
+        machine["version"] = MACHINE_CONFIG_SCHEMA_VERSION
+        machine["updated_at"] = nowi
+        _atomic_switch_write(path, _json_switch_bytes(machine), mode=0o600)
+    return {"ok": True, "binding_key": key, "config_path": str(path),
+            "changed": not previous or previous.get("actor_id") != actor_id,
+            "binding": record}
 
 
 def _codex_config_lock_path(config_path):
@@ -18137,9 +18477,145 @@ def _remote_setup_network(url, project_id, workspaces, actor_id, actor_type):
     }
 
 
+def setup_identity_options(agents, project_id, role, runtime,
+                           bound_actor_id=None):
+    """Build the one-time guided choice without selecting an actor.
+
+    This helper is intentionally pure: discovery may preview the next color,
+    but the server allocates it again under the registration write transaction
+    so two containers cannot both claim the same identity.
+    """
+    role = str(role or "").strip().lower()
+    if role not in AGENT_ROLES:
+        raise AttaccaError("agent role must be director, advisor, or worker")
+    runtime = normalize_agent_runtime(runtime)
+    records = [dict(item) for item in (agents or [])]
+    reusable = []
+    for record in records:
+        parsed = parse_canonical_agent_id(
+            record.get("agent_id"), project_id)
+        if not parsed or parsed["role"] != role \
+                or parsed["runtime"] != runtime:
+            continue
+        reusable.append({
+            "actor_id": record["agent_id"],
+            "persona": parsed.get("persona"),
+            "display_name": record.get("display_name") or record["agent_id"],
+            "owner": record.get("owner"),
+            "compatibility_identity": parsed.get("persona") is None,
+            "currently_bound": record["agent_id"] == bound_actor_id,
+        })
+    reusable.sort(key=lambda item: (
+        not item["currently_bound"], item.get("persona") is None,
+        item.get("persona") or "", item["actor_id"]))
+    next_persona = next_agent_persona(records, project_id, role, runtime)
+    return {
+        "project_id": project_id, "role": role, "runtime": runtime,
+        "bound_actor_id": bound_actor_id,
+        "selection_required": not bool(bound_actor_id),
+        "reusable_identities": reusable,
+        "new_identity": {
+            "mode": "new", "persona_preview": next_persona,
+            "actor_id_preview": canonical_agent_id(
+                project_id, role, runtime, next_persona),
+            "persistent": True,
+        },
+        "temporary_identity": {
+            "mode": "temporary", "persona_preview": next_persona,
+            "actor_id_preview": canonical_agent_id(
+                project_id, role, runtime, next_persona),
+            "persistent": False,
+        },
+    }
+
+
+def select_setup_identity(conn, project_id, role, runtime, *, mode,
+                          actor_id=None, server_url=None,
+                          client_instance=None, home=None, session=None,
+                          requested_by=None, actor_type="agent",
+                          registration_username=None,
+                          authorized_owner_labels=None):
+    """Apply one explicit reuse/new/temporary setup identity choice.
+
+    ``temporary`` changes only the supplied live MCP session and deliberately
+    omits the machine binding.  Its registry row remains as immutable audit
+    history, but no later process selects it implicitly.
+    """
+    mode = str(mode or "").strip().lower()
+    if mode not in ("reuse", "new", "temporary"):
+        raise AttaccaError(
+            "identity mode must be reuse, new, or temporary")
+    role = str(role or "").strip().lower()
+    if role not in AGENT_ROLES:
+        raise AttaccaError("agent role must be director, advisor, or worker")
+    runtime = normalize_agent_runtime(runtime)
+    get_project(conn, project_id)
+    if mode == "reuse":
+        selected = str(actor_id or "").strip()
+        parsed = parse_canonical_agent_id(selected, project_id)
+        row = conn.execute(
+            "SELECT * FROM agents WHERE project_id=? AND agent_id=?",
+            (project_id, selected)).fetchone()
+        if not row or not parsed:
+            raise AttaccaError(
+                "reuse requires one exact registered workspace actor")
+        if parsed["role"] != role or parsed["runtime"] != runtime:
+            raise AttaccaError(
+                "reused actor must match the selected role and runtime")
+        if registration_username:
+            # Authenticated HTTP callers supply the alias-aware owner labels;
+            # direct setup callers still get the conservative exact-username
+            # check instead of being allowed to take over another account.
+            owner_keys = {_auth_owner_alias_key(value) for value in
+                          list(authorized_owner_labels or []) +
+                          [registration_username]}
+            if _auth_owner_alias_key(row["owner"]) not in owner_keys:
+                raise AuthorizationError(
+                    "agent_owner_mismatch: cannot reuse an actor owned by "
+                    "another Attacca user")
+        registration = {"agent_id": selected,
+                        "already_registered": True,
+                        "role": role,
+                        "identity": {"workspace": project_id,
+                                     "role": role, "runtime": runtime,
+                                     "persona": parsed.get("persona"),
+                                     "owner": row["owner"]}}
+    else:
+        caller = str(requested_by or actor_id or runtime).strip()
+        registration = agent_register(
+            conn, project_id, caller, actor_type,
+            role=role, runtime=runtime, canonical_identity=True,
+            allocate_persona=True, distinct_identity=True,
+            registration_username=registration_username,
+            authorized_owner_labels=authorized_owner_labels)
+        selected = registration["agent_id"]
+
+    if session is not None:
+        session.actor = selected
+        session.actor_type = "agent"
+        session.preserve_actor_identity = True
+        if hasattr(session, "_registered"):
+            session._registered = set()
+
+    binding = None
+    if mode in ("reuse", "new") and server_url:
+        binding = machine_actor_binding_set(
+            server_url, project_id, runtime, selected,
+            client_instance=client_instance, home=home)
+    result = {
+        "ok": True, "project_id": project_id, "actor_id": selected,
+        "mode": mode, "temporary": mode == "temporary",
+        "binding_saved": bool(binding), "registration": registration,
+    }
+    if binding:
+        result["binding"] = binding["binding"]
+        result["binding_key"] = binding["binding_key"]
+    return result
+
+
 def discover_remote_setup(url=None, path=None, here=False,
                           actor_id=None, actor_type=None,
-                          selected_project_id=None):
+                          selected_project_id=None, home=None):
     """Read-only first-run discovery for conversational setup."""
     url = configured_server_url(url)
     cwd = Path(path or os.getcwd()).resolve()
@@ -18197,8 +18673,28 @@ def discover_remote_setup(url=None, path=None, here=False,
             p["project_id"] for p in workspaces}:
         raise AttaccaError(
             "cannot inspect unknown workspace '%s'" % network_project)
+    runtime = normalize_agent_runtime(actor=actor_id)
+    client_instance = _binding_client_instance(runtime, home=home)
+    actor_binding = machine_actor_binding_get(
+        url, network_project, runtime, client_instance=client_instance,
+        home=home) if network_project else None
+    effective_actor = (actor_binding or {}).get("actor_id") or actor_id
     network = _remote_setup_network(
-        url, network_project, raw_projects, actor_id, actor_type)
+        url, network_project, raw_projects, effective_actor, actor_type)
+    network["client_instance"] = client_instance
+    network["machine_actor_binding"] = ({
+        "actor_id": actor_binding["actor_id"],
+        "runtime": actor_binding["runtime"],
+        "client_instance": actor_binding["client_instance"],
+        "config_path": actor_binding["config_path"],
+    } if actor_binding else None)
+    if network_project:
+        network["identity_options_by_role"] = {
+            selected_role: setup_identity_options(
+                network.get("agents") or [], network_project, selected_role,
+                runtime, bound_actor_id=(actor_binding or {}).get("actor_id"))
+            for selected_role in AGENT_ROLES
+        }
     return {"server_url": url,
             "git": {"detected": bool(repository["remote"]),
                     "remote": repository["remote"]},
@@ -18215,7 +18711,9 @@ def discover_remote_setup(url=None, path=None, here=False,
 
 def apply_remote_network_setup(url, project_id, actor_id, actor_type,
                                role="keep", lead="keep", bridge=None,
-                               relationship=None, principal_side="other"):
+                               relationship=None, principal_side="other",
+                               identity_mode="auto", identity_actor=None,
+                               client_instance=None, home=None):
     """Apply the explicitly confirmed governance part of guided setup.
 
     The function is deliberately idempotent. Re-running full setup registers
@@ -18232,6 +18730,9 @@ def apply_remote_network_setup(url, project_id, actor_id, actor_type,
         raise AttaccaError("unknown setup workspace '%s'" % project_id)
     if role not in ("keep", "director", "advisor", "worker"):
         raise AttaccaError("role must be keep, director, advisor, or worker")
+    if identity_mode not in ("auto", "reuse", "new", "temporary"):
+        raise AttaccaError(
+            "identity mode must be auto, reuse, new, or temporary")
     if lead not in ("keep", "current", "clear"):
         raise AttaccaError("lead must be keep, current, or clear")
     if principal_side not in ("current", "other"):
@@ -18242,23 +18743,79 @@ def apply_remote_network_setup(url, project_id, actor_id, actor_type,
 
     actions = []
     effective_actor = actor_id
+    runtime = normalize_agent_runtime(actor=actor_id)
+    binding = machine_actor_binding_get(
+        url, project_id, runtime, client_instance=client_instance, home=home)
+    selected_mode = identity_mode
+    if selected_mode == "auto":
+        selected_mode = "reuse" if binding else (
+            "new" if role != "keep" else "auto")
+    if role == "keep" and binding:
+        effective_actor = binding["actor_id"]
     if role != "keep":
-        runtime = normalize_agent_runtime(actor=actor_id)
-        effective_actor = canonical_agent_id(project_id, role, runtime)
         workspace_name = next(
             p["name"] for p in projects if p["project_id"] == project_id)
+        if selected_mode == "reuse":
+            effective_actor = str(
+                identity_actor or (binding or {}).get("actor_id") or "")
+            parsed = parse_canonical_agent_id(effective_actor, project_id)
+            if not parsed or parsed["role"] != role \
+                    or parsed["runtime"] != runtime:
+                raise AttaccaError(
+                    "reuse requires an exact registered actor matching this "
+                    "workspace, role, and runtime")
+            registration_body = {
+                "agent_id": effective_actor,
+                "display_name": workspace_name + " · " + role + " · " +
+                                runtime + (" · " + parsed["persona"]
+                                           if parsed.get("persona") else ""),
+                "role": role, "runtime": runtime,
+                "persona": parsed.get("persona"),
+                "canonical_identity": True,
+                "identity_mode": "reuse",
+            }
+            registration_actor = effective_actor
+        else:
+            # Color selection is repeated atomically by the hosted store;
+            # discovery previews are deliberately not trusted for allocation.
+            registration_body = {
+                "agent_id": actor_id,
+                "display_name": "%s · %s · %s" % (
+                    workspace_name, role, runtime),
+                "role": role, "runtime": runtime,
+                "canonical_identity": True,
+                "allocate_persona": True,
+                "distinct_identity": True,
+                "identity_mode": selected_mode,
+            }
+            registration_actor = actor_id
         registered = remote_json(
             url, "POST", "/v1/projects/%s/agents" % encoded,
-            {"agent_id": actor_id,
-             "display_name": "%s · %s · %s" % (
-                 workspace_name, role, runtime),
-             "role": role, "runtime": runtime,
-             "canonical_identity": True},
-            actor=effective_actor, actor_type=actor_type)
-        actions.append({"kind": "role", "role": role,
+            registration_body,
+            actor=registration_actor, actor_type=actor_type)
+        effective_actor = registered.get("agent_id") or effective_actor
+        actions.append({"kind": "identity", "role": role,
+                        "mode": selected_mode,
                         "actor_id": registered.get("agent_id"),
+                        "persona": (registered.get("identity") or {}).get(
+                            "persona"),
                         "already_registered": bool(
                             registered.get("already_registered"))})
+        if selected_mode in ("reuse", "new"):
+            saved = machine_actor_binding_set(
+                url, project_id, runtime, effective_actor,
+                client_instance=client_instance, home=home)
+            actions.append({"kind": "identity_binding",
+                            "actor_id": effective_actor,
+                            "client_instance": saved["binding"][
+                                "client_instance"],
+                            "changed": saved["changed"]})
+        else:
+            actions.append({
+                "kind": "temporary_identity", "actor_id": effective_actor,
+                "binding_saved": False,
+                "note": "selected only for the current setup/MCP process",
+            })
 
     status = remote_json(
         url, "GET", "/v1/projects/%s/status" % encoded,
@@ -18294,6 +18851,7 @@ def apply_remote_network_setup(url, project_id, actor_id, actor_type,
                                 "unchanged": True})
             return {"ok": True, "project": project_id,
                     "actor": effective_actor,
+                    "identity_mode": selected_mode,
                     "actions": actions}
         principal = None if relationship == "peer" else (
             project_id if principal_side == "current" else bridge)
@@ -18327,6 +18885,7 @@ def apply_remote_network_setup(url, project_id, actor_id, actor_type,
                             "principal": added.get("principal"),
                             "unchanged": False})
     return {"ok": True, "project": project_id, "actor": effective_actor,
+            "identity_mode": selected_mode,
             "actions": actions}
 
 
@@ -19817,6 +20376,13 @@ def build_parser():
     p.add_argument("--role", choices=("keep", "director", "advisor", "worker"),
                    default="keep",
                    help="confirmed role for this AI in the selected workspace")
+    p.add_argument("--identity-mode",
+                   choices=("auto", "reuse", "new", "temporary"),
+                   default="auto",
+                   help="reuse an exact actor, allocate a permanent color, "
+                        "or use a current-process-only temporary color")
+    p.add_argument("--identity-actor", default=None, metavar="ACTOR_ID",
+                   help=argparse.SUPPRESS)
     p.add_argument("--lead", choices=("keep", "current", "clear"),
                    default="keep",
                    help="preserve the lead, make this actor lead, or clear it")
@@ -20573,6 +21139,65 @@ def cli_main(argv=None):
                         else:
                             raise AttaccaError("choose role 1, 2, 3, or 4")
 
+                    # Identity is an installation choice, not a host-session
+                    # choice. Ordinary starts never prompt; explicit setup
+                    # offers takeover/reuse, a permanent next color, or a
+                    # temporary color for only the current MCP process.
+                    identity_options = (
+                        network.get("identity_options_by_role") or {}).get(
+                            args.role) or {}
+                    reusable = identity_options.get(
+                        "reusable_identities") or []
+                    bound_id = (network.get("machine_actor_binding") or {}).get(
+                        "actor_id")
+                    bound = next((item for item in reusable
+                                  if item["actor_id"] == bound_id), None)
+                    choices = []
+                    if bound:
+                        choices.append((
+                            "reuse", bound["actor_id"],
+                            "Continue as %s (%s) — recommended" % (
+                                bound["display_name"],
+                                bound.get("persona") or
+                                "legacy compatibility identity")))
+                    else:
+                        choices.append((
+                            "new", None,
+                            "Create permanent %s identity — recommended" %
+                            ((identity_options.get("new_identity") or {}).get(
+                                "persona_preview") or "next color")))
+                    for item in reusable:
+                        if item["actor_id"] == bound_id:
+                            continue
+                        choices.append((
+                            "reuse", item["actor_id"],
+                            "Take over/reuse %s (%s)" % (
+                                item["display_name"], item.get("persona") or
+                                "legacy compatibility identity")))
+                    if bound:
+                        choices.append((
+                            "new", None,
+                            "Create permanent %s identity" %
+                            ((identity_options.get("new_identity") or {}).get(
+                                "persona_preview") or "next color")))
+                    choices.append((
+                        "temporary", None,
+                        "Use temporary %s identity for this MCP process" %
+                        ((identity_options.get("temporary_identity") or {}).get(
+                            "persona_preview") or "next color")))
+                    print("  this installed client identity:")
+                    for index, (_mode, _actor, label) in enumerate(choices, 1):
+                        print("    %d. %s" % (index, label))
+                    identity_choice = ask(
+                        "  choose identity [1]: ") or "1"
+                    try:
+                        selected_identity = choices[int(identity_choice) - 1]
+                    except (ValueError, IndexError):
+                        raise AttaccaError(
+                            "choose one of the listed identity numbers")
+                    args.identity_mode = selected_identity[0]
+                    args.identity_actor = selected_identity[1]
+
                 keep_relationships = bool(network["existing_relationships"])
                 if keep_relationships:
                     keep = ask("  keep the existing workspace relationships? [Y/n]: ").lower()
@@ -20630,13 +21255,16 @@ def cli_main(argv=None):
             if args.relationship not in (None, "none") and not args.bridge:
                 raise AttaccaError(
                     "--relationship requires a different --bridge workspace")
-            if args.role != "keep" or args.lead != "keep" \
+            if actor_type == "agent" or args.role != "keep" \
+                    or args.lead != "keep" \
                     or args.relationship is not None:
                 network_result = apply_remote_network_setup(
                     setup_url, info["project_id"], actor, actor_type,
                     role=args.role, lead=args.lead, bridge=args.bridge,
                     relationship=args.relationship,
-                    principal_side=args.principal)
+                    principal_side=args.principal,
+                    identity_mode=args.identity_mode,
+                    identity_actor=args.identity_actor)
         credential_result = None
         if info["mode"] == "server" and actor_type == "agent":
             token_actor = (network_result or {}).get("actor") or actor
@@ -20646,7 +21274,9 @@ def cli_main(argv=None):
             close_remote_setup_session(setup_url)
         watcher_result = None
         watcher_error = None
-        if info["mode"] == "server":
+        temporary_identity = bool(
+            (network_result or {}).get("identity_mode") == "temporary")
+        if info["mode"] == "server" and not temporary_identity:
             watcher_actor = (network_result or {}).get("actor") or actor
             watcher_runtime = normalize_agent_runtime(actor=watcher_actor)
             try:
@@ -20660,7 +21290,7 @@ def cli_main(argv=None):
                 watcher_error = str(err)
         cron_result = None
         cron_error = None
-        if info["mode"] == "server":
+        if info["mode"] == "server" and not temporary_identity:
             cron_actor = (network_result or {}).get("actor") or actor
             cron_runtime = normalize_agent_runtime(actor=cron_actor)
             try:
@@ -20707,6 +21337,10 @@ def cli_main(argv=None):
             print("✔ AI Network: %s" % (
                 ", ".join(action["kind"] for action in
                           network_result["actions"]) or "already configured"))
+            if temporary_identity:
+                print("· temporary AI identity: active only for this setup/"
+                      "MCP process; the machine's normal actor binding was "
+                      "not changed")
         if credential_result and credential_result.get("status") in (
                 "ready", "approved"):
             print("✔ client authorization: %s" %

@@ -4615,6 +4615,36 @@ def _compact_cloud_context(value):
     return result
 
 
+def _compact_role_scope(value):
+    """Keep the applicable role instructions ahead of operational state."""
+    if not isinstance(value, dict):
+        return value
+    result = {key: value.get(key) for key in (
+        "actor", "role", "is_lead", "lead_director") if key in value}
+    scopes = []
+    for item in value.get("scopes") or []:
+        if not isinstance(item, dict):
+            continue
+        scope = {key: item.get(key) for key in (
+            "role", "version", "updated_by", "updated_owner", "updated_at")
+                 if key in item}
+        content, truncated = _head_tail_text(
+            item.get("content"), 16_000,
+            "call role_scope_get before relying on the omitted section")
+        scope["content"] = content
+        if truncated:
+            scope["content_truncated"] = True
+        scopes.append(scope)
+    result["scopes"] = scopes
+    effective, effective_truncated = _head_tail_text(
+        value.get("effective_content"), 24_000,
+        "call role_scope_get before relying on the omitted section")
+    result["effective_content"] = effective
+    if effective_truncated:
+        result["effective_content_truncated"] = True
+    return result
+
+
 def _compact_handoff(value):
     if not isinstance(value, dict):
         return value
@@ -4838,7 +4868,10 @@ def _poll_view(snapshot):
         "project_rules_omitted_count": len(omitted_rule_ids),
         "project_rules_omitted_ids": omitted_rule_ids,
         "cloud_context": _compact_cloud_context(
-            handoff.get("cloud_context")),
+            (snapshot.get("cloud_context") or {}).get("cloud_context")
+            if isinstance(snapshot.get("cloud_context"), dict)
+            else handoff.get("cloud_context")),
+        "role_scope": _compact_role_scope(snapshot.get("role_scope")),
         "tasks": [_task_view(task) for task in (tasks.get("tasks") or [])],
         "room_keys": [_message_key(message)
                       for message in (room.get("messages") or [])],
@@ -4953,7 +4986,12 @@ def _compact_snapshot(snapshot):
             "chat/directive with neither is broadcast to everyone. Retain "
             "relevant context even when no action is assigned."),
         "cloud_context": _compact_cloud_context(
-            handoff.get("cloud_context")),
+            (snapshot.get("cloud_context") or {}).get("cloud_context")
+            if isinstance(snapshot.get("cloud_context"), dict)
+            else handoff.get("cloud_context")),
+        "role_scope": _compact_role_scope(snapshot.get("role_scope")),
+        "lead_director": handoff.get("lead_director"),
+        "handoff": _compact_handoff(handoff.get("handoff")),
         "unread_room": unread_messages,
         "unread_room_counts": {
             "total": inbox.get("unread_total", len(unread_messages)),
@@ -4970,8 +5008,6 @@ def _compact_snapshot(snapshot):
             "messages remain behind this page."
             if (inbox.get("may_have_more") or
                 len(all_unread_rows) > len(unread_rows)) else None),
-        "lead_director": handoff.get("lead_director"),
-        "handoff": _compact_handoff(handoff.get("handoff")),
         "decisions": [_decision_view(item) for item in decision_rows[:10]],
         "decisions_total": len(decision_rows),
         "decisions_truncated": len(decision_rows) > 10,
@@ -5002,24 +5038,32 @@ def _mcp_snapshot(status, plugin_root, config, mark_inbox_read=True):
         {"jsonrpc": "2.0", "method": "notifications/initialized"},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
          "params": {"name": "list_projects", "arguments": {}}},
+        # Resolve/register the exact actor before fetching any role-scoped
+        # governance.  Everything after this point follows the durable startup
+        # order: rules, cloud context, role scope, identity handoff, history,
+        # and finally volatile collaboration state.
         {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-         "params": {"name": "get_handoff", "arguments": {}}},
+         "params": {"name": "agent_list", "arguments": {}}},
         {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+         "params": {"name": "rule_list", "arguments": {}}},
+        {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+         "params": {"name": "cloud_context_get", "arguments": {}}},
+        {"jsonrpc": "2.0", "id": 6, "method": "tools/call",
+         "params": {"name": "role_scope_get", "arguments": {}}},
+        {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+         "params": {"name": "get_handoff", "arguments": {}}},
+        {"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+         "params": {"name": "get_project_log", "arguments": {}}},
+        {"jsonrpc": "2.0", "id": 9, "method": "tools/call",
          "params": {"name": "check_inbox",
                     "arguments": {"mark_read": bool(mark_inbox_read),
                                   "limit": STARTUP_INBOX_PAGE_SIZE}}},
-        {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+        {"jsonrpc": "2.0", "id": 10, "method": "tools/call",
          "params": {"name": "room_read", "arguments": {"limit": 50}}},
-        {"jsonrpc": "2.0", "id": 6, "method": "tools/call",
+        {"jsonrpc": "2.0", "id": 11, "method": "tools/call",
          "params": {"name": "task_list", "arguments": {}}},
-        {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+        {"jsonrpc": "2.0", "id": 12, "method": "tools/call",
          "params": {"name": "attacca_status", "arguments": {}}},
-        # A project tool above auto-registers this MCP actor. List agents after
-        # registration, then fetch rules after the actor's real role is known.
-        {"jsonrpc": "2.0", "id": 8, "method": "tools/call",
-         "params": {"name": "agent_list", "arguments": {}}},
-        {"jsonrpc": "2.0", "id": 9, "method": "tools/call",
-         "params": {"name": "rule_list", "arguments": {}}},
     ]
     env = dict(os.environ)
     env.update({"ATTACCA_URL": config["url"],
@@ -5075,13 +5119,16 @@ def _mcp_snapshot(status, plugin_root, config, mark_inbox_read=True):
     return {
         "project": status["project_id"],
         "checked_at": datetime.now(timezone.utc).isoformat(),
-        "handoff": tool_result(3),
-        "inbox": tool_result(4),
-        "room": tool_result(5),
-        "tasks": tool_result(6),
-        "status": tool_result(7),
-        "agents": tool_result(8),
-        "rules": tool_result(9),
+        "agents": tool_result(3),
+        "rules": tool_result(4),
+        "cloud_context": tool_result(5),
+        "role_scope": tool_result(6),
+        "handoff": tool_result(7),
+        "log": tool_result(8),
+        "inbox": tool_result(9),
+        "room": tool_result(10),
+        "tasks": tool_result(11),
+        "status": tool_result(12),
     }
 
 
