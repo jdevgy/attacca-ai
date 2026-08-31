@@ -521,11 +521,14 @@ class GroupRoomContractTest(unittest.TestCase):
         second = c.poll_status(
             self.conn, project, actor_id=reader, actor_type="agent")["mail"]
         self.assertEqual(first, second)
-        self.assertEqual(first["unread_total"], 200)
+        # Exact totals cover the whole authorized unread tail, not just the
+        # bounded page.  The message directed to ``other`` is still visible
+        # group context for ``reader`` under the group-room contract.
+        self.assertEqual(first["unread_total"], 201)
         self.assertEqual(first["unread_addressed"], 1)
         self.assertEqual(first["unread_direct"], 0)
         self.assertEqual(first["unread_everyone"], 1)
-        self.assertEqual(first["unread_group_context"], 199)
+        self.assertEqual(first["unread_group_context"], 200)
         self.assertTrue(first["may_have_more"])
         self.assertTrue(first["messages_include_all_visible"])
         self.assertTrue(first["has_new_mail"])

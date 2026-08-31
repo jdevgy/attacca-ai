@@ -128,8 +128,18 @@ class HttpTestCase(unittest.TestCase):
         self.assertIn("Mark group room read", panel)
         self.assertNotIn("This inbox belongs only to", panel)
         self.assertNotIn("other actors have separate inboxes", panel)
-        self.assertIn("message.origin_project === activeBridge.with", panel)
-        self.assertIn("includes(activeBridge.with)", panel)
+        # T-76 makes conversation scope a server query.  The panel must send
+        # the exact selected conversation and reject a response whose scope
+        # echo does not match; it must not filter only the 60 rows on screen.
+        self.assertIn(
+            "conversation: state.roomConversation, q: state.roomFilter",
+            panel)
+        self.assertIn(
+            'String(echoedConversation ?? "") !== requestedConversation',
+            panel)
+        self.assertIn(
+            "The server filters this exact conversation before applying "
+            "the 60-message page.", panel)
         self.assertNotIn("All room activity", panel)
         self.assertNotIn("return bridges.length === 1", panel)
         self.assertIn("function actorDisplay(actorId)", panel)
@@ -137,9 +147,10 @@ class HttpTestCase(unittest.TestCase):
         self.assertIn("const API_TIMEOUT_MS = 15000", panel)
         self.assertIn("new AbortController()", panel)
         self.assertNotIn("nameFor(", panel)
-        self.assertIn('[workspace, role, runtime].map(identityPart).join(" · ")',
-                      panel)
-        self.assertIn("Workspace · Role · Runtime", panel)
+        self.assertIn("const personaIdentity =", panel)
+        self.assertIn(
+            '[workspace, role, runtime, persona].filter(Boolean)'
+            '.map(identityPart).join(" · ")', panel)
         self.assertIn(
             "It authorizes clients but never renames or replaces an AI "
             "identity", panel)
@@ -237,11 +248,11 @@ class HttpTestCase(unittest.TestCase):
         self.assertIn("const claimant = attribution.current_claimant ||", panel)
         self.assertIn("const claimantText = taskClaimantText(task);", panel)
         self.assertNotIn("Claimant AI", panel)
-        # D-18 renders each group message in the room feed and relationship
-        # evidence; the former separate per-actor inbox renderer was removed.
-        self.assertGreaterEqual(panel.count(
+        # Each server-scoped group message is rendered once.  The former
+        # second client-side relationship projection was removed by T-76.
+        self.assertEqual(panel.count(
             "attributionText(message.actor, message.actor_type, "
-            "message.owner, message.attribution)"), 2)
+            "message.owner, message.attribution)"), 1)
         self.assertIn(
             "attributionText(operational, event.actor_type, event.owner, "
             "event.attribution)", panel)
@@ -1317,11 +1328,28 @@ class HttpTestCase(unittest.TestCase):
         self.assertEqual(shown["status"], "done")
 
     def test_handoff_freshness_verify_and_sync(self):
-        _, before, _ = self.rest("GET", "/v1/projects/hub/handoff")
-        _, updated, _ = self.rest("POST", "/v1/projects/hub/handoff",
-                                  {"objective": "serve the world"}, actor="alice")
-        _, handoff, _ = self.rest("GET", "/v1/projects/hub/handoff")
+        status, registration, _ = self.rest(
+            "POST", "/v1/projects/hub/agents",
+            {"role": "director", "runtime": "codex",
+             "canonical_identity": True, "identity_mode": "new"},
+            actor="admin", actor_type="human")
+        self.assertEqual(status, 200)
+        actor = registration["agent_id"]
+        self.assertEqual(actor, "hub.director.codex.red")
+        _, before, _ = self.rest(
+            "GET", "/v1/projects/hub/handoff", actor=actor,
+            actor_type="agent")
+        status, updated, _ = self.rest(
+            "POST", "/v1/projects/hub/handoff",
+            {"objective": "serve the world", "expected_handoff_version": 0},
+            actor=actor, actor_type="agent")
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["handoff_actor"], actor)
+        _, handoff, _ = self.rest(
+            "GET", "/v1/projects/hub/handoff", actor=actor,
+            actor_type="agent")
         self.assertEqual(handoff["handoff"]["objective"], "serve the world")
+        self.assertEqual(handoff["handoff_actor"], actor)
         _, fresh, _ = self.rest(
             "GET", "/v1/projects/hub/freshness?context_version=%d"
             % before["context_version"])
@@ -1333,7 +1361,7 @@ class HttpTestCase(unittest.TestCase):
         self.assertEqual(sync["events"][0]["seq"], 1)
         self.assertIsInstance(sync["events"][0]["payload"], dict)
 
-    def test_rest_handoff_roles_and_optimistic_conflict(self):
+    def test_rest_handoff_exact_identities_and_optimistic_conflict(self):
         project = "governed-rest"
         self.rest("POST", "/v1/projects",
                   {"project_id": project, "name": "Governed REST"},
@@ -1366,15 +1394,39 @@ class HttpTestCase(unittest.TestCase):
             actor="director-b", actor_type="agent")
         self.assertEqual(status, 400)
         self.assertIn("handoff conflict", conflict["error"])
-        status, denied, _ = self.rest(
+        status, worker_update, _ = self.rest(
             "PUT", "/v1/projects/%s/handoff" % project,
             {"notes": "worker write",
-             "expected_context_version": first["context_version"]},
+             "expected_context_version": first["context_version"],
+             "expected_handoff_version": 0},
             actor="worker", actor_type="agent")
+        # D-19 handoffs belong to every exact registered identity. Role scope
+        # supplies shared background; it does not turn a worker's handoff into
+        # the Director's document or forbid the worker from maintaining one.
+        self.assertEqual(status, 200)
+        self.assertEqual(worker_update["handoff_actor"], "worker")
+        self.assertEqual(worker_update["handoff_version"], 1)
+
+        status, own_conflict, _ = self.rest(
+            "PUT", "/v1/projects/%s/handoff" % project,
+            {"notes": "stale own revision",
+             "expected_context_version": worker_update["context_version"],
+             "expected_handoff_version": 0},
+            actor="director-a", actor_type="agent")
         self.assertEqual(status, 400)
-        self.assertIn("director-only", denied["error"])
-        _, final, _ = self.rest("GET", "/v1/projects/%s/handoff" % project)
-        self.assertEqual(final["handoff"]["what_changed"], "first director")
+        self.assertIn("identity handoff conflict", own_conflict["error"])
+
+        _, director_handoff, _ = self.rest(
+            "GET", "/v1/projects/%s/handoff" % project,
+            actor="director-a", actor_type="agent")
+        _, worker_handoff, _ = self.rest(
+            "GET", "/v1/projects/%s/handoff" % project,
+            actor="worker", actor_type="agent")
+        self.assertEqual(
+            director_handoff["handoff"]["what_changed"], "first director")
+        self.assertIsNone(director_handoff["handoff"]["notes"])
+        self.assertEqual(worker_handoff["handoff"]["notes"], "worker write")
+        self.assertIsNone(worker_handoff["handoff"]["what_changed"])
 
     # -- MCP over streamable HTTP -------------------------------------------
 
@@ -1509,6 +1561,11 @@ class HttpTestCase(unittest.TestCase):
             self.assertEqual(json.loads(err.read())["error"]["code"], -32700)
 
     def test_mcp_drift_guard_state_survives_across_posts(self):
+        status, _, _ = self.rest(
+            "POST", "/v1/projects/hub/agents",
+            {"agent_id": "hub.director.drift.red", "role": "director",
+             "runtime": "drift"}, actor="admin", actor_type="human")
+        self.assertEqual(status, 200)
         _, _, sid = self.mcp_init(actor="stateful")
         status, resp, _ = self.mcp(
             {"jsonrpc": "2.0", "id": 31, "method": "tools/call",
@@ -1516,8 +1573,14 @@ class HttpTestCase(unittest.TestCase):
             session=sid, actor="stateful")
         self.assertFalse(resp["result"]["isError"])
         # someone else advances the context via REST
-        self.rest("POST", "/v1/projects/hub/handoff",
-                  {"objective": "moved underneath"}, actor="other")
+        status, moved, _ = self.rest(
+            "POST", "/v1/projects/hub/handoff",
+            {"objective": "moved underneath",
+             "expected_handoff_version": 0},
+            actor="hub.director.drift.red", actor_type="agent")
+        self.assertEqual(status, 200)
+        self.assertEqual(moved["handoff_actor"],
+                         "hub.director.drift.red")
         _, task, _ = self.rest("POST", "/v1/projects/hub/tasks",
                                {"title": "drift probe"}, actor="stateful")
         status, resp, _ = self.mcp(
@@ -2002,14 +2065,16 @@ class TwoCodexCheckoutFlowTestCase(unittest.TestCase):
     def tearDown(self):
         self._watcher_patch.stop()
 
-    def _proxy(self, server, db, cwd, actor):
+    def _proxy(self, server, db, cwd, actor, home):
         env = dict(os.environ)
         env.pop("CLAUDE_PROJECT_DIR", None)
         env.pop("ATTACCA_PROJECT", None)
+        env.pop("ATTACCA_CLIENT_INSTANCE", None)
         env["ATTACCA_DB"] = str(db)
         env["ATTACCA_URL"] = server.base
         env["ATTACCA_ACTOR"] = actor
         env["ATTACCA_AUTOSTART"] = "0"
+        env["HOME"] = str(home)
         return subprocess.Popen(
             [sys.executable, SCRIPT, "connect", "--url", server.base],
             stdin=subprocess.PIPE,
@@ -2045,8 +2110,10 @@ class TwoCodexCheckoutFlowTestCase(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             db = root / "shared.db"
-            home = root / "home"
-            home.mkdir()
+            home_a = root / "home-a"
+            home_b = root / "home-b"
+            home_a.mkdir()
+            home_b.mkdir()
             a = root / "computer-a" / "checkout-one"
             b = root / "computer-b" / "totally-different-path"
             a.mkdir(parents=True)
@@ -2066,10 +2133,10 @@ class TwoCodexCheckoutFlowTestCase(unittest.TestCase):
                     "codex_a", "agent", db, url=server.base, path=str(a),
                     manage_server=False, manage_tools=False,
                     write_instructions=False, create_project="Two Codex Flow",
-                    home=str(home))
+                    home=str(home_a))
                 discovery_b = c.discover_remote_setup(
                     server.base, path=str(b), actor_id="codex_b",
-                    actor_type="agent")
+                    actor_type="agent", home=home_b)
                 self.assertEqual(discovery_b["action"], "confirm_git_match")
                 self.assertEqual(discovery_b["suggested_project_id"],
                                  setup_a["project_id"])
@@ -2077,24 +2144,24 @@ class TwoCodexCheckoutFlowTestCase(unittest.TestCase):
                     "codex_b", "agent", db, url=server.base, path=str(b),
                     manage_server=False, manage_tools=False,
                     write_instructions=False,
-                    attach_project=setup_a["project_id"], home=str(home))
+                    attach_project=setup_a["project_id"], home=str(home_b))
                 self.assertNotEqual(setup_a["root_path"], setup_b["root_path"])
                 self.assertEqual(setup_a["project_id"], setup_b["project_id"])
                 self.assertTrue((a / ".attacca" / "project.json").is_file())
                 self.assertTrue((b / ".attacca" / "project.json").is_file())
                 network_a = c.apply_remote_network_setup(
                     server.base, setup_a["project_id"], "codex_a", "agent",
-                    role="director", lead="current")
+                    role="director", lead="current", home=home_a)
                 network_b = c.apply_remote_network_setup(
                     server.base, setup_a["project_id"], "codex_b", "agent",
-                    role="worker")
+                    role="worker", home=home_b)
                 self.assertEqual(network_a["actor"],
-                                 "two-codex-flow.director.codex")
+                                 "two-codex-flow.director.codex.red")
                 self.assertEqual(network_b["actor"],
-                                 "two-codex-flow.worker.codex")
+                                 "two-codex-flow.worker.codex.red")
 
-                first = self._proxy(server, db, a, "codex_a")
-                second = self._proxy(server, db, b, "codex_b")
+                first = self._proxy(server, db, a, "codex_a", home_a)
+                second = self._proxy(server, db, b, "codex_b", home_b)
                 self._initialize(first, "codex-a")
                 self._initialize(second, "codex-b")
                 status_a = self._call(first, 2, "attacca_status")
@@ -2102,32 +2169,32 @@ class TwoCodexCheckoutFlowTestCase(unittest.TestCase):
                 self.assertEqual(status_a["project"], setup_a["project_id"])
                 self.assertEqual(status_b["project"], setup_a["project_id"])
                 self.assertEqual(status_a["you"]["actor_id"],
-                                 "two-codex-flow.director.codex")
+                                 "two-codex-flow.director.codex.red")
                 self.assertEqual(status_b["you"]["actor_id"],
-                                 "two-codex-flow.worker.codex")
+                                 "two-codex-flow.worker.codex.red")
 
                 sent_a = self._call(
                     first, 3, "room_send",
                     {"body": "hello from checkout A",
                      "msg_type": "directive",
-                     "mentions": ["two-codex-flow.worker.codex"]})
+                     "mentions": ["two-codex-flow.worker.codex.red"]})
                 seen_b = self._call(
                     second, 3, "check_inbox", {"mark_read": True})
                 from_a = next(m for m in seen_b["messages"]
                               if m["body"] == "hello from checkout A")
                 self.assertEqual(from_a["actor"],
-                                 "two-codex-flow.director.codex")
+                                 "two-codex-flow.director.codex.red")
                 sent_b = self._call(
                     second, 4, "room_send",
                     {"body": "reply from checkout B", "msg_type": "chat",
                      "reply_to": sent_a["event"]["event_id"],
-                     "mentions": ["two-codex-flow.director.codex"]})
+                     "mentions": ["two-codex-flow.director.codex.red"]})
                 seen_a = self._call(
                     first, 4, "check_inbox", {"mark_read": True})
                 from_b = next(m for m in seen_a["messages"]
                               if m["body"] == "reply from checkout B")
                 self.assertEqual(from_b["actor"],
-                                 "two-codex-flow.worker.codex")
+                                 "two-codex-flow.worker.codex.red")
                 self.assertEqual(from_b["reply_to"],
                                  sent_a["event"]["event_id"])
                 self.assertEqual(sent_b["delivered_to"], setup_a["project_id"])
@@ -2499,8 +2566,10 @@ class OneShotSetupTestCase(unittest.TestCase):
             db = Path(tmp) / "network.db"
             current = Path(tmp) / "current"
             master = Path(tmp) / "master"
+            home = Path(tmp) / "home"
             current.mkdir()
             master.mkdir()
+            home.mkdir()
             conn = c.connect(db)
             c.project_init(conn, "admin", "human", path=str(current),
                            project_id="current", name="Current App")
@@ -2513,14 +2582,21 @@ class OneShotSetupTestCase(unittest.TestCase):
                 first = c.apply_remote_network_setup(
                     server.base, "current", actor, "agent",
                     role="director", lead="current", bridge="master",
-                    relationship="master", principal_side="other")
+                    relationship="master", principal_side="other",
+                    home=home)
                 self.assertEqual(
                     [action["kind"] for action in first["actions"]],
-                    ["role", "lead", "bridge"])
+                    ["identity", "identity_binding", "lead", "bridge"])
+                self.assertEqual(first["actor"],
+                                 "current.director.codex.red")
+                self.assertEqual(first["identity_mode"], "new")
                 second = c.apply_remote_network_setup(
                     server.base, "current", actor, "agent",
                     role="director", lead="current", bridge="master",
-                    relationship="master", principal_side="other")
+                    relationship="master", principal_side="other",
+                    home=home)
+                self.assertEqual(second["actor"], first["actor"])
+                self.assertEqual(second["identity_mode"], "reuse")
                 bridge_action = next(
                     action for action in second["actions"]
                     if action["kind"] == "bridge")
@@ -2528,15 +2604,16 @@ class OneShotSetupTestCase(unittest.TestCase):
                 c.remote_json(
                     server.base, "POST", "/v1/projects/master/room",
                     {"body": "Please join the shared delivery room",
-                     "msg_type": "directive", "mentions": [actor],
+                     "msg_type": "directive", "mentions": [first["actor"]],
                      "target_project": "current"},
                     actor="master.director", actor_type="agent")
                 discovery = c.discover_remote_setup(
                     server.base, path=str(current), actor_id=actor,
-                    actor_type="agent", selected_project_id="current")
+                    actor_type="agent", selected_project_id="current",
+                    home=home)
                 network = discovery["network"]
                 self.assertEqual(network["lead_director"],
-                                 "current.director.codex")
+                                 "current.director.codex.red")
                 self.assertEqual(
                     network["current_actor_record"]["role"], "director")
                 self.assertEqual(network["default_relationship"], "master")
@@ -2547,7 +2624,7 @@ class OneShotSetupTestCase(unittest.TestCase):
                     "master")
                 removed = c.apply_remote_network_setup(
                     server.base, "current", actor, "agent", bridge="master",
-                    relationship="none")
+                    relationship="none", home=home)
                 self.assertEqual(removed["actions"][-1]["kind"],
                                  "bridge_removed")
             finally:
@@ -2611,12 +2688,18 @@ class OneShotSetupTestCase(unittest.TestCase):
                 self.assertEqual(
                     [(agent["agent_id"], agent["role"])
                      for agent in agents["agents"]],
-                    [("current-app.director.codex", "director")])
+                    [("current-app.director.codex.red", "director")])
                 _, project_status, _ = server.request(
                     "GET", "/v1/projects/current-app/status",
                     headers={"X-Attacca-Actor": "auditor"})
                 self.assertEqual(project_status["lead_director"],
-                                 "current-app.director.codex")
+                                 "current-app.director.codex.red")
+                binding = c.machine_actor_binding_get(
+                    server.base, "current-app", "codex",
+                    client_instance=client_instance, home=home)
+                self.assertIsNotNone(binding)
+                self.assertEqual(binding["actor_id"],
+                                 "current-app.director.codex.red")
                 self.assertNotIn(
                     "vscode", [agent["agent_id"] for agent in agents["agents"]])
                 watcher_state = json.loads(
