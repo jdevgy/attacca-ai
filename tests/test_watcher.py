@@ -547,16 +547,17 @@ class AutonomousWatcherTestCase(unittest.TestCase):
                         "fields": ["active_work", "next_actions"]}),
                     event(7, "bridge.created", {
                         "with": "upstream", "relation": "master"}),
-                    event(8, "agent.registered", {"agent_id": "noise"}),
-                ], next_after=8), notifier=lambda *_: None)
+                    event(8, "cloud_context.updated", {"version": 4}),
+                    event(9, "agent.registered", {"agent_id": "noise"}),
+                ], next_after=9), notifier=lambda *_: None)
         self.assertTrue(result["queued"])
-        self.assertEqual(result["event_count"], 8)
-        self.assertEqual(result["relevant_count"], 7)
+        self.assertEqual(result["event_count"], 9)
+        self.assertEqual(result["relevant_count"], 8)
         entry = self.state()["subscriptions"][key]
-        self.assertEqual(entry["event_cursor"], 8)
+        self.assertEqual(entry["event_cursor"], 9)
         self.assertEqual(len(entry["attention"]), 1)
         self.assertEqual(entry["attention"][0]["body"], "Ship the fix")
-        self.assertEqual(len(entry["pending"]), 6)
+        self.assertEqual(len(entry["pending"]), 7)
         self.assertTrue(all(row["kind"] == "project_entity_delta"
                             for row in entry["pending"]))
         self.assertNotIn(
@@ -565,7 +566,8 @@ class AutonomousWatcherTestCase(unittest.TestCase):
              for event_type in row["event_types"]})
         summary = "\n".join(row["summary"] for row in entry["pending"])
         for expected in ("Task T-27", "Task plan T-35", "Project Rule R-4",
-                         "Decision D-8", "Handoff", "Bridge upstream"):
+                         "Decision D-8", "Handoff", "Bridge upstream",
+                         "Cloud Context v4"):
             self.assertIn(expected, summary)
         self.assertNotIn("Ship the fix", summary)
         self.assertNotIn("agent.registered", summary)

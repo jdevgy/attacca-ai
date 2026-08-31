@@ -72,6 +72,12 @@ HOOK_NOTICE_RESERVE_BYTES = 24_000
 MANDATORY_RULES_BANNER_MAX_CHARACTERS = 24_000
 STARTUP_INBOX_PAGE_SIZE = 25
 STARTUP_UNREAD_BODY_LIMIT = 2_000
+STARTUP_RULE_PAGE_SIZE = 60
+# Startup must never silently discard binding law behind a collection page.
+# A finite ceiling also prevents a corrupt/malicious server from keeping the
+# lifecycle hook in an unbounded fetch loop.  Crossing it fails the connected
+# snapshot closed instead of presenting a partial rules banner as complete.
+STARTUP_RULE_MAX_PAGES = 64
 WATCHER_ROOM_BODY_LIMIT = 600
 
 # A watcher process keeps executing the Python code which was imported when it
@@ -1127,6 +1133,82 @@ def _server_managed_law_adapter(plugin_root, project_id, root_path, law):
         expected_sha256=law["sha256"], files=None)
 
 
+def _snapshot_cloud_context(snapshot):
+    """Return the exact Cloud Context record from an MCP/offline snapshot."""
+    value = snapshot.get("cloud_context") if isinstance(snapshot, dict) else None
+    if isinstance(value, dict) and isinstance(value.get("cloud_context"), dict):
+        value = value["cloud_context"]
+    return value if isinstance(value, dict) else None
+
+
+def _cloud_context_block_adapter(plugin_root, project_id, root_path,
+                                 cloud_context, create=True):
+    runtime = _load_attacca_runtime(plugin_root)
+    refresh = getattr(runtime, "refresh_cloud_context_block_payload", None)
+    if not callable(refresh):
+        raise RuntimeError(
+            "installed Attacca client cannot synchronize Cloud Context")
+    return refresh(
+        cloud_context, project_id, root_path, files=None, create=create,
+        require_managed_ownership=create)
+
+
+def _refresh_cloud_context_from_snapshot(status, plugin_root, snapshot,
+                                         create=True):
+    """Converge the separate local block from one authenticated snapshot.
+
+    The core adapter compares exact desired bytes and performs no write when
+    version/hash/content already match.  Missing blocks are created only for
+    setup/lifecycle migration; malformed ownership boundaries fail closed.
+    """
+    cloud_context = _snapshot_cloud_context(snapshot)
+    if cloud_context is None:
+        return None
+    checkout_root = str(Path(status["link_path"]).parent.parent) \
+        if status.get("link_path") else status["root"]
+    try:
+        result = _cloud_context_block_adapter(
+            plugin_root, status["project_id"], checkout_root,
+            cloud_context, create=create)
+    except Exception as err:
+        return {
+            "system_message": "Attacca Cloud Context local sync needs attention",
+            "context": (
+                "ATTACCA CLOUD CONTEXT LOCAL SYNC FAILED: %s. The hosted "
+                "Cloud Context in this session brief remains authoritative; "
+                "no malformed or unsafe local marker was overwritten." %
+                _trim(err, 240)),
+        }
+    rows = (result.get("files") or []) if isinstance(result, dict) else []
+    problems = [row for row in rows if row.get("status") in {
+        "malformed", "unsafe_symlink", "write_error",
+        "rollback_refused", "version_conflict", "ownership_invalid"}]
+    changed = [row for row in rows if row.get("changed") is True]
+    if problems:
+        detail = "; ".join(
+            "%s: %s" % (Path(row.get("file") or "instructions").name,
+                         row.get("error") or row.get("status"))
+            for row in problems)
+        return {
+            "system_message": "Attacca Cloud Context local sync needs attention",
+            "context": (
+                "ATTACCA CLOUD CONTEXT LOCAL SYNC NEEDS REVIEW: %s. The "
+                "hosted value remains authoritative and unsafe local files "
+                "were left untouched." % detail),
+        }
+    if not changed:
+        return None
+    names = ", ".join(dict.fromkeys(
+        Path(row["file"]).name for row in changed))
+    return {
+        "system_message": "Attacca Cloud Context refreshed · %s" % names,
+        "context": (
+            "ATTACCA CLOUD CONTEXT LOCAL COPY REFRESHED: %s. Only the "
+            "ATTACCA_CLOUD_CONTEXT marker block changed; local content and "
+            "the separate MANAGED_ATTACCA block were preserved." % names),
+    }
+
+
 def _refresh_managed_laws(status, plugin_root, config=None, fetcher=None):
     """Apply server-authoritative law text without reinstalling executable code."""
     try:
@@ -1161,7 +1243,8 @@ def _refresh_managed_laws(status, plugin_root, config=None, fetcher=None):
                if item.get("changed") is True or
                str(item.get("action") or "").lower().startswith("updated")]
     problems = [item for item in results if item.get("status") in {
-        "malformed", "unsafe_symlink", "unmanaged", "write_error"}]
+        "malformed", "unsafe_symlink", "unmanaged", "missing",
+        "write_error"}]
     if not changed and not problems:
         return None
     files = ", ".join(dict.fromkeys(
@@ -2712,6 +2795,7 @@ def _watcher_relevant_event(event):
     return (event_type == "room.message" or
             event_type.startswith("task.") or
             event_type.startswith("rule.") or
+            event_type.startswith("cloud_context.") or
             event_type.startswith("decision.") or
             event_type.startswith("handoff.") or
             event_type.startswith("bridge."))
@@ -3106,6 +3190,8 @@ def _watcher_entity_key(event):
         return "task:%s" % (task_id or "unknown")
     if event_type.startswith("rule."):
         return "rule:%s" % (payload.get("rule_id") or "unknown")
+    if event_type.startswith("cloud_context."):
+        return "cloud-context"
     if event_type.startswith("decision."):
         return "decision:%s" % (
             payload.get("decision_id") or "unknown")
@@ -3178,6 +3264,12 @@ def _watcher_event_line(event):
             if payload.get("title") else ""
         return "Project Rule %s%s %s%s · %s%s" % (
             rule_id, version, verb, state, actor, title)
+    if event_type.startswith("cloud_context."):
+        version = " v%s" % payload["version"] \
+            if payload.get("version") is not None else ""
+        return ("Cloud Context%s %s · %s — synchronized local context "
+                "changed; read the refreshed authoritative context" %
+                (version, verb, actor))
     if event_type.startswith("decision."):
         decision_id = payload.get("decision_id") or "decision"
         outcome = payload.get("resolution") or payload.get("status")
@@ -3555,18 +3647,34 @@ def _watcher_write_markdown_mirror(entry, adapter):
     rules, tasks, decisions, room, log) to Markdown files under
     <checkout>/.attacca/mirror/ so the AI can read it directly. A convenience
     view only; it never raises and never blocks sync."""
+    root = entry.get("root") if isinstance(entry, dict) else None
+    getter = getattr(adapter, "local_projection", None)
+    if not root or not callable(getter):
+        return
     try:
-        root = entry.get("root") if isinstance(entry, dict) else None
-        getter = getattr(adapter, "local_projection", None)
-        if not root or not callable(getter):
-            return
         projection = getter()
-        if not isinstance(projection, dict):
-            return
         runtime = _load_attacca_runtime(entry.get("plugin_root"))
+    except Exception:
+        return
+    if not isinstance(projection, dict):
+        return
+    try:
         writer = getattr(runtime, "write_state_markdown", None)
         if callable(writer):
             writer(str(Path(root) / ".attacca" / "mirror"), projection)
+    except Exception:
+        pass
+    try:
+        refresh_context = getattr(
+            runtime, "refresh_cloud_context_block_payload", None)
+        cloud_context = projection.get("cloud_context")
+        if callable(refresh_context) and isinstance(cloud_context, dict):
+            # This projection has passed the identity-scoped snapshot and
+            # convergence validation immediately before this call.  Reuse it;
+            # never issue another hosted content request from the watcher.
+            refresh_context(
+                cloud_context, entry["project_id"], root,
+                files=None, create=True, require_managed_ownership=True)
     except Exception:
         pass
 
@@ -3994,7 +4102,8 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
                         "ATTACCA OPERATIONAL BACKLOG · %s\n"
                         "- %d supersedable entity update(s) were compacted. "
                         "No group-room message was dropped; refresh tasks/"
-                        "rules/decisions/handoff for current detail." % (
+                        "rules/Cloud Context/decisions/handoff for current "
+                        "detail." % (
                             entry["project_id"], sum(int(
                                 item.get("event_count") or 0)
                                 for item in coalesced))),
@@ -4667,7 +4776,7 @@ def _compact_rule_view(rule):
     title, title_truncated = _head_tail_text(
         rule.get("title"), 180, "call rule_list for the complete title")
     body, body_truncated = _head_tail_text(
-        rule.get("body"), 600,
+        rule.get("body"), 2_000,
         "call rule_list before acting on this truncated binding rule")
     result.update({"title": title, "body": body})
     if title_truncated:
@@ -4756,12 +4865,33 @@ def _decision_view(decision):
 
 
 def _current_actor_record(snapshot):
-    """Match the effective MCP identity to its post-registration agent row."""
+    """Return the effective actor's authoritative role-bearing record.
+
+    ``agent_list`` is deliberately paginated.  The current actor can therefore
+    be absent from its first page in a large workspace even though the hosted
+    ``attacca_status`` response resolved that exact actor successfully.  Use a
+    matching list row when present, then fall back to the server-owned
+    ``you.identity`` projection instead of treating page omission as an
+    unconfigured identity.
+    """
     status = snapshot.get("status") or {}
-    actor_id = (status.get("you") or {}).get("actor_id")
+    you = status.get("you") or {}
+    actor_id = you.get("actor_id")
     agents = (snapshot.get("agents") or {}).get("agents") or []
-    return next((agent for agent in agents
-                 if agent.get("agent_id") == actor_id), None)
+    record = next((agent for agent in agents
+                   if agent.get("agent_id") == actor_id), None)
+    if record is not None:
+        return record
+    identity = you.get("identity")
+    if not actor_id or not isinstance(identity, dict):
+        return None
+    return {
+        "agent_id": actor_id,
+        "role": identity.get("role"),
+        "runtime": identity.get("runtime"),
+        "owner": identity.get("owner"),
+        "status_identity_projection": True,
+    }
 
 
 def _needs_role_setup(snapshot):
@@ -5045,7 +5175,8 @@ def _mcp_snapshot(status, plugin_root, config, mark_inbox_read=True):
         {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
          "params": {"name": "agent_list", "arguments": {}}},
         {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
-         "params": {"name": "rule_list", "arguments": {}}},
+         "params": {"name": "rule_list", "arguments": {
+             "limit": STARTUP_RULE_PAGE_SIZE, "offset": 0}}},
         {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
          "params": {"name": "cloud_context_get", "arguments": {}}},
         {"jsonrpc": "2.0", "id": 6, "method": "tools/call",
@@ -5087,8 +5218,9 @@ def _mcp_snapshot(status, plugin_root, config, mark_inbox_read=True):
         if isinstance(value, dict) and value.get("id") is not None:
             responses[value["id"]] = value
 
-    def tool_result(request_id):
-        response = responses.get(request_id) or {}
+    def tool_result(request_id, response_map=None):
+        selected_responses = responses if response_map is None else response_map
+        response = selected_responses.get(request_id) or {}
         if response.get("error"):
             error = response["error"]
             data = error.get("data") if isinstance(error, dict) else None
@@ -5108,19 +5240,149 @@ def _mcp_snapshot(status, plugin_root, config, mark_inbox_read=True):
             raise RuntimeError(message)
         return json.loads(result["content"][0]["text"])
 
-    projects = tool_result(2).get("projects") or []
+    def complete_rules(first_page):
+        """Drain every binding-rule page or reject the connected snapshot.
+
+        ``rule_list`` is capped at sixty rows like every long collection, but
+        lifecycle law cannot use ordinary best-effort pagination: a rule on a
+        later page is just as binding as one on page one.  Fetch the remaining
+        known offsets in one additional MCP connection, verify a stable exact
+        collection, and fail closed on malformed, moving, or over-bound data.
+        """
+        if not isinstance(first_page, dict):
+            raise RuntimeError("rule_list returned an invalid first page")
+        rows = first_page.get("rules")
+        try:
+            total = int(first_page["total"])
+            limit = int(first_page["limit"])
+            offset = int(first_page["offset"])
+        except (KeyError, TypeError, ValueError):
+            raise RuntimeError(
+                "rule_list pagination metadata is missing or invalid")
+        if not isinstance(rows, list) or offset != 0 \
+                or limit != STARTUP_RULE_PAGE_SIZE \
+                or total < len(rows) or len(rows) > limit:
+            raise RuntimeError("rule_list returned an inconsistent first page")
+        maximum = STARTUP_RULE_PAGE_SIZE * STARTUP_RULE_MAX_PAGES
+        if total > maximum:
+            raise RuntimeError(
+                "rule_list contains %d applicable rules, above the startup "
+                "safety bound of %d; refusing a partial binding-law snapshot"
+                % (total, maximum))
+        expected_more = len(rows) < total
+        if bool(first_page.get("has_more")) != expected_more:
+            raise RuntimeError("rule_list first-page has_more is inconsistent")
+        if not expected_more:
+            return first_page
+
+        page_offsets = list(range(limit, total, limit))
+        page_requests = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "attacca-session-hook",
+                                       "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        ]
+        request_ids = []
+        for index, page_offset in enumerate(page_offsets):
+            request_id = 100 + index
+            request_ids.append(request_id)
+            page_requests.append({
+                "jsonrpc": "2.0", "id": request_id,
+                "method": "tools/call",
+                "params": {"name": "rule_list", "arguments": {
+                    "limit": STARTUP_RULE_PAGE_SIZE,
+                    "offset": page_offset}},
+            })
+        page_proc = subprocess.run(
+            [sys.executable, str(plugin_root / "attacca.py"), "connect",
+             "--url", config["url"]], cwd=status["root"], env=env,
+            input="\n".join(json.dumps(item) for item in page_requests) + "\n",
+            capture_output=True, text=True,
+            timeout=max(4, min(20, 4 + len(page_offsets))))
+        if page_proc.returncode != 0:
+            raise RuntimeError(
+                page_proc.stderr.strip() or
+                "MCP rule paging exited %d" % page_proc.returncode)
+        page_responses = {}
+        for line in page_proc.stdout.splitlines():
+            value = json.loads(line)
+            if isinstance(value, dict) and value.get("id") is not None:
+                page_responses[value["id"]] = value
+
+        all_rows = list(rows)
+        for index, (request_id, page_offset) in enumerate(
+                zip(request_ids, page_offsets)):
+            page = tool_result(request_id, page_responses)
+            page_rows = page.get("rules") if isinstance(page, dict) else None
+            try:
+                page_total = int(page["total"])
+                page_limit = int(page["limit"])
+                returned_offset = int(page["offset"])
+            except (KeyError, TypeError, ValueError):
+                raise RuntimeError(
+                    "rule_list continuation metadata is missing or invalid")
+            expected_page_more = page_offset + len(page_rows or []) < total
+            if not isinstance(page_rows, list) \
+                    or page_total != total \
+                    or page_limit != limit \
+                    or returned_offset != page_offset \
+                    or len(page_rows) > limit \
+                    or bool(page.get("has_more")) != expected_page_more:
+                raise RuntimeError(
+                    "rule_list changed or returned an inconsistent page at "
+                    "offset %d; refusing a partial binding-law snapshot"
+                    % page_offset)
+            all_rows.extend(page_rows)
+        if len(all_rows) != total:
+            raise RuntimeError(
+                "rule_list returned %d of %d applicable rules; refusing a "
+                "partial binding-law snapshot" % (len(all_rows), total))
+        rule_ids = [str(row.get("rule_id") or "")
+                    for row in all_rows if isinstance(row, dict)]
+        if len(rule_ids) != total or any(not value for value in rule_ids) \
+                or len(set(rule_ids)) != total:
+            raise RuntimeError(
+                "rule_list returned missing or duplicate rule ids; refusing "
+                "a partial binding-law snapshot")
+        complete = dict(first_page)
+        complete.update({"rules": all_rows, "offset": 0,
+                         "has_more": False})
+        return complete
+
+    project_page = tool_result(2)
+    projects = project_page.get("projects") or []
+    current_status = None
     if status["project_id"] not in {p.get("project_id") for p in projects}:
-        known = ", ".join(p.get("name") or p.get("project_id")
-                          for p in projects) or "none yet"
-        raise StaleProjectLink(
-            "The saved workspace '%s' does not exist on the configured "
-            "server. Available workspaces: %s."
-            % (status["project_id"], known))
+        # list_projects is deliberately capped at 60.  A linked workspace can
+        # therefore be absent from that first authorized page even though all
+        # exact project-scoped startup calls succeeded.  attacca_status is an
+        # exact current-workspace read, so use it as the authoritative
+        # existence proof before diagnosing a stale checkout link.
+        try:
+            candidate_status = tool_result(12)
+        except HostedAuthenticationRequired:
+            raise
+        except RuntimeError:
+            candidate_status = None
+        if isinstance(candidate_status, dict) and \
+                candidate_status.get("project") == status["project_id"]:
+            current_status = candidate_status
+        else:
+            known = ", ".join(p.get("name") or p.get("project_id")
+                              for p in projects) or "none yet"
+            qualifier = " (first page)" if project_page.get("has_more") else ""
+            raise StaleProjectLink(
+                "The saved workspace '%s' does not exist on the configured "
+                "server. Available workspaces%s: %s."
+                % (status["project_id"], qualifier, known))
+    complete_rule_page = complete_rules(tool_result(4))
     return {
         "project": status["project_id"],
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "agents": tool_result(3),
-        "rules": tool_result(4),
+        "rules": complete_rule_page,
         "cloud_context": tool_result(5),
         "role_scope": tool_result(6),
         "handoff": tool_result(7),
@@ -5128,7 +5390,7 @@ def _mcp_snapshot(status, plugin_root, config, mark_inbox_read=True):
         "inbox": tool_result(9),
         "room": tool_result(10),
         "tasks": tool_result(11),
-        "status": tool_result(12),
+        "status": current_status or tool_result(12),
     }
 
 
@@ -5953,6 +6215,8 @@ def _active_output(status, offline_adapter=None, offline_factory=None,
         # Sync activation is additive. A missing token/route/mirror or an
         # unwritable watcher directory can never break this healthy MCP brief.
         _watcher_activate_after_mcp(status, config, snapshot)
+        cloud_context_notice = _refresh_cloud_context_from_snapshot(
+            status, plugin_root, snapshot, create=True)
         identity, _ = _poll_entry(status, config)
         _record_poll(status, identity, interval, time.time(),
                      _poll_view(snapshot))
@@ -5990,6 +6254,7 @@ handoff before further writes.
         output = _append_notice(output, pending_notice)
         output = _append_notice(
             output, _refresh_managed_laws(status, plugin_root, config=config))
+        output = _append_notice(output, cloud_context_notice)
         output = _append_notice(
             output, update_notice)
         output = _append_notice(output, watcher_notice)
@@ -6098,6 +6363,18 @@ def _change_summary(status, previous, current, snapshot, interval):
                 item.get("rule_id"), item.get("version"),
                 _trim(item.get("title"), 70)) for item in rules[:5])
             or "none active"))
+    if previous.get("cloud_context") != current.get("cloud_context"):
+        cloud_context = current.get("cloud_context") or {}
+        content = str(cloud_context.get("content") or "")
+        updated = "Cloud Context changed to v%s" % (
+            cloud_context.get("version") or "?")
+        if content:
+            updated += (
+                "; this refreshed text is authoritative for the current "
+                "session:\n\n%s\n\n[END ATTACCA CLOUD CONTEXT]" % content)
+        else:
+            updated += "; the authoritative context is now empty"
+        details.append(updated)
 
     group_details = []
     inbox_keys = {_message_key(message) for message in inbox_messages}
@@ -6303,12 +6580,15 @@ def _periodic_output(status, event_name, offline_adapter=None,
     try:
         snapshot = _mcp_snapshot(status, plugin_root, config)
         _watcher_activate_after_mcp(status, config, snapshot)
+        cloud_context_notice = _refresh_cloud_context_from_snapshot(
+            status, plugin_root, snapshot, create=True)
         # Kimi has no command SessionStart hook. Refresh laws only after the
         # saved workspace has been validated by the successful MCP snapshot.
         law_notice = _refresh_managed_laws(
             status, plugin_root, config=config) \
             if is_kimi_prompt else None
-        notices = (law_notice, update_notice, terminal_notice,
+        notices = (law_notice, cloud_context_notice, update_notice,
+                   terminal_notice,
                    inbox_check_notice,
                    _watcher_attention_notice(status, config))
         current = _poll_view(snapshot)

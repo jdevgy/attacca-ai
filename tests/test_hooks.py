@@ -570,10 +570,16 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             conn = c.connect(db)
             c.project_init(conn, "setup", "human", path=str(checkout),
                            project_id="shared")
-            self._register_actor(conn, "shared", "codex", "worker")
-            self._register_actor(conn, "shared", "claude", "director")
-            c.update_handoff(conn, "shared", "setup", "human",
-                             {"objective": "ship the panel"})
+            codex_actor = self._register_actor(
+                conn, "shared", "codex", "worker")
+            claude_actor = self._register_actor(
+                conn, "shared", "claude", "director")
+            c.update_handoff(
+                conn, "shared", codex_actor, "agent",
+                {"objective": "ship the Codex panel"})
+            c.update_handoff(
+                conn, "shared", claude_actor, "agent",
+                {"objective": "review the Claude panel"})
             c.rule_create(conn, "shared", "setup", "human",
                           "Build on v2", "Put new work in v2.",
                           scope="everyone", priority=10)
@@ -601,19 +607,23 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             self.assertIn("MCP startup", payload["systemMessage"])
             context = payload["hookSpecificOutput"]["additionalContext"]
             self.assertIn("through the configured MCP connection", context)
-            self.assertIn("ship the panel", context)
+            self.assertIn("ship the Codex panel", context)
+            self.assertNotIn("review the Claude panel", context)
             self.assertIn("please check this", context)
             self.assertNotIn("ATTACCA CLAUDE SESSION LOOP", context)
             brief = json.loads(context.rsplit("\n\n", 1)[1])
             self.assertEqual(brief["actor"], "shared.worker.codex")
-            self.assertEqual(brief["project_rules"][0]["title"],
-                             "Build on v2")
+            self.assertEqual(
+                [rule["title"] for rule in brief["project_rules"]],
+                [c.DEFAULT_AUTHORITY_RULE_TITLE, "Build on v2"])
             claude_payload = json.loads(claude_result.stdout)
             self.assertIn("Attacca active", claude_payload["systemMessage"])
             claude_context = claude_payload["hookSpecificOutput"]["additionalContext"]
             claude_brief = json.loads(claude_context.rsplit("\n\n", 1)[1])
             self.assertEqual(claude_brief["actor"],
                              "shared.director.claude")
+            self.assertIn("review the Claude panel", claude_context)
+            self.assertNotIn("ship the Codex panel", claude_context)
             self.assertIn("please check this", claude_context)
             self.assertEqual(
                 claude_context.count("ATTACCA CLAUDE SESSION LOOP"), 1)
@@ -635,9 +645,11 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             conn = c.connect(db)
             c.project_init(conn, "setup", "human", path=str(checkout),
                            project_id="shared")
-            self._register_actor(conn, "shared", "codex", "worker")
-            c.update_handoff(conn, "shared", "setup", "human",
-                             {"objective": "keep continuity loaded"})
+            codex_actor = self._register_actor(
+                conn, "shared", "codex", "worker")
+            c.update_handoff(
+                conn, "shared", codex_actor, "agent",
+                {"objective": "keep continuity loaded"})
             conn.close()
             original_version = c.VERSION
             available_version = next_patch(original_version)
@@ -773,11 +785,13 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                 seeded_at = seeded["last_poll_at"]
 
                 # The second prompt is inside both the shared-state throttle
-                # and the exact-release reminder window, so it stays silent.
+                # and the exact-release reminder window. The mandatory R-0
+                # rule is still re-pinned; no update-choice reminder appears.
                 second = self._hook(
                     checkout, root / "unused", home, url=url,
                     runtime="kimi", event="UserPromptSubmit")
-                self.assertEqual(second.stdout, "")
+                self.assertIn(c.DEFAULT_AUTHORITY_RULE_BODY, second.stdout)
+                self.assertNotIn("ATTACCA UPDATE CHOICE", second.stdout)
                 still_seeded = next(iter(
                     self._poll_state(plugin_data)["polls"].values()))
                 self.assertEqual(still_seeded["last_poll_at"], seeded_at)
@@ -787,7 +801,8 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                 skipped = self._hook(
                     checkout, root / "unused", home, url=url,
                     runtime="kimi", event="UserPromptSubmit")
-                self.assertEqual(skipped.stdout, "")
+                self.assertIn(c.DEFAULT_AUTHORITY_RULE_BODY, skipped.stdout)
+                self.assertNotIn("ATTACCA UPDATE CHOICE", skipped.stdout)
             finally:
                 c.VERSION = original_version
                 server.shutdown()
@@ -1201,8 +1216,8 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             self.assertEqual(agents.read_text(), before + desired + after)
             self.assertIn("AGENTS.md", notice["context"])
 
-    def test_managed_law_v11_auto_refreshes_to_v12_without_touching_user_bytes(self):
-        self.assertEqual(c.MANAGED_BLOCK_VERSION, 12)
+    def test_previous_managed_law_auto_refreshes_to_v13_without_touching_user_bytes(self):
+        self.assertEqual(c.MANAGED_BLOCK_VERSION, 13)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             checkout = root / "repo"
@@ -1212,11 +1227,12 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             link.write_text(json.dumps({
                 "schema_version": 1, "project_id": "shared"}))
             desired = c.managed_instruction_block("shared", None)
+            previous_version = c.MANAGED_BLOCK_VERSION - 1
             previous = desired.replace(
-                "MANAGED_ATTACCA:BEGIN v=12",
-                "MANAGED_ATTACCA:BEGIN v=11", 1).replace(
-                    "Every directed assignment and broadcast directive must",
-                    "Directed assignments should", 1)
+                "MANAGED_ATTACCA:BEGIN v=%d" % c.MANAGED_BLOCK_VERSION,
+                "MANAGED_ATTACCA:BEGIN v=%d" % previous_version, 1).replace(
+                    "Lifecycle sync refreshes that read-only block only",
+                    "Cloud Context refresh was previously manual", 1)
             prefix = "# Human instructions\n\nKeep before byte-for-byte.\n\n"
             suffix = "\n\n## Human tail\nKeep after byte-for-byte.\n"
             agents = checkout / "AGENTS.md"
@@ -1604,7 +1620,8 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                 conn.close()
                 periodic = self._hook(
                     checkout, data, home, url=url, event="UserPromptSubmit")
-                self.assertEqual(periodic.stdout, "")
+                self.assertIn(c.DEFAULT_AUTHORITY_RULE_BODY, periodic.stdout)
+                self.assertNotIn("ATTACCA AUTOMATIC UPDATE", periodic.stdout)
                 conn = c.connect(db)
                 unread = c.inbox_read(
                     conn, "shared", actor, mark_read=False)["messages"]
@@ -1645,7 +1662,8 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
 
                 throttled = self._hook(
                     checkout, data, home, url=url, event="UserPromptSubmit")
-                self.assertEqual(throttled.stdout, "")
+                self.assertIn(c.DEFAULT_AUTHORITY_RULE_BODY, throttled.stdout)
+                self.assertNotIn("ATTACCA AUTOMATIC UPDATE", throttled.stdout)
                 still_seeded = next(iter(
                     self._poll_state(data)["polls"].values()))
                 self.assertEqual(still_seeded["last_poll_at"], seeded_at)
@@ -1653,7 +1671,8 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                 self._expire_polls(data)
                 unchanged = self._hook(
                     checkout, data, home, url=url, event="UserPromptSubmit")
-                self.assertEqual(unchanged.stdout, "")
+                self.assertIn(c.DEFAULT_AUTHORITY_RULE_BODY, unchanged.stdout)
+                self.assertNotIn("ATTACCA AUTOMATIC UPDATE", unchanged.stdout)
                 refreshed = next(iter(
                     self._poll_state(data)["polls"].values()))
                 self.assertGreater(refreshed["last_poll_at"], 0)
@@ -1677,11 +1696,13 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             conn = c.connect(db)
             c.project_init(conn, "setup", "human", path=str(checkout),
                            project_id="shared")
-            self._register_actor(conn, "shared", "codex", "worker")
+            codex_actor = self._register_actor(
+                conn, "shared", "codex", "worker")
             c.agent_register(conn, "shared", "other", "agent",
                              role="director", runtime="hook-test-other")
-            c.update_handoff(conn, "shared", "setup", "human",
-                             {"objective": "initial objective"})
+            c.update_handoff(
+                conn, "shared", codex_actor, "agent",
+                {"objective": "initial objective"})
             conn.close()
             server = c.AttaccaServer(("127.0.0.1", 0), db)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1691,7 +1712,7 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                 startup = self._hook(checkout, data, home, url=url)
                 actor = self._startup_actor(startup)
                 conn = c.connect(db)
-                c.update_handoff(conn, "shared", "other", "agent",
+                c.update_handoff(conn, "shared", actor, "agent",
                                  {"objective": "coordinate release"})
                 c.room_send(conn, "shared", "other", "agent",
                             "review the release notes",

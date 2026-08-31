@@ -64,7 +64,7 @@ try:
 except ImportError:  # pragma: no cover - Windows keeps thread serialization
     fcntl = None
 
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 MCP_SUPPORTED_PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18")
 MCP_DEFAULT_PROTOCOL = "2025-06-18"
 DEFAULT_UPDATE_INTERVAL_SECONDS = 60
@@ -138,6 +138,10 @@ TASK_STATUSES = ["queued", "claimed", "blocked", "review", "done", "cancelled"]
 DECISION_STATUSES = ["proposed", "accepted", "rejected", "superseded"]
 RISK_LEVELS = ["low", "medium", "high"]
 TASK_PLAN_STATUSES = ["draft", "in_review", "changes_requested", "approved"]
+TASK_PLAN_EVENT_TYPES = [
+    "task.plan.created", "task.plan.revised", "task.plan.submitted",
+    "task.plan.approved", "task.plan.suggested", "task.plan.commented",
+]
 TASK_PLAN_REVIEW_TYPES = ["approval", "suggestion"]
 TASK_PLAN_SUGGESTION_STATUSES = ["open", "addressed", "dismissed"]
 DECISION_RESOLUTIONS = ["accepted", "rejected", "superseded"]
@@ -151,7 +155,10 @@ LOG_EXCLUDED_MSG_TYPES = {"chat", "status"}
 
 MANAGED_BEGIN = "<!-- MANAGED_ATTACCA:BEGIN"
 MANAGED_END = "<!-- MANAGED_ATTACCA:END -->"
-MANAGED_BLOCK_VERSION = 12
+MANAGED_BLOCK_VERSION = 13
+_CLOUD_CONTEXT_UNSET = object()
+_INSTRUCTION_FILE_ABSENT = object()
+_INSTRUCTION_WRITE_THREAD_LOCK = threading.RLock()
 _MANAGED_TEMPLATE_PROJECT = "attacca-project"
 _MANAGED_BEGIN_LINE = re.compile(
     r"(?m)^<!-- MANAGED_ATTACCA:BEGIN\b[^\r\n]*-->[ \t]*\r?$")
@@ -571,11 +578,39 @@ def qualify_actor(actor, owner=None):
 
 
 AGENT_ROLES = ("director", "advisor", "worker")
+# Human-friendly installation identities are allocated from one deterministic
+# workspace-global namespace.  The normalized lower-case value is stored in
+# the canonical actor id; clients present the title-cased form (``Gibbs``) and
+# may address it as ``@Gibbs``.  Keep the old color constant below solely for
+# compatibility with actors created by 0.5.1 and earlier -- colors are never
+# rewritten and are no longer allocated to new identities.
+AGENT_PERSONA_NAMES = (
+    "gibbs", "turing", "hopper", "curie", "lovelace", "shannon",
+    "bohr", "darwin", "faraday", "newton", "tesla", "franklin",
+    "pasteur", "galileo", "kepler", "maxwell", "noether", "raman",
+    "sagan", "mendel", "feynman", "dirac", "euler", "gauss",
+    "hilbert", "euclid", "archimedes", "copernicus", "hubble",
+    "meitner", "mccarthy", "ritchie", "hamilton", "lamarr", "wu",
+    "carver", "babbage", "bernerslee", "dijkstra", "knuth", "kay",
+    "engelbart", "torvalds", "yonath", "goodall", "payne", "rubin",
+    "ride", "jemison", "chandrasekhar", "ramanujan", "saha", "bose",
+    "kalam", "bell", "morse", "watt", "volta", "ohm", "hertz",
+    "joule", "kelvin", "planck", "pauli", "fermi", "heisenberg",
+    "schrodinger", "boltzmann", "huygens", "hooke", "lister",
+    "snow", "nightingale", "mayer", "herschel", "leavitt", "burnell",
+    "yalow", "mcclintock", "hodgkin", "blackwell", "johnson",
+    "vaughan", "wilkins", "thompson", "cerf", "kahn", "stallman",
+    "wall", "matsumoto", "rossum", "eich", "gosling", "stroustrup",
+)
 AGENT_PERSONA_COLORS = (
     "red", "blue", "green", "yellow", "purple", "orange", "pink",
     "cyan", "teal", "indigo", "violet", "amber", "lime", "coral",
     "navy", "mint", "rose", "gold", "silver",
 )
+_AGENT_PERSONA_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$", re.ASCII)
+_AGENT_WIRE_SLUG_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$", re.ASCII)
 _KNOWN_RUNTIMES = (
     "claude", "codex", "kimi", "cline", "cursor", "windsurf", "gemini",
     "vscode", "opencode", "glm",
@@ -613,12 +648,18 @@ def normalize_agent_persona(persona=None):
     """Normalize an optional human-selected durable AI persona suffix."""
     if persona is None or not str(persona).strip():
         return None
-    value = slugify(str(persona))
+    raw = str(persona).strip()
+    if not raw.isascii() or not re.search(r"[A-Za-z0-9]", raw, re.ASCII):
+        raise AttaccaError(
+            "persona must use only the wire-safe ASCII name alphabet")
+    value = slugify(raw)
+    if not _AGENT_PERSONA_RE.fullmatch(value) or "--" in value:
+        raise AttaccaError(
+            "persona must normalize to 1-40 lowercase ASCII letters, "
+            "digits, or single hyphens")
     if value in ("default", "none", "unassigned"):
         raise AttaccaError(
             "persona must be a distinct name, not '%s'" % value)
-    if len(value) > 40:
-        raise AttaccaError("persona is limited to 40 normalized characters")
     return value
 
 
@@ -627,14 +668,36 @@ def canonical_agent_id(project_id, role, runtime, persona=None):
     role = (role or "unassigned").lower()
     if role not in AGENT_ROLES + ("unassigned",):
         raise AttaccaError("unknown agent role %r" % role)
-    base = "%s.%s.%s" % (
-        slugify(project_id), role, normalize_agent_runtime(runtime))
+    normalized_runtime = normalize_agent_runtime(runtime)
     persona = normalize_agent_persona(persona)
+    if persona and (
+            not normalized_runtime.isascii()
+            or not _AGENT_WIRE_SLUG_RE.fullmatch(normalized_runtime)
+            or "--" in normalized_runtime):
+        raise AttaccaError(
+            "named identity runtime must use a normalized ASCII wire slug")
+    base = "%s.%s.%s" % (
+        slugify(project_id), role, normalized_runtime)
     return "%s.%s" % (base, persona) if persona else base
 
 
+def agent_persona_name(persona):
+    """Return the stable friendly spelling used by setup and addressing."""
+    normalized = normalize_agent_persona(persona)
+    return normalized[:1].upper() + normalized[1:] if normalized else None
+
+
+def agent_persona_fields(persona):
+    normalized = normalize_agent_persona(persona)
+    if not normalized:
+        return {"persona": None, "persona_name": None, "short_name": None}
+    friendly = agent_persona_name(normalized)
+    return {"persona": normalized, "persona_name": friendly,
+            "short_name": "@" + friendly}
+
+
 def next_agent_persona(agents_or_conn, project_id, role, runtime):
-    """Return the next deterministic collision-free color persona.
+    """Return the next deterministic project-global friendly persona.
 
     Callers that create the actor must hold the same database write
     transaction while selecting and inserting it.  Accepting either a
@@ -644,35 +707,43 @@ def next_agent_persona(agents_or_conn, project_id, role, runtime):
     role = str(role or "").strip().lower()
     if role not in AGENT_ROLES:
         raise AttaccaError("agent role must be director, advisor, or worker")
-    runtime = normalize_agent_runtime(runtime)
+    # Role/runtime are validated because they remain part of the actor id, but
+    # they deliberately do not partition the persona namespace. ``@Gibbs``
+    # must identify at most one current actor anywhere in this workspace.
+    normalize_agent_runtime(runtime)
     if hasattr(agents_or_conn, "execute"):
         records = [dict(row) for row in agents_or_conn.execute(
             "SELECT * FROM agents WHERE project_id=?", (project_id,))]
+        reserved = {row["persona"] for row in agents_or_conn.execute(
+            "SELECT persona FROM agent_persona_reservations"
+            " WHERE project_id=?", (project_id,))}
     else:
         records = [dict(row) for row in (agents_or_conn or [])]
-    used = set()
+        reserved = set()
+    used = set(reserved)
     for record in records:
         parsed = parse_canonical_agent_id(
             record.get("agent_id"), project_id)
-        if not parsed or parsed.get("role") != role \
-                or parsed.get("runtime") != runtime:
+        if not parsed:
             continue
         if parsed.get("persona"):
             used.add(parsed["persona"])
-    for color in AGENT_PERSONA_COLORS:
-        if color not in used:
-            return color
+    for name in AGENT_PERSONA_NAMES:
+        if name not in used:
+            return name
     generation = 2
     while True:
-        for color in AGENT_PERSONA_COLORS:
-            candidate = "%s-%d" % (color, generation)
+        for name in AGENT_PERSONA_NAMES:
+            # No punctuation keeps the generated value a genuine one-word
+            # short name while retaining a deterministic exhaustion path.
+            candidate = "%s%d" % (name, generation)
             if candidate not in used:
                 return candidate
         generation += 1
 
 
 def allocate_agent_persona(conn, project_id, role, runtime):
-    """Compatibility name for the product's deterministic color allocator."""
+    """Compatibility name for the deterministic friendly-name allocator."""
     return next_agent_persona(conn, project_id, role, runtime)
 
 
@@ -687,9 +758,219 @@ def parse_canonical_agent_id(actor_id, project_id=None):
         return None
     if any(not part or slugify(part) != part for part in parts):
         return None
+    if len(parts) == 4 and (
+            not parts[2].isascii()
+            or not _AGENT_WIRE_SLUG_RE.fullmatch(parts[2])
+            or "--" in parts[2]
+            or not parts[3].isascii()
+            or not _AGENT_PERSONA_RE.fullmatch(parts[3])
+            or "--" in parts[3]
+            or parts[3] in ("default", "none", "unassigned")):
+        return None
     return {"project_id": parts[0], "role": parts[1],
             "runtime": normalize_agent_runtime(parts[2]),
             "persona": parts[3] if len(parts) == 4 else None}
+
+
+_PERSONA_HISTORY_COLUMNS = (
+    ("events", ("actor_id", "payload"), "seq"),
+    ("agents", ("agent_id",), "registered_at"),
+    ("actor_aliases", ("legacy_actor_id", "canonical_actor_id"),
+     "migrated_at"),
+    ("projects", ("created_by", "lead_director"), "created_at"),
+    ("bridges", ("created_by", "access_a", "access_b"), "created_at"),
+    ("inbox_cursors", ("actor_id",), "updated_at"),
+    ("message_dispositions", ("actor_id", "updated_by"), "updated_at"),
+    ("tasks", ("claimed_by", "created_by"), "created_at"),
+    ("task_plan_revisions", ("authored_by",), "authored_at"),
+    ("handoffs", ("updated_by",), "updated_at"),
+    ("identity_handoffs", ("actor_id", "updated_by"), "updated_at"),
+    ("role_scope_revisions", ("updated_by",), "updated_at"),
+    ("decisions", ("proposed_by", "resolved_by"), "created_at"),
+    ("project_rules", ("created_by", "updated_by"), "created_at"),
+    ("project_cloud_context", ("updated_by",), "updated_at"),
+    ("sync_operations", ("actor_id",), "created_at"),
+    ("auth_tokens", ("actor_id",), "created_at"),
+    ("auth_token_actor_bindings", ("actor_id",), "created_at"),
+    ("auth_migration_targets", ("actor_id",), "created_at"),
+    ("agent_clients", ("agent_id",), "first_seen_at"),
+)
+
+
+def _persona_actors_in_value(value, project_id):
+    """Yield exact canonical persona actors embedded in structured history."""
+    if value is None:
+        return []
+    if isinstance(value, (dict, list, tuple)):
+        items = value.values() if isinstance(value, dict) else value
+        result = []
+        for item in items:
+            result.extend(_persona_actors_in_value(item, project_id))
+        return result
+    text = str(value).strip()
+    if not text:
+        return []
+    if text[:1] in ("{", "["):
+        try:
+            return _persona_actors_in_value(json.loads(text), project_id)
+        except (TypeError, ValueError):
+            pass
+    lowered = text.lower()
+    parts = lowered.split(".")
+    if len(parts) == 4 \
+            and parts[0] == slugify(project_id) \
+            and parts[1] in AGENT_ROLES + ("unassigned",) \
+            and (text != lowered
+                 or not text.isascii()
+                 or not parts[2].isascii()
+                 or not _AGENT_WIRE_SLUG_RE.fullmatch(parts[2])
+                 or "--" in parts[2]
+                 or not _AGENT_PERSONA_RE.fullmatch(parts[3])
+                 or "--" in parts[3]
+                 or parts[3] in ("default", "none", "unassigned")):
+        raise AttaccaError(
+            "invalid_agent_persona_history: named actor %r does not use "
+            "the normalized ASCII persona alphabet" % text)
+    exact = parse_canonical_agent_id(text, project_id)
+    if exact and exact.get("persona"):
+        return [text.lower()]
+    prefix = re.escape(slugify(project_id))
+    pattern = re.compile(
+        r"(?<![\w.-])(" + prefix +
+        r"\.(?:director|advisor|worker|unassigned)"
+        r"\.[\w-]+\.[\w-]+)(?![\w.-])",
+        re.IGNORECASE)
+    result = []
+    for match in pattern.finditer(text):
+        actor = match.group(1).lower()
+        parsed = parse_canonical_agent_id(actor, project_id)
+        if not parsed or not parsed.get("persona"):
+            raise AttaccaError(
+                "invalid_agent_persona_history: named actor %r does not "
+                "use the normalized ASCII persona alphabet" %
+                match.group(1))
+        result.append(actor)
+    return result
+
+
+def _persona_seed_marker(project_id):
+    return "agent_persona_reservations.seed.v2.%s" % slugify(project_id)
+
+
+def _seed_project_persona_reservations(conn, project_id, force=False):
+    """Reserve every persona carried by durable historical identity state.
+
+    The first migration scan is marked per workspace because HTTP opens a new
+    SQLite connection per request. Ordinary reads and exact identity reuse
+    rely on the indexed append-only table. A new named-identity creation calls
+    this with ``force=True`` so a post-marker raw/import history write cannot
+    make an old name appear available; restore paths import the registry in
+    their own atomic transaction.
+    """
+    marker = _persona_seed_marker(project_id)
+    if not force and conn.execute(
+            "SELECT 1 FROM server_settings WHERE setting_key=?",
+            (marker,)).fetchone():
+        return 0
+    inserted = 0
+    seen = set()
+    for table, requested_columns, order_column in _PERSONA_HISTORY_COLUMNS:
+        columns = {row["name"] for row in conn.execute(
+            "PRAGMA table_info(%s)" % table)}
+        selected = [column for column in requested_columns
+                    if column in columns]
+        if "project_id" not in columns or not selected:
+            continue
+        ordering = (" ORDER BY %s" % order_column) \
+            if order_column in columns else ""
+        rows = conn.execute(
+            "SELECT %s FROM %s WHERE project_id=?%s" %
+            (",".join(selected), table, ordering), (project_id,)).fetchall()
+        for row in rows:
+            for column in selected:
+                for actor_id in _persona_actors_in_value(
+                        row[column], project_id):
+                    parsed = parse_canonical_agent_id(actor_id, project_id)
+                    persona = parsed.get("persona") if parsed else None
+                    if not persona or persona in seen:
+                        continue
+                    seen.add(persona)
+                    cursor = conn.execute(
+                        "INSERT OR IGNORE INTO agent_persona_reservations"
+                        " (project_id,persona,persona_name,reserved_actor_id,"
+                        " reserved_at,source) VALUES (?,?,?,?,?,?)",
+                        (project_id, persona, agent_persona_name(persona),
+                         actor_id, now_iso(), "historical:%s.%s" %
+                         (table, column)))
+                    inserted += cursor.rowcount
+    conn.execute(
+        "INSERT OR IGNORE INTO server_settings"
+        " (setting_key,value,updated_at) VALUES (?,?,?)",
+        (marker, json.dumps(True), now_iso()))
+    return inserted
+
+
+def _persona_reservation_actor_matches(conn, project_id, reserved_actor_id,
+                                       target_actor_id):
+    """Follow immutable migration aliases without changing the reservation."""
+    current = str(reserved_actor_id or "").strip()
+    target = str(target_actor_id or "").strip()
+    visited = set()
+    while current and current not in visited:
+        if current == target:
+            return True
+        visited.add(current)
+        row = conn.execute(
+            "SELECT canonical_actor_id FROM actor_aliases"
+            " WHERE project_id=? AND legacy_actor_id=?",
+            (project_id, current)).fetchone()
+        current = row["canonical_actor_id"] if row else None
+    return False
+
+
+def _reserve_agent_persona_in_tx(conn, project_id, persona, actor_id,
+                                 source, migration_sources=None):
+    """Atomically bind an unused name, or validate exact identity reuse."""
+    persona = normalize_agent_persona(persona)
+    if not persona:
+        return None
+    actor = parse_canonical_agent_id(actor_id, project_id)
+    if not actor or actor.get("persona") != persona:
+        raise AttaccaError(
+            "persona reservation actor must be a canonical same-workspace "
+            "identity ending in .%s" % persona)
+    row = conn.execute(
+        "SELECT * FROM agent_persona_reservations"
+        " WHERE project_id=? AND persona=?", (project_id, persona)).fetchone()
+    existing_actor = conn.execute(
+        "SELECT 1 FROM agents WHERE project_id=? AND agent_id=?",
+        (project_id, actor_id)).fetchone()
+    permitted_source = set(str(item) for item in (migration_sources or []))
+    if row:
+        allowed = bool(existing_actor) or _persona_reservation_actor_matches(
+            conn, project_id, row["reserved_actor_id"], actor_id)
+        # An authorized explicit migration may rename the canonical role or
+        # runtime while retaining the person's short name. The reservation
+        # remains append-only and its original actor later resolves by alias.
+        allowed = allowed or row["reserved_actor_id"] in permitted_source
+        if not allowed:
+            raise AttaccaError(
+                "persona_name_reserved: @%s has already been used in"
+                " workspace '%s' by '%s'; persona names are never reused" %
+                (agent_persona_name(persona), project_id,
+                 row["reserved_actor_id"]))
+        return dict(row)
+    nowi = now_iso()
+    conn.execute(
+        "INSERT INTO agent_persona_reservations"
+        " (project_id,persona,persona_name,reserved_actor_id,reserved_at,source)"
+        " VALUES (?,?,?,?,?,?)",
+        (project_id, persona, agent_persona_name(persona), actor_id, nowi,
+         str(source or "agent.registration")))
+    return {"project_id": project_id, "persona": persona,
+            "persona_name": agent_persona_name(persona),
+            "reserved_actor_id": actor_id, "reserved_at": nowi,
+            "source": str(source or "agent.registration")}
 
 
 def legacy_actor_role_hint(actor_id):
@@ -1152,6 +1433,31 @@ CREATE TABLE IF NOT EXISTS agents (
   last_seen_at  TEXT,
   PRIMARY KEY (project_id, agent_id)
 );
+-- A short persona name is a workspace-global identity resource. Reservations
+-- outlive agent rows and aliases so a deleted/migrated Gibbs can never become
+-- a different actor later. Product code only inserts; triggers make the
+-- append-only invariant explicit even for accidental maintenance SQL.
+CREATE TABLE IF NOT EXISTS agent_persona_reservations (
+  project_id        TEXT NOT NULL,
+  persona           TEXT NOT NULL COLLATE NOCASE,
+  persona_name      TEXT NOT NULL,
+  reserved_actor_id TEXT NOT NULL,
+  reserved_at       TEXT NOT NULL,
+  source            TEXT NOT NULL,
+  PRIMARY KEY (project_id, persona)
+);
+CREATE INDEX IF NOT EXISTS idx_persona_reservation_actor
+  ON agent_persona_reservations (project_id, reserved_actor_id);
+CREATE TRIGGER IF NOT EXISTS agent_persona_reservations_no_update
+BEFORE UPDATE ON agent_persona_reservations
+BEGIN
+  SELECT RAISE(ABORT, 'agent persona reservations are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS agent_persona_reservations_no_delete
+BEFORE DELETE ON agent_persona_reservations
+BEGIN
+  SELECT RAISE(ABORT, 'agent persona reservations are append-only');
+END;
 CREATE TABLE IF NOT EXISTS actor_aliases (
   project_id        TEXT NOT NULL,
   legacy_actor_id   TEXT NOT NULL,
@@ -1532,6 +1838,37 @@ def connect(db_path):
                     "INSERT INTO server_settings(setting_key,value,updated_at)"
                     " VALUES ('auth.owner_user_id',?,?)",
                     (json.dumps(first_admin["user_id"]), now_iso()))
+        # Product defaults are ordinary, editable Project Rules, not hidden
+        # authorization logic.  Seed them once for every pre-existing
+        # workspace while opening an upgraded database.  A connect-time
+        # migration is system work, so never attribute it to whichever
+        # request/thread happened to open this connection or to that caller's
+        # checkout.  New-project creation below retains its real initiating
+        # human/Git attribution.
+        previous_owner = current_owner()
+        previous_git = current_git_context()
+        try:
+            set_current_owner(None)
+            set_current_git_context(None, None, None)
+            with write_tx(conn):
+                for project_row in conn.execute(
+                        "SELECT project_id FROM projects ORDER BY created_at"):
+                    _seed_default_authority_rule_in_tx(
+                        conn, project_row["project_id"])
+        finally:
+            set_current_owner(previous_owner)
+            set_current_git_context(
+                previous_git["branch"], previous_git["revision"],
+                previous_git["device_id"])
+        # One-time migration for the project-global, never-reused short-name
+        # namespace. This scans immutable history as well as current actor
+        # rows, so deleting or migrating an old colored/named actor cannot
+        # release its persona for a different identity.
+        with write_tx(conn):
+            for project_row in conn.execute(
+                    "SELECT project_id FROM projects ORDER BY created_at"):
+                _seed_project_persona_reservations(
+                    conn, project_row["project_id"])
         # One-time purpose-aware migration from the retired project-global
         # handoff.  Only the latest row with an exact registered canonical
         # writer can become that writer's identity handoff.  Ambiguous/web
@@ -4042,6 +4379,11 @@ def append_event(conn, project_id, actor_id, actor_type, event_type, payload,
     """Append one hash-chained event; returns the stored event as a dict."""
 
     def _do():
+        parsed_actor = parse_canonical_agent_id(actor_id, project_id)
+        if parsed_actor and parsed_actor.get("persona"):
+            _reserve_agent_persona_in_tx(
+                conn, project_id, parsed_actor["persona"],
+                str(actor_id).strip().lower(), "event.actor")
         row = conn.execute(
             "SELECT seq, hash FROM events WHERE project_id=? ORDER BY seq DESC LIMIT 1",
             (project_id,)).fetchone()
@@ -4118,13 +4460,55 @@ def get_project(conn, project_id):
     return dict(row)
 
 
-def list_projects(conn):
+def _friendly_agent_descriptor(conn, project_id, actor_id,
+                               fallback="Current Lead Director"):
+    """Return setup-safe identity copy without exposing a canonical id.
+
+    Setup discovery may run under an account which is not allowed to reuse
+    the Lead's identity.  The Lead still needs a useful human-facing label,
+    but the raw canonical actor id is an implementation/audit identifier and
+    must not become the fallback UI label.
+    """
+    raw = str(actor_id or "").strip()
+    if not raw:
+        return None
+    row = conn.execute(
+        "SELECT display_name FROM agents WHERE project_id=? AND agent_id=?",
+        (project_id, raw)).fetchone()
+    parsed = parse_canonical_agent_id(raw, project_id)
+    short_name = ("@" + agent_persona_name(parsed.get("persona"))) \
+        if parsed and parsed.get("persona") else None
+    display_name = str(row["display_name"] or "").strip() if row else ""
+    if not display_name or display_name.casefold() == raw.casefold():
+        display_name = short_name or fallback
+    return {"display_name": display_name, "short_name": short_name}
+
+
+def _project_setup_option(conn, project):
+    """Return one complete but non-secret guided-setup workspace option."""
+    value = {key: project.get(key) for key in (
+        "project_id", "name", "repository_fingerprint", "lead_director")}
+    value["lead_director_descriptor"] = _friendly_agent_descriptor(
+        conn, project.get("project_id"), project.get("lead_director"))
+    return value
+
+
+def list_projects(conn, query=None, limit=None, offset=0, sort=None,
+                  options=False):
     rows = conn.execute(
         "SELECT p.*, (SELECT COUNT(*) FROM events e WHERE e.project_id=p.project_id) AS events,"
         " (SELECT COUNT(*) FROM tasks t WHERE t.project_id=p.project_id"
         "   AND t.status NOT IN ('done','cancelled')) AS open_tasks"
         " FROM projects p ORDER BY p.created_at").fetchall()
-    return {"projects": [dict(r) for r in rows]}
+    projects = [dict(r) for r in rows]
+    if limit is None and query is None and sort is None and not options:
+        return {"projects": projects}
+    if options:
+        projects = [_project_setup_option(conn, item) for item in projects]
+    return _collection_page(
+        projects, "projects", query=query, limit=limit, offset=offset,
+        sort=sort, date_fields=("created_at",), id_fields=("project_id",),
+        options=options)
 
 
 def _validated_repository_fingerprint(value):
@@ -4318,6 +4702,7 @@ def project_init(conn, actor_id, actor_type, path=None, project_id=None,
         append_event(conn, project_id, actor_id, actor_type, "project.created",
                      {"name": name, "root_path": str(root),
                       "repository_fingerprint": repository_fingerprint}, in_tx=True)
+        _seed_default_authority_rule_in_tx(conn, project_id)
         # Direct/local setup may create the project without passing through
         # the REST wrapper that normally grants the authenticated creator its
         # membership.  Preserve that creator access atomically, but only for
@@ -4501,9 +4886,9 @@ def role_scope_set(conn, project_id, actor_id, actor_type, role, content,
             "context_version": context_version, "event": event}
 
 
-def role_scope_history(conn, project_id, role, limit=20, actor_id=None,
-                       actor_type="agent", query=None, offset=None,
-                       sort=None):
+def role_scope_history(conn, project_id, role, limit=60, actor_id=None,
+                       actor_type="agent", query=None, offset=0,
+                       sort="newest"):
     get_project(conn, project_id)
     role = _role_scope_name(role)
     if actor_type == "agent":
@@ -4514,18 +4899,14 @@ def role_scope_history(conn, project_id, role, limit=20, actor_id=None,
                 (actor_id, actual or "unassigned"))
     elif actor_type != "human":
         raise AttaccaError("role scope history requires a project identity")
-    paged = offset is not None or query is not None or sort is not None
     rows = conn.execute(
         "SELECT * FROM role_scope_revisions WHERE project_id=? AND role=?"
         " ORDER BY version DESC",
         (project_id, role)).fetchall()
     versions = [_role_scope_dict(row) for row in rows]
-    if not paged:
-        versions = versions[:max(1, min(int(limit or 20), 200))]
-        return {"project": project_id, "role": role, "versions": versions}
     result = _collection_page(
         versions, "versions", query=query, limit=limit,
-        offset=offset or 0, sort=sort, date_fields=("updated_at",),
+        offset=offset, sort=sort, date_fields=("updated_at",),
         id_fields=("version",))
     result.update({"project": project_id, "role": role})
     return result
@@ -4850,6 +5231,129 @@ def update_handoff(conn, project_id, actor_id, actor_type, updates,
 
 # --- room ------------------------------------------------------------------
 
+_BODY_SHORT_MENTION_RE = re.compile(
+    r"(?<![A-Za-z0-9_.@\\])@([A-Za-z][A-Za-z0-9-]{0,39})"
+    r"(?![A-Za-z0-9_.-])")
+
+
+def _resolve_room_mention(conn, project_id, selector, from_body=False):
+    """Resolve one friendly selector while retaining exact legacy mentions."""
+    raw = str(selector or "").strip()
+    if not raw:
+        raise AttaccaError("mentions must not contain empty values")
+    had_at = raw.startswith("@")
+    candidate = raw[1:] if had_at else raw
+    # Exact canonical mentions remain authoritative, but validate that they
+    # address the selected local/target room and a current registered actor.
+    exact = parse_canonical_agent_id(candidate)
+    if exact:
+        if exact["project_id"] != slugify(project_id):
+            raise AttaccaError(
+                "room_mention_project_mismatch: exact actor '%s' is not in"
+                " addressed workspace '%s'" % (candidate, project_id))
+        row = conn.execute(
+            "SELECT agent_id FROM agents WHERE project_id=? AND agent_id=?",
+            (project_id, candidate.lower())).fetchone()
+        if not row:
+            alias = conn.execute(
+                "SELECT canonical_actor_id FROM actor_aliases"
+                " WHERE project_id=? AND legacy_actor_id=?",
+                (project_id, candidate.lower())).fetchone()
+            if alias:
+                row = conn.execute(
+                    "SELECT agent_id FROM agents"
+                    " WHERE project_id=? AND agent_id=?",
+                    (project_id, alias["canonical_actor_id"])).fetchone()
+        if not row:
+            raise AttaccaError(
+                "room_mention_actor_inactive: exact actor '%s' is not a"
+                " current registered member of workspace '%s'" %
+                (candidate, project_id))
+        return row["agent_id"]
+
+    # Legacy clients used opaque ids such as ``claude`` or ``worker-a``.
+    # Keep that compatibility only when the selector exactly names a current
+    # registered row (or an exact historical alias whose canonical actor is
+    # still registered).  Passing arbitrary raw strings through would create
+    # messages that look directly addressed but can never reach an inbox.
+    row = conn.execute(
+        "SELECT agent_id FROM agents WHERE project_id=? AND agent_id=?",
+        (project_id, candidate)).fetchone()
+    if row:
+        return row["agent_id"]
+    alias = conn.execute(
+        "SELECT canonical_actor_id FROM actor_aliases"
+        " WHERE project_id=? AND legacy_actor_id=?",
+        (project_id, candidate)).fetchone()
+    if alias:
+        row = conn.execute(
+            "SELECT agent_id FROM agents WHERE project_id=? AND agent_id=?",
+            (project_id, alias["canonical_actor_id"])).fetchone()
+        if row:
+            return row["agent_id"]
+
+    normalized = None
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{0,39}", candidate):
+        normalized = normalize_agent_persona(candidate)
+    matches = []
+    if normalized:
+        for row in conn.execute(
+                "SELECT agent_id FROM agents WHERE project_id=?",
+                (project_id,)):
+            parsed = parse_canonical_agent_id(row["agent_id"], project_id)
+            if parsed and parsed.get("persona") == normalized:
+                matches.append(row["agent_id"])
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise AttaccaError(
+            "room_mention_ambiguous: @%s matches multiple compatibility"
+            " identities in workspace '%s'; use one exact canonical actor" %
+            (agent_persona_name(normalized), project_id))
+    reservation = conn.execute(
+        "SELECT reserved_actor_id FROM agent_persona_reservations"
+        " WHERE project_id=? AND persona=?", (project_id, normalized)
+    ).fetchone() if normalized else None
+    if reservation:
+        raise AttaccaError(
+            "room_mention_inactive: @%s is a historic reserved identity in"
+            " workspace '%s' but has no current registered actor" %
+            (agent_persona_name(normalized), project_id))
+    # @Name tokens are unambiguously intended as short mentions. Plain
+    # title-cased selectors are also the documented friendly form. Preserve
+    # lower-case raw/legacy ids for old clients rather than reinterpreting
+    # every historical mention value as a new persona selector.
+    if had_at and not from_body or (candidate[:1].isupper()
+                                    and "." not in candidate):
+        raise AttaccaError(
+            "room_mention_unknown: @%s is not a current registered persona"
+            " in workspace '%s'" % (candidate, project_id))
+    if from_body:
+        # Lower-case @everyone/@github-style prose is not necessarily an
+        # Attacca persona. Known names still resolve case-insensitively above;
+        # unknown title-cased @Persona typos fail rather than broadcasting.
+        return None
+    raise AttaccaError(
+        "room_mention_unknown: '%s' is not an exact current registered actor"
+        " in workspace '%s'" % (raw, project_id))
+
+
+def resolve_room_mentions(conn, project_id, body, mentions=None):
+    """Canonicalize explicit and inline ``@Name`` mentions, preserving body."""
+    resolved = []
+    for selector in mentions or []:
+        actor_id = _resolve_room_mention(
+            conn, project_id, selector, from_body=False)
+        if actor_id not in resolved:
+            resolved.append(actor_id)
+    for match in _BODY_SHORT_MENTION_RE.finditer(str(body or "")):
+        actor_id = _resolve_room_mention(
+            conn, project_id, "@" + match.group(1), from_body=True)
+        if actor_id and actor_id not in resolved:
+            resolved.append(actor_id)
+    return resolved
+
+
 def room_send(conn, project_id, actor_id, actor_type, body, msg_type="chat",
               mentions=None, task_id=None, reply_to=None, origin_project=None,
               target_project=None):
@@ -4871,14 +5375,6 @@ def room_send(conn, project_id, actor_id, actor_type, body, msg_type="chat",
         raise AttaccaError(
             "room_send: msg_type must be one of %s" % ", ".join(MSG_TYPES))
     mentions = _require_str_list("mentions", mentions)
-    # Persist an explicit empty destination list for new local-only rows.
-    # Absence of this key is reserved for the historic source-side bridge
-    # schema and is what activates counterpart inference on read.
-    payload = {"msg_type": msg_type, "body": str(body), "mirrored_to": []}
-    if mentions:
-        payload["mentions"] = mentions
-    if reply_to:
-        payload["reply_to"] = reply_to
     local_only = False
     if target_project:
         target_project = get_project(conn, target_project)["project_id"]
@@ -4908,6 +5404,22 @@ def room_send(conn, project_id, actor_id, actor_type, body, msg_type="chat",
         # mention belongs to this workspace unless the caller names one exact
         # target_project. This prevents routine project work from leaking into
         # a scoped feedback/advisory bridge merely because it is structured.
+    # Resolve only after bridge existence and source participation have been
+    # authorized. Otherwise distinct unknown/inactive errors would disclose a
+    # target workspace's actor history to a caller who cannot enter its room.
+    # An explicit cross-project message resolves solely on the target side; a
+    # same-named source actor must never steal the mention.
+    mention_project = target_project or project_id
+    mentions = resolve_room_mentions(
+        conn, mention_project, str(body), mentions=mentions)
+    # Persist an explicit empty destination list for new local-only rows.
+    # Absence of this key is reserved for the historic source-side bridge
+    # schema and is what activates counterpart inference on read.
+    payload = {"msg_type": msg_type, "body": str(body), "mirrored_to": []}
+    if mentions:
+        payload["mentions"] = mentions
+    if reply_to:
+        payload["reply_to"] = reply_to
     if actor_type == "agent" and msg_type == "directive" and any(
             bridge["relation"] == "master" and
             bridge.get("principal") == project_id
@@ -5097,8 +5609,12 @@ def room_history(conn, project_id, actor_id=None, actor_type="agent",
                  sort="newest", known_latest_seq=None):
     """Server-filtered, visibility-safe room history for the Control Panel."""
     get_project(conn, project_id)
-    limit = max(1, min(int(limit or 60), 60))
-    offset = max(0, int(offset or 0))
+    try:
+        limit = max(1, min(int(limit or 60), 60))
+        offset = max(0, int(offset or 0))
+    except (TypeError, ValueError):
+        raise AttaccaError("limit and offset must be integers")
+    selected_sort = _collection_sort(sort)
     conversation = str(conversation or "local").strip()
     if conversation != "local":
         if not _bridge_row(conn, project_id, conversation):
@@ -5138,7 +5654,7 @@ def room_history(conn, project_id, actor_id=None, actor_type="agent",
                           "reply_to": payload.get("reply_to"),
                       }).casefold() for term in terms)]
     total = len(authorized)
-    reverse = str(sort or "newest").lower() != "oldest"
+    reverse = selected_sort == "newest"
     authorized.sort(key=lambda item: int(item[0]["seq"]), reverse=reverse)
     latest_seq = max((int(row["seq"]) for row, _ in authorized), default=0)
     if known_latest_seq is None:
@@ -6239,22 +6755,76 @@ def _task_current_claimant(task, actions, conn=None, project_id=None):
     }
 
 
-def _task_plan_summary(row):
+def _task_plan_summary(row, include_search=False):
     if not row:
         return None
-    return {
+    raw_sections = row["sections"]
+    sections = json.loads(raw_sections or "[]") \
+        if isinstance(raw_sections, str) else list(raw_sections or [])
+    result = {
         "version": row["version"], "status": row["status"],
         "title": row["title"],
-        "section_count": len(json.loads(row["sections"] or "[]")),
+        "section_count": len(sections),
         "content_sha256": row["content_sha256"],
         "authored_by": row["authored_by"],
         "authored_owner": row["authored_owner"],
         "authored_at": row["authored_at"], "updated_at": row["updated_at"],
     }
+    if include_search:
+        # Search membership is evaluated against the complete immutable plan
+        # revision, while the returned directory row remains a compact
+        # summary.  This private field is removed after paging.
+        result["_search_content"] = {
+            "overview": row["overview"], "sections": sections}
+    return result
+
+
+TASK_ATTRIBUTION_EVENT_TYPES = (
+    "task.created", "task.claimed", "task.lease_renewed",
+    "task.reported", "task.completed", "task.status_changed",
+    "task.released",
+)
+
+
+def _task_attribution_event_rows(conn, project_id, task_ids):
+    """Return only the latest lifecycle event of each relevant kind.
+
+    A board page needs exact claimant/report attribution, not every immutable
+    plan comment and lease renewal ever recorded for every task.  Keeping one
+    latest row per lifecycle kind makes the nested board projection bounded
+    (at most seven rows per task) while ``task_show`` remains the paged history
+    endpoint.
+    """
+    task_ids = [str(task_id) for task_id in (task_ids or []) if task_id]
+    if not task_ids:
+        return {}, {}
+    task_marks = ",".join("?" for _ in task_ids)
+    type_marks = ",".join("?" for _ in TASK_ATTRIBUTION_EVENT_TYPES)
+    rows = conn.execute(
+        "SELECT e.* FROM events e JOIN ("
+        " SELECT task_id,event_type,MAX(seq) AS max_seq FROM events"
+        " WHERE project_id=? AND task_id IN (%s)"
+        " AND event_type IN (%s) GROUP BY task_id,event_type"
+        ") latest ON latest.task_id=e.task_id"
+        " AND latest.event_type=e.event_type AND latest.max_seq=e.seq"
+        " WHERE e.project_id=? ORDER BY e.task_id,e.seq" %
+        (task_marks, type_marks),
+        [project_id] + task_ids + list(TASK_ATTRIBUTION_EVENT_TYPES) +
+        [project_id]).fetchall()
+    by_task = {}
+    for event in rows:
+        by_task.setdefault(event["task_id"], []).append(event)
+    counts = {row["task_id"]: row["n"] for row in conn.execute(
+        "SELECT task_id,COUNT(*) AS n FROM events WHERE project_id=?"
+        " AND task_id IN (%s) AND event_type LIKE 'task.%%'"
+        " GROUP BY task_id" % task_marks,
+        [project_id] + task_ids).fetchall()}
+    return by_task, counts
 
 
 def _task_dict(row, event_rows=None, conn=None, project_id=None,
-               plan_row=None):
+               plan_row=None, attribution_event_rows=None,
+               actions_total=None):
     task = dict(row)
     task["expected_scope"] = json.loads(task.get("expected_scope") or "[]")
     task["dependencies"] = json.loads(task.get("dependencies") or "[]")
@@ -6262,8 +6832,18 @@ def _task_dict(row, event_rows=None, conn=None, project_id=None,
     task["plan"] = _task_plan_summary(plan_row)
     actions = [_ledger_action(item, conn, project_id) for item in (event_rows or [])
                if item["event_type"].startswith("task.")]
+    if attribution_event_rows is None:
+        attribution_actions = actions
+    else:
+        attribution_actions = [
+            _ledger_action(item, conn, project_id)
+            for item in attribution_event_rows
+            if item["event_type"].startswith("task.")]
     task["actions"] = actions
-    task["attribution"] = _task_attribution(actions)
+    task["attribution"] = _task_attribution(attribution_actions)
+    if actions_total is not None:
+        task["actions_total"] = int(actions_total)
+        task["actions_compacted"] = int(actions_total) > len(actions)
     if task.get("last_report"):
         task["last_report"] = json.loads(task["last_report"])
         reported = task["attribution"].get("reported") or {}
@@ -6279,7 +6859,7 @@ def _task_dict(row, event_rows=None, conn=None, project_id=None,
     else:
         task["verification_status"] = "not_reported"
     task["attribution"]["current_claimant"] = _task_current_claimant(
-        task, actions, conn, project_id)
+        task, attribution_actions, conn, project_id)
     if task["status"] == "claimed" and task.get("lease_until") \
             and task["lease_until"] < now_iso():
         task["lease_expired"] = True
@@ -6330,10 +6910,14 @@ def task_list(conn, project_id, status=None, query=None, limit=None, offset=0,
         raise AttaccaError(
             "status must be one of active, all, %s" %
             ", ".join(TASK_STATUSES))
-    paged = limit is not None
-    if paged:
+    explicit_paging = limit is not None or query is not None or bool(offset) \
+        or sort is not None
+    try:
         limit = max(1, min(int(limit or 60), 60))
         offset = max(0, int(offset or 0))
+    except (TypeError, ValueError):
+        raise AttaccaError("limit and offset must be integers")
+    selected_sort = _collection_sort(sort)
     terms = _search_query_terms(query)
     where = ["project_id=?"]
     params = [project_id]
@@ -6355,8 +6939,8 @@ def task_list(conn, project_id, status=None, query=None, limit=None, offset=0,
     total = conn.execute(
         "SELECT COUNT(*) AS n FROM tasks WHERE " + where_sql,
         params).fetchone()["n"]
-    if paged:
-        direction = "ASC" if str(sort or "newest").lower() == "oldest" \
+    if explicit_paging:
+        direction = "ASC" if selected_sort == "oldest" \
             else "DESC"
         rows = conn.execute(
             "SELECT * FROM tasks WHERE " + where_sql +
@@ -6365,47 +6949,107 @@ def task_list(conn, project_id, status=None, query=None, limit=None, offset=0,
             params + [limit, offset]).fetchall()
     elif status:
         rows = conn.execute(
-            "SELECT * FROM tasks WHERE " + where_sql + " ORDER BY task_id",
-            params).fetchall()
+            "SELECT * FROM tasks WHERE " + where_sql +
+            " ORDER BY task_id LIMIT ? OFFSET ?",
+            params + [limit, offset]).fetchall()
     else:
         rows = conn.execute(
             "SELECT * FROM tasks WHERE project_id=? ORDER BY "
             " CASE status WHEN 'claimed' THEN 0 WHEN 'review' THEN 1 WHEN 'blocked' THEN 2"
             "  WHEN 'queued' THEN 3 WHEN 'done' THEN 4 ELSE 5 END,"
-            " CAST(SUBSTR(task_id,3) AS INTEGER)", (project_id,)).fetchall()
-    task_events = conn.execute(
-        "SELECT * FROM events WHERE project_id=? AND task_id IS NOT NULL"
-        " AND event_type LIKE 'task.%' ORDER BY seq", (project_id,)).fetchall()
-    by_task = {}
-    for event in task_events:
-        by_task.setdefault(event["task_id"], []).append(event)
-    plan_rows = conn.execute(
-        "SELECT p.* FROM task_plan_revisions p WHERE p.project_id=?"
-        " AND p.version=(SELECT MAX(q.version) FROM task_plan_revisions q"
-        " WHERE q.project_id=p.project_id AND q.task_id=p.task_id)",
-        (project_id,)).fetchall()
+            " CAST(SUBSTR(task_id,3) AS INTEGER) LIMIT ? OFFSET ?",
+            (project_id, limit, offset)).fetchall()
+    task_ids = [row["task_id"] for row in rows]
+    by_task, action_counts = _task_attribution_event_rows(
+        conn, project_id, task_ids)
+    if task_ids:
+        task_marks = ",".join("?" for _ in task_ids)
+        plan_rows = conn.execute(
+            "SELECT p.* FROM task_plan_revisions p WHERE p.project_id=?"
+            " AND p.task_id IN (%s)"
+            " AND p.version=(SELECT MAX(q.version) FROM task_plan_revisions q"
+            " WHERE q.project_id=p.project_id AND q.task_id=p.task_id)" %
+            task_marks, [project_id] + task_ids).fetchall()
+    else:
+        plan_rows = []
     plans = {row["task_id"]: row for row in plan_rows}
     result = {"project": project_id,
               "tasks": [_task_dict(row, by_task.get(row["task_id"], []),
-                                   conn, project_id, plans.get(row["task_id"]))
+                                   conn, project_id, plans.get(row["task_id"]),
+                                   actions_total=action_counts.get(
+                                       row["task_id"], 0))
                         for row in rows]}
-    if paged:
-        result.update({"total": total, "unfiltered_total": unfiltered_total,
-                       "limit": limit, "offset": offset,
-                       "has_more": offset + len(rows) < total})
+    result.update({"total": total, "unfiltered_total": unfiltered_total,
+                   "limit": limit, "offset": offset,
+                   "has_more": offset + len(rows) < total})
     return result
 
 
-def task_show(conn, project_id, task_id):
+def _task_history_filter(rows, value):
+    raw = [item.strip() for item in str(value or "").split(",")
+           if item.strip()]
+    if not raw or raw == ["all"]:
+        return rows
+    wanted = set(raw)
+    return [row for row in rows if row.get("event_type") in wanted]
+
+
+def task_show(conn, project_id, task_id, action_query=None,
+              action_filter=None, action_limit=60, action_offset=0,
+              action_sort="oldest", history_query=None,
+              history_filter=None, history_limit=60, history_offset=0,
+              history_sort="oldest"):
     rows = conn.execute(
         "SELECT * FROM events WHERE project_id=? AND task_id=? ORDER BY seq",
         (project_id, task_id)).fetchall()
     plan_row = conn.execute(
         "SELECT * FROM task_plan_revisions WHERE project_id=? AND task_id=?"
         " ORDER BY version DESC LIMIT 1", (project_id, task_id)).fetchone()
-    task = _task_dict(_task_row(conn, project_id, task_id), rows,
-                      conn, project_id, plan_row)
-    task["history"] = [line for line in (render_log_line(r) for r in rows) if line]
+    action_rows = [row for row in rows
+                   if row["event_type"].startswith("task.")]
+    all_actions = [_ledger_action(row, conn, project_id)
+                   for row in action_rows]
+    actions = _task_history_filter(all_actions, action_filter)
+    action_page = _collection_page(
+        actions, "actions", query=action_query, limit=action_limit,
+        offset=action_offset, sort=action_sort, date_fields=("at",),
+        id_fields=("seq",))
+    action_page["unfiltered_total"] = len(all_actions)
+    selected_action_seqs = {item["seq"] for item in action_page["actions"]}
+    selected_action_rows = [row for row in action_rows
+                            if row["seq"] in selected_action_seqs]
+    attribution_rows, _counts = _task_attribution_event_rows(
+        conn, project_id, [task_id])
+    task = _task_dict(
+        _task_row(conn, project_id, task_id), selected_action_rows,
+        conn, project_id, plan_row,
+        attribution_event_rows=attribution_rows.get(task_id, []),
+        actions_total=action_page["unfiltered_total"])
+    # _task_dict preserves ledger order, so restore the requested display
+    # order after conversion when newest was selected.
+    task["actions"] = action_page["actions"]
+    task["actions_pagination"] = {
+        key: action_page[key] for key in (
+            "total", "unfiltered_total", "limit", "offset", "has_more")}
+    all_history_rows = []
+    for row in rows:
+        line = render_log_line(row)
+        if line:
+            all_history_rows.append({
+                "line": line, "seq": row["seq"], "at": row["created_at"],
+                "event_type": row["event_type"], "actor_id": row["actor_id"],
+                "payload": json.loads(row["payload"] or "{}"),
+            })
+    history_rows = _task_history_filter(all_history_rows, history_filter)
+    history_page = _collection_page(
+        history_rows, "history", query=history_query, limit=history_limit,
+        offset=history_offset, sort=history_sort, date_fields=("at",),
+        id_fields=("seq",))
+    history_page["unfiltered_total"] = len(all_history_rows)
+    task["history"] = [item["line"] for item in history_page["history"]]
+    task["history_pagination"] = {
+        key: history_page[key] for key in (
+            "total", "unfiltered_total", "limit", "offset", "has_more")}
     return task
 
 
@@ -6531,10 +7175,105 @@ def _task_plan_event_rows(conn, project_id, task_id, version=None):
             if json.loads(row["payload"] or "{}").get("plan_version") == version]
 
 
-def _task_plan_dict(row, events=None, conn=None, project_id=None):
+def _task_plan_filter_values(value, kind):
+    """Normalize an optional revision-status or plan-event filter."""
+    if value is None or not str(value).strip():
+        return None
+    raw = [part.strip().lower() for part in re.split(
+        r"[,|]", str(value)) if part.strip()]
+    if not raw or "all" in raw:
+        return None
+    if kind == "revision":
+        invalid = [item for item in raw if item not in TASK_PLAN_STATUSES]
+        if invalid:
+            raise AttaccaError(
+                "revision_filter must be all or one or more of %s" %
+                ", ".join(TASK_PLAN_STATUSES))
+        return set(raw)
+    aliases = {
+        "create": {"task.plan.created"},
+        "created": {"task.plan.created"},
+        "revision": {"task.plan.revised"},
+        "revisions": {"task.plan.revised"},
+        "revised": {"task.plan.revised"},
+        "submit": {"task.plan.submitted"},
+        "submitted": {"task.plan.submitted"},
+        "approval": {"task.plan.approved"},
+        "approvals": {"task.plan.approved"},
+        "approved": {"task.plan.approved"},
+        "suggestion": {"task.plan.suggested"},
+        "suggestions": {"task.plan.suggested"},
+        "suggested": {"task.plan.suggested"},
+        "suggest_edit": {"task.plan.suggested"},
+        "comment": {"task.plan.commented"},
+        "comments": {"task.plan.commented"},
+        "commented": {"task.plan.commented"},
+        "review": {
+            "task.plan.approved", "task.plan.suggested",
+            "task.plan.commented",
+        },
+        "reviews": {
+            "task.plan.approved", "task.plan.suggested",
+            "task.plan.commented",
+        },
+    }
+    selected = set()
+    for item in raw:
+        event_type = item if item.startswith("task.plan.") else None
+        if event_type in TASK_PLAN_EVENT_TYPES:
+            selected.add(event_type)
+        elif item in aliases:
+            selected.update(aliases[item])
+        else:
+            raise AttaccaError(
+                "action_filter must be all, review, or one or more of %s" %
+                ", ".join(item.rsplit(".", 1)[-1]
+                          for item in TASK_PLAN_EVENT_TYPES))
+    return selected
+
+
+def _task_plan_sort(value, default, label):
+    selected = str(value or default).strip().lower()
+    if selected not in ("newest", "oldest"):
+        raise AttaccaError("%s_sort must be newest or oldest" % label)
+    return selected
+
+
+def _task_plan_page(rows, key, *, query=None, filter_value=None,
+                    filter_kind, limit=60, offset=0, sort=None):
+    """Filter/sort the complete plan collection before taking one page."""
+    complete = [dict(row) for row in (rows or [])]
+    selected_values = _task_plan_filter_values(filter_value, filter_kind)
+    filtered = complete
+    if selected_values is not None:
+        field = "status" if filter_kind == "revision" else "event_type"
+        filtered = [row for row in complete
+                    if row.get(field) in selected_values]
+    page = _collection_page(
+        filtered, key, query=query, limit=limit, offset=offset, sort=sort,
+        date_fields=(("updated_at", "authored_at") if
+                     filter_kind == "revision" else ("at",)),
+        id_fields=(("version",) if filter_kind == "revision" else ("seq",)))
+    # _collection_page sees the post-filter collection. Preserve the exact
+    # full authorized count separately from total after filter + search.
+    page["unfiltered_total"] = len(complete)
+    if filter_kind == "revision":
+        for item in page[key]:
+            item.pop("_search_content", None)
+    return page
+
+
+def _task_plan_page_metadata(page):
+    return {key: page[key] for key in (
+        "total", "unfiltered_total", "limit", "offset", "has_more")}
+
+
+def _task_plan_dict(row, events=None, conn=None, project_id=None,
+                    actions=None):
     plan = dict(row)
     plan["sections"] = json.loads(plan["sections"] or "[]")
-    actions = [_ledger_action(item, conn, project_id) for item in (events or [])]
+    actions = list(actions) if actions is not None else [
+        _ledger_action(item, conn, project_id) for item in (events or [])]
     plan["actions"] = actions
     plan["approvals"] = [action for action in actions
                          if action["event_type"] == "task.plan.approved"]
@@ -6545,22 +7284,63 @@ def _task_plan_dict(row, events=None, conn=None, project_id=None):
     return plan
 
 
-def task_plan_get(conn, project_id, task_id, version=None):
+def task_plan_get(conn, project_id, task_id, version=None,
+                  revision_query=None, revision_filter=None,
+                  revision_limit=60, revision_offset=0,
+                  revision_sort="newest", action_query=None,
+                  action_filter=None, action_limit=60, action_offset=0,
+                  action_sort="oldest"):
+    revision_sort = _task_plan_sort(
+        revision_sort, "newest", "revision")
+    action_sort = _task_plan_sort(action_sort, "oldest", "action")
     selected = _latest_task_plan_row(
         conn, project_id, task_id, version=version)
     revisions = conn.execute(
         "SELECT * FROM task_plan_revisions WHERE project_id=? AND task_id=?"
         " ORDER BY version DESC", (project_id, task_id)).fetchall()
+    revision_page = _task_plan_page(
+        [_task_plan_summary(row, include_search=True) for row in revisions],
+        "revisions",
+        query=revision_query, filter_value=revision_filter,
+        filter_kind="revision", limit=revision_limit,
+        offset=revision_offset, sort=revision_sort)
+    empty_action_page = _task_plan_page(
+        [], "actions", query=action_query, filter_value=action_filter,
+        filter_kind="action", limit=action_limit, offset=action_offset,
+        sort=action_sort)
     if not selected:
-        return {"project": project_id, "task_id": task_id,
-                "plan": None, "revisions": []}
+        result = {"project": project_id, "task_id": task_id,
+                  "plan": None, "revisions": revision_page["revisions"]}
+        result.update(_task_plan_page_metadata(revision_page))
+        result["pagination"] = {
+            "revisions": _task_plan_page_metadata(revision_page),
+            "actions": _task_plan_page_metadata(empty_action_page),
+        }
+        return result
     events = _task_plan_event_rows(
         conn, project_id, task_id, selected["version"])
-    return {
+    all_actions = [_ledger_action(item, conn, project_id) for item in events]
+    action_page = _task_plan_page(
+        all_actions, "actions", query=action_query,
+        filter_value=action_filter, filter_kind="action",
+        limit=action_limit, offset=action_offset, sort=action_sort)
+    plan = _task_plan_dict(
+        selected, conn=conn, project_id=project_id,
+        actions=action_page["actions"])
+    plan["actions_pagination"] = _task_plan_page_metadata(action_page)
+    result = {
         "project": project_id, "task_id": task_id,
-        "plan": _task_plan_dict(selected, events, conn, project_id),
-        "revisions": [_task_plan_summary(row) for row in revisions],
+        "plan": plan, "revisions": revision_page["revisions"],
+        "pagination": {
+            "revisions": _task_plan_page_metadata(revision_page),
+            "actions": _task_plan_page_metadata(action_page),
+        },
     }
+    # Root pagination fields apply to the root revisions collection, matching
+    # other collection endpoints while the selected plan carries its own
+    # namespaced action metadata.
+    result.update(_task_plan_page_metadata(revision_page))
+    return result
 
 
 def task_plan_set(conn, project_id, task_id, actor_id, actor_type,
@@ -7125,6 +7905,67 @@ def _registered_actor_role(conn, project_id, actor_id):
     return (row["role"] or "unassigned") if row else "unassigned"
 
 
+DEFAULT_AUTHORITY_RULE_ID = "R-0"
+DEFAULT_AUTHORITY_RULE_KEY = "local_hierarchy_acknowledgement"
+DEFAULT_AUTHORITY_RULE_TITLE = "Acknowledge local Director hierarchy"
+DEFAULT_AUTHORITY_RULE_BODY = (
+    "At the first direct response and periodically during a sustained "
+    "exchange, a Worker or Advisor communicating directly with a currently "
+    "registered Director in the same workspace must acknowledge that "
+    "Director as the project MASTER for coordination. A registered non-Lead "
+    "Director communicating directly with the workspace's currently "
+    "designated Lead Director must acknowledge the Lead Director as the "
+    "MASTER coordinator. Direct communication means an explicit local "
+    "mention, reply, or selected recipient; mere group-room visibility does "
+    "not trigger this rule. Verify current role and Lead status from Attacca "
+    "state, not display names or actor text. This is conversational protocol "
+    "only: it grants no permissions, never lets Lead status or runtime bypass "
+    "role checks, and never applies to remote/bridged actors. Cross-project "
+    "authority comes only from bridge policy and the message authority tag."
+)
+
+
+def _seed_default_authority_rule_in_tx(conn, project_id):
+    """Insert the editable product-default R-0 exactly once.
+
+    This helper must run inside the caller's write transaction.  ``R-0`` is
+    deliberately a normal Project Rule: authorized humans and Directors may
+    revise or disable it, and a later database open never restores the
+    product text over their governance choice.
+    """
+    existing = conn.execute(
+        "SELECT 1 FROM project_rules WHERE project_id=? AND rule_id=?",
+        (project_id, DEFAULT_AUTHORITY_RULE_ID)).fetchone()
+    if existing:
+        return None
+    nowi = now_iso()
+    owner = current_owner()
+    inserted = conn.execute(
+        "INSERT OR IGNORE INTO project_rules"
+        " (project_id,rule_id,title,body,scope,priority,enabled,version,"
+        " created_by,created_owner,created_at,updated_by,updated_owner,"
+        " updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (project_id, DEFAULT_AUTHORITY_RULE_ID,
+         DEFAULT_AUTHORITY_RULE_TITLE, DEFAULT_AUTHORITY_RULE_BODY,
+         "everyone", 0, 1, 1, "system", owner, nowi, "system", owner,
+         nowi))
+    if inserted.rowcount != 1:
+        return None
+    context_version = bump_context_version(conn, project_id)
+    event = append_event(
+        conn, project_id, "system", "system", "rule.created",
+        {"rule_id": DEFAULT_AUTHORITY_RULE_ID,
+         "title": DEFAULT_AUTHORITY_RULE_TITLE,
+         "body": DEFAULT_AUTHORITY_RULE_BODY,
+         "scope": "everyone", "priority": 0, "enabled": True,
+         "version": 1, "source": "attacca.product_default",
+         "default_key": DEFAULT_AUTHORITY_RULE_KEY},
+        in_tx=True)
+    return {"rule": _rule_dict(_rule_row(
+                conn, project_id, DEFAULT_AUTHORITY_RULE_ID)),
+            "context_version": context_version, "event": event}
+
+
 def _require_rule_manager(conn, project_id, actor_id, actor_type):
     if actor_type == "human":
         return "human"
@@ -7209,6 +8050,10 @@ def rule_list(conn, project_id, actor_id=None, actor_type="agent",
         else (["everyone", role] if role in AGENT_ROLES else ["everyone"])
     rules = [_rule_dict(row) for row in rows]
     unfiltered_total = len(rules)
+    # Count the complete authorized/scope-filtered rule set before status,
+    # query, and paging.  Panel and MCP consumers must not infer this from a
+    # sixty-row page (which undercounts large rule directories).
+    enabled_total = sum(1 for rule in rules if rule["enabled"])
     status = str(status or "").strip().lower() or None
     if status == "all":
         status = None
@@ -7220,13 +8065,16 @@ def rule_list(conn, project_id, actor_id=None, actor_type="agent",
         rules = [rule for rule in rules if not rule["enabled"]]
     if limit is None and query is None and sort is None and status is None:
         return {"project": project_id, "actor_role": role,
-                "applicable_scopes": applicable_scopes, "rules": rules}
+                "applicable_scopes": applicable_scopes, "rules": rules,
+                "enabled_total": enabled_total}
     result = _collection_page(
         rules, "rules", query=query, limit=limit, offset=offset, sort=sort,
-        date_fields=("updated_at", "created_at"), id_fields=("rule_id",))
+        date_fields=("updated_at", "created_at"), id_fields=("rule_id",),
+        preserve_order=sort is None)
     result["unfiltered_total"] = unfiltered_total
     result.update({"project": project_id, "actor_role": role,
-                   "applicable_scopes": applicable_scopes})
+                   "applicable_scopes": applicable_scopes,
+                   "enabled_total": enabled_total})
     return result
 
 
@@ -7371,8 +8219,9 @@ def _cloud_context_dict(row):
 
 def cloud_context_get(conn, project_id, actor_id=None, actor_type="agent"):
     """Read the project cloud context: a single shared free-text document, like
-    a hosted AGENTS.md / CLAUDE.md, that is injected into every session brief.
-    Any worker may read it; only humans and Directors may edit it."""
+    a hosted AGENTS.md / CLAUDE.md. It is loaded at session start and retained
+    while its version/hash is unchanged. Any worker may read it; only humans
+    and Directors may edit it."""
     get_project(conn, project_id)
     return {"project": project_id,
             "cloud_context": _cloud_context_dict(_cloud_context_row(
@@ -7388,6 +8237,11 @@ def cloud_context_set(conn, project_id, actor_id, actor_type, content,
     content = str(content)
     if len(content) > 100000:
         raise AttaccaError("cloud context is limited to 100000 characters")
+    if "ATTACCA_CLOUD_CONTEXT:BEGIN" in content or \
+            "ATTACCA_CLOUD_CONTEXT:END" in content:
+        raise AttaccaError(
+            "Cloud Context content cannot contain its managed block marker "
+            "tokens")
     if expected_version is not None:
         try:
             expected_version = int(expected_version)
@@ -7554,6 +8408,22 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
                    allow_foreign_owner=False,
                    authorized_owner_labels=None):
     requested_id = agent_id or actor_id
+    # Preserve the caller's explicit runtime before canonical actor discovery
+    # normalizes from ``requested_id``. Otherwise an authenticated request for
+    # exact actor ``...codex.gibbs`` with runtime=claude is silently rewritten
+    # back to codex and evades the protected-field check.
+    explicit_runtime = normalize_agent_runtime(runtime) \
+        if runtime is not None and str(runtime).strip() else None
+    explicit_persona = normalize_agent_persona(persona) \
+        if persona is not None and str(persona).strip() else None
+    requested_identity_parts = parse_canonical_agent_id(
+        requested_id, project_id) if canonical_identity else None
+    requested_runtime_conflict = bool(
+        requested_identity_parts and explicit_runtime and
+        explicit_runtime != requested_identity_parts["runtime"])
+    requested_persona_conflict = bool(
+        requested_identity_parts and explicit_persona and
+        explicit_persona != requested_identity_parts.get("persona"))
     registration_username = str(registration_username or "").strip() or None
     authorized_owner_keys = {
         _auth_owner_alias_key(value)
@@ -7562,6 +8432,17 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
     if registration_username:
         authorized_owner_keys.add(
             _auth_owner_alias_key(registration_username))
+    if (requested_runtime_conflict or requested_persona_conflict) \
+            and registration_username and not allow_foreign_owner:
+        raise AuthorizationError(
+            "agent_registration_not_idempotent: authenticated user"
+            " '%s' cannot register exact actor '%s' with contradictory %s" %
+            (registration_username, requested_id, ", ".join(
+                item for item, conflict in ((
+                    "runtime '%s'" % explicit_runtime,
+                    requested_runtime_conflict), (
+                    "persona '%s'" % explicit_persona,
+                    requested_persona_conflict)) if conflict)))
 
     def owner_is_authorized(row):
         return bool(row and row["owner"] and
@@ -7607,13 +8488,28 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
                      "bridge_access_migrated": 0,
                      "state_changed": False}
         if canonical_identity:
+            # A pre-feature workspace is backfilled once. Normal registration
+            # and allocation then consult only the indexed append-only table;
+            # rescanning an unbounded event ledger under BEGIN IMMEDIATE would
+            # stall every writer in a large workspace.
+            _seed_project_persona_reservations(
+                conn, project_id, force=False)
             records = [dict(row) for row in conn.execute(
                 "SELECT * FROM agents WHERE project_id=?", (project_id,))]
-            requested_parts = parse_canonical_agent_id(
-                requested_id, project_id)
+            requested_parts = requested_identity_parts
             identity = registered_agent_identity(
                 records, project_id, requested_id, runtime=runtime)
-            runtime = identity["runtime"]
+            runtime_conflict = requested_runtime_conflict
+            # An authorized administrator/legacy migration is still allowed
+            # to move an exact actor to a new canonical runtime. Non-admin
+            # authenticated clients were rejected above without mutation.
+            runtime = explicit_runtime if runtime_conflict \
+                else identity["runtime"]
+            if runtime_conflict:
+                identity = dict(identity)
+                identity["runtime"] = runtime
+                identity["role"] = requested_parts["role"]
+                identity["persona"] = requested_parts.get("persona")
             if role is None:
                 if identity.get("conflict_roles"):
                     raise AttaccaError(
@@ -7634,17 +8530,23 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
             if allocate_persona:
                 if persona is not None and str(persona).strip():
                     raise AttaccaError(
-                        "choose either automatic color allocation or an "
+                        "choose either automatic name allocation or an "
                         "explicit persona, not both")
                 if role not in AGENT_ROLES:
                     raise AttaccaError(
-                        "automatic color allocation requires an explicit "
+                        "automatic name allocation requires an explicit "
                         "director, advisor, or worker role")
+                # The migration marker proves only that history was scanned
+                # once. Raw maintenance/import writes may have added a named
+                # historical actor afterward, so every *creation* boundary
+                # performs an explicit safe rescan before choosing a name.
+                _seed_project_persona_reservations(
+                    conn, project_id, force=True)
                 persona = next_agent_persona(
-                    records, project_id, role, runtime)
+                    conn, project_id, role, runtime)
                 # A new installation identity is deliberately independent.
                 # Never migrate the currently selected actor's inbox, claims,
-                # handoff, aliases, or lead pointer into the new color.
+                # handoff, aliases, or lead pointer into the new name.
                 distinct_identity = True
             persona = normalize_agent_persona(
                 persona if persona is not None else
@@ -7652,6 +8554,14 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
                  identity.get("persona")))
             agent_id = canonical_agent_id(
                 project_id, role, runtime, persona)
+            if persona and not allocate_persona and not conn.execute(
+                    "SELECT 1 FROM agents WHERE project_id=? AND agent_id=?",
+                    (project_id, agent_id)).fetchone():
+                # Explicit/recovered named identity creation is the other
+                # reuse boundary. Reconcile post-marker durable history before
+                # attempting to reserve the requested short name.
+                _seed_project_persona_reservations(
+                    conn, project_id, force=True)
             matching = [] if distinct_identity else [
                 record["agent_id"] for record in records
                 if _matching_runtime(record, runtime)
@@ -7715,6 +8625,11 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
                     "agent_registration_not_idempotent: authenticated user"
                     " '%s' cannot change an existing actor's owner, role, or"
                     " runtime: %s" % (registration_username, detail))
+            _reserve_agent_persona_in_tx(
+                conn, project_id, persona, agent_id,
+                "agent.automatic_name" if allocate_persona
+                else "agent.explicit_persona",
+                migration_sources=(matching if not distinct_identity else []))
             migration = _migrate_actor_references_in_tx(
                 conn, project_id, matching, agent_id, role)
             # A self-registration/setup action is attributed to the new
@@ -7726,7 +8641,8 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
             if display_name is None:
                 display_name = "%s · %s · %s%s" % (
                     project["name"], role or "unassigned", runtime,
-                    " · %s" % persona if persona else "")
+                    " · %s" % agent_persona_name(persona)
+                    if persona else "")
         else:
             agent_id = requested_id
         row = conn.execute(
@@ -7765,11 +8681,12 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
             result = {"ok": True, "agent_id": agent_id,
                       "already_registered": True,
                       "role": role if role is not None else previous_role,
-                      "identity": {"workspace": project_id,
-                                   "role": role if role is not None else previous_role,
-                                   "runtime": runtime,
-                                   "persona": persona,
-                                   "owner": effective_owner},
+                      "identity": dict(
+                          {"workspace": project_id,
+                           "role": role if role is not None else previous_role,
+                           "runtime": runtime,
+                           "owner": effective_owner},
+                          **agent_persona_fields(persona)),
                       "migration": migration}
             if allocate_persona:
                 result["persona_allocated"] = persona
@@ -7822,9 +8739,10 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
                              in_tx=True)
     result = {"ok": True, "agent_id": agent_id,
               "already_registered": False, "role": role, "event": event,
-              "identity": {"workspace": project_id, "role": role,
-                           "runtime": runtime, "persona": persona,
-                           "owner": owner},
+              "identity": dict(
+                  {"workspace": project_id, "role": role,
+                   "runtime": runtime, "owner": owner},
+                  **agent_persona_fields(persona)),
               "migration": migration}
     if allocate_persona:
         result["persona_allocated"] = persona
@@ -7846,29 +8764,47 @@ def agent_list(conn, project_id, query=None, limit=None, offset=0, sort=None,
         runtime = normalize_agent_runtime(agent.get("runtime")) \
             if agent.get("runtime") else normalize_agent_runtime(
                 actor=agent.get("agent_id"))
-        agent["identity"] = {
+        parsed = parse_canonical_agent_id(
+            agent.get("agent_id"), project_id)
+        persona = (parsed or {}).get("persona")
+        agent["identity"] = dict({
             "workspace": project_id,
             "role": agent.get("role") or "unassigned",
             "runtime": runtime,
-            "persona": (parse_canonical_agent_id(
-                agent.get("agent_id"), project_id) or {}).get("persona"),
             "owner": agent.get("owner"),
-        }
-        parsed = parse_canonical_agent_id(agent.get("agent_id"), project_id)
+        }, **agent_persona_fields(persona))
+        agent.update({key: value for key, value in
+                      agent_persona_fields(persona).items()
+                      if key != "persona"})
         agent["operational_actor_id"] = (agent.get("agent_id") if parsed else
             canonical_agent_id(project_id, agent.get("role"), runtime))
         agents.append(agent)
     if limit is None and query is None and sort is None and not options:
         return {"project": project_id, "agents": agents}
+    identity_metadata = {}
     if options:
         agents = [{key: agent.get(key) for key in (
-            "agent_id", "display_name", "role", "runtime")}
+            "agent_id", "display_name", "role", "runtime",
+            "persona_name", "short_name")}
             for agent in agents]
+        # The append-only reservation directory can grow without bound.  It
+        # is setup-only input used to preview a never-reused name and must not
+        # hitchhike on routine panel/MCP agent pages.
+        identity_metadata = {
+            "persona_names_reserved": [row["persona"] for row in conn.execute(
+                "SELECT persona FROM agent_persona_reservations"
+                " WHERE project_id=? ORDER BY reserved_at,persona",
+                (project_id,))],
+            "next_persona": next_agent_persona(
+                conn, project_id, "director", "codex"),
+        }
     result = _collection_page(
         agents, "agents", query=query, limit=limit, offset=offset, sort=sort,
         date_fields=("registered_at",),
         id_fields=("agent_id",), options=options)
     result["project"] = project_id
+    if identity_metadata:
+        result.update(identity_metadata)
     return result
 
 
@@ -8213,6 +9149,13 @@ def _search_predicate(columns, terms):
 PANEL_COLLECTION_LIMIT = 60
 
 
+def _collection_sort(value, default="newest", label="sort"):
+    selected = str(value or default).strip().lower()
+    if selected not in ("newest", "oldest"):
+        raise AttaccaError("%s must be newest or oldest" % label)
+    return selected
+
+
 def _natural_value(value):
     """Return a deterministic natural-sort key for human-facing ids."""
     return tuple(int(part) if part.isdigit() else part.casefold()
@@ -8221,7 +9164,7 @@ def _natural_value(value):
 
 def _collection_page(rows, key, query=None, limit=60, offset=0,
                      sort="newest", date_fields=None, id_fields=None,
-                     options=False):
+                     options=False, preserve_order=False):
     """Filter and paginate an already-authorized collection.
 
     Authorization/visibility must happen before this helper is called.  That
@@ -8229,6 +9172,7 @@ def _collection_page(rows, key, query=None, limit=60, offset=0,
     records the caller cannot inspect.
     """
     authorized = [dict(row) for row in (rows or [])]
+    selected_sort = _collection_sort(sort)
     unfiltered_total = len(authorized)
     terms = _search_query_terms(query)
     filtered = authorized
@@ -8251,14 +9195,16 @@ def _collection_page(rows, key, query=None, limit=60, offset=0,
         return next((row.get(field) for field in id_fields
                      if row.get(field) is not None), "")
 
-    newest = str(sort or "newest").strip().lower() != "oldest"
-    present = [row for row in filtered if dated(row)]
-    missing = [row for row in filtered if not dated(row)]
-    present.sort(key=lambda row: (dated(row), _natural_value(identifier(row))),
-                 reverse=newest)
-    missing.sort(key=lambda row: _natural_value(identifier(row)),
-                 reverse=newest)
-    filtered = present + missing
+    if not preserve_order:
+        newest = selected_sort == "newest"
+        present = [row for row in filtered if dated(row)]
+        missing = [row for row in filtered if not dated(row)]
+        present.sort(
+            key=lambda row: (dated(row), _natural_value(identifier(row))),
+            reverse=newest)
+        missing.sort(key=lambda row: _natural_value(identifier(row)),
+                     reverse=newest)
+        filtered = present + missing
 
     if options:
         selected = filtered
@@ -8280,6 +9226,11 @@ def _collection_page(rows, key, query=None, limit=60, offset=0,
         "offset": page_offset,
         "has_more": False if options else page_offset + len(selected) < total,
     }
+
+
+def _collection_metadata(page):
+    return {key: page[key] for key in (
+        "total", "unfiltered_total", "limit", "offset", "has_more")}
 
 
 def _search_room_line(row, payload):
@@ -8307,8 +9258,12 @@ def search_project(conn, project_id, query, limit=20, actor_id=None,
     terms = _search_query_terms(query)
     if not terms:
         raise AttaccaError("search query needs at least one letter or number")
-    limit = max(1, min(int(limit or 20), PANEL_COLLECTION_LIMIT))
-    offset = max(0, int(offset or 0))
+    try:
+        limit = max(1, min(int(limit or 20), PANEL_COLLECTION_LIMIT))
+        offset = max(0, int(offset or 0))
+    except (TypeError, ValueError):
+        raise AttaccaError("limit and offset must be integers")
+    sort = _collection_sort(sort)
 
     event_where, event_params = _search_predicate(
         ["payload", "actor_id", "event_type", "task_id"], terms)
@@ -8431,6 +9386,14 @@ def search_project(conn, project_id, query, limit=20, actor_id=None,
             if all(term in canonical_json(value).casefold() for term in terms):
                 role_scopes.append(value)
 
+    persona_where, persona_params = _search_predicate(
+        ["persona", "persona_name"], terms)
+    identity_names = [dict(row) for row in conn.execute(
+        "SELECT project_id,persona,persona_name,reserved_at"
+        " FROM agent_persona_reservations WHERE project_id=? AND " +
+        persona_where + " ORDER BY reserved_at DESC,persona",
+        [project_id] + persona_params).fetchall()]
+
     unified = []
     unified.extend({
         "kind": "event", "id": "#%s" % item["seq"],
@@ -8464,6 +9427,12 @@ def search_project(conn, project_id, query, limit=20, actor_id=None,
         "text": "%s role scope" % item["role"],
         "updated_at": item.get("updated_at"), "data": item,
     } for item in role_scopes)
+    unified.extend({
+        "kind": "identity_name", "id": "@%s" % item["persona_name"],
+        "text": "Reserved identity name @%s (never reused)" %
+                item["persona_name"],
+        "updated_at": item.get("reserved_at"), "data": item,
+    } for item in identity_names)
     page = _collection_page(
         unified, "results", limit=limit, offset=offset, sort=sort,
         date_fields=("updated_at",), id_fields=("id",))
@@ -8484,6 +9453,7 @@ def search_project(conn, project_id, query, limit=20, actor_id=None,
         "rules": selected_by_kind.get("rule", []),
         "handoff_versions": selected_by_kind.get("handoff", []),
         "role_scope_versions": selected_by_kind.get("role_scope", []),
+        "identity_names": selected_by_kind.get("identity_name", []),
         "total_hits": len(unified),
         "hint": ("Punctuation and spacing are ignored between terms; every "
                  "returned record contains all query terms."),
@@ -8662,7 +9632,10 @@ MCP_TOOLS = [
         "inputSchema": {"type": "object", "properties": {
             "project": PROJECT_PROP,
             "role": _s("Role Scope whose revisions to read."),
-            "limit": _i("Max versions (default 20)."),
+            "q": _s("Search the complete revision history before paging."),
+            "limit": _i("Page size (default/max 60)."),
+            "offset": _i("Zero-based revision offset."),
+            "sort": _s("newest | oldest (default newest)."),
         }, "required": ["role"]},
     },
     {
@@ -8671,7 +9644,12 @@ MCP_TOOLS = [
                        "decisions, handoff updates, directives. Use to understand recent "
                        "history beyond the handoff.",
         "inputSchema": {"type": "object", "properties": {
-            "project": PROJECT_PROP, "limit": _i("Max lines (default 40).")}},
+            "project": PROJECT_PROP,
+            "q": _s("Search the complete visible log before paging."),
+            "limit": _i("Page size (default 40, max 60)."),
+            "offset": _i("Zero-based log offset."),
+            "sort": _s("newest | oldest (default newest)."),
+        }},
     },
     {
         "name": "room_send",
@@ -8807,7 +9785,13 @@ MCP_TOOLS = [
         "name": "bridge_list",
         "description": "List connected projects, authority relationships, both "
                        "participation policies, and whether this AI may enter each room.",
-        "inputSchema": {"type": "object", "properties": {"project": PROJECT_PROP}},
+        "inputSchema": {"type": "object", "properties": {
+            "q": _s("Search the complete authorized bridge directory before paging."),
+            "limit": _i("Page size (default/max 60)."),
+            "offset": _i("Zero-based bridge offset."),
+            "sort": _s("newest | oldest (default newest)."),
+            "project": PROJECT_PROP,
+        }},
     },
     {
         "name": "bridge_remove",
@@ -8831,7 +9815,9 @@ MCP_TOOLS = [
                        "work depends on what, why, or who happened earlier.",
         "inputSchema": {"type": "object", "properties": {
             "query": _s("Text to search for (case-insensitive substring)."),
-            "limit": _i("Max hits per category (default 20)."),
+            "limit": _i("One unified result page (default 20, max 60)."),
+            "offset": _i("Zero-based offset across all result kinds."),
+            "sort": _s("newest | oldest (default newest)."),
             "project": PROJECT_PROP,
         }, "required": ["query"]},
     },
@@ -8855,31 +9841,81 @@ MCP_TOOLS = [
     },
     {
         "name": "task_list",
-        "description": "List tasks on the shared board (all workers see the same board). "
-                       "Check this before starting work to avoid duplicating a claimed task.",
+        "description": "List one bounded, server-filtered task-board page (all "
+                       "workers see the same board). Check this before starting "
+                       "work to avoid duplicating a claimed task.",
         "inputSchema": {"type": "object", "properties": {
-            "status": _s("Filter: %s." % " | ".join(TASK_STATUSES)),
+            "status": _s("Filter: active | all | %s." %
+                         " | ".join(TASK_STATUSES)),
+            "q": _s("Search the complete board before slicing."),
+            "limit": {"type": "integer", "minimum": 1, "maximum": 60,
+                      "description": "Tasks per page (default/max 60)."},
+            "offset": {"type": "integer", "minimum": 0,
+                       "description": "Zero-based task offset."},
+            "sort": _s("newest | oldest."),
             "project": PROJECT_PROP,
         }},
     },
     {
         "name": "task_show",
-        "description": "Show one task with its complete immutable action history, "
-                       "including separate AI actor and human-user attribution. Use "
-                       "this after search when investigating a known task.",
+        "description": "Show one task with independent bounded pages of its "
+                       "immutable task actions and human-readable history, "
+                       "including separate AI actor and human-user attribution.",
         "inputSchema": {"type": "object", "properties": {
             "task_id": _s("Task id, e.g. T-3."),
+            "action_q": _s("Search complete task-action history before slicing."),
+            "action_filter": _s("Comma-separated exact task event types."),
+            "action_limit": {"type": "integer", "minimum": 1, "maximum": 60},
+            "action_offset": {"type": "integer", "minimum": 0},
+            "action_sort": _s("newest | oldest."),
+            "history_q": _s("Search complete readable task history before slicing."),
+            "history_filter": _s("Comma-separated exact event types."),
+            "history_limit": {"type": "integer", "minimum": 1, "maximum": 60},
+            "history_offset": {"type": "integer", "minimum": 0},
+            "history_sort": _s("newest | oldest."),
             "project": PROJECT_PROP,
         }, "required": ["task_id"]},
     },
     {
         "name": "task_plan_get",
-        "description": "Open a task's complete detailed plan, its immutable revision "
-                       "list, review actions, approvals, comments, and edit suggestions. "
-                       "Omit version for the latest plan.",
+        "description": "Open a task's complete selected detailed plan plus bounded, "
+                       "server-filtered pages of immutable revisions and that plan's "
+                       "review actions, approvals, comments, and edit suggestions. "
+                       "Omit version for the latest plan; each history page is capped "
+                       "at 60.",
         "inputSchema": {"type": "object", "properties": {
             "task_id": _s("Task id, e.g. T-3."),
             "version": _i("Optional historical plan version."),
+            "revision_q": _s(
+                "Search the complete revision history before slicing."),
+            "revision_filter": _s(
+                "Revision status filter: all, draft, in_review, "
+                "changes_requested, or approved; comma-separated values are "
+                "ORed."),
+            "revision_limit": {
+                "type": "integer", "minimum": 1, "maximum": 60,
+                "description": "Revision rows per page (default/max 60)."},
+            "revision_offset": {
+                "type": "integer", "minimum": 0,
+                "description": "Zero-based revision page offset."},
+            "revision_sort": _s(
+                "newest | oldest (default newest)."),
+            "action_q": _s(
+                "Search the selected plan's complete action/event history "
+                "before slicing."),
+            "action_filter": _s(
+                "Action filter: all, review, created, revised, submitted, "
+                "approved, suggested, or commented; comma-separated values "
+                "are ORed."),
+            "action_limit": {
+                "type": "integer", "minimum": 1, "maximum": 60,
+                "description": "Selected-plan actions per page "
+                "(default/max 60)."},
+            "action_offset": {
+                "type": "integer", "minimum": 0,
+                "description": "Zero-based selected-plan action offset."},
+            "action_sort": _s(
+                "newest | oldest (default oldest for compatibility)."),
             "project": PROJECT_PROP,
         }, "required": ["task_id"]},
     },
@@ -9006,9 +10042,13 @@ MCP_TOOLS = [
     },
     {
         "name": "decision_list",
-        "description": "List decision records (proposed and resolved) for the project.",
+        "description": "List one bounded, server-filtered decision page.",
         "inputSchema": {"type": "object", "properties": {
-            "status": _s("Filter: proposed | accepted | rejected | superseded."),
+            "status": _s("Filter: all | proposed | accepted | rejected | superseded."),
+            "q": _s("Search the complete visible decision set before paging."),
+            "limit": _i("Page size (default/max 60)."),
+            "offset": _i("Zero-based decision offset."),
+            "sort": _s("newest | oldest (default newest)."),
             "project": PROJECT_PROP,
         }},
     },
@@ -9023,6 +10063,11 @@ MCP_TOOLS = [
                 "Include disabled rules (human/Director management only)."),
             "include_all": _b(
                 "Include all role scopes (human/Director management only)."),
+            "status": _s("Filter: all | enabled | disabled."),
+            "q": _s("Search the complete authorized rule set before paging."),
+            "limit": _i("Page size (default/max 60)."),
+            "offset": _i("Zero-based rule offset."),
+            "sort": _s("newest | oldest; omit for binding priority order."),
             "project": PROJECT_PROP,
         }},
     },
@@ -9086,25 +10131,32 @@ MCP_TOOLS = [
     },
     {
         "name": "agent_register",
-        "description": "Register (or refresh) your agent identity for this project: role, "
-                       "display name, runtime. Do this once when you first join a project.",
+        "description": "Register a new generated identity or select one exact existing "
+                       "identity during explicit setup. Ordinary startup silently reuses "
+                       "the installed client binding.",
         "inputSchema": {"type": "object", "properties": {
             "agent_id": _s("Stable id (defaults to your configured actor id)."),
             "display_name": _s("Human-friendly name, e.g. 'Backend Director'."),
             "role": _s("e.g. director, backend, frontend, security_review."),
             "runtime": _s("e.g. claude-code, codex-cli, glm, human."),
-            "persona": _s("Exact existing persona when reusing an identity."),
+            "persona": _s("Existing short name (for example Gibbs) for selection-only reuse."),
             "identity_mode": _s(
                 "reuse | new | temporary. New/temporary allocate the next "
-                "collision-free color; guided setup only."),
+                "project-global never-reused friendly name; reuse never "
+                "migrates or rewrites identity state. Guided setup only."),
             "project": PROJECT_PROP,
         }},
     },
     {
         "name": "agent_list",
-        "description": "List the agents/humans registered in this project and when they "
-                       "were last active.",
-        "inputSchema": {"type": "object", "properties": {"project": PROJECT_PROP}},
+        "description": "List one bounded, server-filtered page of registered agents/humans.",
+        "inputSchema": {"type": "object", "properties": {
+            "q": _s("Search the complete authorized agent directory before paging."),
+            "limit": _i("Page size (default/max 60)."),
+            "offset": _i("Zero-based agent offset."),
+            "sort": _s("newest | oldest (default newest)."),
+            "project": PROJECT_PROP,
+        }},
     },
     {
         "name": "list_projects",
@@ -9112,7 +10164,12 @@ MCP_TOOLS = [
                        "cross-project coordination/messaging). Also returns your effective "
                        "MCP actor identity so guided setup assigns the role to this AI, "
                        "not to the shell user running its helper command.",
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": {"type": "object", "properties": {
+            "q": _s("Search the complete authorized workspace directory before paging."),
+            "limit": _i("Page size (default/max 60)."),
+            "offset": _i("Zero-based workspace offset."),
+            "sort": _s("newest | oldest (default newest)."),
+        }},
     },
     {
         "name": "append_event",
@@ -9455,7 +10512,7 @@ class McpSession:
                                      use_cwd=self.detect_cwd)
         # Register from the raw runtime hint so migration records aliases for
         # both it and the old owner-prefixed form; operations then use the
-        # canonical workspace.role.runtime identity.
+        # canonical workspace.role.runtime[.persona] identity.
         self._auto_register(self._conn(), project, self._actor())
         return project
 
@@ -9505,6 +10562,12 @@ class McpSession:
                 result["projects"] = [
                     item for item in result["projects"]
                     if item["project_id"] in allowed_projects]
+            result = _collection_page(
+                result["projects"], "projects", query=args.get("q"),
+                limit=args.get("limit") or PANEL_COLLECTION_LIMIT,
+                offset=args.get("offset") or 0,
+                sort=args.get("sort") or "newest",
+                date_fields=("created_at",), id_fields=("project_id",))
             # Setup must assign governance to the AI that is actually running,
             # not to the shell account (for example `vscode`) that happens to
             # execute its command. This unscoped call is available before a
@@ -9573,7 +10636,10 @@ class McpSession:
         if name == "bridge_list":
             project, actor = self._project_actor(args)
             return bridge_list(conn, project, actor_id=actor,
-                               actor_type=atype)
+                               actor_type=atype, query=args.get("q"),
+                               limit=args.get("limit") or 60,
+                               offset=args.get("offset") or 0,
+                               sort=args.get("sort") or "newest")
 
         if name == "bridge_update_access":
             project, actor = self._project_actor(args)
@@ -9597,7 +10663,9 @@ class McpSession:
             project, actor = self._project_actor(args)
             return search_project(conn, project, args.get("query"),
                                   limit=args.get("limit") or 20,
-                                  actor_id=actor, actor_type=atype)
+                                  actor_id=actor, actor_type=atype,
+                                  offset=args.get("offset") or 0,
+                                  sort=args.get("sort") or "newest")
 
         if name == "update_handoff":
             project, actor = self._project_actor(args)
@@ -9636,13 +10704,18 @@ class McpSession:
             project, actor = self._project_actor(args)
             return role_scope_history(
                 conn, project, role=args.get("role"),
-                limit=args.get("limit") or 20, actor_id=actor,
-                actor_type=atype)
+                limit=args.get("limit") or PANEL_COLLECTION_LIMIT,
+                actor_id=actor, actor_type=atype, query=args.get("q"),
+                offset=args.get("offset") or 0,
+                sort=args.get("sort") or "newest")
 
         if name == "get_project_log":
             project, actor = self._project_actor(args)
-            return project_log(conn, project, limit=args.get("limit") or 40,
-                               actor_id=actor, actor_type=atype)
+            return project_log(
+                conn, project, limit=args.get("limit") or 40,
+                actor_id=actor, actor_type=atype, query=args.get("q"),
+                offset=args.get("offset") or 0,
+                sort=args.get("sort") or "newest")
 
         if name == "room_send":
             requested = self._project(args)
@@ -9685,16 +10758,42 @@ class McpSession:
 
         if name == "task_list":
             project, actor = self._project_actor(args)
-            return task_list(conn, project, status=args.get("status"))
+            return task_list(
+                conn, project, status=args.get("status"), query=args.get("q"),
+                limit=args.get("limit") or 60, offset=args.get("offset") or 0,
+                sort=args.get("sort") or "newest")
 
         if name == "task_show":
             project, actor = self._project_actor(args)
-            return task_show(conn, project, task_id=args.get("task_id"))
+            return task_show(
+                conn, project, task_id=args.get("task_id"),
+                action_query=args.get("action_q"),
+                action_filter=args.get("action_filter"),
+                action_limit=args.get("action_limit") or 60,
+                action_offset=args.get("action_offset") or 0,
+                action_sort=args.get("action_sort") or "oldest",
+                history_query=args.get("history_q"),
+                history_filter=args.get("history_filter"),
+                history_limit=args.get("history_limit") or 60,
+                history_offset=args.get("history_offset") or 0,
+                history_sort=args.get("history_sort") or "oldest")
 
         if name == "task_plan_get":
             project, actor = self._project_actor(args)
             return task_plan_get(conn, project, task_id=args.get("task_id"),
-                                 version=args.get("version"))
+                                 version=args.get("version"),
+                                 revision_query=args.get("revision_q"),
+                                 revision_filter=args.get("revision_filter"),
+                                 revision_limit=args.get("revision_limit") or 60,
+                                 revision_offset=args.get("revision_offset") or 0,
+                                 revision_sort=args.get("revision_sort") or
+                                 "newest",
+                                 action_query=args.get("action_q"),
+                                 action_filter=args.get("action_filter"),
+                                 action_limit=args.get("action_limit") or 60,
+                                 action_offset=args.get("action_offset") or 0,
+                                 action_sort=args.get("action_sort") or
+                                 "oldest")
 
         if name == "task_plan_set":
             project, actor = self._project_actor(args)
@@ -9767,14 +10866,22 @@ class McpSession:
 
         if name == "decision_list":
             project, actor = self._project_actor(args)
-            return decision_list(conn, project, status=args.get("status"))
+            return decision_list(
+                conn, project, status=args.get("status"),
+                query=args.get("q"), limit=args.get("limit") or 60,
+                offset=args.get("offset") or 0,
+                sort=args.get("sort") or "newest")
 
         if name == "rule_list":
             project, actor = self._project_actor(args)
             return rule_list(
                 conn, project, actor_id=actor, actor_type=atype,
                 include_disabled=bool(args.get("include_disabled")),
-                include_all=bool(args.get("include_all")))
+                include_all=bool(args.get("include_all")),
+                status=args.get("status"), query=args.get("q"),
+                limit=args.get("limit") or 60,
+                offset=args.get("offset") or 0,
+                sort=args.get("sort"))
 
         if name == "rule_create":
             project, actor = self._project_actor(args)
@@ -9827,17 +10934,25 @@ class McpSession:
             authorized_owner_labels = auth_principal_owner_labels(
                 conn, principal) if principal and principal.get("user_id") \
                 else []
-            result = agent_register(
-                conn, project, actor, atype,
-                agent_id=args.get("agent_id"),
-                display_name=args.get("display_name"),
-                role=args.get("role"), runtime=args.get("runtime"),
-                persona=args.get("persona"),
-                allocate_persona=identity_mode in ("new", "temporary"),
-                distinct_identity=identity_mode in ("new", "temporary"),
-                canonical_identity=atype == "agent",
-                registration_username=registration_username,
-                authorized_owner_labels=authorized_owner_labels)
+            if identity_mode == "reuse":
+                result = select_registered_agent_identity(
+                    conn, project, actor, agent_id=args.get("agent_id"),
+                    persona=args.get("persona"), role=args.get("role"),
+                    runtime=args.get("runtime"),
+                    registration_username=registration_username,
+                    authorized_owner_labels=authorized_owner_labels)
+            else:
+                result = agent_register(
+                    conn, project, actor, atype,
+                    agent_id=args.get("agent_id"),
+                    display_name=args.get("display_name"),
+                    role=args.get("role"), runtime=args.get("runtime"),
+                    persona=args.get("persona"),
+                    allocate_persona=identity_mode in ("new", "temporary"),
+                    distinct_identity=identity_mode in ("new", "temporary"),
+                    canonical_identity=atype == "agent",
+                    registration_username=registration_username,
+                    authorized_owner_labels=authorized_owner_labels)
             if identity_mode:
                 # This is the server-side half of the explicit setup choice.
                 # A connect proxy mirrors the selected id into either its
@@ -9857,7 +10972,11 @@ class McpSession:
 
         if name == "agent_list":
             project, actor = self._project_actor(args)
-            return agent_list(conn, project)
+            return agent_list(
+                conn, project, query=args.get("q"),
+                limit=args.get("limit") or 60,
+                offset=args.get("offset") or 0,
+                sort=args.get("sort") or "newest")
 
         if name == "append_event":
             project, actor = self._project_actor(args)
@@ -9987,6 +11106,7 @@ def _api_project_init(conn, actor_id, actor_type, body):
                      {"name": name, "root_path": None,
                       "repository_fingerprint": repository_fingerprint},
                      in_tx=True)
+        _seed_default_authority_rule_in_tx(conn, project_id)
         _grant_new_project_creator_membership_in_tx(
             conn, project_id, actor_id, actor_type)
     return {"project_id": project_id, "name": name, "root_path": None,
@@ -10051,8 +11171,12 @@ def activity_history(conn, project_id, actor_id=None, actor_type="agent",
                      known_latest_seq=None):
     """Visibility-filtered full-ledger search, then stable 60-row paging."""
     get_project(conn, project_id)
-    limit = max(1, min(int(limit or 60), 60))
-    offset = max(0, int(offset or 0))
+    try:
+        limit = max(1, min(int(limit or 60), 60))
+        offset = max(0, int(offset or 0))
+    except (TypeError, ValueError):
+        raise AttaccaError("limit and offset must be integers")
+    selected_sort = _collection_sort(sort)
     rows = conn.execute(
         "SELECT * FROM events WHERE project_id=? ORDER BY seq ASC",
         (project_id,)).fetchall()
@@ -10086,7 +11210,7 @@ def activity_history(conn, project_id, actor_id=None, actor_type="agent",
                           "payload": payload,
                       }).casefold() for term in terms)]
     total = len(authorized)
-    reverse = str(sort or "newest").lower() != "oldest"
+    reverse = selected_sort == "newest"
     authorized.sort(key=lambda item: int(item[0]["seq"]), reverse=reverse)
     latest_seq = max((int(row["seq"]) for row, _ in authorized), default=0)
     if known_latest_seq is None:
@@ -10715,6 +11839,10 @@ def _sync_projection(conn, scope):
         conn, scope["project_id"], actor_id=scope["actor_id"],
         actor_type=scope["actor_type"],
         include_all=scope["actor_type"] == "human")["scopes"]
+    persona_reservations = [dict(row) for row in conn.execute(
+        "SELECT project_id,persona,persona_name,reserved_at"
+        " FROM agent_persona_reservations WHERE project_id=?"
+        " ORDER BY reserved_at,persona", (scope["project_id"],)).fetchall()]
     projection = {
         "project": snapshot["project"],
         # ``handoffs`` remains the schema-v1 compatibility resource name, but
@@ -10723,6 +11851,9 @@ def _sync_projection(conn, scope):
         "handoffs": identity_handoffs,
         "identity_handoffs": identity_handoffs,
         "role_scopes": role_scopes,
+        # Negotiated schema-v2 resource. The originating actor/source are
+        # administrative audit details and are deliberately not mirrored.
+        "persona_reservations": persona_reservations,
         "rules": rules,
         "cloud_context": cloud_context_get(
             conn, scope["project_id"])["cloud_context"],
@@ -13336,9 +14467,41 @@ def _r_auth_logout(h, m, q):
                    "Cache-Control": "no-store"})
 
 
+_AUTH_COLLECTION_FIELDS = {
+    "tokens": (("last_used_at", "created_at"), ("token_id",)),
+    "terminals": (("last_used_at", "created_at"), ("token_id",)),
+    "terminal_enrollments": (("created_at",), ("user_code",)),
+    "client_keys": (("last_used_at", "created_at"), ("token_id",)),
+    "service_keys": (("last_used_at", "created_at"), ("token_id",)),
+    "invitations": (("created_at",), ("invitation_id",)),
+}
+
+
+def _auth_collection_page(rows, key, q, prefix=None):
+    """Page one legacy credential inventory without hiding exact totals."""
+    prefix = str(prefix or "").strip("_")
+
+    def option(name, default=None):
+        scoped = "%s_%s" % (prefix, name) if prefix else name
+        if q.get(scoped) is not None:
+            return q.get(scoped)
+        if prefix and q.get(name) is not None:
+            return q.get(name)
+        return default
+
+    dates, identifiers = _AUTH_COLLECTION_FIELDS[key]
+    return _collection_page(
+        rows or [], key, query=option("q"),
+        limit=option("limit", PANEL_COLLECTION_LIMIT),
+        offset=option("offset", 0), sort=option("sort", "newest"),
+        date_fields=dates, id_fields=identifiers)
+
+
 def _r_auth_tokens_list(h, m, q):
     principal = _require_auth_session(h)
-    h._reply_json(200, auth_token_list(h._conn(), principal["username"]),
+    payload = auth_token_list(h._conn(), principal["username"])
+    page = _auth_collection_page(payload.get("tokens"), "tokens", q)
+    h._reply_json(200, dict({"username": payload["username"]}, **page),
                   {"Cache-Control": "no-store"})
 
 
@@ -13394,8 +14557,19 @@ def _r_auth_access(h, m, q):
     # account-wide enrollment/migration data is browser-session only.
     if principal and principal.get("auth_kind") != "session":
         principal = None
-    h._reply_json(200, auth_access_payload(
-        h._conn(), principal=principal, server=h.server),
+    payload = auth_access_payload(
+        h._conn(), principal=principal, server=h.server)
+    pages = {}
+    for key in ("terminals", "terminal_enrollments", "client_keys",
+                "service_keys", "invitations"):
+        page = _auth_collection_page(payload.get(key), key, q, prefix=key)
+        payload[key] = page[key]
+        pages[key] = _collection_metadata(page)
+    payload["collection_pages"] = pages
+    payload["collection_counts"] = {
+        key: value["unfiltered_total"] for key, value in pages.items()}
+    payload["bounded_summary"] = True
+    h._reply_json(200, payload,
         {"Cache-Control": "no-store"})
 
 
@@ -13403,10 +14577,14 @@ def _r_auth_terminal_enrollments(h, m, q):
     principal = _require_admin_session(h)
     payload = auth_access_payload(
         h._conn(), principal=principal, server=h.server)
-    h._reply_json(200, {
-        "terminal_enrollments": payload["terminal_enrollments"],
-        "terminals": payload["terminals"],
-    }, {"Cache-Control": "no-store"})
+    enrollments = _auth_collection_page(
+        payload["terminal_enrollments"], "terminal_enrollments", q)
+    terminals = _auth_collection_page(
+        payload["terminals"], "terminals", q, prefix="terminals")
+    result = dict(enrollments)
+    result["terminals"] = terminals["terminals"]
+    result["terminals_pagination"] = _collection_metadata(terminals)
+    h._reply_json(200, result, {"Cache-Control": "no-store"})
 
 
 def _r_auth_terminal_enrollment_get(h, m, q):
@@ -13490,7 +14668,8 @@ def _r_auth_service_keys(h, m, q):
     principal = _require_auth_session(h)
     payload = auth_access_payload(
         h._conn(), principal=principal, server=h.server)
-    h._reply_json(200, {"service_keys": payload["service_keys"]},
+    h._reply_json(200, _auth_collection_page(
+        payload["service_keys"], "service_keys", q),
                   {"Cache-Control": "no-store"})
 
 
@@ -13515,7 +14694,8 @@ def _r_auth_invitations(h, m, q):
     principal = _require_admin_session(h)
     payload = auth_access_payload(
         h._conn(), principal=principal, server=h.server)
-    h._reply_json(200, {"invitations": payload["invitations"]},
+    h._reply_json(200, _auth_collection_page(
+        payload["invitations"], "invitations", q),
                   {"Cache-Control": "no-store"})
 
 
@@ -13737,8 +14917,13 @@ def _r_projects_list(h, m, q):
                               if project["project_id"] in allowed]
     options = str(q.get("options", "0")).lower() in ("1", "true", "yes")
     if options:
-        result["projects"] = [{key: project.get(key) for key in (
-            "project_id", "name")}
+        # Guided setup consumes this complete authorized directory to match a
+        # checkout to its stable workspace and to show the current Lead
+        # Director before asking whether a new Director should lead.  These
+        # fields are non-secret discovery metadata; dropping them makes the
+        # options endpoint complete in row count but unusable in meaning.
+        result["projects"] = [
+            _project_setup_option(h._conn(), project)
             for project in result["projects"]]
     page = _collection_page(
         result["projects"], "projects", query=q.get("q"),
@@ -14351,14 +15536,41 @@ def _r_task_create(h, m, q):
 
 
 def _r_task_show(h, m, q):
-    h._reply_json(200, task_show(h._conn(), m.group(1), m.group(2)))
+    h._reply_json(200, task_show(
+        h._conn(), m.group(1), m.group(2),
+        action_query=q.get("action_q"),
+        action_filter=q.get("action_filter"),
+        action_limit=q.get("action_limit") or 60,
+        action_offset=q.get("action_offset") or 0,
+        action_sort=q.get("action_sort") or "oldest",
+        history_query=q.get("history_q"),
+        history_filter=q.get("history_filter"),
+        history_limit=q.get("history_limit") or 60,
+        history_offset=q.get("history_offset") or 0,
+        history_sort=q.get("history_sort") or "oldest"))
 
 
 def _r_task_plan_get(h, m, q):
     version = q.get("version")
     h._reply_json(200, task_plan_get(
         h._conn(), m.group(1), m.group(2),
-        version=int(version) if version is not None else None))
+        version=version,
+        revision_query=q.get("revision_q") or q.get("revisions_q"),
+        revision_filter=q.get("revision_filter") or
+        q.get("revisions_filter"),
+        revision_limit=q.get("revision_limit") or
+        q.get("revisions_limit") or 60,
+        revision_offset=q.get("revision_offset") or
+        q.get("revisions_offset") or 0,
+        revision_sort=q.get("revision_sort") or
+        q.get("revisions_sort") or "newest",
+        action_query=q.get("action_q") or q.get("actions_q"),
+        action_filter=q.get("action_filter") or q.get("actions_filter"),
+        action_limit=q.get("action_limit") or q.get("actions_limit") or 60,
+        action_offset=q.get("action_offset") or
+        q.get("actions_offset") or 0,
+        action_sort=q.get("action_sort") or q.get("actions_sort") or
+        "oldest"))
 
 
 def _r_task_plan_set(h, m, q):
@@ -14456,7 +15668,7 @@ def _r_rules_list(h, m, q):
         h._conn(), m.group(1), actor_id=actor, actor_type=atype,
         include_disabled=include_disabled, include_all=include_all,
         query=q.get("q"), limit=q.get("limit") or PANEL_COLLECTION_LIMIT,
-        offset=q.get("offset") or 0, sort=q.get("sort") or "newest",
+        offset=q.get("offset") or 0, sort=q.get("sort"),
         status=q.get("status")))
 
 
@@ -14537,11 +15749,44 @@ def _r_poll_status(h, m, q):
 
 def _r_agents_list(h, m, q):
     options = str(q.get("options", "0")).lower() in ("1", "true", "yes")
-    h._reply_json(200, agent_list(
+    reuse_options = str(q.get("reuse_options", "0")).lower() in (
+        "1", "true", "yes")
+    if reuse_options:
+        options = True
+    result = agent_list(
         h._conn(), m.group(1), query=q.get("q"),
         limit=q.get("limit") or PANEL_COLLECTION_LIMIT,
         offset=q.get("offset") or 0, sort=q.get("sort") or "newest",
-        options=options))
+        options=options)
+    if reuse_options:
+        principal = getattr(h, "principal", None) or {}
+        request_actor, request_actor_type = h._actor()
+        exact_current_actor = request_actor \
+            if request_actor_type == "agent" else None
+        labels = auth_principal_owner_labels(
+            h._conn(), principal) if principal.get("user_id") else []
+        if not labels and current_owner():
+            labels = [current_owner()]
+        owner_keys = {_auth_owner_alias_key(value) for value in labels
+                      if str(value or "").strip()}
+        owners = {row["agent_id"]: row["owner"] for row in h._conn().execute(
+            "SELECT agent_id,owner FROM agents WHERE project_id=?",
+            (m.group(1),)).fetchall()}
+        # A compatibility setup request may already carry an exact machine
+        # binding while having no historical owner label.  Keep that one
+        # current actor usable without widening the directory to any other
+        # owner (or to other ownerless compatibility rows).
+        result["agents"] = [
+            row for row in result.get("agents") or []
+            if row.get("agent_id") == exact_current_actor or (
+                owners.get(row.get("agent_id")) and
+                _auth_owner_alias_key(owners[row["agent_id"]]) in owner_keys)]
+        result.update({"total": len(result["agents"]),
+                       "unfiltered_total": len(result["agents"]),
+                       "limit": max(1, len(result["agents"])),
+                       "offset": 0, "has_more": False,
+                       "reuse_options": True})
+    h._reply_json(200, result)
 
 
 def _r_agent_register(h, m, q):
@@ -14558,24 +15803,40 @@ def _r_agent_register(h, m, q):
     registration_username = principal.get("username") if principal else None
     authorized_owner_labels = auth_principal_owner_labels(
         h._conn(), principal) if principal and principal.get("user_id") else []
-    result = agent_register(
-        h._conn(), m.group(1), actor, atype, agent_id=body.get("agent_id"),
-        display_name=body.get("display_name"), role=body.get("role"),
-        runtime=body.get("runtime"), persona=body.get("persona"),
-        allocate_persona=(body.get("allocate_persona") is True or
-                          body.get("identity_mode") in ("new", "temporary")),
-        distinct_identity=(body.get("distinct_identity") is True or
-                           body.get("identity_mode") in ("new", "temporary")),
-        canonical_identity=(atype == "agent" or
-                            bool(principal and
-                                 principal.get("token_kind") == "client") or
-                            (atype == "human" and
-                             body.get("canonical_identity") is True)),
-        registration_username=registration_username,
-        allow_foreign_owner=bool(
-            principal and principal.get("auth_kind") == "session"
-            and principal.get("is_admin")),
-        authorized_owner_labels=authorized_owner_labels)
+    identity_mode = str(body.get("identity_mode") or "").strip().lower()
+    if identity_mode and identity_mode not in ("reuse", "new", "temporary"):
+        raise AttaccaError(
+            "identity mode must be reuse, new, or temporary")
+    admin_override = bool(
+        principal and principal.get("auth_kind") == "session"
+        and principal.get("is_admin"))
+    if identity_mode == "reuse":
+        result = select_registered_agent_identity(
+            h._conn(), project_id, actor, agent_id=body.get("agent_id"),
+            persona=body.get("persona"), role=body.get("role"),
+            runtime=body.get("runtime"),
+            registration_username=registration_username,
+            allow_foreign_owner=admin_override,
+            authorized_owner_labels=authorized_owner_labels)
+        result["identity_mode"] = "reuse"
+    else:
+        result = agent_register(
+            h._conn(), m.group(1), actor, atype,
+            agent_id=body.get("agent_id"),
+            display_name=body.get("display_name"), role=body.get("role"),
+            runtime=body.get("runtime"), persona=body.get("persona"),
+            allocate_persona=(body.get("allocate_persona") is True or
+                              identity_mode in ("new", "temporary")),
+            distinct_identity=(body.get("distinct_identity") is True or
+                               identity_mode in ("new", "temporary")),
+            canonical_identity=(atype == "agent" or
+                                bool(principal and
+                                     principal.get("token_kind") == "client") or
+                                (atype == "human" and
+                                 body.get("canonical_identity") is True)),
+            registration_username=registration_username,
+            allow_foreign_owner=admin_override,
+            authorized_owner_labels=authorized_owner_labels)
     h._reply_json(200, result)
 
 
@@ -15079,7 +16340,7 @@ def _offline_proxy_marker(adapter, proof):
 def _offline_proxy_mark(result, adapter, proof):
     value = dict(result)
     value.update(_offline_proxy_marker(adapter, proof))
-    value.setdefault("pending_mutations", [{
+    pending = [{
         "kind": "pending_mutation",
         "client_mutation_id": item["client_mutation_id"],
         "operation": item["operation"],
@@ -15089,7 +16350,14 @@ def _offline_proxy_mark(result, adapter, proof):
         "pending_sync": True,
         "local_only": True,
         "hint": "Queued locally; not yet accepted by the hosted ledger.",
-    } for item in adapter.pending_overlays()])
+    } for item in adapter.pending_overlays()]
+    if "pending_mutations" not in value:
+        pending_page = _collection_page(
+            pending, "pending_mutations", limit=PANEL_COLLECTION_LIMIT,
+            offset=0, sort="newest", id_fields=("client_mutation_id",))
+        value["pending_mutations"] = pending_page["pending_mutations"]
+        value["pending_mutations_pagination"] = _collection_metadata(
+            pending_page)
     return value
 
 
@@ -15101,9 +16369,17 @@ def _offline_proxy_task(projection, task_id):
     return dict(task)
 
 
-def _offline_proxy_plan(snapshot, task_id, version=None):
+def _offline_proxy_plan(snapshot, task_id, version=None,
+                        revision_query=None, revision_filter=None,
+                        revision_limit=60, revision_offset=0,
+                        revision_sort="newest", action_query=None,
+                        action_filter=None, action_limit=60,
+                        action_offset=0, action_sort="oldest"):
     projection = snapshot["projection"]
     _offline_proxy_task(projection, task_id)
+    revision_sort = _task_plan_sort(
+        revision_sort, "newest", "revision")
+    action_sort = _task_plan_sort(action_sort, "oldest", "action")
     plans = [dict(item) for item in projection.get("task_plans", [])
              if item.get("task_id") == task_id]
     plans.sort(key=lambda item: int(item.get("version") or 0), reverse=True)
@@ -15119,9 +16395,26 @@ def _offline_proxy_plan(snapshot, task_id, version=None):
         if selected is None:
             raise AttaccaError(
                 "task %s has no cached plan version %s" % (task_id, wanted))
+    revisions = [_task_plan_summary(item, include_search=True)
+                 for item in plans]
+    revision_page = _task_plan_page(
+        revisions, "revisions", query=revision_query,
+        filter_value=revision_filter, filter_kind="revision",
+        limit=revision_limit, offset=revision_offset, sort=revision_sort)
+    empty_action_page = _task_plan_page(
+        [], "actions", query=action_query, filter_value=action_filter,
+        filter_kind="action", limit=action_limit, offset=action_offset,
+        sort=action_sort)
     if selected is None:
-        return {"project": snapshot["scope"]["project_id"],
-                "task_id": task_id, "plan": None, "revisions": []}
+        result = {"project": snapshot["scope"]["project_id"],
+                  "task_id": task_id, "plan": None,
+                  "revisions": revision_page["revisions"],
+                  "pagination": {
+                      "revisions": _task_plan_page_metadata(revision_page),
+                      "actions": _task_plan_page_metadata(empty_action_page),
+                  }}
+        result.update(_task_plan_page_metadata(revision_page))
+        return result
     selected_version = int(selected.get("version") or 0)
     events = [event for event in _offline_proxy_visible_events(snapshot)
               if event.get("task_id") == task_id
@@ -15129,25 +16422,27 @@ def _offline_proxy_plan(snapshot, task_id, version=None):
               and int((event.get("payload") or {}).get("plan_version") or 0)
               == selected_version]
     actions = [_offline_proxy_action(event) for event in events]
-    selected["actions"] = actions
-    selected["approvals"] = [item for item in actions
+    action_page = _task_plan_page(
+        actions, "actions", query=action_query,
+        filter_value=action_filter, filter_kind="action",
+        limit=action_limit, offset=action_offset, sort=action_sort)
+    selected["actions"] = action_page["actions"]
+    selected["approvals"] = [item for item in selected["actions"]
                               if item["event_type"] == "task.plan.approved"]
-    selected["suggestions"] = [item for item in actions
+    selected["suggestions"] = [item for item in selected["actions"]
                                 if item["event_type"] == "task.plan.suggested"]
-    selected["comments"] = [item for item in actions
+    selected["comments"] = [item for item in selected["actions"]
                              if item["event_type"] == "task.plan.commented"]
-    revisions = [{
-        "version": item.get("version"), "status": item.get("status"),
-        "title": item.get("title"),
-        "section_count": len(item.get("sections") or []),
-        "content_sha256": item.get("content_sha256"),
-        "authored_by": item.get("authored_by"),
-        "authored_owner": item.get("authored_owner"),
-        "authored_at": item.get("authored_at"),
-        "updated_at": item.get("updated_at"),
-    } for item in plans]
-    return {"project": snapshot["scope"]["project_id"],
-            "task_id": task_id, "plan": selected, "revisions": revisions}
+    selected["actions_pagination"] = _task_plan_page_metadata(action_page)
+    result = {"project": snapshot["scope"]["project_id"],
+              "task_id": task_id, "plan": selected,
+              "revisions": revision_page["revisions"],
+              "pagination": {
+                  "revisions": _task_plan_page_metadata(revision_page),
+                  "actions": _task_plan_page_metadata(action_page),
+              }}
+    result.update(_task_plan_page_metadata(revision_page))
+    return result
 
 
 def _offline_proxy_collect_refs(value, found=None):
@@ -15482,11 +16777,19 @@ class OfflineProxySession:
             }
             return _offline_proxy_mark(result, adapter, proof)
         if name == "get_project_log":
-            limit = max(1, min(int(args.get("limit") or 40), 1000))
-            return _offline_proxy_mark({
-                "project": project_id,
-                "log": (projection.get("full_log") or [])[-limit:],
-            }, adapter, proof)
+            entries = [{"line": str(line), "seq": index + 1,
+                        "created_at": str(line)[:24]}
+                       for index, line in enumerate(
+                           projection.get("full_log") or [])]
+            page = _collection_page(
+                entries, "entries", query=args.get("q"),
+                limit=args.get("limit") or 40,
+                offset=args.get("offset") or 0,
+                sort=args.get("sort") or "newest",
+                date_fields=("created_at",), id_fields=("seq",))
+            page["log"] = [item["line"] for item in page["entries"]]
+            return _offline_proxy_mark(
+                dict({"project": project_id}, **page), adapter, proof)
         if name == "room_read":
             limit = max(1, min(int(args.get("limit") or 30), 500))
             since = args.get("since_seq")
@@ -15525,69 +16828,183 @@ class OfflineProxySession:
                 mark_read=mark_read, limit=args.get("limit") or 50),
                 adapter, proof)
         if name == "bridge_list":
-            return _offline_proxy_mark({
-                "project": project_id,
-                "bridges": projection.get("bridges") or [],
-            }, adapter, proof)
-        if name == "task_list":
-            status_filter = args.get("status")
-            if status_filter and status_filter not in TASK_STATUSES:
-                raise AttaccaError(
-                    "status must be one of %s" % ", ".join(TASK_STATUSES))
-            tasks = [dict(item) for item in projection.get("tasks", [])
-                     if not status_filter or item.get("status") == status_filter]
+            page = _collection_page(
+                projection.get("bridges") or [], "bridges",
+                query=args.get("q"), limit=args.get("limit") or 60,
+                offset=args.get("offset") or 0,
+                sort=args.get("sort") or "newest",
+                date_fields=("created_at",), id_fields=("with",))
             return _offline_proxy_mark(
-                {"project": project_id, "tasks": tasks}, adapter, proof)
+                dict({"project": project_id}, **page), adapter, proof)
+        if name == "task_list":
+            status_filter = str(args.get("status") or "").strip().lower()
+            if status_filter and status_filter not in TASK_STATUSES + [
+                    "active", "all"]:
+                raise AttaccaError(
+                    "status must be one of active, all, %s" %
+                    ", ".join(TASK_STATUSES))
+            all_tasks = [dict(item) for item in projection.get("tasks", [])]
+            if status_filter == "active":
+                tasks = [item for item in all_tasks if item.get("status") not in
+                         ("done", "cancelled")]
+            elif status_filter and status_filter != "all":
+                tasks = [item for item in all_tasks
+                         if item.get("status") == status_filter]
+            else:
+                tasks = all_tasks
+            page = _collection_page(
+                tasks, "tasks", query=args.get("q"),
+                limit=args.get("limit") or 60,
+                offset=args.get("offset") or 0,
+                sort=args.get("sort") or "newest",
+                date_fields=("updated_at", "created_at"),
+                id_fields=("task_id",))
+            page["unfiltered_total"] = len(all_tasks)
+            return _offline_proxy_mark(
+                dict({"project": project_id}, **page), adapter, proof)
         if name == "task_show":
             task = _offline_proxy_task(projection, args.get("task_id"))
             task_events = [event for event in events
                            if event.get("task_id") == task.get("task_id")]
-            task["actions"] = [_offline_proxy_action(event)
-                               for event in task_events
-                               if str(event.get("event_type") or "").startswith(
-                                   "task.")]
-            task["history"] = [
-                "%s %s by %s" % (event.get("created_at"),
-                                  event.get("event_type"),
-                                  event.get("actor_id"))
-                for event in task_events]
+            all_actions = [_offline_proxy_action(event)
+                           for event in task_events
+                           if str(event.get("event_type") or "").startswith(
+                               "task.")]
+            actions = _task_history_filter(
+                all_actions, args.get("action_filter"))
+            action_page = _collection_page(
+                actions, "actions", query=args.get("action_q"),
+                limit=args.get("action_limit") or 60,
+                offset=args.get("action_offset") or 0,
+                sort=args.get("action_sort") or "oldest",
+                date_fields=("at",), id_fields=("seq",))
+            action_page["unfiltered_total"] = len(all_actions)
+            task["actions"] = action_page["actions"]
+            task["actions_total"] = len(all_actions)
+            task["actions_compacted"] = len(all_actions) > len(
+                task["actions"])
+            task["actions_pagination"] = {
+                key: action_page[key] for key in (
+                    "total", "unfiltered_total", "limit", "offset",
+                    "has_more")}
+            all_history = [{
+                "line": "%s %s by %s" % (
+                    event.get("created_at"), event.get("event_type"),
+                    event.get("actor_id")),
+                "seq": event.get("seq"), "at": event.get("created_at"),
+                "event_type": event.get("event_type"),
+                "actor_id": event.get("actor_id"),
+                "payload": event.get("payload") or {},
+            } for event in task_events]
+            history = _task_history_filter(
+                all_history, args.get("history_filter"))
+            history_page = _collection_page(
+                history, "history", query=args.get("history_q"),
+                limit=args.get("history_limit") or 60,
+                offset=args.get("history_offset") or 0,
+                sort=args.get("history_sort") or "oldest",
+                date_fields=("at",), id_fields=("seq",))
+            history_page["unfiltered_total"] = len(all_history)
+            task["history"] = [item["line"]
+                               for item in history_page["history"]]
+            task["history_pagination"] = {
+                key: history_page[key] for key in (
+                    "total", "unfiltered_total", "limit", "offset",
+                    "has_more")}
             return _offline_proxy_mark(task, adapter, proof)
         if name == "task_plan_get":
             return _offline_proxy_mark(_offline_proxy_plan(
-                snapshot, args.get("task_id"), args.get("version")),
+                snapshot, args.get("task_id"), args.get("version"),
+                revision_query=args.get("revision_q"),
+                revision_filter=args.get("revision_filter"),
+                revision_limit=args.get("revision_limit") or 60,
+                revision_offset=args.get("revision_offset") or 0,
+                revision_sort=args.get("revision_sort") or "newest",
+                action_query=args.get("action_q"),
+                action_filter=args.get("action_filter"),
+                action_limit=args.get("action_limit") or 60,
+                action_offset=args.get("action_offset") or 0,
+                action_sort=args.get("action_sort") or "oldest"),
                 adapter, proof)
         if name == "decision_list":
-            wanted = args.get("status")
-            decisions = [dict(item) for item in projection.get("decisions", [])
+            wanted = str(args.get("status") or "").strip().lower()
+            if wanted == "all":
+                wanted = ""
+            if wanted and wanted not in DECISION_STATUSES:
+                raise AttaccaError(
+                    "decision status must be one of all, %s" %
+                    ", ".join(DECISION_STATUSES))
+            all_decisions = [dict(item) for item in
+                             projection.get("decisions", [])]
+            decisions = [item for item in all_decisions
                          if not wanted or item.get("status") == wanted]
+            page = _collection_page(
+                decisions, "decisions", query=args.get("q"),
+                limit=args.get("limit") or 60,
+                offset=args.get("offset") or 0,
+                sort=args.get("sort") or "newest",
+                date_fields=("resolved_at", "created_at"),
+                id_fields=("decision_id",))
+            page["unfiltered_total"] = len(all_decisions)
             return _offline_proxy_mark(
-                {"project": project_id, "decisions": decisions},
-                adapter, proof)
+                dict({"project": project_id}, **page), adapter, proof)
         if name == "rule_list":
             if args.get("include_disabled") or args.get("include_all"):
                 raise AttaccaError(
                     "offline mirror contains applicable active rules only; "
                     "rule management views require hosted MCP")
-            return _offline_proxy_mark({
-                "project": project_id, "role": scope["role"],
-                "rules": adapter.rules_for_role(scope["role"]),
-            }, adapter, proof)
+            status = str(args.get("status") or "").strip().lower()
+            if status == "all":
+                status = ""
+            if status not in ("", "enabled", "disabled"):
+                raise AttaccaError(
+                    "rule status must be all, enabled, or disabled")
+            if status == "disabled":
+                raise AttaccaError(
+                    "disabled rule inventory requires hosted MCP")
+            rules = adapter.rules_for_role(scope["role"])
+            enabled_total = sum(
+                1 for rule in rules if rule.get("enabled", True))
+            page = _collection_page(
+                rules, "rules", query=args.get("q"),
+                limit=args.get("limit") or 60,
+                offset=args.get("offset") or 0,
+                sort=args.get("sort"),
+                date_fields=("updated_at", "created_at"),
+                id_fields=("rule_id",),
+                preserve_order=args.get("sort") is None)
+            return _offline_proxy_mark(dict({
+                "project": project_id, "actor_role": scope["role"],
+                "applicable_scopes": ["everyone", scope["role"]],
+                "enabled_total": enabled_total,
+            }, **page), adapter, proof)
         if name == "agent_list":
-            return _offline_proxy_mark({
-                "project": project_id,
-                "agents": projection.get("agents") or [],
-            }, adapter, proof)
+            page = _collection_page(
+                projection.get("agents") or [], "agents",
+                query=args.get("q"), limit=args.get("limit") or 60,
+                offset=args.get("offset") or 0,
+                sort=args.get("sort") or "newest",
+                date_fields=("registered_at", "last_seen_at"),
+                id_fields=("agent_id",))
+            return _offline_proxy_mark(
+                dict({"project": project_id}, **page), adapter, proof)
         if name == "list_projects":
             scoped_project = dict(project)
             scoped_project.setdefault("project_id", project_id)
-            return _offline_proxy_mark({
-                "projects": [scoped_project], "scope_limited": True,
+            page = _collection_page(
+                [scoped_project], "projects", query=args.get("q"),
+                limit=args.get("limit") or 60,
+                offset=args.get("offset") or 0,
+                sort=args.get("sort") or "newest",
+                date_fields=("created_at",), id_fields=("project_id",))
+            return _offline_proxy_mark(dict({
+                "scope_limited": True,
                 "you": {"actor_id": scope["actor_id"],
                         "actor_type": scope["actor_type"],
                         "runtime": self.runtime,
                         "owner": scope["principal_id"],
                         "identity_pending": False},
-            }, adapter, proof)
+            }, **page), adapter, proof)
         if name == "check_freshness":
             current = project.get("context_version") or \
                 snapshot["cursor"]["context_version"]
@@ -15614,7 +17031,6 @@ class OfflineProxySession:
             if not terms:
                 raise AttaccaError(
                     "search query needs at least one letter or number")
-            limit = max(1, min(int(args.get("limit") or 20), 100))
 
             def matches(value):
                 text = " ".join(re.findall(
@@ -15622,7 +17038,7 @@ class OfflineProxySession:
                 return all(term in text for term in terms)
 
             event_hits = []
-            for event in reversed(events):
+            for event in events:
                 if not matches(event):
                     continue
                 payload = event.get("payload") or {}
@@ -15649,47 +17065,123 @@ class OfflineProxySession:
                                  "authority": payload.get("authority"),
                                  "mirrored_to": payload.get("mirrored_to") or []})
                 event_hits.append(item)
-                if len(event_hits) >= limit:
-                    break
             task_hits = [dict(item) for item in projection.get("tasks", [])
-                         if matches(item)][:limit]
+                         if matches(item)]
             decision_hits = [dict(item) for item in
                              projection.get("decisions", [])
-                             if matches(item)][:limit]
+                             if matches(item)]
             rule_hits = [dict(item) for item in adapter.rules_for_role(
-                scope["role"]) if matches(item)][:limit]
+                scope["role"]) if matches(item)]
             handoff_hits = [dict(item) for item in
-                            reversed(projection.get("handoffs", []))
-                            if matches(item)][:limit]
-            pending_hits = []
-            for overlay in adapter.pending_overlays():
-                if not matches(overlay):
-                    continue
-                pending_hits.append({
-                    "kind": "pending_mutation",
-                    "client_mutation_id": overlay["client_mutation_id"],
-                    "operation": overlay["operation"],
-                    "payload": overlay["payload"],
-                    "metadata": overlay["metadata"],
-                    "sync_state": overlay["sync_state"],
-                    "pending_sync": True,
-                    "local_only": True,
-                    "hint": "Queued locally; not yet accepted by the hosted ledger.",
-                })
-                if len(pending_hits) >= limit:
-                    break
+                            projection.get("identity_handoffs",
+                                           projection.get("handoffs", []))
+                            if matches(item)]
+            role_scope_hits = [dict(item) for item in
+                               projection.get("role_scopes", [])
+                               if matches(item)]
+            identity_name_hits = [dict(item) for item in
+                                  projection.get("persona_reservations", [])
+                                  if matches(item)]
+            pending_hits = [{
+                "kind": "pending_mutation",
+                "client_mutation_id": overlay["client_mutation_id"],
+                "operation": overlay["operation"],
+                "payload": overlay["payload"],
+                "metadata": overlay["metadata"],
+                "sync_state": overlay["sync_state"],
+                "pending_sync": True,
+                "local_only": True,
+                "hint": "Queued locally; not yet accepted by the hosted ledger.",
+            } for overlay in adapter.pending_overlays() if matches(overlay)]
+
+            unified = []
+            unified.extend({
+                "kind": "event", "id": "#%s" % item.get("seq"),
+                "text": item.get("line") or item.get("body") or
+                        item.get("event_type"),
+                "updated_at": item.get("at"), "seq": item.get("seq"),
+                "data": item,
+            } for item in event_hits)
+            unified.extend({
+                "kind": "task", "id": item.get("task_id"),
+                "text": "%s · %s" % (
+                    item.get("title") or "Task", item.get("status") or ""),
+                "updated_at": item.get("updated_at") or
+                              item.get("created_at"), "data": item,
+            } for item in task_hits)
+            unified.extend({
+                "kind": "decision", "id": item.get("decision_id"),
+                "text": "%s · %s" % (
+                    item.get("title") or "Decision",
+                    item.get("status") or ""),
+                "updated_at": item.get("resolved_at") or
+                              item.get("created_at"), "data": item,
+            } for item in decision_hits)
+            unified.extend({
+                "kind": "rule", "id": item.get("rule_id"),
+                "text": item.get("title") or "Rule",
+                "updated_at": item.get("updated_at") or
+                              item.get("created_at"), "data": item,
+            } for item in rule_hits)
+            unified.extend({
+                "kind": "handoff", "id": "%s:v%s" % (
+                    item.get("actor_id") or "identity",
+                    item.get("version") or 0),
+                "text": "Identity handoff updated by %s" % (
+                    item.get("updated_by") or "unknown"),
+                "updated_at": item.get("updated_at"), "data": item,
+            } for item in handoff_hits)
+            unified.extend({
+                "kind": "role_scope", "id": "%s:v%s" % (
+                    item.get("role") or "role", item.get("version") or 0),
+                "text": "%s role scope" % (item.get("role") or "role"),
+                "updated_at": item.get("updated_at"), "data": item,
+            } for item in role_scope_hits)
+            unified.extend({
+                "kind": "identity_name", "id": "@%s" % (
+                    item.get("persona_name") or item.get("persona") or
+                    "identity"),
+                "text": "Reserved identity name @%s (never reused)" % (
+                    item.get("persona_name") or item.get("persona") or
+                    "identity"),
+                "updated_at": item.get("reserved_at"), "data": item,
+            } for item in identity_name_hits)
+            unified.extend({
+                "kind": "pending_mutation",
+                "id": item.get("client_mutation_id"),
+                "text": item.get("operation") or "Pending mutation",
+                "updated_at": (item.get("metadata") or {}).get("created_at"),
+                "data": item,
+            } for item in pending_hits)
+            page = _collection_page(
+                unified, "results", limit=args.get("limit") or 20,
+                offset=args.get("offset") or 0,
+                sort=args.get("sort") or "newest",
+                date_fields=("updated_at",), id_fields=("id",))
+            page["unfiltered_total"] = page["total"]
+            selected_by_kind = {}
+            for item in page["results"]:
+                selected_by_kind.setdefault(item["kind"], []).append(
+                    item["data"])
             result = {
                 "project": project_id, "query": str(query),
                 "query_terms": terms, "term_semantics": "AND",
-                "events": event_hits, "tasks": task_hits,
-                "decisions": decision_hits, "rules": rule_hits,
-                "handoff_versions": handoff_hits,
-                "pending_mutations": pending_hits,
-                "total_hits": sum(map(len, (event_hits, task_hits,
-                                            decision_hits, rule_hits,
-                                            handoff_hits, pending_hits))),
-                "hint": "Results come from the last verified identity mirror.",
+                "events": selected_by_kind.get("event", []),
+                "tasks": selected_by_kind.get("task", []),
+                "decisions": selected_by_kind.get("decision", []),
+                "rules": selected_by_kind.get("rule", []),
+                "handoff_versions": selected_by_kind.get("handoff", []),
+                "role_scope_versions": selected_by_kind.get(
+                    "role_scope", []),
+                "identity_names": selected_by_kind.get(
+                    "identity_name", []),
+                "pending_mutations": selected_by_kind.get(
+                    "pending_mutation", []),
+                "total_hits": len(unified),
+                "hint": ("One unified page from the last verified identity "
+                         "mirror; every result contains all query terms."),
             }
+            result.update(page)
             return _offline_proxy_mark(result, adapter, proof)
         raise AttaccaError("tool %s is not available from an offline mirror" % name)
 
@@ -16282,7 +17774,7 @@ def run_connect_proxy(url=None, actor=None, actor_type=None, project=None,
             if selected else None
         if not parsed:
             return
-        selected_project = context.get("project") or parsed["workspace"]
+        selected_project = context.get("project") or parsed["project_id"]
         state["project"] = selected_project
         if mode == "temporary":
             state["temporary_actor"] = selected
@@ -18688,7 +20180,8 @@ def _project_for_cwd(conn, cwd):
 
 
 def _configure_checkout(project_id, root, db_path, url, stdio,
-                        write_instructions, manage_tools, skip_tools, home):
+                        write_instructions, manage_tools, skip_tools, home,
+                        cloud_context_payload=_CLOUD_CONTEXT_UNSET):
     """Write only checkout-local/global client configuration.
 
     `root` is always the current machine's checkout. It is intentionally not
@@ -18716,14 +20209,41 @@ def _configure_checkout(project_id, root, db_path, url, stdio,
             project_id, root, db_path, url=url, stdio=stdio,
             skip=skip_tools, home=home)
     instruction_files = []
+    instruction_file_statuses = []
+    cloud_context_files = []
+    instruction_sync_ok = True
     if write_instructions:
-        instruction_files = [f["file"] for f in
-                             install_instructions(
-                                 project_id, root, db_path)["files"]]
+        instruction_sync = install_instructions(
+            project_id, root, db_path,
+            cloud_context_payload=cloud_context_payload)
+        instruction_file_statuses = instruction_sync.get("files") or []
+        instruction_files = [
+            row["file"] for row in instruction_file_statuses
+            if row.get("changed") is True]
+        cloud_context_files = instruction_sync.get("cloud_context_files") or []
+        instruction_sync_ok = bool(instruction_sync.get("ok"))
+        if not instruction_sync_ok:
+            safe_statuses = {
+                "created", "updated", "current", "linked", "absent"}
+            failures = [
+                row for row in instruction_file_statuses + cloud_context_files
+                if row.get("status") not in safe_statuses]
+            detail = "; ".join(
+                "%s [%s]: %s" % (
+                    Path(row.get("file") or "instructions").name,
+                    row.get("status") or "failed",
+                    row.get("error") or row.get("action") or
+                    "instruction synchronization failed")
+                for row in failures) or "unknown instruction sync failure"
+            raise AttaccaError(
+                "checkout instruction synchronization failed: %s" % detail)
     return {"project_link": project_link, "mcp_json": mcp_json,
             "claude_connection": claude_connection,
             "configured_tools": configured, "not_detected": not_detected,
-            "instruction_files": instruction_files}
+            "instruction_files": instruction_files,
+            "instruction_file_statuses": instruction_file_statuses,
+            "cloud_context_files": cloud_context_files,
+            "instruction_sync_ok": instruction_sync_ok}
 
 
 def one_shot_setup(conn, actor_id, actor_type, db_path, url=DEFAULT_URL,
@@ -18825,19 +20345,24 @@ def _remote_setup_network(url, project_id, workspaces, actor_id, actor_type):
     bridges = []
     relationship_inbox = []
     agents = []
+    persona_names_reserved = []
     if candidate:
         encoded = urllib.parse.quote(project_id, safe="")
         bridges = (remote_json(
-            url, "GET", "/v1/projects/%s/bridges" % encoded,
+            url, "GET", "/v1/projects/%s/bridges?options=1" % encoded,
             actor=actor_id, actor_type=actor_type).get("bridges") or [])
         inbox = remote_json(
             url, "GET", "/v1/projects/%s/inbox?mark_read=0&limit=100" % encoded,
             actor=actor_id, actor_type=actor_type)
         relationship_inbox = [m for m in (inbox.get("messages") or [])
                               if m.get("origin_project") or m.get("authority")]
-        agents = (remote_json(
-            url, "GET", "/v1/projects/%s/agents" % encoded,
-            actor=actor_id, actor_type=actor_type).get("agents") or [])
+        agent_payload = remote_json(
+            url, "GET",
+            "/v1/projects/%s/agents?options=1&reuse_options=1" % encoded,
+            actor=actor_id, actor_type=actor_type)
+        agents = agent_payload.get("agents") or []
+        persona_names_reserved = agent_payload.get(
+            "persona_names_reserved") or []
     other = [p for p in workspaces if p["project_id"] != project_id]
     suggested_master = next(
         (m.get("origin_project") for m in relationship_inbox
@@ -18870,11 +20395,14 @@ def _remote_setup_network(url, project_id, workspaces, actor_id, actor_type):
         "current_actor": identity["actor_id"],
         "current_runtime": identity["runtime"],
         "lead_director": candidate.get("lead_director") if candidate else None,
+        "lead_director_descriptor": (
+            candidate.get("lead_director_descriptor") if candidate else None),
         "lead_director_record": next(
             (a for a in agents if candidate and
              a.get("agent_id") == candidate.get("lead_director")), None),
         "current_actor_record": identity["record"],
         "agents": agents,
+        "persona_names_reserved": persona_names_reserved,
         "existing_relationships": named_bridges,
         "relationship_inbox": named_inbox,
         "available_workspaces": [
@@ -18888,10 +20416,10 @@ def _remote_setup_network(url, project_id, workspaces, actor_id, actor_type):
 
 
 def setup_identity_options(agents, project_id, role, runtime,
-                           bound_actor_id=None):
+                           bound_actor_id=None, reserved_personas=None):
     """Build the one-time guided choice without selecting an actor.
 
-    This helper is intentionally pure: discovery may preview the next color,
+    This helper is intentionally pure: discovery may preview the next name,
     but the server allocates it again under the registration write transaction
     so two containers cannot both claim the same identity.
     """
@@ -18910,6 +20438,9 @@ def setup_identity_options(agents, project_id, role, runtime,
         reusable.append({
             "actor_id": record["agent_id"],
             "persona": parsed.get("persona"),
+            "persona_name": agent_persona_name(parsed.get("persona")),
+            "short_name": ("@" + agent_persona_name(parsed.get("persona")))
+            if parsed.get("persona") else None,
             "display_name": record.get("display_name") or record["agent_id"],
             "owner": record.get("owner"),
             "compatibility_identity": parsed.get("persona") is None,
@@ -18918,7 +20449,13 @@ def setup_identity_options(agents, project_id, role, runtime,
     reusable.sort(key=lambda item: (
         not item["currently_bound"], item.get("persona") is None,
         item.get("persona") or "", item["actor_id"]))
-    next_persona = next_agent_persona(records, project_id, role, runtime)
+    preview_records = list(records) + [
+        {"agent_id": canonical_agent_id(
+            project_id, "unassigned", "reserved", item)}
+        for item in (reserved_personas or [])]
+    next_persona = next_agent_persona(
+        preview_records, project_id, role, runtime)
+    preview_fields = agent_persona_fields(next_persona)
     return {
         "project_id": project_id, "role": role, "runtime": runtime,
         "bound_actor_id": bound_actor_id,
@@ -18926,16 +20463,110 @@ def setup_identity_options(agents, project_id, role, runtime,
         "reusable_identities": reusable,
         "new_identity": {
             "mode": "new", "persona_preview": next_persona,
+            "persona_name": preview_fields["persona_name"],
+            "short_name": preview_fields["short_name"],
             "actor_id_preview": canonical_agent_id(
                 project_id, role, runtime, next_persona),
             "persistent": True,
         },
-        "temporary_identity": {
+        "temporary_identity": ({
             "mode": "temporary", "persona_preview": next_persona,
+            "persona_name": preview_fields["persona_name"],
+            "short_name": preview_fields["short_name"],
             "actor_id_preview": canonical_agent_id(
                 project_id, role, runtime, next_persona),
             "persistent": False,
-        },
+        } if bound_actor_id else None),
+    }
+
+
+def select_registered_agent_identity(conn, project_id, current_actor_id,
+                                     *, agent_id=None, persona=None,
+                                     role=None, runtime=None,
+                                     registration_username=None,
+                                     allow_foreign_owner=False,
+                                     authorized_owner_labels=None):
+    """Resolve an existing exact actor without mutating identity state.
+
+    This is the only implementation of ``identity_mode=reuse``. In
+    particular, selecting ``persona=gibbs`` while the current MCP process is
+    Hopper must not create an alias, move a claim/cursor/handoff, delete a row,
+    or update either registry record.
+    """
+    get_project(conn, project_id)
+    current_parts = parse_canonical_agent_id(current_actor_id, project_id)
+    explicit_target = str(agent_id or "").strip() or None
+    explicit_parts = parse_canonical_agent_id(explicit_target, project_id) \
+        if explicit_target else None
+    role = str(role or (explicit_parts or current_parts or {}).get("role")
+               or "").strip().lower()
+    runtime = normalize_agent_runtime(
+        runtime or (explicit_parts or current_parts or {}).get("runtime")
+        or current_actor_id)
+    normalized_persona = normalize_agent_persona(persona) \
+        if persona is not None and str(persona).strip() else None
+    if explicit_target:
+        if not explicit_parts:
+            # Three-part canonical compatibility identities still parse; raw
+            # legacy ids are accepted only when they are exact current rows.
+            legacy_row = conn.execute(
+                "SELECT * FROM agents WHERE project_id=? AND agent_id=?",
+                (project_id, explicit_target)).fetchone()
+            if not legacy_row:
+                raise AttaccaError(
+                    "identity_reuse_target_required: reuse requires an"
+                    " existing exact registered workspace actor")
+        if normalized_persona is not None and (not explicit_parts or
+                explicit_parts.get("persona") != normalized_persona):
+            raise AttaccaError(
+                "identity_reuse_selector_conflict: exact actor and persona"
+                " select different identities")
+        target = explicit_target
+    elif normalized_persona is not None:
+        if role not in AGENT_ROLES:
+            raise AttaccaError(
+                "identity_reuse_role_required: persona reuse needs the"
+                " existing actor's director, advisor, or worker role")
+        target = canonical_agent_id(
+            project_id, role, runtime, normalized_persona)
+    else:
+        target = str(current_actor_id or "").strip()
+    row = conn.execute(
+        "SELECT * FROM agents WHERE project_id=? AND agent_id=?",
+        (project_id, target)).fetchone()
+    if not row:
+        raise AttaccaError(
+            "identity_reuse_target_required: reuse is selection-only and"
+            " requires an existing exact registered actor")
+    parsed = parse_canonical_agent_id(target, project_id)
+    if role and row["role"] != role:
+        raise AttaccaError(
+            "identity_reuse_role_mismatch: selected actor has role '%s',"
+            " not '%s'" % (row["role"] or "unassigned", role))
+    row_runtime = normalize_agent_runtime(row["runtime"], row["agent_id"])
+    if runtime and row_runtime != runtime:
+        raise AttaccaError(
+            "identity_reuse_runtime_mismatch: selected actor uses runtime"
+            " '%s', not '%s'" % (row_runtime, runtime))
+    username = str(registration_username or "").strip() or None
+    if username and not allow_foreign_owner:
+        owner_keys = {_auth_owner_alias_key(value) for value in
+                      list(authorized_owner_labels or []) + [username]
+                      if str(value or "").strip()}
+        if not row["owner"] or _auth_owner_alias_key(row["owner"]) \
+                not in owner_keys:
+            raise AuthorizationError(
+                "agent_owner_mismatch: cannot reuse an actor owned by"
+                " another Attacca user")
+    selected_persona = (parsed or {}).get("persona")
+    return {
+        "ok": True, "agent_id": target, "already_registered": True,
+        "selection_only": True, "role": row["role"],
+        "identity": dict({
+            "workspace": project_id, "role": row["role"],
+            "runtime": row_runtime, "owner": row["owner"],
+        }, **agent_persona_fields(selected_persona)),
+        "migration": {"aliases": [], "state_changed": False},
     }
 
 
@@ -18961,35 +20592,12 @@ def select_setup_identity(conn, project_id, role, runtime, *, mode,
     runtime = normalize_agent_runtime(runtime)
     get_project(conn, project_id)
     if mode == "reuse":
-        selected = str(actor_id or "").strip()
-        parsed = parse_canonical_agent_id(selected, project_id)
-        row = conn.execute(
-            "SELECT * FROM agents WHERE project_id=? AND agent_id=?",
-            (project_id, selected)).fetchone()
-        if not row or not parsed:
-            raise AttaccaError(
-                "reuse requires one exact registered workspace actor")
-        if parsed["role"] != role or parsed["runtime"] != runtime:
-            raise AttaccaError(
-                "reused actor must match the selected role and runtime")
-        if registration_username:
-            # Authenticated HTTP callers supply the alias-aware owner labels;
-            # direct setup callers still get the conservative exact-username
-            # check instead of being allowed to take over another account.
-            owner_keys = {_auth_owner_alias_key(value) for value in
-                          list(authorized_owner_labels or []) +
-                          [registration_username]}
-            if _auth_owner_alias_key(row["owner"]) not in owner_keys:
-                raise AuthorizationError(
-                    "agent_owner_mismatch: cannot reuse an actor owned by "
-                    "another Attacca user")
-        registration = {"agent_id": selected,
-                        "already_registered": True,
-                        "role": role,
-                        "identity": {"workspace": project_id,
-                                     "role": role, "runtime": runtime,
-                                     "persona": parsed.get("persona"),
-                                     "owner": row["owner"]}}
+        registration = select_registered_agent_identity(
+            conn, project_id, actor_id, agent_id=actor_id,
+            role=role, runtime=runtime,
+            registration_username=registration_username,
+            authorized_owner_labels=authorized_owner_labels)
+        selected = registration["agent_id"]
     else:
         caller = str(requested_by or actor_id or runtime).strip()
         registration = agent_register(
@@ -19033,12 +20641,15 @@ def discover_remote_setup(url=None, path=None, here=False,
     local_root = Path(inherited_link["root_path"]) if inherited_link \
         else (cwd if here else git_worktree_root(cwd))
     repository = git_repository_info(local_root)
-    response = remote_json(url, "GET", "/v1/projects",
+    response = remote_json(url, "GET", "/v1/projects?options=1",
                            actor=actor_id, actor_type=actor_type)
     raw_projects = response.get("projects") or []
     folder_name = local_root.name
     folder_slug = slugify(folder_name)
     workspaces = [{"project_id": p["project_id"], "name": p["name"],
+                   "lead_director": p.get("lead_director"),
+                   "lead_director_descriptor": p.get(
+                       "lead_director_descriptor"),
                    "git_match": bool(repository["fingerprint"] and
                                      p.get("repository_fingerprint") ==
                                      repository["fingerprint"]),
@@ -19102,7 +20713,8 @@ def discover_remote_setup(url=None, path=None, here=False,
         network["identity_options_by_role"] = {
             selected_role: setup_identity_options(
                 network.get("agents") or [], network_project, selected_role,
-                runtime, bound_actor_id=(actor_binding or {}).get("actor_id"))
+                runtime, bound_actor_id=(actor_binding or {}).get("actor_id"),
+                reserved_personas=network.get("persona_names_reserved") or [])
             for selected_role in AGENT_ROLES
         }
     return {"server_url": url,
@@ -19131,8 +20743,17 @@ def apply_remote_network_setup(url, project_id, actor_id, actor_type,
     or churning ledger events.
     """
     url = configured_server_url(url)
+    if identity_mode not in ("auto", "reuse", "new", "temporary"):
+        raise AttaccaError(
+            "identity mode must be auto, reuse, new, or temporary")
+    if identity_mode == "temporary":
+        raise AttaccaError(
+            "temporary_identity_requires_current_mcp: a shell/setup "
+            "subprocess cannot change its parent coding client's MCP "
+            "identity; call agent_register with identity_mode=temporary "
+            "through the current Attacca MCP proxy")
     encoded = urllib.parse.quote(project_id, safe="")
-    projects = remote_json(url, "GET", "/v1/projects",
+    projects = remote_json(url, "GET", "/v1/projects?options=1",
                            actor=actor_id, actor_type=actor_type).get(
                                "projects") or []
     known = {p["project_id"] for p in projects}
@@ -19140,9 +20761,6 @@ def apply_remote_network_setup(url, project_id, actor_id, actor_type,
         raise AttaccaError("unknown setup workspace '%s'" % project_id)
     if role not in ("keep", "director", "advisor", "worker"):
         raise AttaccaError("role must be keep, director, advisor, or worker")
-    if identity_mode not in ("auto", "reuse", "new", "temporary"):
-        raise AttaccaError(
-            "identity mode must be auto, reuse, new, or temporary")
     if lead not in ("keep", "current", "clear"):
         raise AttaccaError("lead must be keep, current, or clear")
     if principal_side not in ("current", "other"):
@@ -19177,7 +20795,8 @@ def apply_remote_network_setup(url, project_id, actor_id, actor_type,
             registration_body = {
                 "agent_id": effective_actor,
                 "display_name": workspace_name + " · " + role + " · " +
-                                runtime + (" · " + parsed["persona"]
+                                runtime + (" · " + agent_persona_name(
+                                           parsed["persona"])
                                            if parsed.get("persona") else ""),
                 "role": role, "runtime": runtime,
                 "persona": parsed.get("persona"),
@@ -19221,11 +20840,9 @@ def apply_remote_network_setup(url, project_id, actor_id, actor_type,
                                 "client_instance"],
                             "changed": saved["changed"]})
         else:
-            actions.append({
-                "kind": "temporary_identity", "actor_id": effective_actor,
-                "binding_saved": False,
-                "note": "selected only for the current setup/MCP process",
-            })
+            raise AttaccaError(
+                "temporary_identity_requires_current_mcp: no persistent "
+                "binding was written")
 
     status = remote_json(
         url, "GET", "/v1/projects/%s/status" % encoded,
@@ -19413,9 +21030,29 @@ def one_shot_remote_setup(actor_id, actor_type, db_path, url=None,
         matched_by = "created" if created else (
             project.get("matched_by") or "existing")
 
+    # Fetch the authoritative hosted Cloud Context before touching instruction
+    # files.  Hosted setup must never populate a checkout from the unrelated
+    # private SQLite path supplied for local/serverless compatibility.
+    hosted_cloud_context = None
+    if write_instructions:
+        hosted_response = remote_json(
+            url, "GET", "/v1/projects/%s/cloud-context" %
+            urllib.parse.quote(selected, safe=""),
+            actor=actor_id, actor_type=actor_type,
+            project_id=selected)
+        hosted_cloud_context = hosted_response.get("cloud_context") \
+            if isinstance(hosted_response, dict) else None
+        if not isinstance(hosted_cloud_context, dict):
+            raise AttaccaError(
+                "hosted setup received no valid Cloud Context for workspace "
+                "'%s'; no checkout instruction files were written" % selected)
+        hosted_cloud_context = _validated_cloud_context_payload(
+            hosted_cloud_context)
     files = _configure_checkout(
         selected, local_root, db_path, url, False, write_instructions,
-        manage_tools, skip_tools, home)
+        manage_tools, skip_tools, home,
+        cloud_context_payload=hosted_cloud_context
+        if write_instructions else _CLOUD_CONTEXT_UNSET)
     return {"project_id": selected, "root_path": str(local_root),
             "project_created": created, "matched_by": matched_by,
             "mode": "server", "tools_only": False,
@@ -19546,7 +21183,7 @@ def managed_instruction_block(project_id, db_path):
     lines.append("shared by ALL workers — Claude Code, Kimi Code, Codex, GLM, Cline,")
     lines.append("other agents and humans. It is the source of truth for project")
     lines.append("state: append-only event ledger, shared task board with work claims,")
-    lines.append("decision records, a human+AI project room, and the current handoff.")
+    lines.append("decision records, a human+AI project room, identity handoffs, and role scopes.")
     lines.append("The project owns the knowledge; your session is replaceable.")
     lines.append("")
     lines.append("MCP server `attacca` exposes the tools (get_handoff, room_send,")
@@ -19555,8 +21192,9 @@ def managed_instruction_block(project_id, db_path):
     lines.append("")
     lines.append("The installed plugin's **lifecycle hooks are the primary continuity path**.")
     lines.append("On startup/resume/clear/compact they resolve `.attacca/project.json` and")
-    lines.append("load the handoff, mandatory Project Rules, inbox, room, tasks, agents, and")
-    lines.append("status through MCP. A background watcher polls the hosted workspace every")
+    lines.append("load mandatory Project Rules, Cloud Context, the applicable Role Scope, the")
+    lines.append("exact identity handoff, inbox, room, tasks, agents, and status through MCP.")
+    lines.append("A background watcher polls the hosted workspace every")
     lines.append("minute by default (configurable) even while the coding client is idle,")
     lines.append("queues concise changes, and surfaces them independently where the OS allows.")
     lines.append("Lifecycle hooks ensure the watcher is running, perform an immediate refresh,")
@@ -19572,8 +21210,13 @@ def managed_instruction_block(project_id, db_path):
     lines.append("refreshes only this managed block, preserves all content outside the")
     lines.append("markers, and reports the exact files changed.")
     lines.append("")
-    lines.append("Agent identities use `workspace.role.runtime` (for example,")
-    lines.append("`analytics-engine.director.codex`). The authenticated human operator is")
+    lines.append("New agent identities use `workspace.role.runtime.persona` (for example,")
+    lines.append("`analytics-engine.director.codex.gibbs`) and expose a project-unique")
+    lines.append("friendly address such as `@Gibbs`. Existing legacy three-part identities")
+    lines.append("and earlier colored persona identities remain valid for compatibility or")
+    lines.append("explicit migration. The client installation binding selects the exact")
+    lines.append("identity; a normal startup or resumed session silently reuses that binding.")
+    lines.append("The authenticated human operator is")
     lines.append("recorded separately on every mutation as `Run by user`; never combine or")
     lines.append("substitute the human and AI identities. Git branch and revision describe the")
     lines.append("originating client checkout, not the hosted server checkout.")
@@ -19583,7 +21226,8 @@ def managed_instruction_block(project_id, db_path):
     lines.append("")
     lines.append("1. **Session start and group-room reading**: use the injected")
     lines.append("   `ATTACCA ACTIVE SESSION BRIEF`. If that brief is absent, immediately")
-    lines.append("   call `get_handoff`, then `check_inbox` and `room_read` before any other")
+    lines.append("   call `rule_list`, `cloud_context_get`, `role_scope_get`, and `get_handoff`,")
+    lines.append("   then `check_inbox` and `room_read` before any other")
     lines.append("   work. A Project Room or permitted bridged conversation is a GROUP CHAT:")
     lines.append("   read every participation-visible unread message, including messages that")
     lines.append("   mention or reply to somebody else. Mentions/replies identify the expected")
@@ -19610,14 +21254,17 @@ def managed_instruction_block(project_id, db_path):
     lines.append("   automatic refresh. Only humans and registered Directors may create, edit,")
     lines.append("   enable, or disable rules.")
     lines.append("   **Cloud Context — the shared project context file**: Attacca Cloud Context")
-    lines.append("   is this project’s authoritative “cloud” AGENTS.md/CLAUDE.md — injected into")
-    lines.append("   every brief and editable only by humans and registered Directors")
-    lines.append("   (`cloud_context_get` / `cloud_context_set`). Read it every turn as the")
-    lines.append("   current project context. When it is richer than the human’s local")
-    lines.append("   AGENTS.md/CLAUDE.md (the content OUTSIDE these managed markers), offer to")
-    lines.append("   sync it down into that local file so the checkout keeps the best context —")
-    lines.append("   never modifying this managed block, which Attacca maintains and syncs")
-    lines.append("   separately.")
+    lines.append("   is this project’s authoritative “cloud” AGENTS.md/CLAUDE.md — loaded in full")
+    lines.append("   at session start and editable only by humans and registered Directors")
+    lines.append("   (`cloud_context_get` / `cloud_context_set`). Read it at session start and")
+    lines.append("   retain it as current context while its version/hash is unchanged. The")
+    lines.append("   watcher refetches it only after a change and injects the refreshed context")
+    lines.append("   at the next supported turn. Setup installs it into a separate")
+    lines.append("   marker-bounded `ATTACCA_CLOUD_CONTEXT` block in AGENTS.md/CLAUDE.md.")
+    lines.append("   Lifecycle sync refreshes that read-only block only when its hosted")
+    lines.append("   version/hash changes and otherwise performs no write. Never edit inside")
+    lines.append("   either Attacca-owned block; local human content outside both blocks is")
+    lines.append("   preserved.")
     lines.append("   **On first setup, de-duplicate the local AGENTS.md/CLAUDE.md**: remove or")
     lines.append("   consolidate any project context now provided by this managed block or by")
     lines.append("   Cloud Context so the two do not overlap — keep only genuinely local")
@@ -19651,12 +21298,15 @@ def managed_instruction_block(project_id, db_path):
     lines.append("   directives, and meaningful coordination through Attacca as the work happens;")
     lines.append("   do not leave project state only in chat or private files. Every write must")
     lines.append("   retain the authenticated human, canonical AI actor, and available Git context.")
-    lines.append("8. **Handoff — canonical transition state, Director-only**: after reporting")
-    lines.append("   task evidence, Directors update objective / what_changed / active_work /")
-    lines.append("   blockers / risks / next_actions at a meaningful transition or session end.")
-    lines.append("   Advisors and workers must use `task_report` and `room_send`; they cannot")
-    lines.append("   write the shared handoff. A Director must pass the context version from")
-    lines.append("   `get_handoff`; a stale version is rejected and must be reconciled.")
+    lines.append("8. **Identity handoff and Role Scope**: every exact registered identity —")
+    lines.append("   Director, Advisor, or Worker — owns and updates only its own identity")
+    lines.append("   handoff after reporting task evidence and at meaningful transitions or")
+    lines.append("   session end. Pass the exact handoff version returned by `get_handoff`;")
+    lines.append("   stale concurrent writes are rejected and must be reconciled. The applicable")
+    lines.append("   Role Scope supplies durable role-level context shared by identities with")
+    lines.append("   that authority. Only humans and registered Directors govern Role Scopes,")
+    lines.append("   Project Rules, and Cloud Context; no identity may overwrite another")
+    lines.append("   identity’s handoff.")
     lines.append("9. **Drift Guard**: if any response carries a `stale_context_warning`,")
     lines.append("   re-run `get_handoff` before further writes.")
     lines.append("")
@@ -19768,52 +21418,199 @@ def inspect_managed_instruction_file(path, desired_project_id=None,
     return result
 
 
-def _atomic_write_instruction(target, text, expected_text=None):
-    """Atomically replace a regular instruction file in its own directory."""
+@contextlib.contextmanager
+def _instruction_write_lock(target):
+    """Serialize Attacca's managed-law and Cloud Context writers per file.
+
+    A stable sidecar is required because replacing ``target`` changes its
+    inode, making a lock held on the target itself ineffective for the next
+    writer.  The process-wide lock supplies the same guarantee on platforms
+    without ``flock``; Unix clients additionally coordinate across processes.
+    """
+    target = Path(target)
+    lock_owner = str(os.getuid()) if hasattr(os, "getuid") else \
+        sha256_hex(str(Path.home()))[:16]
+    lock_root = Path(tempfile.gettempdir()) / (
+        "attacca-instruction-locks-%s" % lock_owner)
+    with _INSTRUCTION_WRITE_THREAD_LOCK:
+        if lock_root.is_symlink():
+            raise AttaccaError(
+                "instruction lock directory is an unsafe symlink: %s" %
+                lock_root)
+        try:
+            lock_root.mkdir(mode=0o700, parents=False, exist_ok=True)
+            lock_root_stat = lock_root.stat()
+        except OSError as err:
+            raise AttaccaError(
+                "could not prepare instruction lock directory: %s" % err)
+        if not stat.S_ISDIR(lock_root_stat.st_mode) or \
+                lock_root_stat.st_mode & 0o077:
+            raise AttaccaError(
+                "instruction lock directory is not private: %s" % lock_root)
+        if hasattr(os, "getuid") and lock_root_stat.st_uid != os.getuid():
+            raise AttaccaError(
+                "instruction lock directory has another owner: %s" %
+                lock_root)
+        target_key = str(target.parent.resolve() / target.name)
+        lock_path = lock_root / (sha256_hex(target_key) + ".lock")
+        flags = os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            lock_fd = os.open(str(lock_path), flags, 0o600)
+        except OSError as err:
+            raise AttaccaError(
+                "could not lock instruction file %s: %s" % (target, err))
+        try:
+            lock_stat = os.fstat(lock_fd)
+            if not stat.S_ISREG(lock_stat.st_mode):
+                raise AttaccaError(
+                    "instruction lock is not a regular file: %s" % lock_path)
+            with os.fdopen(lock_fd, "a+") as lock_handle:
+                lock_fd = None
+                if fcntl is not None:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    if fcntl is not None:
+                        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
+
+
+def _instruction_snapshot(target):
+    """Read a regular file and return text plus a race-detection signature."""
     target = Path(target)
     if target.is_symlink():
-        raise AttaccaError("refusing to replace symlink %s" % target)
-    mode = (target.stat().st_mode & 0o7777) if target.exists() else 0o644
-    fd, temporary_name = tempfile.mkstemp(
-        prefix=".%s." % target.name, suffix=".tmp", dir=str(target.parent))
-    temporary = Path(temporary_name)
+        raise AttaccaError("instruction file became a symlink during refresh")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(str(temporary), mode)
-        if expected_text is not None:
-            if target.is_symlink():
+        descriptor = os.open(str(target), flags)
+    except OSError as err:
+        raise AttaccaError(
+            "could not recheck instruction file before refresh: %s" % err)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise AttaccaError("instruction path is not a regular file")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            raw = handle.read()
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    signature = (
+        before.st_dev, before.st_ino, before.st_size,
+        getattr(before, "st_mtime_ns", int(before.st_mtime * 1000000000)),
+        getattr(before, "st_ctime_ns", int(before.st_ctime * 1000000000)),
+    )
+    after_signature = (
+        after.st_dev, after.st_ino, after.st_size,
+        getattr(after, "st_mtime_ns", int(after.st_mtime * 1000000000)),
+        getattr(after, "st_ctime_ns", int(after.st_ctime * 1000000000)),
+    )
+    if signature != after_signature:
+        raise AttaccaError(
+            "instruction file changed while it was read; left it untouched")
+    try:
+        return raw.decode("utf-8"), signature
+    except UnicodeError as err:
+        raise AttaccaError(
+            "could not decode instruction file before refresh: %s" % err)
+
+
+def _atomic_write_instruction(target, text, expected_text=None):
+    """Atomically replace an instruction file with a serialized CAS.
+
+    ``_INSTRUCTION_FILE_ABSENT`` is an explicit expected state.  It prevents
+    a setup/lifecycle writer that observed no file from overwriting a file
+    created before its rename.  A text expectation protects existing files.
+    Both managed-law and Cloud Context refreshes use this helper and therefore
+    cannot pass their comparison checks concurrently and clobber each other.
+    """
+    target = Path(target)
+    temporary = None
+    with _instruction_write_lock(target):
+        if target.is_symlink():
+            raise AttaccaError("refusing to replace symlink %s" % target)
+        exists = target.exists()
+        current_text = None
+        current_signature = None
+        if exists:
+            current_text, current_signature = _instruction_snapshot(target)
+        if expected_text is _INSTRUCTION_FILE_ABSENT:
+            if exists:
+                if current_text == text:
+                    return False
                 raise AttaccaError(
-                    "instruction file became a symlink during refresh")
-            try:
-                current_text = target.read_bytes().decode("utf-8")
-            except (OSError, UnicodeError) as err:
+                    "instruction file was created concurrently; left it "
+                    "untouched")
+        elif expected_text is not None:
+            if not exists:
                 raise AttaccaError(
-                    "could not recheck instruction file before refresh: %s"
-                    % err)
+                    "instruction file disappeared concurrently; left it "
+                    "untouched")
             if current_text != expected_text:
                 if current_text == text:
                     return False  # another lifecycle hook already converged
                 raise AttaccaError(
                     "instruction file changed concurrently; left it untouched")
-        os.replace(str(temporary), str(target))
-        # Persist the rename where the platform supports directory fsync.
+        mode = (target.stat().st_mode & 0o7777) if exists else 0o644
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=".%s." % target.name, suffix=".tmp", dir=str(target.parent))
+        temporary = Path(temporary_name)
         try:
-            directory_fd = os.open(str(target.parent), os.O_RDONLY)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(str(temporary), mode)
+            # Detect a non-cooperating editor after the first CAS read.  The
+            # sidecar lock closes the compare/replace window for every Attacca
+            # writer; this second snapshot narrows it for arbitrary editors.
+            if exists:
+                verified_text, verified_signature = _instruction_snapshot(
+                    target)
+                if verified_text != current_text or \
+                        verified_signature != current_signature:
+                    if verified_text == text:
+                        return False
+                    raise AttaccaError(
+                        "instruction file changed before atomic replace; left "
+                        "it untouched")
+            elif target.exists() or target.is_symlink():
+                try:
+                    raced_text, _signature = _instruction_snapshot(target)
+                except AttaccaError:
+                    raced_text = None
+                if raced_text == text:
+                    return False
+                raise AttaccaError(
+                    "instruction file was created before atomic replace; left "
+                    "it untouched")
+            os.replace(str(temporary), str(target))
+            # Persist the rename where the platform supports directory fsync.
             try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        except OSError:
-            pass
-        return True
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+                directory_fd = os.open(str(target.parent), os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                pass
+            return True
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def _instruction_target(root, filename):
@@ -19853,8 +21650,45 @@ def _standard_claude_link_target(target, root):
     return expected
 
 
+def _create_standard_claude_link(target, root):
+    """Atomically create ``CLAUDE.md -> AGENTS.md`` without replacement."""
+    target = Path(target)
+    root = Path(root).resolve()
+    with _instruction_write_lock(target):
+        if target.exists() or target.is_symlink():
+            if target.is_symlink():
+                try:
+                    _standard_claude_link_target(target, root)
+                    return False
+                except AttaccaError:
+                    pass
+            raise AttaccaError(
+                "CLAUDE.md was created concurrently; left it untouched")
+        try:
+            os.symlink("AGENTS.md", str(target))
+        except FileExistsError:
+            if target.is_symlink():
+                try:
+                    _standard_claude_link_target(target, root)
+                    return False
+                except AttaccaError:
+                    pass
+            raise AttaccaError(
+                "CLAUDE.md was created concurrently; left it untouched")
+        try:
+            directory_fd = os.open(str(target.parent), os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
+        return True
+
+
 def _managed_instruction_sync(project_id, root_path, db_path, files=None,
-                              managed_only=False, desired_block=None):
+                              managed_only=False, desired_block=None,
+                              cloud_context_payload=_CLOUD_CONTEXT_UNSET):
     if not root_path or not Path(root_path).is_dir():
         raise AttaccaError(
             "project root %s does not exist; re-run init in the project dir"
@@ -19906,10 +21740,18 @@ def _managed_instruction_sync(project_id, root_path, db_path, files=None,
                 })
                 continue
             if not target.exists() and not managed_only:
-                target.symlink_to("AGENTS.md")
+                try:
+                    linked = _create_standard_claude_link(target, root)
+                except (OSError, AttaccaError) as err:
+                    results.append({"file": str(target), "changed": False,
+                                    "status": "write_error",
+                                    "action": "CLAUDE.md link failed",
+                                    "error": str(err)})
+                    continue
                 results.append({"file": str(target),
-                                "changed": True, "status": "linked",
-                                "action": "symlinked to AGENTS.md",
+                                "changed": linked, "status": "linked",
+                                "action": "symlinked to AGENTS.md" if linked
+                                else "already links to AGENTS.md",
                                 "metadata": desired_metadata})
                 continue
         if target.is_symlink():
@@ -19941,7 +21783,7 @@ def _managed_instruction_sync(project_id, root_path, db_path, files=None,
             continue
         span = None
         old_metadata = None
-        expected_text = None
+        expected_text = _INSTRUCTION_FILE_ABSENT
         if target.exists():
             if not target.is_file():
                 entry = {"file": str(root / filename), "changed": False,
@@ -20059,24 +21901,51 @@ def _managed_instruction_sync(project_id, root_path, db_path, files=None,
     # with the managed block for EVERY project — create it on setup, refresh it
     # in place on later runs. Best-effort: never break the managed-block write.
     cloud_context_files = []
-    if db_path:
+    cloud_context_ok = True
+    if cloud_context_payload is not _CLOUD_CONTEXT_UNSET:
+        try:
+            cloud_result = refresh_cloud_context_block_payload(
+                cloud_context_payload, project_id, root_path,
+                files=filenames, create=not managed_only,
+                require_managed_ownership=not managed_only)
+            cloud_context_files = cloud_result.get("files", [])
+            cloud_context_ok = bool(cloud_result.get("ok")) and not any(
+                row.get("status") == "ownership_required"
+                for row in cloud_context_files)
+        except Exception as err:
+            cloud_context_ok = False
+            cloud_context_files = [{
+                "file": str(root / filename), "changed": False,
+                "status": "validation_error", "error": str(err)}
+                for filename in filenames]
+    elif db_path:
         try:
             _cc_conn = connect(db_path)
             try:
-                cloud_context_files = refresh_cloud_context_block(
+                cloud_result = refresh_cloud_context_block(
                     _cc_conn, project_id, root_path, files=filenames,
-                    create=not managed_only).get("files", [])
+                    create=not managed_only,
+                    require_managed_ownership=not managed_only)
+                cloud_context_files = cloud_result.get("files", [])
+                cloud_context_ok = bool(cloud_result.get("ok")) and not any(
+                    row.get("status") == "ownership_required"
+                    for row in cloud_context_files)
             finally:
                 _cc_conn.close()
-        except Exception:
-            cloud_context_files = []
+        except Exception as err:
+            cloud_context_ok = False
+            cloud_context_files = [{
+                "file": str(root / filename), "changed": False,
+                "status": "validation_error", "error": str(err)}
+                for filename in filenames]
     return {
         "cloud_context_files": cloud_context_files,
-        "ok": not any(item["status"] in (
+        "ok": cloud_context_ok and not any(item["status"] in (
             "malformed", "unsafe_symlink", "unmanaged", "future",
             "write_error")
                       for item in results),
-        "changed": any(item["changed"] for item in results),
+        "changed": (any(item["changed"] for item in results) or
+                    any(item.get("changed") for item in cloud_context_files)),
         "managed_only": managed_only,
         "metadata": desired_metadata,
         "files": results,
@@ -20117,10 +21986,12 @@ def refresh_managed_instruction_block(project_id, root_path, block,
         desired_block=block)
 
 
-def install_instructions(project_id, root_path, db_path, files=None):
+def install_instructions(project_id, root_path, db_path, files=None,
+                         cloud_context_payload=_CLOUD_CONTEXT_UNSET):
     """Setup-time install: create or append, then refresh on later runs."""
     return _managed_instruction_sync(
-        project_id, root_path, db_path, files=files, managed_only=False)
+        project_id, root_path, db_path, files=files, managed_only=False,
+        cloud_context_payload=cloud_context_payload)
 
 
 # ---------------------------------------------------------------------------
@@ -20340,21 +22211,70 @@ def write_state_markdown(out_dir, projection):
 
 CLOUD_CONTEXT_BEGIN = "<!-- ATTACCA_CLOUD_CONTEXT:BEGIN"
 CLOUD_CONTEXT_END = "<!-- ATTACCA_CLOUD_CONTEXT:END -->"
-_CLOUD_CONTEXT_BLOCK_RE = re.compile(
-    r"(?ms)^<!-- ATTACCA_CLOUD_CONTEXT:BEGIN\b[^\r\n]*-->.*?"
-    r"^<!-- ATTACCA_CLOUD_CONTEXT:END -->[ \t]*$")
+_CLOUD_CONTEXT_BEGIN_LINE = re.compile(
+    r"(?m)^<!-- ATTACCA_CLOUD_CONTEXT:BEGIN\b[^\r\n]*-->[ \t]*\r?$")
+_CLOUD_CONTEXT_END_LINE = re.compile(
+    r"(?m)^<!-- ATTACCA_CLOUD_CONTEXT:END -->[ \t]*\r?$")
+
+
+def _validated_cloud_context_payload(cloud_context):
+    """Validate one server/local Cloud Context projection before rendering."""
+    if cloud_context is None:
+        cloud_context = {"content": "", "version": 0,
+                         "sha256": sha256_hex("")}
+    if not isinstance(cloud_context, dict):
+        raise AttaccaError("Cloud Context payload must be an object")
+    content = cloud_context.get("content")
+    if not isinstance(content, str):
+        raise AttaccaError("Cloud Context content must be text")
+    if "ATTACCA_CLOUD_CONTEXT:BEGIN" in content or \
+            "ATTACCA_CLOUD_CONTEXT:END" in content:
+        raise AttaccaError(
+            "Cloud Context content cannot contain its managed block marker "
+            "tokens")
+    version = cloud_context.get("version")
+    if type(version) is not int or version < 0:
+        raise AttaccaError("Cloud Context version must be a non-negative integer")
+    digest = cloud_context.get("sha256") or sha256_hex(content)
+    if not isinstance(digest, str) or \
+            re.fullmatch(r"[0-9a-f]{64}", digest) is None or \
+            digest != sha256_hex(content):
+        raise AttaccaError("Cloud Context sha256 does not match its content")
+    return {"content": content, "version": version, "sha256": digest}
+
+
+def _cloud_context_block_span(text):
+    """Return the only valid Cloud Context marker span, or ``None``.
+
+    A duplicate or partial marker is never guessed at because doing so could
+    overwrite user-authored bytes outside Attacca's ownership boundary.
+    """
+    text = text or ""
+    begins = list(_CLOUD_CONTEXT_BEGIN_LINE.finditer(text))
+    ends = list(_CLOUD_CONTEXT_END_LINE.finditer(text))
+    if text.count("ATTACCA_CLOUD_CONTEXT:BEGIN") != len(begins) or \
+            text.count("ATTACCA_CLOUD_CONTEXT:END") != len(ends):
+        raise AttaccaError("Cloud Context marker text is malformed")
+    if not begins and not ends:
+        return None
+    if len(begins) != 1 or len(ends) != 1 or \
+            ends[0].start() <= begins[0].start():
+        raise AttaccaError(
+            "Cloud Context block is malformed (expected one BEGIN followed "
+            "by one END marker)")
+    return begins[0].start(), ends[0].start() + len(CLOUD_CONTEXT_END)
 
 
 def cloud_context_block(cloud_context, project_id):
     """Build the versioned, sha-stamped Cloud Context block for AGENTS.md /
     CLAUDE.md. Like the managed block, it is a self-delimited region that
     Attacca owns; content outside the markers is never touched."""
-    cc = cloud_context or {}
-    content = (cc.get("content") or "").strip()
-    version = cc.get("version") or 0
-    sha = cc.get("sha256") or sha256_hex(content)
+    cc = _validated_cloud_context_payload(cloud_context)
+    content = cc["content"]
+    version = cc["version"]
+    sha = cc["sha256"]
     header = "%s v=%s sha=%s project=%s do_not_edit=true -->" % (
-        CLOUD_CONTEXT_BEGIN, version, sha[:16], project_id)
+        CLOUD_CONTEXT_BEGIN, version, sha, project_id)
     body = content if content else "_No cloud context set yet._"
     note = ("<!-- Attacca Cloud Context: the shared project summary, synced "
             "from the server. Do not edit inside these markers; edit via the "
@@ -20364,61 +22284,264 @@ def cloud_context_block(cloud_context, project_id):
 
 def cloud_context_block_present(text):
     """Return (present, version, sha) for a Cloud Context block in ``text``."""
-    match = _CLOUD_CONTEXT_BLOCK_RE.search(text or "")
-    if not match:
+    try:
+        span = _cloud_context_block_span(text or "")
+    except AttaccaError:
         return False, None, None
-    head = match.group(0).splitlines()[0]
+    if span is None:
+        return False, None, None
+    head = (text or "")[span[0]:span[1]].splitlines()[0]
     ver = re.search(r"\bv=(\S+)", head)
     sha = re.search(r"\bsha=(\S+)", head)
     return True, (ver.group(1) if ver else None), (sha.group(1) if sha else None)
 
 
-def refresh_cloud_context_block(conn, project_id, root_path, files=None,
-                                create=False):
+def _cloud_context_block_metadata(block):
+    """Validate ownership/version metadata from one existing local block."""
+    span = _cloud_context_block_span(block)
+    if span != (0, len(block)):
+        raise AttaccaError("value is not exactly one Cloud Context block")
+    header = block.splitlines()[0] if block.splitlines() else ""
+    version_match = re.search(r"(?:^|\s)v=(\d+)(?=\s|-->)", header)
+    sha_match = re.search(r"(?:^|\s)sha=([0-9a-f]+)(?=\s|-->)", header)
+    project_match = re.search(r"(?:^|\s)project=([^\s>]+)(?=\s|-->)", header)
+    owner_match = re.search(
+        r"(?:^|\s)do_not_edit=([^\s>]+)(?=\s|-->)", header)
+    if not version_match:
+        raise AttaccaError("Cloud Context block version is missing or invalid")
+    if not sha_match or len(sha_match.group(1)) not in (16, 64):
+        raise AttaccaError("Cloud Context block sha is missing or invalid")
+    if not project_match:
+        raise AttaccaError("Cloud Context block project is missing")
+    if not owner_match or owner_match.group(1).lower() != "true":
+        raise AttaccaError(
+            "Cloud Context block lacks do_not_edit=true ownership marker")
+    return {
+        "version": int(version_match.group(1)),
+        "sha256": sha_match.group(1),
+        "project_id": project_match.group(1),
+        "do_not_edit": True,
+    }
+
+
+def _managed_file_owns_cloud_context(text, project_id):
+    """Return validated per-file setup ownership for Cloud block creation."""
+    span = _managed_block_span(text or "")
+    if span is None:
+        return False, "matching MANAGED_ATTACCA block is absent"
+    metadata = _metadata_for_managed_block((text or "")[span[0]:span[1]])
+    if metadata.get("project_id") != project_id:
+        raise AttaccaError(
+            "MANAGED_ATTACCA block belongs to another project")
+    if not metadata.get("do_not_edit"):
+        raise AttaccaError(
+            "MANAGED_ATTACCA block lacks do_not_edit=true")
+    if type(metadata.get("version")) is not int or metadata["version"] < 1:
+        raise AttaccaError("MANAGED_ATTACCA block version is invalid")
+    return True, None
+
+
+def refresh_cloud_context_block_payload(cloud_context, project_id, root_path,
+                                        files=None, create=False,
+                                        require_managed_ownership=False):
     """Sync the Cloud Context into AGENTS.md/CLAUDE.md as a managed block.
 
     If the block already exists it is refreshed in place (auto, like the
     managed law block). If it is absent it is only added when ``create`` is
-    true (the AI offers this first). Everything outside the markers, including
-    the managed protocol block and the human's own text, is preserved."""
-    cc = cloud_context_get(conn, project_id)["cloud_context"]
+    true (setup/lifecycle migration). Everything outside the markers,
+    including the managed protocol block and the human's own text, is
+    preserved. Exact current bytes are a no-op, so an unchanged hosted
+    version/hash never rewrites the checkout."""
+    cc = _validated_cloud_context_payload(cloud_context)
     block = cloud_context_block(cc, project_id)
+    if not root_path or not Path(root_path).is_dir():
+        raise AttaccaError("project root %s does not exist" %
+                           (root_path or "(unset)"))
     root = Path(root_path).resolve()
     results = []
-    for filename in (files or ["AGENTS.md", "CLAUDE.md"]):
-        target = root / filename
-        if target.is_symlink():
-            # Follow the managed convention: a CLAUDE.md symlink to AGENTS.md
-            # is refreshed through AGENTS.md, not written twice.
+    default_files = files is None
+    filenames = list(files or ["AGENTS.md", "CLAUDE.md"])
+    processed = {}
+    for filename in filenames:
+        target = _instruction_target(root, filename)
+        if default_files and filename == "CLAUDE.md" \
+                and not target.exists() and not target.is_symlink() \
+                and (root / "AGENTS.md").is_file():
+            # Never manufacture a CLAUDE.md containing only Cloud Context: it
+            # could shadow an existing AGENTS.md managed protocol in clients
+            # that prefer CLAUDE.md. Setup's managed installer creates the
+            # standard safe symlink; lifecycle migration leaves a missing
+            # secondary filename missing.
             results.append({"file": str(target), "changed": False,
-                            "status": "linked"})
+                            "status": "absent", "version": cc["version"],
+                            "sha256": cc["sha256"]})
             continue
-        text = target.read_text(encoding="utf-8") if target.exists() else ""
-        match = _CLOUD_CONTEXT_BLOCK_RE.search(text)
-        if match:
-            if match.group(0).strip() == block.strip():
+        if target.is_symlink():
+            if filename != "CLAUDE.md":
                 results.append({"file": str(target), "changed": False,
-                                "status": "current"})
+                                "status": "unsafe_symlink"})
                 continue
-            new_text = text[:match.start()] + block + text[match.end():]
+            try:
+                target = _standard_claude_link_target(target, root)
+            except AttaccaError as err:
+                results.append({"file": str(root / filename),
+                                "changed": False,
+                                "status": "unsafe_symlink",
+                                "error": str(err)})
+                continue
+        target_key = str(target.resolve()) if target.exists() else str(target)
+        if target_key in processed:
+            prior = processed[target_key]
+            results.append({"file": str(root / filename),
+                            "resolved_file": str(target),
+                            "changed": False, "status": "linked",
+                            "version": cc["version"],
+                            "sha256": cc["sha256"]})
+            continue
+        expected_text = _INSTRUCTION_FILE_ABSENT
+        if target.exists():
+            if not target.is_file():
+                entry = {"file": str(root / filename), "changed": False,
+                         "status": "malformed",
+                         "error": "instruction path is not a regular file"}
+                results.append(entry)
+                processed[target_key] = entry
+                continue
+            try:
+                text = target.read_bytes().decode("utf-8")
+                expected_text = text
+                span = _cloud_context_block_span(text)
+            except (OSError, UnicodeError, AttaccaError) as err:
+                entry = {"file": str(root / filename), "changed": False,
+                         "status": "malformed", "error": str(err)}
+                results.append(entry)
+                processed[target_key] = entry
+                continue
+        else:
+            text = ""
+            span = None
+        if span is not None:
+            old_block = text[span[0]:span[1]]
+            try:
+                old_metadata = _cloud_context_block_metadata(old_block)
+            except AttaccaError as err:
+                entry = {"file": str(root / filename), "changed": False,
+                         "status": "malformed", "error": str(err)}
+                results.append(entry)
+                processed[target_key] = entry
+                continue
+            if old_metadata["project_id"] != project_id:
+                entry = {"file": str(root / filename), "changed": False,
+                         "status": "malformed",
+                         "error": "Cloud Context block belongs to project "
+                                  "'%s', not '%s'" % (
+                                      old_metadata["project_id"], project_id),
+                         "local_version": old_metadata["version"],
+                         "version": cc["version"]}
+                results.append(entry)
+                processed[target_key] = entry
+                continue
+            if old_metadata["version"] > cc["version"]:
+                entry = {"file": str(root / filename), "changed": False,
+                         "status": "rollback_refused",
+                         "error": "local Cloud Context v%d is newer than "
+                                  "incoming v%d" % (
+                                      old_metadata["version"], cc["version"]),
+                         "local_version": old_metadata["version"],
+                         "version": cc["version"],
+                         "local_sha256": old_metadata["sha256"],
+                         "sha256": cc["sha256"]}
+                results.append(entry)
+                processed[target_key] = entry
+                continue
+            if old_metadata["version"] == cc["version"] and \
+                    not cc["sha256"].startswith(old_metadata["sha256"]):
+                entry = {"file": str(root / filename), "changed": False,
+                         "status": "version_conflict",
+                         "error": "local and incoming Cloud Context v%d have "
+                                  "different sha256 values" % cc["version"],
+                         "local_version": old_metadata["version"],
+                         "version": cc["version"],
+                         "local_sha256": old_metadata["sha256"],
+                         "sha256": cc["sha256"]}
+                results.append(entry)
+                processed[target_key] = entry
+                continue
+            if old_block == block:
+                entry = {"file": str(root / filename), "changed": False,
+                         "status": "current", "version": cc["version"],
+                         "sha256": cc["sha256"]}
+                results.append(entry)
+                processed[target_key] = entry
+                continue
+            new_text = text[:span[0]] + block + text[span[1]:]
             status = "updated"
         else:
             if not create:
-                results.append({"file": str(target), "changed": False,
-                                "status": "absent"})
+                entry = {"file": str(root / filename), "changed": False,
+                         "status": "absent", "version": cc["version"],
+                         "sha256": cc["sha256"]}
+                results.append(entry)
+                processed[target_key] = entry
                 continue
+            if require_managed_ownership:
+                try:
+                    owned, ownership_error = _managed_file_owns_cloud_context(
+                        text, project_id)
+                except AttaccaError as err:
+                    owned, ownership_error = False, str(err)
+                    ownership_status = "ownership_invalid"
+                else:
+                    ownership_status = "ownership_required"
+                if not owned:
+                    entry = {"file": str(root / filename), "changed": False,
+                             "status": ownership_status,
+                             "error": ownership_error,
+                             "version": cc["version"],
+                             "sha256": cc["sha256"]}
+                    results.append(entry)
+                    processed[target_key] = entry
+                    continue
             if not text:
                 new_text = block + "\n"
             else:
                 sep = "\n" if text.endswith("\n") else "\n\n"
                 new_text = text + sep + block + "\n"
             status = "created"
-        tmp = target.with_name(target.name + ".attacca-tmp")
-        tmp.write_text(new_text, encoding="utf-8")
-        os.replace(str(tmp), str(target))
-        results.append({"file": str(target), "changed": True, "status": status})
-    return {"ok": True, "project": project_id, "files": results,
-            "version": cc.get("version"), "sha256": cc.get("sha256")}
+        try:
+            wrote = _atomic_write_instruction(
+                target, new_text, expected_text=expected_text)
+        except (OSError, UnicodeError, AttaccaError) as err:
+            entry = {"file": str(root / filename), "changed": False,
+                     "status": "write_error", "error": str(err)}
+            results.append(entry)
+            processed[target_key] = entry
+            continue
+        entry = {"file": str(root / filename), "changed": wrote,
+                 "status": status if wrote else "current",
+                 "version": cc["version"], "sha256": cc["sha256"]}
+        if target != root / filename:
+            entry["resolved_file"] = str(target)
+        results.append(entry)
+        processed[target_key] = entry
+    return {"ok": not any(item.get("status") in {
+                "malformed", "unsafe_symlink", "write_error",
+                "rollback_refused", "version_conflict",
+                "ownership_invalid"}
+                for item in results),
+            "project": project_id, "files": results,
+            "changed": any(item.get("changed") for item in results),
+            "version": cc["version"], "sha256": cc["sha256"]}
+
+
+def refresh_cloud_context_block(conn, project_id, root_path, files=None,
+                                create=False,
+                                require_managed_ownership=False):
+    """Database-backed adapter for serverless setup and local development."""
+    cc = cloud_context_get(conn, project_id)["cloud_context"]
+    return refresh_cloud_context_block_payload(
+        cc, project_id, root_path, files=files, create=create,
+        require_managed_ownership=require_managed_ownership)
 
 
 def _version_tuple(value):
@@ -20789,8 +22912,9 @@ def build_parser():
     p.add_argument("--identity-mode",
                    choices=("auto", "reuse", "new", "temporary"),
                    default="auto",
-                   help="reuse an exact actor, allocate a permanent color, "
-                        "or use a current-process-only temporary color")
+                   help="reuse an exact actor, allocate a permanent unique "
+                        "name; temporary identities can only be activated "
+                        "through an already-authorized current MCP proxy")
     p.add_argument("--identity-actor", default=None, metavar="ACTOR_ID",
                    help=argparse.SUPPRESS)
     p.add_argument("--lead", choices=("keep", "current", "clear"),
@@ -20825,7 +22949,7 @@ def build_parser():
     p.add_argument("--owner", default=None,
                    help="your name for attribution — every ledger event and "
                         "agent is tagged separately; it is never prefixed to "
-                        "the workspace.role.runtime actor id")
+                        "the workspace.role.runtime[.persona] actor id")
     p.add_argument("--details", action="store_true",
                    help="print the full per-tool configuration reference "
                         "instead of running setup")
@@ -20964,6 +23088,20 @@ def cli_main(argv=None):
     if not args.command:
         parser.print_help()
         return 0
+
+    # A setup subprocess cannot mutate the MCP proxy that is already loaded
+    # by its parent coding session.  Reject this mode before opening a local
+    # database, linking the checkout, provisioning credentials, or writing
+    # any machine configuration.  Native guided setup performs a temporary
+    # switch directly through the current proxy instead.
+    if args.command == "setup" and \
+            getattr(args, "identity_mode", None) == "temporary":
+        raise AttaccaError(
+            "temporary_identity_requires_current_mcp: direct CLI setup "
+            "cannot activate a temporary identity; use native guided setup "
+            "from an already-bound coding session so it can call "
+            "agent_register with identity_mode=temporary through the "
+            "current Attacca MCP proxy")
 
     if args.command == "serve":
         run_server(db_path, host=args.host, port=args.port,
@@ -21510,12 +23648,22 @@ def cli_main(argv=None):
                 if actor_type == "agent":
                     lead = network.get("lead_director")
                     current_ai = network.get("current_actor") or actor
+                    lead_descriptor = network.get(
+                        "lead_director_descriptor") or {}
                     if lead == current_ai:
-                        print("  lead director remains %s" % current_ai)
+                        print("  this AI remains Lead Director (%s)" % (
+                            lead_descriptor.get("short_name") or
+                            lead_descriptor.get("display_name") or
+                            "current identity"))
                         args.role = "director"
                     elif lead:
                         lead_record = network.get("lead_director_record") or {}
-                        lead_name = lead_record.get("display_name") or lead
+                        lead_name = (
+                            lead_record.get("short_name") or
+                            lead_record.get("display_name") or
+                            lead_descriptor.get("short_name") or
+                            lead_descriptor.get("display_name") or
+                            "Current Lead Director")
                         print("  current lead director: %s" % lead_name)
                         print("    1. Keep that lead; join this AI as another director (default)")
                         print("    2. Replace the lead with this AI")
@@ -21551,8 +23699,8 @@ def cli_main(argv=None):
 
                     # Identity is an installation choice, not a host-session
                     # choice. Ordinary starts never prompt; explicit setup
-                    # offers takeover/reuse, a permanent next color, or a
-                    # temporary color for only the current MCP process.
+                    # offers takeover/reuse, a permanent next name, or a
+                    # temporary name for only the current MCP process.
                     identity_options = (
                         network.get("identity_options_by_role") or {}).get(
                             args.role) or {}
@@ -21568,33 +23716,33 @@ def cli_main(argv=None):
                             "reuse", bound["actor_id"],
                             "Continue as %s (%s) — recommended" % (
                                 bound["display_name"],
-                                bound.get("persona") or
+                                bound.get("persona_name") or
                                 "legacy compatibility identity")))
                     else:
                         choices.append((
                             "new", None,
                             "Create permanent %s identity — recommended" %
                             ((identity_options.get("new_identity") or {}).get(
-                                "persona_preview") or "next color")))
+                                "persona_name") or "next name")))
                     for item in reusable:
                         if item["actor_id"] == bound_id:
                             continue
                         choices.append((
                             "reuse", item["actor_id"],
                             "Take over/reuse %s (%s)" % (
-                                item["display_name"], item.get("persona") or
+                                item["display_name"],
+                                item.get("persona_name") or
                                 "legacy compatibility identity")))
                     if bound:
                         choices.append((
                             "new", None,
                             "Create permanent %s identity" %
                             ((identity_options.get("new_identity") or {}).get(
-                                "persona_preview") or "next color")))
-                    choices.append((
-                        "temporary", None,
-                        "Use temporary %s identity for this MCP process" %
-                        ((identity_options.get("temporary_identity") or {}).get(
-                            "persona_preview") or "next color")))
+                                "persona_name") or "next name")))
+                    # A child shell process cannot mutate the already-running
+                    # parent MCP proxy. Native $attacca:setup offers the
+                    # temporary choice and performs it with agent_register in
+                    # that exact proxy after this wiring command completes.
                     print("  this installed client identity:")
                     for index, (_mode, _actor, label) in enumerate(choices, 1):
                         print("    %d. %s" % (index, label))
@@ -21665,6 +23813,13 @@ def cli_main(argv=None):
             if args.relationship not in (None, "none") and not args.bridge:
                 raise AttaccaError(
                     "--relationship requires a different --bridge workspace")
+            if args.identity_mode == "temporary":
+                raise AttaccaError(
+                    "temporary_identity_requires_current_mcp: direct CLI "
+                    "setup cannot activate a temporary identity; use native "
+                    "guided setup from an already-bound coding session so "
+                    "it can call agent_register with identity_mode=temporary "
+                    "through the current Attacca MCP proxy")
             if actor_type == "agent" or args.role != "keep" \
                     or args.lead != "keep" \
                     or args.relationship is not None:
@@ -21684,9 +23839,7 @@ def cli_main(argv=None):
             close_remote_setup_session(setup_url)
         watcher_result = None
         watcher_error = None
-        temporary_identity = bool(
-            (network_result or {}).get("identity_mode") == "temporary")
-        if info["mode"] == "server" and not temporary_identity:
+        if info["mode"] == "server":
             watcher_actor = (network_result or {}).get("actor") or actor
             watcher_runtime = normalize_agent_runtime(actor=watcher_actor)
             try:
@@ -21700,7 +23853,7 @@ def cli_main(argv=None):
                 watcher_error = str(err)
         cron_result = None
         cron_error = None
-        if info["mode"] == "server" and not temporary_identity:
+        if info["mode"] == "server":
             cron_actor = (network_result or {}).get("actor") or actor
             cron_runtime = normalize_agent_runtime(actor=cron_actor)
             try:
@@ -21741,16 +23894,20 @@ def cli_main(argv=None):
         if info["instruction_files"]:
             print("✔ modified agent instructions (review before commit): %s"
                   % ", ".join(Path(f).name for f in info["instruction_files"]))
+        cloud_files_changed = [
+            row for row in (info.get("cloud_context_files") or [])
+            if row.get("changed") is True]
+        if cloud_files_changed:
+            print("✔ synchronized Cloud Context local block: %s"
+                  % ", ".join(dict.fromkeys(
+                      Path(row["file"]).name for row in cloud_files_changed)))
         if info["not_detected"]:
             print("· not detected (skipped): %s" % ", ".join(info["not_detected"]))
         if network_result:
             print("✔ AI Network: %s" % (
                 ", ".join(action["kind"] for action in
-                          network_result["actions"]) or "already configured"))
-            if temporary_identity:
-                print("· temporary AI identity: active only for this setup/"
-                      "MCP process; the machine's normal actor binding was "
-                      "not changed")
+                          network_result["actions"]) or
+                "already configured"))
         if credential_result and credential_result.get("status") in (
                 "ready", "approved"):
             print("✔ client authorization: %s" %

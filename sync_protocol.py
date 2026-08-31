@@ -83,15 +83,16 @@ _IDENTITY_PROJECTION_REQUIRED = {
 _IDENTITY_PROJECTION_OPTIONAL = {
     "task_plans", "full_log", "actor_aliases", "cloud_context",
     "message_dispositions", "identity_handoffs", "role_scopes",
+    "persona_reservations",
 }
-# Projection schema v2 is explicitly resource-negotiated.  Adding these two
-# resources does not relabel an already verified v2 mirror: the negotiated
+# Projection schema v2 is explicitly resource-negotiated.  Adding resources
+# does not relabel an already verified v2 mirror: the negotiated
 # resource list is part of both its visibility fingerprint and storage key.
 # An older v2 client continues to offer its smaller list and never receives
 # fields it does not understand.
 _PROJECTION_V2_RESOURCES = {
     "cloud_context", "message_dispositions", "identity_handoffs",
-    "role_scopes",
+    "role_scopes", "persona_reservations",
 }
 _PROJECTION_RESOURCE_INTRODUCED = {
     key: LEGACY_PROJECTION_SCHEMA_VERSION
@@ -107,6 +108,10 @@ _LEGACY_PROJECTION_RESOURCES = {
 }
 _PROJECTION_CAPABILITY_KEYS = {"format", "schema_version", "resources"}
 _PROJECTION_RESOURCE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_PERSONA_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$", re.ASCII)
+_WIRE_SLUG_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$", re.ASCII)
 _MAX_PROJECTION_RESOURCES = 64
 _SECRET_KEYS = {
     "api_token", "auth_sessions", "auth_tokens", "credentials",
@@ -688,7 +693,7 @@ def validate_identity_projection(projection, scope, partial=False):
     for key in ("handoffs", "identity_handoffs", "role_scopes", "rules",
                 "tasks", "decisions", "room_messages", "agents",
                 "bridges", "task_plans", "full_log", "actor_aliases",
-                "message_dispositions"):
+                "message_dispositions", "persona_reservations"):
         if key in value and not isinstance(value[key], list):
             _error("invalid_projection", "projection.%s must be an array" % key)
         if key in value and key != "full_log":
@@ -716,6 +721,14 @@ def validate_identity_projection(projection, scope, partial=False):
             actor_id = cursor.get("actor_id")
             if actor_id is not None and actor_id != scope["actor_id"]:
                 _error("cross_actor_inbox", "inbox cursor belongs to another actor")
+    # Validate this privacy-redacted registry even when an older client did
+    # not negotiate it.  Server filtering must never make a projector leak of
+    # reserved_actor_id/source disappear before the trust boundary checks it.
+    if "persona_reservations" in value:
+        _validate_persona_reservation_rows(
+            value["persona_reservations"], scope)
+    if "agents" in value:
+        _projected_named_agent_personas(value["agents"], scope)
     return value
 
 
@@ -870,6 +883,104 @@ def _validate_role_scope_rows(rows, scope, project):
                     "%s.event_id must be a string or null" % path)
 
 
+def _validate_persona_reservation_rows(rows, scope):
+    """Validate the non-sensitive identity-mirror name registry.
+
+    A mirror needs all previously used friendly names to avoid presenting an
+    unsafe name as available while offline.  It does *not* need to learn the
+    original/deleted actor or internal migration source.  Exact-key checking
+    makes that privacy boundary fail closed before bytes become authoritative
+    local state.
+    """
+    required = {"project_id", "persona", "persona_name", "reserved_at"}
+    seen = set()
+    previous = None
+    for index, row in enumerate(rows):
+        path = "projection.persona_reservations[%d]" % index
+        _exact_keys(row, required, label="persona reservation")
+        if row.get("project_id") != scope["project_id"]:
+            _error(
+                "cross_project_projection",
+                "%s belongs to another project" % path)
+        persona = row.get("persona")
+        if not isinstance(persona, str) \
+                or not _PERSONA_RE.fullmatch(persona) \
+                or "--" in persona \
+                or persona in {"default", "none", "unassigned"}:
+            _error(
+                "invalid_persona_reservation",
+                "%s.persona is not a normalized short name" % path)
+        if persona in seen:
+            _error(
+                "invalid_persona_reservation",
+                "projection.persona_reservations contains duplicate persona "
+                "%s" % persona)
+        seen.add(persona)
+        expected_name = persona[:1].upper() + persona[1:]
+        if row.get("persona_name") != expected_name:
+            _error(
+                "invalid_persona_reservation",
+                "%s.persona_name does not match its stable friendly spelling"
+                % path)
+        reserved_at = _timestamp(
+            row.get("reserved_at"), "%s.reserved_at" % path)
+        ordering = (reserved_at, persona)
+        if previous is not None and ordering <= previous:
+            _error(
+                "invalid_persona_reservation",
+                "projection.persona_reservations must be ordered by "
+                "reserved_at and persona")
+        previous = ordering
+
+
+def _projected_named_agent_personas(rows, scope):
+    """Validate canonical named agent rows and return persona ownership.
+
+    Legacy/raw agent identifiers remain readable.  Once an identifier has the
+    canonical four-part shape for this project, however, its runtime and
+    persona are wire values: lowercase ASCII only.  This prevents Unicode
+    lookalikes from crossing a verified mirror boundary.
+    """
+    named = {}
+    for index, row in enumerate(rows):
+        path = "projection.agents[%d]" % index
+        if not isinstance(row, dict):
+            _error("invalid_projection", "%s must be an object" % path)
+        actor_id = row.get("agent_id")
+        if not isinstance(actor_id, str):
+            continue
+        text = actor_id.strip()
+        parts = text.split(".")
+        looks_named = len(parts) == 4 \
+            and parts[0].lower() == scope["project_id"].lower() \
+            and parts[1].lower() in {
+                "director", "advisor", "worker", "unassigned",
+            }
+        if not looks_named:
+            continue
+        persona = parts[3]
+        if text != text.lower() \
+                or parts[0] != scope["project_id"] \
+                or not parts[2].isascii() \
+                or not _WIRE_SLUG_RE.fullmatch(parts[2]) \
+                or "--" in parts[2] \
+                or not persona.isascii() \
+                or not _PERSONA_RE.fullmatch(persona) \
+                or "--" in persona \
+                or persona in {"default", "none", "unassigned"}:
+            _error(
+                "invalid_agent_persona",
+                "%s.agent_id is not a normalized ASCII named identity" %
+                path)
+        # Pre-feature workspaces may retain two historical exact actors with
+        # the same old color/name. The registry still prevents allocation to
+        # a third actor, while exact IDs remain selectable and @Name remains
+        # ambiguous. Coverage—not destructive history cleanup—is the mirror
+        # invariant here.
+        named.setdefault(persona, text)
+    return named
+
+
 def _validate_negotiated_identity_resources(value, scope, selected,
                                               partial=False):
     resources = set(selected["resources"])
@@ -896,6 +1007,26 @@ def _validate_negotiated_identity_resources(value, scope, selected,
         if "role_scopes" in value:
             _validate_role_scope_rows(
                 value["role_scopes"], scope, value.get("project"))
+    if "persona_reservations" in resources:
+        reservations = value.get("persona_reservations")
+        if reservations is not None:
+            _validate_persona_reservation_rows(
+                reservations, scope)
+        named = _projected_named_agent_personas(
+            value.get("agents") or [], scope)
+        if named and reservations is None and not partial:
+            _error(
+                "missing_persona_reservations",
+                "a negotiated full projection with named agents requires "
+                "the complete persona reservation registry")
+        if named and reservations is not None:
+            reserved = {row["persona"] for row in reservations}
+            missing = sorted(set(named) - reserved)
+            if missing:
+                _error(
+                    "incomplete_persona_reservations",
+                    "named projected agent persona(s) are absent from the "
+                    "reservation registry: %s" % ", ".join(missing))
 
 
 def validate_projection_for_capabilities(projection, scope, capabilities,

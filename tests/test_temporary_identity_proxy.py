@@ -15,6 +15,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -39,6 +40,7 @@ class TemporaryIdentityProxyContractTest(unittest.TestCase):
         self.client_instance = "codex-install-isolated"
         self.device_id = "device-isolated"
         self.permanent_actor = "proj.director.codex.red"
+        self.compatibility_actor = "proj.director.codex"
         self.processes = []
 
         conn = core.connect(self.db)
@@ -62,6 +64,12 @@ class TemporaryIdentityProxyContractTest(unittest.TestCase):
                 agent_id=self.permanent_actor,
                 display_name="Red Codex Director", role="director",
                 runtime="codex", registration_username="jack")
+            core.agent_register(
+                conn, "proj", "web.jack", "human",
+                agent_id=self.compatibility_actor,
+                display_name="Existing compatibility identity",
+                role="director", runtime="codex",
+                registration_username="jack")
             principal = core._auth_principal(
                 conn, user, "session", session_hash="isolated-session")
             created = core.auth_client_key_create(
@@ -205,7 +213,7 @@ class TemporaryIdentityProxyContractTest(unittest.TestCase):
             "identity_mode": "temporary",
         }, request_id=3)
         temporary_actor = selected["agent_id"]
-        self.assertEqual(temporary_actor, "proj.director.codex.blue")
+        self.assertEqual(temporary_actor, "proj.director.codex.gibbs")
         self.assertEqual(self._binding_actor(), self.permanent_actor)
 
         # The same long-running stdio proxy adopts the temporary actor after
@@ -220,6 +228,68 @@ class TemporaryIdentityProxyContractTest(unittest.TestCase):
             self._status_actor(restarted, 5), self.permanent_actor)
         self.assertEqual(self._binding_actor(), self.permanent_actor)
 
+    def test_shell_setup_cannot_claim_to_activate_parent_proxy_temporary_actor(self):
+        with mock.patch.object(core, "remote_json") as remote:
+            with self.assertRaisesRegex(
+                    core.AttaccaError,
+                    "temporary_identity_requires_current_mcp"):
+                core.apply_remote_network_setup(
+                    "http://127.0.0.1:9", "proj", "codex", "agent",
+                    role="director", identity_mode="temporary")
+            remote.assert_not_called()
+
+        skill = (ROOT / "skills" / "setup" / "SKILL.md").read_text(
+            encoding="utf-8")
+        self.assertIn("current Attacca MCP proxy", skill)
+        self.assertIn("identity_mode=temporary", skill)
+        self.assertIn("do not offer temporary", skill)
+        self.assertIn("valid binding", skill)
+        self.assertNotIn(
+            "`--identity-mode new|reuse|temporary`", skill)
+
+        # The public CLI must fail before it opens/creates a database, links
+        # the checkout, performs authentication, or changes machine state.
+        # Port 9 is intentionally unreachable; reaching it would prove the
+        # guard ran too late.
+        blocked_checkout = self.root / "blocked-cli-checkout"
+        blocked_checkout.mkdir()
+        before_home = {
+            str(path.relative_to(self.home)): path.read_bytes()
+            for path in self.home.rglob("*") if path.is_file()
+        }
+        blocked_db = self.root / "must-not-exist.db"
+        environment = self._environment()
+        environment["ATTACCA_DB"] = str(blocked_db)
+        environment["ATTACCA_URL"] = "http://127.0.0.1:9"
+        completed = subprocess.run(
+            [sys.executable, SCRIPT, "setup", "--url",
+             "http://127.0.0.1:9", "--here", "--attach", "proj",
+             "--role", "director", "--identity-mode", "temporary",
+             "--no-server"],
+            cwd=str(blocked_checkout), env=environment,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=10, check=False)
+        self.assertEqual(completed.returncode, 2, completed)
+        self.assertIn(
+            "temporary_identity_requires_current_mcp", completed.stderr)
+        self.assertIn("native guided setup", completed.stderr)
+        self.assertIn("agent_register", completed.stderr)
+        self.assertNotIn("--identity-mode defer", completed.stderr)
+        self.assertFalse(blocked_db.exists())
+        self.assertFalse((blocked_checkout / ".attacca").exists())
+        after_home = {
+            str(path.relative_to(self.home)): path.read_bytes()
+            for path in self.home.rglob("*") if path.is_file()
+        }
+        self.assertEqual(after_home, before_home)
+
+    def test_unlinked_proxy_fallback_uses_parsed_project_id_key(self):
+        source = (ROOT / "attacca.py").read_text(encoding="utf-8")
+        self.assertIn(
+            'context.get("project") or parsed["project_id"]', source)
+        self.assertNotIn(
+            'context.get("project") or parsed["workspace"]', source)
+
     def test_new_and_reuse_modes_rebind_then_survive_proxy_restart(self):
         proxy = self._start_proxy()
         self.assertEqual(self._status_actor(proxy, 2), self.permanent_actor)
@@ -229,7 +299,7 @@ class TemporaryIdentityProxyContractTest(unittest.TestCase):
             "identity_mode": "new",
         }, request_id=3)
         new_actor = created["agent_id"]
-        self.assertEqual(new_actor, "proj.director.codex.blue")
+        self.assertEqual(new_actor, "proj.director.codex.gibbs")
         self.assertEqual(self._status_actor(proxy, 4), new_actor)
         self.assertEqual(self._binding_actor(), new_actor)
 
@@ -248,6 +318,22 @@ class TemporaryIdentityProxyContractTest(unittest.TestCase):
         after_reuse_restart = self._start_proxy()
         self.assertEqual(
             self._status_actor(after_reuse_restart, 8), self.permanent_actor)
+
+        compatibility = self._tool(proxy, "agent_register", {
+            "agent_id": self.compatibility_actor,
+            "role": "director", "runtime": "codex",
+            "identity_mode": "reuse",
+        }, request_id=9)
+        self.assertEqual(
+            compatibility["agent_id"], self.compatibility_actor)
+        self.assertEqual(
+            self._status_actor(proxy, 10), self.compatibility_actor)
+        self.assertEqual(self._binding_actor(), self.compatibility_actor)
+
+        after_compatibility_restart = self._start_proxy()
+        self.assertEqual(
+            self._status_actor(after_compatibility_restart, 11),
+            self.compatibility_actor)
 
 
 if __name__ == "__main__":

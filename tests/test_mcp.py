@@ -395,14 +395,18 @@ class McpTestCase(unittest.TestCase):
             proc.stderr.close()
 
     def test_inbox_autoregister_and_owner_via_mcp(self):
+        # A legacy selector is accepted only after it exactly identifies a
+        # current registered actor; arbitrary future strings must not create
+        # unreachable addressed mail.
+        bob = self.client(actor="codex_director",
+                          extra_env={"ATTACCA_OWNER": "mia"})
+        bob.initialize(client_name="codex-cli")
+        bob.call_tool("agent_list", {})  # first scoped call registers Bob
         alice = self.client(actor="claude_director",
                             extra_env={"ATTACCA_OWNER": "jack"})
         alice.initialize(client_name="claude-code")
         alice.call_tool("room_send", {"body": "ping bob",
                                       "mentions": ["mia.codex_director"]})
-        bob = self.client(actor="codex_director",
-                          extra_env={"ATTACCA_OWNER": "mia"})
-        bob.initialize(client_name="codex-cli")
         is_err, _, inbox = bob.call_tool("check_inbox", {})
         self.assertFalse(is_err)
         self.assertEqual([m["body"] for m in inbox["messages"]], ["ping bob"])

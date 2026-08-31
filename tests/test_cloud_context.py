@@ -1,9 +1,10 @@
 """T-48 cloud context + the mandatory-rules banner + cloud-context brief wiring.
 
 Cloud context is a per-project free-text document (like a hosted
-AGENTS.md/CLAUDE.md) injected into every session brief and editable only by
-humans and registered Directors. The rules banner pins mandatory Project Rules
-at the top of every injected turn so they survive host-side truncation.
+AGENTS.md/CLAUDE.md) loaded into the session-start brief, retained while its
+version/hash is unchanged, and editable only by humans and registered Directors.
+The rules banner pins mandatory Project Rules at the top of every injected turn
+so they survive host-side truncation.
 """
 import importlib.util
 import os

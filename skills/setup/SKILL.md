@@ -15,8 +15,8 @@ In Claude Code, use its native choice UI for each decision. Codex has no popup
 choice picker for this flow, so present a short numbered list and ask the user
 to type a number or displayed name. Keep exact project and actor ids from
 discovery only as internal arguments; never display, invent, or ask for a raw
-id. Identity choices use friendly role, runtime, and color labels such as
-**Codex Director · Red**.
+id. Identity choices use the generated project-unique name and short address,
+such as **Gibbs · @Gibbs · Director · Codex**.
 
 ## FAST PATH — this is a DECISION flow, NOT a thinking job
 
@@ -38,7 +38,7 @@ On invocation, do exactly this:
    picker — go straight to the choices.
 3. Apply the confirmed choices once. A first/unbound installation uses one
    `setup …` command. An explicitly requested switch in an already-running MCP
-   process uses that current Attacca MCP's `agent_register` path described in
+   process uses the **current Attacca MCP proxy** `agent_register` path described in
    §3 so the active proxy actually adopts the selection. Then give one short
    confirmation line.
 
@@ -158,8 +158,8 @@ python3 "ATTACCA_RUNTIME" \
 ## 2. Choose this AI's role
 
 Use `network.current_actor_record` internally, but show only its friendly
-display name, role, runtime, and color plus the current Lead Director before the
-role question. Never render its raw actor ID.
+persona name, `@ShortName`, role, and runtime plus the current Lead Director
+before the role question. Never render its raw actor ID.
 
 - On a first setup with no lead, default to **Director + Lead Director**
   (`--role director --lead current`). Also list Director without assigning a
@@ -172,7 +172,7 @@ role question. Never render its raw actor ID.
 
 Label the authority difference clearly. Every registered role owns and may
 update only its own exact-identity handoff after reporting work; it can never
-overwrite another color's handoff. Advisor and Worker still cannot manage
+overwrite another named identity's handoff. Advisor and Worker still cannot manage
 Project Rules, Cloud Context, or Role Scope. Humans and registered Directors
 manage the versioned Role Scope shared by each role; the selected Lead Director
 also receives the `lead_director` overlay. Handoff and Role Scope writes use
@@ -183,41 +183,52 @@ their own optimistic versions and stale writes must reload and reconcile.
 Read `network.machine_actor_binding` and the selected role's entry in
 `network.identity_options_by_role`. The canonical durable shape is internally
 `workspace.role.runtime.persona`, but never show that raw string. New setup-
-created identities always have a color. A discovered three-part actor without a
-persona is a compatibility identity: it may be explicitly reused/taken over,
-but setup must never silently migrate, clone, or rename it.
+created identities receive human-friendly names such as **Gibbs** with short
+address **@Gibbs**. The server transactionally reserves each name
+case-insensitively across the entire project—every role, runtime, current
+identity, and historical identity—so a name is never issued twice. A discovered
+three-part actor or an existing Red/Blue persona is a compatibility identity: it
+may be explicitly reused/taken over, but setup must never silently migrate,
+clone, or rename it.
 
 Offer these friendly choices:
 
 1. When a valid binding exists for the chosen role/runtime, **Continue as
-   <Role> · <Runtime> · <Color> (recommended)**. This keeps the saved exact
+   <Name> · @<Name> · <Role> · <Runtime> (recommended)**. This keeps the saved exact
    identity.
 2. For each other same-owner reusable identity, **Take over/reuse <Role> ·
-   <Runtime> · <Color>**. Explain in one short clause that simultaneous clients
+   <Runtime> · <Name> (@<Name>)**. Explain in one short clause that simultaneous clients
    reusing it intentionally share its handoff, inbox cursor, and task leases.
    Label a three-part choice **Existing compatibility identity**, never with its
    raw actor ID.
-3. **Create permanent <next color> identity**. The server allocates the next
-   collision-free color atomically; a preview from discovery is only a label.
-4. **Use temporary <next color> identity in this MCP process**. It creates a
+3. **Create permanent <next generated name> identity**. The server allocates and
+   forever reserves the name atomically; `persona_name` / `short_name` from
+   discovery are previews only (the first available project name is Gibbs).
+4. When a valid machine binding already authorizes this running proxy, **Use
+   temporary <next generated name> identity in this MCP process**. It creates a
    separately auditable actor but does not replace the machine binding; a fresh
    process does not select it automatically.
 
-If there is no binding, recommend **Create permanent <next color> identity**,
-while still offering same-owner reusable identities and the temporary choice.
+If there is no binding, recommend **Create permanent <next generated name>
+identity** and offer same-owner reusable identities, but do not offer temporary:
+D-17 requires an exact registered actor before MCP can authorize the selection.
 Never infer takeover merely because the same runtime is already registered.
 
-For a first/unbound setup, carry the choice into the single CLI apply command as
-`--identity-mode new|reuse|temporary`; only a reuse passes the discovered exact
+For a first/unbound permanent setup, carry the choice into the single CLI apply
+command as `--identity-mode new|reuse`; only a reuse passes the discovered exact
 actor through hidden `--identity-actor`, and that raw value is never displayed.
-Permanent new/reuse saves the machine binding. Temporary skips watcher/cron
-binding for that selection.
+Permanent new/reuse saves the machine binding. Reuse is selection-only: it
+never merges, deletes, renames, or otherwise mutates the identity that was
+active before the selection.
 
 When setup was explicitly invoked to switch an already-linked, already-running
-client, make the switch through the **current Attacca MCP proxy** so it takes
-effect in this process. Call `agent_register` with the selected `role`, current
-`runtime`, and `identity_mode`. For reuse, also pass only the selected
-discovered `persona` internally; never show or ask for the full actor ID. A
+client with a valid binding, make the switch through the **current Attacca MCP
+proxy** so it takes effect in this process. Call `agent_register` with the
+selected `role`, current `runtime`, and `identity_mode` (`identity_mode=temporary`
+for the process-only choice). For reuse, pass the selected discovered `persona`
+for a named identity. A persona-less three-part compatibility choice instead
+passes its exact discovered `agent_id` as a hidden tool argument; never show or
+ask the human for that raw value. A
 successful `new` or `reuse` response updates the machine binding and hot-switches
 the proxy. A successful `temporary` response hot-switches only this proxy's
 in-memory actor. Never call this path during ordinary startup/resume. If setup
@@ -255,7 +266,7 @@ inventing a target.
 After confirmation, build one shell-quoted command containing exactly one
 workspace action (attach, create, or already-linked default), the selected
 role, identity, and lead flags, and only confirmed relationship flags. This is
-the first/unbound path; an in-process switch follows §3 instead:
+the first/unbound path; an already-bound in-process switch follows §3 instead:
 
 ```bash
 python3 "ATTACCA_RUNTIME" \
@@ -267,9 +278,10 @@ python3 "ATTACCA_RUNTIME" \
 
 Replace all uppercase tokens, including `ATTACCA_RUNTIME`, with their exact
 internally resolved values; they are not literal arguments. `IDENTITY_FLAGS` is
-`--identity-mode new|reuse|temporary` plus hidden `--identity-actor` only for
-reuse. Never display that hidden value. Do not use `-i`, because this guided
-flow already obtained typed choices.
+`--identity-mode new|reuse` plus hidden `--identity-actor` only for reuse. Never
+display that hidden value. `temporary` appears only in a current-proxy
+`agent_register` call for an already-bound client. Do not use `-i`, because this
+guided flow already obtained typed choices.
 
 Setup must configure all detected coding tools, MCP, managed instructions, and
 the lifecycle startup hook. Inspect its result for server URL,
@@ -331,7 +343,7 @@ silently import, create, or claim work, and never claim newly created tasks as
 part of setup. With no candidates, report that and make no write.
 
 Finish with a concise summary of the server, Git remote/folder, workspace,
-project link, friendly role/runtime/color identity, whether the identity is
+project link, friendly name / `@ShortName` / role / runtime identity, whether the identity is
 permanently bound or current-process temporary, lead, relationship direction,
 tool/MCP/hook verification, and tasks created or skipped. Another checkout
 joins the same project by confirming the same Git workspace or selecting the

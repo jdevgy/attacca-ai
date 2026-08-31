@@ -98,6 +98,11 @@ class PanelServerPaginationContracts(unittest.TestCase):
                 " VALUES (?,?,NULL,NULL,'fixture',?,1,NULL)",
                 (project_id, name, created_at),
             )
+        conn.execute(
+            "UPDATE projects SET repository_fingerprint=?, lead_director=?"
+            " WHERE project_id='hub'",
+            ("fixture-hub-fingerprint", DIRECTOR),
+        )
         for index in range(ROW_COUNT):
             marker = "cobalt" if index % 7 == 0 else "plain"
             project_id = "space-%s-%03d" % (marker, index)
@@ -609,8 +614,53 @@ class PanelServerPaginationContracts(unittest.TestCase):
         options = self.get_json("/v1/projects?options=1", self.viewer_session)
         self.assertEqual(len(options["projects"]), len(self.authorized_project_ids))
         for item in options["projects"]:
-            self.assertTrue({"project_id", "name"}.issubset(item))
-            self.assertFalse({"root_path", "events", "open_tasks"}.intersection(item))
+            self.assertTrue({
+                "project_id", "name", "repository_fingerprint",
+                "lead_director",
+            }.issubset(item))
+            self.assertFalse(
+                {"root_path", "events", "open_tasks"}.intersection(item))
+        hub = next(item for item in options["projects"]
+                   if item["project_id"] == "hub")
+        self.assertEqual(
+            hub["repository_fingerprint"], "fixture-hub-fingerprint")
+        self.assertEqual(hub["lead_director"], DIRECTOR)
+
+    def test_invalid_collection_sorts_are_client_errors_not_newest_fallbacks(self):
+        cases = (
+            ("/v1/projects?sort=sideways", self.viewer_session),
+            ("/v1/projects/hub/tasks?sort=sideways", self.actor_headers()),
+            ("/v1/projects/hub/room/history?sort=sideways",
+             self.actor_headers()),
+            ("/v1/projects/hub/activity?sort=sideways",
+             self.actor_headers()),
+            ("/v1/projects/hub/decisions?sort=sideways",
+             self.actor_headers()),
+            ("/v1/projects/hub/agents?sort=sideways",
+             self.actor_headers()),
+        )
+        for path, headers in cases:
+            with self.subTest(path=path):
+                response = self.request("GET", path, headers=headers)
+                self.assertEqual(response["status"], 400, response["body"])
+                self.assertIn("newest or oldest", response["body"]["error"])
+
+    def test_setup_discovery_uses_complete_option_directories_past_sixty(self):
+        checkout = Path(self.temp.name) / "setup-directory-checkout"
+        home = Path(self.temp.name) / "setup-directory-home"
+        checkout.mkdir(exist_ok=True)
+        home.mkdir(exist_ok=True)
+        discovered = core.discover_remote_setup(
+            "http://%s:%s" % (self.host, self.port), path=checkout,
+            here=True, actor_id=DIRECTOR, actor_type="agent",
+            selected_project_id="hub", home=home)
+        self.assertEqual(discovered["network"]["workspace_id"], "hub")
+        self.assertEqual(discovered["network"]["lead_director"], DIRECTOR)
+        self.assertEqual(
+            len(discovered["workspaces"]), ROW_COUNT + 4)
+        self.assertIn(
+            "space-cobalt-000",
+            {row["project_id"] for row in discovered["workspaces"]})
 
     def test_handoff_history_filters_and_sorts_before_offset(self):
         query = "handoff cobalt"
@@ -773,7 +823,7 @@ class PanelServerPaginationContracts(unittest.TestCase):
             body,
             "rules",
             total=len(matches),
-            unfiltered=ROW_COUNT,
+            unfiltered=ROW_COUNT + 1,
             limit=7,
             offset=2,
             has_more=2 + len(body["rules"]) < len(matches),
@@ -804,7 +854,7 @@ class PanelServerPaginationContracts(unittest.TestCase):
             body,
             "entries",
             total=len(expected),
-            unfiltered=ROW_COUNT,
+            unfiltered=ROW_COUNT + 1,
             limit=8,
             offset=3,
             has_more=3 + len(body["entries"]) < len(expected),
@@ -927,7 +977,7 @@ class PanelServerPaginationContracts(unittest.TestCase):
         )
 
     def test_activity_filters_authorized_ledger_before_exact_counts_and_offset(self):
-        worker_total = ROW_COUNT + ROW_COUNT
+        worker_total = ROW_COUNT + ROW_COUNT + 1
         director_total = worker_total + len(self.hidden_room_sequences)
         denied = self.get_json(
             "/v1/projects/hub/activity?q=secret+bridge&limit=999",

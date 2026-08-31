@@ -626,6 +626,18 @@
 
       function newListPage() { return { offset: 0 }; }
 
+      function newTaskPlanState(taskId = "", overrides = {}) {
+        return {
+          taskId, data: null, error: "", loading: false, edit: false,
+          selectedVersion: null, requestSerial: 0,
+          revisionQuery: "", revisionFilter: "all", revisionOffset: 0,
+          revisionSort: "newest",
+          actionQuery: "", actionFilter: "all", actionOffset: 0,
+          actionSort: "oldest",
+          ...overrides
+        };
+      }
+
       function responseRows(response, key) {
         if (Array.isArray(response?.[key])) return response[key];
         return Array.isArray(response?.rows) ? response.rows : [];
@@ -660,7 +672,7 @@
 
       function resetProjectPages() {
         ["tasks", "decisions", "rules", "agents", "bridges", "handoff",
-          "log", "search"].forEach(resetListPage);
+          "roleScopeHistory", "log", "search"].forEach(resetListPage);
       }
 
       function listQuery(view, extra = {}) {
@@ -830,7 +842,7 @@
         workspaceSearch: "",
         taskFilter: "active",
         taskSearch: "",
-        taskPlan: { taskId: "", data: null, error: "", loading: false, edit: false, selectedVersion: null },
+        taskPlan: newTaskPlanState(),
         roomConversation: "local",
         roomFilter: "",
         activityFilter: "",
@@ -842,13 +854,15 @@
         handoffSearch: "",
         handoffActor: "",
         roleScopeRole: "",
+        roleScopeHistorySearch: "",
         logSearch: "",
         clientKeySearch: "",
         listSort: readListSorts(),
         listPages: {
           workspaces: newListPage(), tasks: newListPage(), decisions: newListPage(),
           rules: newListPage(), agents: newListPage(), bridges: newListPage(),
-          handoff: newListPage(), log: newListPage(), search: newListPage(),
+          handoff: newListPage(), roleScopeHistory: newListPage(),
+          log: newListPage(), search: newListPage(),
           clientKeys: newListPage()
         },
         roomFeed: newFeedState(),
@@ -910,8 +924,60 @@
         return state.projects.find(project => project.project_id === id)?.name || id || "Unknown workspace";
       }
 
+      // TESTABLE_NAMED_IDENTITY_HELPERS:BEGIN
+      function agentPersonaName(agent) {
+        if (!agent) return "";
+        const explicit = agent.persona_name || agent.identity?.persona_name;
+        if (explicit) return String(explicit);
+        const raw = String(agent.operational_actor_id || agent.agent_id || "");
+        const parts = raw.split(".");
+        const roles = new Set(["director", "advisor", "worker", "unassigned"]);
+        return parts.length >= 4 && roles.has(parts[parts.length - 3])
+          ? identityPart(parts[parts.length - 1]) : "";
+      }
+
+      function agentShortName(agent) {
+        if (!agent) return "";
+        const explicit = agent.short_name || agent.identity?.short_name;
+        if (explicit) return String(explicit).startsWith("@") ? String(explicit) : `@${explicit}`;
+        const name = agentPersonaName(agent);
+        return name ? `@${name}` : "";
+      }
+
+      function agentFriendlyName(agent) {
+        return agentPersonaName(agent) || "Existing compatibility identity";
+      }
+
+      function agentDisplayDescription(agent) {
+        const display = String(agent?.display_name || "").trim();
+        if (!display) return "";
+        const rawIds = new Set([
+          String(agent?.agent_id || "").trim(),
+          String(agent?.operational_actor_id || "").trim()
+        ].filter(Boolean).map(value => value.toLowerCase()));
+        return rawIds.has(display.toLowerCase()) ? "" : display;
+      }
+
+      function agentChoiceLabel(agent) {
+        const name = agentFriendlyName(agent);
+        const address = agentShortName(agent);
+        return [name, address,
+          agent.role ? identityPart(agent.role) : "",
+          agent.runtime ? identityPart(agent.runtime) : ""]
+          .filter(Boolean).join(" · ");
+      }
+      // TESTABLE_NAMED_IDENTITY_HELPERS:END
+
       function actorDisplay(actorId) {
         const raw = String(actorId || "unknown");
+        const registered = (state.data.agentOptions?.agents ||
+          state.data.agents?.agents || state.workspaceAgents?.[state.projectId] || [])
+          .find(agent => agent.agent_id === raw || agent.operational_actor_id === raw);
+        if (registered?.operational_actor_id && registered.operational_actor_id !== raw) {
+          return actorDisplay(registered.operational_actor_id);
+        }
+        const registeredAddress = agentShortName(registered);
+        if (registeredAddress) return registeredAddress;
         const parts = raw.split(".");
         const roles = new Set(["director", "advisor", "worker", "unassigned", "human", "tool", "system"]);
         const personaIdentity = parts.length >= 4 && roles.has(parts[parts.length - 3]);
@@ -921,12 +987,8 @@
           const role = parts.pop();
           const workspaceId = parts.join(".");
           const workspace = state.projects.find(project => project.project_id === workspaceId)?.name || workspaceId;
-          return [workspace, role, runtime, persona].filter(Boolean).map(identityPart).join(" · ");
-        }
-        const registered = (state.data.agentOptions?.agents ||
-          state.data.agents?.agents || []).find(agent => agent.agent_id === raw);
-        if (registered?.operational_actor_id && registered.operational_actor_id !== raw) {
-          return actorDisplay(registered.operational_actor_id);
+          if (persona) return `@${identityPart(persona)}`;
+          return [workspace, role, runtime].filter(Boolean).map(identityPart).join(" · ");
         }
         const lower = raw.toLowerCase();
         const runtime = ["claude", "codex", "kimi", "cline", "cursor", "windsurf", "gemini", "vscode", "opencode", "glm"].find(name => lower.includes(name));
@@ -1063,6 +1125,64 @@
       }
       // TESTABLE_TASK_PLAN_HELPERS:END
 
+      function taskPlanRequestSuffix(selected = state.taskPlan) {
+        const params = new URLSearchParams({
+          revision_limit: String(PANEL_PAGE_SIZE),
+          revision_offset: String(Math.max(0, selected.revisionOffset || 0)),
+          revision_sort: selected.revisionSort || "newest",
+          action_limit: String(PANEL_PAGE_SIZE),
+          action_offset: String(Math.max(0, selected.actionOffset || 0)),
+          action_sort: selected.actionSort || "oldest"
+        });
+        if (selected.selectedVersion != null) {
+          params.set("version", String(selected.selectedVersion));
+        }
+        if (selected.revisionQuery) params.set("revision_q", selected.revisionQuery);
+        if (selected.revisionFilter && selected.revisionFilter !== "all") {
+          params.set("revision_filter", selected.revisionFilter);
+        }
+        if (selected.actionQuery) params.set("action_q", selected.actionQuery);
+        if (selected.actionFilter && selected.actionFilter !== "all") {
+          params.set("action_filter", selected.actionFilter);
+        }
+        return `?${params.toString()}`;
+      }
+
+      function taskPlanCollectionPage(payload, kind) {
+        const selected = state.taskPlan;
+        if (kind === "revision") {
+          const metadata = payload?.pagination?.revisions || payload || {};
+          return responsePage({
+            ...metadata, revisions: payload?.revisions || []
+          }, "revisions", selected.revisionOffset);
+        }
+        const metadata = payload?.plan?.actions_pagination ||
+          payload?.pagination?.actions || {};
+        return responsePage({
+          ...metadata, actions: payload?.plan?.actions || []
+        }, "actions", selected.actionOffset);
+      }
+
+      function taskPlanSortControl(kind) {
+        const selected = state.taskPlan;
+        const value = selected[`${kind}Sort`] ||
+          (kind === "revision" ? "newest" : "oldest");
+        return `<label class="cluster small" for="task-plan-${h(kind)}-sort"><span class="faint">Sort by date</span><select id="task-plan-${h(kind)}-sort" data-task-plan-sort="${h(kind)}" aria-label="Sort plan ${h(kind)} history by date"><option value="newest" ${value === "newest" ? "selected" : ""}>Newest first</option><option value="oldest" ${value === "oldest" ? "selected" : ""}>Oldest first</option></select></label>`;
+      }
+
+      function taskPlanPageToolbar(payload, kind, noun) {
+        const page = taskPlanCollectionPage(payload, kind);
+        const shown = page.total === page.unfilteredTotal
+          ? `${page.total} ${noun}`
+          : `${page.total} matching of ${page.unfilteredTotal} ${noun}`;
+        const range = page.rows.length
+          ? `${page.rangeStart}–${page.rangeEnd} of ${page.total}`
+          : page.offset > 0 && page.total > 0
+          ? `No results at offset ${page.offset} · ${page.total} total`
+          : `0 of ${page.total}`;
+        return `<div class="feed-toolbar"><div class="feed-pagination" role="navigation" aria-label="${h(noun)} pages"><button class="button quiet small" type="button" data-action="task-plan-page" data-task-plan-page="${h(kind)}" data-direction="-1" ${page.offset <= 0 ? "disabled" : ""}>Previous</button><span class="feed-range">${h(range)}</span><button class="button quiet small" type="button" data-action="task-plan-page" data-task-plan-page="${h(kind)}" data-direction="1" ${page.hasMore ? "" : "disabled"}>Next</button></div><span class="faint small">${h(shown)} · ${h(page.limit)} per page</span></div>`;
+      }
+
       function j(value) { return h(JSON.stringify(value, null, 2)); }
       function pathFor(suffix = "") { return `/v1/projects/${encodeURIComponent(state.projectId)}${suffix}`; }
       function list(value) { return String(value || "").split(",").map(item => item.trim()).filter(Boolean); }
@@ -1073,13 +1193,57 @@
       function bridgeParticipationLabel(value) {
         return BRIDGE_PARTICIPATION.find(([preset]) => preset === value)?.[1] || value || "All roles";
       }
-      function bridgeParticipationFields(formKey, side, workspaceId, preset = "all", allowedAgents = []) {
+
+      function bridgeAgentDirectory(workspaceId) {
+        if (!workspaceId) return [];
+        if (workspaceId === state.projectId) {
+          return state.data.agentOptions?.agents ||
+            state.data.agents?.agents || state.workspaceAgents?.[workspaceId] || [];
+        }
+        return state.workspaceAgents?.[workspaceId] || [];
+      }
+
+      function bridgeAgentOptions(workspaceId, allowedAgents = []) {
+        const selected = new Set((allowedAgents || []).map(String));
+        const directory = bridgeAgentDirectory(workspaceId);
+        const knownIds = new Set();
+        const rows = directory.map(agent => {
+          const canonical = String(agent.operational_actor_id || agent.agent_id || "");
+          [agent.agent_id, agent.operational_actor_id].filter(Boolean)
+            .forEach(actorId => knownIds.add(String(actorId)));
+          const isSelected = selected.has(canonical) ||
+            selected.has(String(agent.agent_id || ""));
+          return { canonical, label: agentChoiceLabel(agent), selected: isSelected };
+        }).filter(row => row.canonical).sort((left, right) =>
+          left.label.localeCompare(right.label, undefined,
+            { numeric: true, sensitivity: "base" }));
+        for (const actorId of selected) {
+          if (!knownIds.has(actorId)) rows.push({
+            canonical: actorId,
+            label: "Existing compatibility identity · unavailable from directory",
+            selected: true
+          });
+        }
+        if (!rows.length) {
+          const label = !workspaceId ? "Choose a connected workspace first"
+            : state.workspaceAgentErrors?.[workspaceId]
+            ? "Identity directory unavailable"
+            : "No registered AI identities";
+          return `<option value="" disabled>${h(label)}</option>`;
+        }
+        return rows.map(row => `<option value="${h(row.canonical)}" ${row.selected ? "selected" : ""}>${h(row.label)}</option>`).join("");
+      }
+
+      function bridgeParticipationFields(formKey, side, workspaceId, preset = "all", allowedAgents = [], workspaceLabel = null) {
         const peer = side === "peer";
         const policyName = peer ? "peer_participation" : "participation";
         const agentsName = peer ? "peer_selected_agents" : "selected_agents";
         const selectedAgents = preset === "selected_agents";
         const token = `${String(formKey).replace(/[^a-zA-Z0-9_-]/g, "-")}-${side}`;
-        return `<div class="field"><label for="bridge-policy-${h(token)}">${h(projectName(workspaceId))} participation</label><select id="bridge-policy-${h(token)}" name="${policyName}" data-participation-select data-participation-side="${side}">${bridgeParticipationOptions(preset)}</select><span class="help">Controls who may read, send, or mutate this inter-project conversation from ${h(projectName(workspaceId))}.</span></div><div class="field" data-selected-agents-side="${side}" ${selectedAgents ? "" : "hidden"}><label for="bridge-agents-${h(token)}">Selected agents in ${h(projectName(workspaceId))}</label><input id="bridge-agents-${h(token)}" name="${agentsName}" value="${h((allowedAgents || []).join(", "))}" placeholder="${h(workspaceId)}.director.codex" ${selectedAgents ? "required" : "disabled"}><span class="help">Comma-separated registered AI actor IDs. Humans retain repair access.</span></div>`;
+        const label = workspaceLabel || projectName(workspaceId);
+        const size = Math.min(8, Math.max(3,
+          bridgeAgentDirectory(workspaceId).length || 3));
+        return `<div class="field"><label for="bridge-policy-${h(token)}">${h(label)} participation</label><select id="bridge-policy-${h(token)}" name="${policyName}" data-participation-select data-participation-side="${side}">${bridgeParticipationOptions(preset)}</select><span class="help">Controls who may read, send, or mutate this inter-project conversation from ${h(label)}.</span></div><div class="field" data-selected-agents-side="${side}" ${selectedAgents ? "" : "hidden"}><label for="bridge-agents-${h(token)}">Selected identities in ${h(label)}</label><select id="bridge-agents-${h(token)}" name="${agentsName}" multiple size="${size}" data-bridge-agent-select data-bridge-agent-workspace="${h(workspaceId)}" ${selectedAgents ? "required" : "disabled"}>${bridgeAgentOptions(workspaceId, allowedAgents)}</select><span class="help">Choose friendly names or @ShortNames. Exact actor IDs are submitted internally; humans retain repair access.</span></div>`;
       }
       function statusBadge(value) { const text = value || "unknown"; return `<span class="badge ${h(text)}">${h(text)}</span>`; }
       function fmtTime(value, withDate = true) {
@@ -1633,7 +1797,8 @@
         const dataKey = {
           workspaces: "projectPage", tasks: "tasks", decisions: "decisions",
           rules: "rules", agents: "agents", bridges: "bridges",
-          handoff: "handoffHistory", log: "log", room: "room",
+          handoff: "handoffHistory", roleScopeHistory: "roleScopeHistory",
+          log: "log", room: "room",
           activity: "events"
         }[view];
         if (dataKey) {
@@ -1827,11 +1992,13 @@
           };
           if (roleScopeManager || ROLE_SCOPE_NAMES.includes(panelAgentRecord()?.role)) {
             endpoints.roleScopeHistory = pathFor(
-              `/role-scopes/${encodeURIComponent(roleScope)}/history?limit=${PANEL_PAGE_SIZE}`);
+              `/role-scopes/${encodeURIComponent(roleScope)}/history${listQuery("roleScopeHistory", {
+                q: state.roleScopeHistorySearch
+              })}`);
           }
           if (state.taskPlan.taskId) {
-            const version = state.taskPlan.selectedVersion;
-            endpoints.selectedPlan = pathFor(`/tasks/${encodeURIComponent(state.taskPlan.taskId)}/plan${version == null ? "" : `?version=${encodeURIComponent(version)}`}`);
+            const suffix = taskPlanRequestSuffix(state.taskPlan);
+            endpoints.selectedPlan = pathFor(`/tasks/${encodeURIComponent(state.taskPlan.taskId)}/plan${suffix}`);
           }
           const entries = Object.entries(endpoints);
           const results = await Promise.allSettled(entries.map(([, endpoint]) => api(endpoint)));
@@ -1858,6 +2025,10 @@
               state.errors[key] = result.reason.message;
             }
           });
+          if (Array.isArray(state.data.agentOptions?.agents)) {
+            state.workspaceAgents[projectAtStart] = state.data.agentOptions.agents;
+            delete state.workspaceAgentErrors[projectAtStart];
+          }
           const contextVersion = state.data.handoff?.context_version;
           try {
             const freshness = await api(pathFor(`/freshness${contextVersion == null ? "" : `?context_version=${encodeURIComponent(contextVersion)}`}`));
@@ -2000,7 +2171,7 @@
           </div>
           <div class="grid two section-gap">
             <section class="card"><div class="card-head"><h2>Workers</h2><button class="button quiet small" data-view="settings">Register worker</button></div><div class="card-body">
-              ${agents.length ? `<div class="list">${agents.map(agent => `<div class="list-row"><div><div class="list-title">${h(agent.display_name || actorDisplay(agent.agent_id))}</div><div class="list-meta"><span title="${h(agent.agent_id)}">${h(actorDisplay(agent.agent_id))}</span>${ownerChip(agent.owner)}<span>${h(agent.role || "role not set")}</span><span>${h(agent.runtime || "runtime not set")}</span></div></div><div class="faint small">${h(relativeTime(agent.last_seen_at))}</div></div>`).join("")}</div>` : empty("No workers registered", "Workers appear here after they register with this workspace.")}
+              ${agents.length ? `<div class="list">${agents.map(agent => `<div class="list-row"><div><div class="list-title">${h(agentFriendlyName(agent))}</div><div class="list-meta"><span>${h(agentShortName(agent) || "Compatibility record")}</span>${agentDisplayDescription(agent) && agentDisplayDescription(agent) !== agentFriendlyName(agent) ? `<span>${h(agentDisplayDescription(agent))}</span>` : ""}${ownerChip(agent.owner)}<span>${h(agent.role || "role not set")}</span><span>${h(agent.runtime || "runtime not set")}</span></div></div><div class="faint small">${h(relativeTime(agent.last_seen_at))}</div></div>`).join("")}</div>` : empty("No workers registered", "Workers appear here after they register with this workspace.")}
             </div></section>
             <section class="card"><div class="card-head"><h2>Continuity</h2></div><div class="card-body stack">
               <div class="list-row"><div><div class="list-title">Git branch</div><div class="list-meta"><span>Current server-side checkout</span></div></div><code>${h(handoff.git?.branch || "—")}</code></div>
@@ -2108,16 +2279,31 @@
       function renderTaskPlanPanel(task) {
         const selected = state.taskPlan;
         if (selected.loading) return `<section class="task-plan-panel"><div class="muted">Loading full plan…</div></section>`;
-        if (selected.error) return `<section class="task-plan-panel"><div class="notice error"><span>!</span><div><strong>Plan could not load</strong><br>${h(selected.error)}</div></div><div class="form-actions"><button class="button quiet small" type="button" data-action="close-task-plan">Close</button><button class="button small" type="button" data-action="view-task-plan" data-task="${h(task.task_id)}">Retry</button></div></section>`;
+        if (selected.error) return `<section class="task-plan-panel"><div class="notice error"><span>!</span><div><strong>Plan could not load</strong><br>${h(selected.error)}</div></div><div class="form-actions"><button class="button quiet small" type="button" data-action="close-task-plan">Close</button><button class="button small" type="button" data-action="view-task-plan" data-task="${h(task.task_id)}" ${selected.selectedVersion == null ? "" : `data-version="${h(selected.selectedVersion)}"`}>Retry</button></div></section>`;
         const payload = selected.data || { plan: null, revisions: [] };
         const plan = payload.plan;
         if (!plan) return `<section class="task-plan-panel"><div class="task-plan-head"><div><div class="eyebrow">Detailed task plan</div><h3>No plan yet</h3><p class="muted small">Use a structured plan for large work, then submit it for human or Director approval and section-level suggestions.</p></div><button class="button quiet small" type="button" data-action="close-task-plan">Close</button></div>${canEditTaskPlan(task) ? renderTaskPlanEditor(task) : `<div class="notice error section-gap"><span>i</span><div><strong>Read-only for this identity.</strong><br>A human, registered Director, or the active task claimant can create the plan.</div></div>`}</section>`;
         const revisions = payload.revisions || [];
-        const latestVersion = revisions.reduce((latest, item) => Math.max(latest, Number(item.version) || 0), Number(plan.version) || 0);
+        const revisionInPage = revisions.some(item =>
+          Number(item.version) === Number(plan.version));
+        const revisionChoices = revisionInPage ? revisions : [
+          { version: plan.version, status: plan.status, outside_page: true },
+          ...revisions
+        ];
+        const latestVersion = Number(task.plan?.version) ||
+          revisions.reduce((latest, item) => Math.max(
+            latest, Number(item.version) || 0), Number(plan.version) || 0);
         const historical = Number(plan.version) !== latestVersion;
         const editable = canEditTaskPlan(task) && !historical;
         const approvable = canApproveTaskPlan() && !historical && plan.status === "in_review";
         const feedbackOpen = !historical && plan.status === "in_review";
+        const revisionFilters = ["all", "draft", "in_review", "changes_requested", "approved"];
+        const actionFilters = [
+          ["all", "All activity"], ["review", "Reviews"],
+          ["approved", "Approvals"], ["suggested", "Edit suggestions"],
+          ["commented", "Comments"], ["submitted", "Submissions"],
+          ["revised", "Revisions"], ["created", "Creation"]
+        ];
         const actionButtons = historical ? "" : `<div class="cluster">
           ${plan.status === "draft" && editable ? `<button class="button primary small" type="button" data-action="submit-task-plan" data-task="${h(task.task_id)}" data-version="${h(plan.version)}">Submit for review</button>` : ""}
           ${approvable ? `<button class="button primary small" type="button" data-action="approve-task-plan" data-task="${h(task.task_id)}" data-version="${h(plan.version)}">Approve entire plan</button>` : ""}
@@ -2126,13 +2312,15 @@
           ${editable ? `<button class="button small" type="button" data-action="edit-task-plan" data-task="${h(task.task_id)}">${plan.status === "draft" ? "Revise draft" : "Create new revision"}</button>` : ""}
         </div>`;
         return `<section class="task-plan-panel" aria-label="Detailed plan for ${h(task.task_id)}">
-          <div class="task-plan-head"><div><div class="cluster"><span class="eyebrow">Detailed task plan</span>${statusBadge(plan.status)}${historical ? `<span class="badge done">historical</span>` : `<span class="badge accepted">latest</span>`}</div><h3>${h(plan.title)}</h3><div class="list-meta"><span>version ${h(plan.version)}</span><span>${h(plan.sections?.length || 0)} section${plan.sections?.length === 1 ? "" : "s"}</span><span>authored ${h(fmtTime(plan.authored_at))}</span></div></div><div class="cluster"><label class="field small">Revision<select data-plan-version="${h(task.task_id)}" aria-label="Plan revision">${revisions.map(item => `<option value="${h(item.version)}" ${Number(item.version) === Number(plan.version) ? "selected" : ""}>v${h(item.version)} · ${h(item.status)}</option>`).join("")}</select></label><button class="button quiet small" type="button" data-action="close-task-plan">Close</button></div></div>
+          <div class="task-plan-head"><div><div class="cluster"><span class="eyebrow">Detailed task plan</span>${statusBadge(plan.status)}${historical ? `<span class="badge done">historical</span>` : `<span class="badge accepted">latest</span>`}</div><h3>${h(plan.title)}</h3><div class="list-meta"><span>version ${h(plan.version)}</span><span>${h(plan.sections?.length || 0)} section${plan.sections?.length === 1 ? "" : "s"}</span><span>authored ${h(fmtTime(plan.authored_at))}</span></div></div><button class="button quiet small" type="button" data-action="close-task-plan">Close</button></div>
+          <div class="filterbar section-gap"><input id="task-plan-revision-search" type="search" value="${h(selected.revisionQuery)}" placeholder="Search every plan revision…" aria-label="Search all plan revisions"><select id="task-plan-revision-filter" aria-label="Filter plan revision status">${revisionFilters.map(value => `<option value="${h(value)}" ${selected.revisionFilter === value ? "selected" : ""}>${value === "all" ? "All statuses" : h(identityPart(value))}</option>`).join("")}</select>${taskPlanSortControl("revision")}</div><div class="faint small">Revision search, status, and date order apply to the complete immutable history before each page.</div>
+          <div class="task-plan-head section-gap"><label class="field small">Revision<select data-plan-version="${h(task.task_id)}" aria-label="Plan revision">${revisionChoices.map(item => `<option value="${h(item.version)}" ${Number(item.version) === Number(plan.version) ? "selected" : ""}>v${h(item.version)} · ${h(item.status)}${item.outside_page ? " · selected outside this page" : ""}</option>`).join("")}</select></label></div>${taskPlanPageToolbar(payload, "revision", "plan revisions")}
           ${plan.overview ? `<div class="task-plan-overview">${h(plan.overview)}</div>` : ""}
           ${!canApproveTaskPlan() && feedbackOpen ? `<div class="notice section-gap"><span>i</span><div><strong>Approval is restricted to a human or registered Director.</strong><br>This identity may still leave attributed comments and edit suggestions.</div></div>` : ""}
           <div class="plan-sections">${(plan.sections || []).map((section, index) => `<article class="plan-section"><div class="task-plan-head"><div><div class="eyebrow">Section ${index + 1} · ${h(section.section_id)}</div><h4>${h(section.title)}</h4></div>${feedbackOpen ? `<div class="cluster">${approvable ? `<button class="button primary small" type="button" data-action="approve-task-plan" data-task="${h(task.task_id)}" data-version="${h(plan.version)}" data-section="${h(section.section_id)}">Approve section</button>` : ""}<button class="button small" type="button" data-action="suggest-task-plan" data-task="${h(task.task_id)}" data-version="${h(plan.version)}" data-section="${h(section.section_id)}">Suggest edit</button><button class="button quiet small" type="button" data-action="comment-task-plan" data-task="${h(task.task_id)}" data-version="${h(plan.version)}" data-section="${h(section.section_id)}">Comment</button></div>` : ""}</div><div class="plan-section-body">${h(section.body)}</div></article>`).join("")}</div>
           ${actionButtons}
           ${selected.edit && editable ? renderTaskPlanEditor(task, plan) : ""}
-          <div class="plan-review-history"><div class="eyebrow">Plan activity · immutable attribution</div>${(plan.actions || []).length ? plan.actions.map(action => { const detail = action.payload || {}; return `<div class="plan-review-row"><div class="cluster"><strong>${h(planActionLabel(action.event_type))}</strong>${detail.section_id ? `<span class="chip">${h(detail.section_id)}</span>` : ""}<span class="faint small">${h(fmtTime(action.at))}</span></div>${detail.note ? `<div class="prose small section-gap">${h(detail.note)}</div>` : ""}<div class="list-meta">${actionAttribution("By", action)}</div></div>`; }).join("") : `<div class="muted small">No plan actions recorded for this revision.</div>`}</div>
+          <div class="plan-review-history"><div class="eyebrow">Plan activity · immutable attribution</div><div class="filterbar section-gap"><input id="task-plan-action-search" type="search" value="${h(selected.actionQuery)}" placeholder="Search every action on this revision…" aria-label="Search all actions on this plan revision"><select id="task-plan-action-filter" aria-label="Filter plan activity type">${actionFilters.map(([value, label]) => `<option value="${h(value)}" ${selected.actionFilter === value ? "selected" : ""}>${h(label)}</option>`).join("")}</select>${taskPlanSortControl("action")}</div><div class="faint small">Activity search, type, and date order apply to the complete selected-revision history before each page.</div>${(plan.actions || []).length ? plan.actions.map(action => { const detail = action.payload || {}; return `<div class="plan-review-row"><div class="cluster"><strong>${h(planActionLabel(action.event_type))}</strong>${detail.section_id ? `<span class="chip">${h(detail.section_id)}</span>` : ""}<span class="faint small">${h(fmtTime(action.at))}</span></div>${detail.note ? `<div class="prose small section-gap">${h(detail.note)}</div>` : ""}<div class="list-meta">${actionAttribution("By", action)}</div></div>`; }).join("") : `<div class="muted small section-gap">${h(selected.actionQuery || selected.actionFilter !== "all" ? "No plan activity matches this full-history filter." : selected.actionOffset ? "No plan activity is available at this offset." : "No plan actions recorded for this revision.")}</div>`}${taskPlanPageToolbar(payload, "action", "plan actions")}</div>
         </section>`;
       }
 
@@ -2184,7 +2372,7 @@
               ${conversationDenied || conversationMetadataUnavailable ? `<div class="notice error"><span>!</span><div><strong>Sending is disabled for this conversation.</strong><br>${conversationMetadataUnavailable ? "Bridge metadata must load successfully before the panel can prove the destination." : "Participation is an access policy, not a relationship state. Ask a human or registered Director to update access in AI Network; do not delete the bridge just to grant access."}</div></div>` : `<form data-form="send-room">
                 <div class="field"><label for="room-body">Message</label><textarea id="room-body" name="body" required placeholder="Tell the project what matters…"></textarea></div>
                 <div class="field section-gap"><label for="room-destination">Destination</label><select id="room-destination" name="target_project"><optgroup label="Local"><option value="${h(state.projectId)}" ${localConversation ? "selected" : ""}>Local workspace room · ${h(sourceName)}</option></optgroup>${bridges.length ? `<optgroup label="Inter-project">${bridges.map(bridge => `<option value="${h(bridge.with)}" ${state.roomConversation === bridge.with ? "selected" : ""} ${bridge.can_participate === false ? "disabled" : ""}>${h(sourceName)} ↔ ${h(projectName(bridge.with))} · ${h(bridge.relation)}${bridge.can_participate === false ? " · access denied" : ""}</option>`).join("")}</optgroup>` : ""}</select><span class="help">A bridge destination is retained on both workspace rooms; Local stays only in ${h(sourceName)}. Denied destinations cannot be selected.</span></div>
-                <div class="form-grid section-gap"><div class="field"><label for="room-type">Type</label><select id="room-type" name="msg_type">${["chat","directive","claim","handoff","challenge","decision","approval","status","system"].map(type => `<option>${type}</option>`).join("")}</select></div><div class="field"><label for="room-task">Task ID</label><input id="room-task" name="task_id" placeholder="T-13"></div><div class="field"><label for="room-mentions">Mention</label><input id="room-mentions" name="mentions" placeholder="workspace.role.runtime"></div><div class="field"><label for="room-reply">Reply to message</label><select id="room-reply" name="reply_to"><option value="">No reply</option>${messages.filter(message => message.event_id).map(message => `<option value="${h(message.event_id)}">#${h(message.seq)} · ${h(actorDisplay(message.actor))} · ${h(String(message.body || "").slice(0, 34))}</option>`).join("")}</select></div></div>
+                <div class="form-grid section-gap"><div class="field"><label for="room-type">Type</label><select id="room-type" name="msg_type">${["chat","directive","claim","handoff","challenge","decision","approval","status","system"].map(type => `<option>${type}</option>`).join("")}</select></div><div class="field"><label for="room-task">Task ID</label><input id="room-task" name="task_id" placeholder="T-13"></div><div class="field"><label for="room-mentions">Mention</label><input id="room-mentions" name="mentions" placeholder="@Gibbs, @Turing"><span class="help">Use project-unique short names such as @Gibbs. Matching is case-insensitive; the server records the exact canonical identities.</span></div><div class="field"><label for="room-reply">Reply to message</label><select id="room-reply" name="reply_to"><option value="">No reply</option>${messages.filter(message => message.event_id).map(message => `<option value="${h(message.event_id)}">#${h(message.seq)} · ${h(actorDisplay(message.actor))} · ${h(String(message.body || "").slice(0, 34))}</option>`).join("")}</select></div></div>
                 <div class="form-actions"><button class="button primary" type="submit">Send to room</button></div>
               </form>`}
               <div class="notice section-gap"><span>i</span><div>Use room messages for coordination. Create a task for owned work and a decision for a durable project choice; chat alone records neither.</div></div>
@@ -2214,7 +2402,7 @@
         }];
         agents.forEach(agent => choices.push({
           actor_id: agent.agent_id,
-          label: `${agent.display_name || actorDisplay(agent.agent_id)} · ${agent.role || "unassigned"}`
+          label: agentChoiceLabel(agent)
         }));
         if (response?.handoff_actor) choices.push({
           actor_id: response.handoff_actor,
@@ -2241,19 +2429,23 @@
         const history = state.data.roleScopeHistory || {};
         const hasHistory = Object.prototype.hasOwnProperty.call(state.data, "roleScopeHistory");
         const historyMismatch = hasHistory && String(history.role || "") !== activeRole;
-        const versions = historyMismatch ? [] : responseRows(history, "versions");
+        const historyResponse = historyMismatch
+          ? { versions: [], total: 0, unfiltered_total: 0,
+              limit: PANEL_PAGE_SIZE, offset: 0, has_more: false }
+          : history;
+        const versions = responseRows(historyResponse, "versions");
         const roleOptions = allowedRoles.length ? allowedRoles : ROLE_SCOPE_NAMES;
         const canEdit = manager && Boolean(scope);
         const errors = [state.errors.roleScopes, state.errors.roleScopeHistory,
           historyMismatch ? "The role-scope history response did not match the requested role; no revisions were rendered." : ""
         ].filter(Boolean);
         return `<section class="card section-gap" id="role-scope-manager"><div class="card-head"><div><h2>Shared role scope</h2><span class="faint small">Role background loaded before the exact-identity handoff</span></div>${manager ? `<span class="badge accepted">management enabled</span>` : `<span class="badge blocked">read only</span>`}</div><div class="card-body">
-          <div class="notice"><span>§</span><div><strong>Role scope and identity handoff are separate.</strong><br>Every registered ${h(roleScopeLabel(activeRole))} receives this shared background. The Lead Director layer overlays the Director scope only for the exact identity currently leading; changing it never merges colored identities or their handoffs.</div></div>
+          <div class="notice"><span>§</span><div><strong>Role scope and identity handoff are separate.</strong><br>Every registered ${h(roleScopeLabel(activeRole))} receives this shared background. The Lead Director layer overlays the Director scope only for the exact identity currently leading; changing it never merges named identities or their handoffs.</div></div>
           ${errors.length ? errorNotice(errors.join(" · ")) : ""}
           <div class="form-grid section-gap"><div class="field"><label for="role-scope-role">Role scope</label><select id="role-scope-role" ${allowedRoles.length ? "" : "disabled"}>${roleOptions.map(role => `<option value="${h(role)}" ${role === activeRole ? "selected" : ""}>${h(roleScopeLabel(role))}</option>`).join("")}</select><span class="help">${manager ? "Humans and registered Directors may manage every role scope." : "This identity may read only its applicable registered-role scope."}</span></div><div class="field"><label>Effective panel role</label><div class="list-row"><span>${h(response.actor_role ? roleScopeLabel(response.actor_role) : state.prefs.actorType === "human" ? "Human manager" : "Unassigned")}</span>${response.lead_director === state.prefs.actor ? `<span class="badge accepted">lead overlay active</span>` : ""}</div></div></div>
           ${!manager && response.effective_content ? `<details class="section-gap"><summary><strong>Effective role context for this identity</strong></summary><pre class="code-block section-gap">${h(response.effective_content)}</pre></details>` : ""}
           ${scope ? `<form data-form="save-role-scope" data-role="${h(activeRole)}" class="section-gap"><input type="hidden" name="expected_version" value="${h(scope.version || 0)}"><div class="field"><label for="role-scope-content">${h(roleScopeLabel(activeRole))} shared background · version ${h(scope.version || 0)}</label><textarea id="role-scope-content" name="content" rows="10" maxlength="100000" ${canEdit ? "" : "disabled"} placeholder="Durable background every identity in this role should receive…">${h(scope.content || "")}</textarea><span class="help">${scope.updated_at ? `Updated ${h(fmtTime(scope.updated_at))} by ${h(actorDisplay(scope.updated_by || "unknown"))}` : "No revision has been written yet."}${scope.updated_owner ? ` · Run by user: ${h(scope.updated_owner)}` : ""}</span></div>${canEdit ? `<div class="form-actions"><button class="button primary" type="submit">Save ${h(roleScopeLabel(activeRole))} role scope</button></div>` : ""}</form>` : empty("No applicable role scope", state.prefs.actorType === "agent" ? "Register this exact identity with a Director, Advisor, or Worker role before role background can apply." : "The hosted service did not return a role-scope record.")}
-          <div class="section-gap"><div class="cluster"><strong>${h(roleScopeLabel(activeRole))} revision history</strong><span class="faint small">newest first · up to ${h(PANEL_PAGE_SIZE)}</span></div><div class="list section-gap">${versions.length ? versions.map(version => `<details class="list-row" style="display:block"><summary><span class="list-title">v${h(version.version)}</span> <span class="faint small">${h(attributionText(version.updated_by || "unknown", String(version.updated_by || "").startsWith("web.") ? "human" : "agent", version.updated_owner))} · ${h(fmtTime(version.updated_at))}</span></summary><div class="message-body section-gap">${h(version.content || "")}</div></details>`).join("") : empty(historyMismatch ? "Role-scope history rejected" : "No role-scope revisions", historyMismatch ? "Refresh after the server can prove the requested role." : "The first saved role background will appear here.")}</div></div>
+          <div class="section-gap"><div class="cluster"><strong>${h(roleScopeLabel(activeRole))} revision history</strong></div><div class="filterbar section-gap"><input id="role-scope-history-search" type="search" value="${h(state.roleScopeHistorySearch)}" placeholder="Search the complete role-scope history…" aria-label="Search role-scope revision history">${sortControl("roleScopeHistory")}</div><div class="faint small">Search and date order are applied to the complete authorized revision history before each page.</div><div class="list section-gap">${versions.length ? versions.map(version => `<details class="list-row" style="display:block"><summary><span class="list-title">v${h(version.version)}</span> <span class="faint small">${h(attributionText(version.updated_by || "unknown", String(version.updated_by || "").startsWith("web.") ? "human" : "agent", version.updated_owner))} · ${h(fmtTime(version.updated_at))}</span></summary><div class="message-body section-gap">${h(version.content || "")}</div></details>`).join("") : empty(historyMismatch ? "Role-scope history rejected" : state.roleScopeHistorySearch ? "No matching role-scope revisions" : listPage("roleScopeHistory").offset ? "No revisions are available at this offset" : "No role-scope revisions", historyMismatch ? "Refresh after the server can prove the requested role." : state.roleScopeHistorySearch ? "Change or clear the full-history search." : "The first saved role background will appear here.")}</div>${pageToolbar("roleScopeHistory", historyResponse, "versions", "role-scope revisions")}</div>
         </div></section>`;
       }
 
@@ -2282,7 +2474,7 @@
         ].filter(Boolean);
         return pageHead("Exact-identity continuity", "Handoff", "Read any known identity's cold-start brief. Only the exact current identity may update its own independent history.") +
           (errors.length ? errorNotice(errors.join(" · ")) : "") +
-          `<section class="card"><div class="card-body"><div class="form-grid"><div class="field wide"><label for="handoff-identity">Exact identity</label><select id="handoff-identity">${identityChoices.map(choice => `<option value="${h(choice.actor_id)}" ${choice.actor_id === requestedActor ? "selected" : ""}>${h(choice.label)} · ${h(choice.actor_id)}</option>`).join("")}</select><span class="help">Persona colors are separate continuity owners. Selecting another identity is always read-only and never changes this panel's authenticated actor.</span></div></div></div></section>
+          `<section class="card"><div class="card-body"><div class="form-grid"><div class="field wide"><label for="handoff-identity">Exact identity</label><select id="handoff-identity">${identityChoices.map(choice => `<option value="${h(choice.actor_id)}" ${choice.actor_id === requestedActor ? "selected" : ""}>${h(choice.label)}</option>`).join("")}</select><span class="help">Named personas are separate continuity owners. Selecting another identity is always read-only and never changes this panel's authenticated actor; canonical IDs stay internal.</span></div></div></div></section>
           <div class="grid main-side section-gap"><section class="card"><div class="card-head"><div><h2>Current handoff · ${h(actorDisplay(requestedActor))}</h2><span class="faint small">identity v${h(response.handoff_version ?? 0)} · context v${h(response.context_version ?? "—")}</span></div><span class="faint small">${response.handoff_updated_by ? h(attributionText(response.handoff_updated_by, response.handoff_attribution?.actor_type || (String(response.handoff_updated_by).startsWith("web.") ? "human" : "agent"), response.handoff_updated_owner, response.handoff_attribution)) : "not written"} · ${h(fmtTime(response.handoff_updated_at))}</span></div><div class="card-body">
             ${response.legacy_handoff_fallback ? `<div class="notice"><span>i</span><div><strong>Legacy project snapshot shown as a compatibility starting point.</strong><br>The archive remains read-only; the first update by ${h(actorDisplay(requestedActor))} creates identity handoff v1 without merging another identity's history.</div></div>` : ""}
             ${canWrite ? `<div class="notice"><span>✓</span><div><strong>You are editing your own exact identity handoff.</strong><br>This write cannot target or replace another identity, even when the signed-in human manages the workspace.</div></div>` : `<div class="notice error"><span>i</span><div><strong>Read only for this selection.</strong><br>${ownIdentity && !hasHandoff ? "The exact-identity handoff must load successfully before an update can be submitted." : ownIdentity ? `${h(actorDisplay(state.prefs.actor))} must be a registered AI identity or authenticated human to write its own handoff.` : `Switch back to ${h(actorDisplay(state.prefs.actor))} to edit. Another identity's handoff can only be updated by that exact identity.`}</div></div>`}
@@ -2346,7 +2538,7 @@
         const pagedEvents = activityPage.rows;
         const verify = state.data.verify;
         return pageHead("Append-only record", "Activity & ledger", "Inspect raw events, append a custom event, and verify the local hash chain.", `<button class="button" data-action="verify-ledger">Verify ledger</button>`) +
-          `<div class="notice"><span>i</span><div><strong>Attribution is recorded literally.</strong><br>New canonical AI actor IDs are <code>&lt;workspace&gt;.&lt;role&gt;.&lt;runtime&gt;.&lt;color&gt;</code> and are displayed as <strong>Workspace · Role · Runtime · Color</strong>. Existing three-part identities remain visible as compatibility records. <strong>Run by user</strong> is the separate authenticated human responsible for that AI action. Browser identity headers cannot override the signed-in human account. Legacy <code>jack.vscode</code> rows marked human/tool came from the <code>vscode</code> shell account; they are not evidence that the VS Code AI performed that work.</div></div>` +
+          `<div class="notice"><span>i</span><div><strong>Attribution is recorded literally.</strong><br>New canonical AI actors have an internal <code>&lt;workspace&gt;.&lt;role&gt;.&lt;runtime&gt;.&lt;persona&gt;</code> identity and a project-unique friendly name such as <strong>Gibbs</strong> / <strong>@Gibbs</strong>. Names are reserved forever across the project, regardless of role or runtime. Existing Red/Blue and three-part identities remain visible as compatibility records and are never renamed. <strong>Run by user</strong> is the separate authenticated human responsible for that AI action. Browser identity headers cannot override the signed-in human account. Legacy <code>jack.vscode</code> rows marked human/tool came from the <code>vscode</code> shell account; they are not evidence that the VS Code AI performed that work.</div></div>` +
           (state.errors.events ? errorNotice(state.errors.events) : "") +
           `<div class="grid main-side"><section class="card"><div class="card-head"><h2>${h(activityPage.total)} matching events</h2>${verify ? statusBadge(verify.ok ? "ok" : "error") : ""}</div><div class="card-body"><div class="filterbar"><input id="activity-search" type="search" value="${h(state.activityFilter)}" placeholder="Search full ledger by type, actor, task, user, or payload…" aria-label="Filter activity history"><span class="faint small">Raw Activity semantics are unchanged; the server searches the complete authorized ledger before paging.</span></div>${activityPage.total || activityPage.offset ? feedToolbar("activity", activityPage, `${pagedEvents.length} raw events returned`) : ""}${pagedEvents.length ? `<div class="history-feed" id="activity-feed" role="log" aria-label="Activity event history" aria-live="off" tabindex="0" data-feed-scope="${h(activityScope)}">${pagedEvents.map(event => { const operational = event.operational_actor_id || event.actor_id; return `<details class="event-row" data-feed-key="${h(event.seq)}"><summary><span class="mono faint">#${h(event.seq)}</span><span class="truncate">${statusBadge(event.event_type)}</span><span class="event-actor truncate muted" title="Ledger actor: ${h(event.actor_id)}">${h(attributionText(operational, event.actor_type, event.owner, event.attribution))}</span><span class="faint small">${h(fmtTime(event.created_at, false))}</span></summary><pre class="event-payload">${j(event.payload)}</pre></details>`; }).join("")}</div>` : empty(state.activityFilter ? "No matching events" : activityPage.offset ? "No events at this offset" : "No events yet", state.activityFilter ? "Change or clear the full-ledger search." : activityPage.offset ? "Use Newer to return to an available page." : "Append a custom event or wait for project activity.")}</div></section>
           <aside class="stack"><div class="card"><div class="card-head"><h2>Search project memory</h2>${state.searchResults ? `<span class="badge accepted">${h(state.searchResults.total ?? state.searchResults.total_hits ?? 0)} hits</span>` : ""}</div><div class="card-body"><form data-form="search-project"><div class="field"><label for="project-memory-search">Query</label><input id="project-memory-search" type="search" name="query" required value="${h(state.searchQuery)}" placeholder="decision, filename, message…"></div><div class="form-actions">${sortControl("search")}<button class="button primary small" type="submit">Search everything</button></div></form>${renderSearchResults(state.searchResults)}</div></div>
@@ -2360,14 +2552,14 @@
         return pageHead(
           "Shared project context",
           "Cloud Context",
-          "A hosted AGENTS.md / CLAUDE.md for this workspace \u2014 injected into every AI session brief. Editable by humans and Directors.",
+          "A hosted AGENTS.md / CLAUDE.md for this workspace \u2014 loaded at session start and refreshed when its version changes. Editable by humans and Directors.",
           `<button class="button" data-view="rules">Open Core Rules</button>`
         ) +
-          `<div class="notice"><span>!</span><div><strong>This document is read by every AI on every turn.</strong><br>It is pinned into each session brief alongside the mandatory Project Rules. Keep it short and durable \u2014 deploy targets, invariants, do-not-touch areas. Only humans and registered Directors can edit it.</div></div>` +
+          `<div class="notice"><span>!</span><div><strong>This document is loaded into every AI session, then cached while unchanged.</strong><br>The lifecycle watcher compares its version/hash; a change triggers one authenticated refetch, refreshes the local marker block, and injects the new context at the next supported turn. Keep it durable \u2014 invariants, architecture, and do-not-touch areas. Only humans and registered Directors can edit it.</div></div>` +
           (state.errors.cloudContext ? errorNotice(state.errors.cloudContext) : "") +
           `<section class="card section-gap"><div class="card-head"><div><h2>Workspace cloud context</h2><span class="faint small">version ${h(cc.version)}${cc.updated_at ? ` \u00b7 updated ${h(fmtTime(cc.updated_at))}` : ""}${cc.updated_by ? ` \u00b7 by ${h(actorDisplay(cc.updated_by))}` : ""}</span></div>${canManage ? `<span class="badge accepted">management enabled</span>` : `<span class="badge blocked">read only</span>`}</div><div class="card-body">
             ${canManage ? "" : `<div class="notice error"><span>i</span><div><strong>Human or registered Director management only.</strong><br>${h(attributionText(state.prefs.actor, state.prefs.actorType, state.prefs.owner))} may read the cloud context but cannot edit it.</div></div>`}
-            <form data-form="save-cloud-context"><input type="hidden" name="expected_version" value="${h(cc.version)}"><div class="field wide"><label for="cloud-context-body">Context document</label><textarea id="cloud-context-body" name="content" rows="18" ${canManage ? "" : "disabled"} placeholder="# Project context every AI should read each turn">${h(cc.content || "")}</textarea></div>${canManage ? `<div class="form-actions"><button class="button primary" type="submit">Save cloud context</button></div>` : ""}</form>
+            <form data-form="save-cloud-context"><input type="hidden" name="expected_version" value="${h(cc.version)}"><div class="field wide"><label for="cloud-context-body">Context document</label><textarea id="cloud-context-body" name="content" rows="18" ${canManage ? "" : "disabled"} placeholder="# Durable project context loaded at session start">${h(cc.content || "")}</textarea></div>${canManage ? `<div class="form-actions"><button class="button primary" type="submit">Save cloud context</button></div>` : ""}</form>
           </div></section>`;
       }
 
@@ -2412,11 +2604,11 @@
           `<div class="notice"><span>i</span><div><strong>Relationship and participation answer different questions.</strong><br>Peer / Master / Advisor defines authority between workspaces. Participation defines which AIs may enter that one inter-project conversation. Changing participation never deletes the relationship; deleting the relationship disconnects the workspace rooms entirely. Roles still follow the workspace, not the app window.</div></div>
           <div class="grid two section-gap">
             <section class="card"><div class="card-head"><h2>Directors & workers</h2><span class="faint small">${h(responsePage(agentResponse, "agents", listPage("agents").offset).unfilteredTotal)} registered</span></div><div class="card-body"><div class="filterbar"><input id="agent-search" type="search" value="${h(state.agentSearch)}" placeholder="Search all registered identities…" aria-label="Search registered identities">${sortControl("agents")}</div>
-              <form data-form="set-lead"><div class="field"><label for="lead-agent">Lead Director</label><select id="lead-agent" name="agent_id"><option value="">No lead director</option>${directors.map(agent => `<option value="${h(agent.agent_id)}" ${status.lead_director === agent.agent_id ? "selected" : ""}>${h(agent.display_name || actorDisplay(agent.agent_id))}</option>`).join("")}</select><span class="help">Only registered Directors can lead. The choice persists across Claude, Codex, Kimi, and other clients in this workspace.</span></div><div class="form-actions"><button class="button primary" type="submit">Save lead</button></div></form>
-              <div class="list section-gap">${agents.length ? agents.map(agent => `<div class="list-row"><div><div class="list-title">${h(agent.display_name || actorDisplay(agent.agent_id))}</div><div class="list-meta"><span title="${h(agent.agent_id)}">${h(actorDisplay(agent.agent_id))}</span>${ownerChip(agent.owner)}<span>${h(agent.role || "role not assigned")}</span><span>${h(agent.runtime || "runtime unknown")}</span><span>seen ${h(fmtTime(agent.last_seen_at || agent.registered_at))}</span></div></div>${agent.agent_id === status.lead_director ? `<span class="badge accepted">lead</span>` : statusBadge(agent.role || "unassigned")}</div>`).join("") : `<div class="muted">${h(state.agentSearch ? "No registered identities match this full-directory search." : listPage("agents").offset ? "No identities are available at this offset." : "No AIs registered yet. Guided setup asks for the first AI's role and recommends Director.")}</div>`}</div>${pageToolbar("agents", agentResponse, "agents", "registered identities")}
+              <form data-form="set-lead"><div class="field"><label for="lead-agent">Lead Director</label><select id="lead-agent" name="agent_id"><option value="">No lead director</option>${directors.map(agent => `<option value="${h(agent.agent_id)}" ${status.lead_director === agent.agent_id ? "selected" : ""}>${h(agentChoiceLabel(agent))}</option>`).join("")}</select><span class="help">Only registered Directors can lead. The choice persists across Claude, Codex, Kimi, and other clients in this workspace.</span></div><div class="form-actions"><button class="button primary" type="submit">Save lead</button></div></form>
+              <div class="list section-gap">${agents.length ? agents.map(agent => `<div class="list-row"><div><div class="list-title">${h(agentFriendlyName(agent))}</div><div class="list-meta"><span>${h(agentShortName(agent) || "Compatibility record")}</span>${agentDisplayDescription(agent) && agentDisplayDescription(agent) !== agentFriendlyName(agent) ? `<span>${h(agentDisplayDescription(agent))}</span>` : ""}${ownerChip(agent.owner)}<span>${h(agent.role || "role not assigned")}</span><span>${h(agent.runtime || "runtime unknown")}</span><span>seen ${h(fmtTime(agent.last_seen_at || agent.registered_at))}</span></div></div>${agent.agent_id === status.lead_director ? `<span class="badge accepted">lead</span>` : statusBadge(agent.role || "unassigned")}</div>`).join("") : `<div class="muted">${h(state.agentSearch ? "No registered identities match this full-directory search." : listPage("agents").offset ? "No identities are available at this offset." : "No AIs registered yet. Guided setup asks for the first AI's role and recommends Director.")}</div>`}</div>${pageToolbar("agents", agentResponse, "agents", "registered identities")}
             </div></section>
-            <section class="card"><div class="card-head"><h2>Register or change an AI role</h2></div><div class="card-body"><form data-form="register-agent"><div class="form-grid"><div class="field"><label for="agent-pick">AI agent</label><select id="agent-pick" name="agent_id" data-agent-pick>${agentOptions.map(agent => `<option value="${h(agent.agent_id)}">${h(agent.display_name || actorDisplay(agent.agent_id))} · ${h(agent.role || "unassigned")}</option>`).join("")}<option value="__new__">+ Register a new actor…</option></select><span class="help">Pick an existing AI to change its role, or choose "Register a new actor".</span></div><div class="field" data-new-actor ${agentOptions.length ? "hidden" : ""}><label for="agent-id-new">New canonical actor ID</label><input id="agent-id-new" name="agent_id_new" placeholder="analytics-admin.director.codex.red"><span class="help">&lt;workspace&gt;.&lt;role&gt;.&lt;runtime&gt;.&lt;color&gt; — do not add the owner's name. Guided setup allocates the color automatically.</span></div><div class="field"><label for="agent-name">Display name</label><input id="agent-name" name="display_name" placeholder="Analytics Admin · Director · Codex · Red"></div><div class="field"><label for="agent-role">Role</label><select id="agent-role" name="role"><option value="director">Director · governance + own handoff</option><option value="advisor">Advisor · own identity handoff</option><option value="worker">Worker · own identity handoff</option></select></div><div class="field" data-new-actor ${agentOptions.length ? "hidden" : ""}><label for="agent-runtime">Runtime</label><input id="agent-runtime" name="runtime" placeholder="codex"></div></div><div class="form-actions"><button class="button primary" type="submit">Save AI role</button></div></form></div></section>
-            <section class="card" style="grid-column:1/-1"><div class="card-head"><h2>Connect workspace rooms</h2><span class="faint small">default relationship: master</span></div><div class="card-body"><form data-form="add-bridge"><div class="field"><label for="bridge-project">Connected workspace</label><select id="bridge-project" name="other_project" required ${otherProjects.length ? "" : "disabled"}><option value="">Choose workspace…</option>${otherProjects.map(project => `<option value="${h(project.project_id)}">${h(project.name)} · ${h(project.project_id)}</option>`).join("")}</select></div><div class="bridge-relationship section-gap"><div class="eyebrow">Authority relationship</div><div class="form-grid section-gap"><div class="field"><label for="bridge-relation">Relationship</label><select id="bridge-relation" name="relation"><option value="master">Master / subordinate (default)</option><option value="peer">Peer</option><option value="advisor">Advisor</option></select></div><div class="field"><label for="bridge-principal">Who is master/advisor?</label><select id="bridge-principal" name="principal_side"><option value="other">Connected workspace (default)</option><option value="current">This workspace</option></select></div></div></div><div class="bridge-relationship section-gap"><div class="eyebrow">Initial room participation</div><p class="muted small">Set access atomically when creating the relationship. This policy does not change which workspace is master, advisor, or peer.</p><div class="form-grid section-gap">${bridgeParticipationFields("new", "local", state.projectId)}${bridgeParticipationFields("new", "peer", "Connected workspace")}</div></div><div class="form-actions"><button class="button primary" type="submit" ${otherProjects.length ? "" : "disabled"}>Create relationship</button></div></form><div class="notice section-gap"><span>i</span><div>Master directives are binding; advisor messages are advice; peers are equal. Participation independently limits who may read, send, or mutate the named inter-project conversation.</div></div></div></section>
+            <section class="card"><div class="card-head"><h2>Create an AI identity or change its role</h2></div><div class="card-body"><form data-form="register-agent"><div class="form-grid"><div class="field"><label for="agent-pick">AI identity</label><select id="agent-pick" name="agent_id" data-agent-pick>${agentOptions.map(agent => `<option value="${h(agent.agent_id)}">${h(agentChoiceLabel(agent))}</option>`).join("")}<option value="__new__">+ Create a generated identity…</option></select><span class="help">Choose a friendly project identity such as Gibbs, or ask the server to reserve the next never-before-used name. Canonical actor IDs remain internal.</span></div><div class="field"><label for="agent-name">Display description (optional)</label><input id="agent-name" name="display_name" placeholder="Recommendation engine Director"></div><div class="field"><label for="agent-role">Role</label><select id="agent-role" name="role"><option value="director">Director · governance + own handoff</option><option value="advisor">Advisor · own identity handoff</option><option value="worker">Worker · own identity handoff</option></select></div><div class="field" data-new-actor ${agentOptions.length ? "hidden" : ""}><label for="agent-runtime">Runtime</label><input id="agent-runtime" name="runtime" placeholder="codex" ${agentOptions.length ? "" : "required"}><span class="help">The server generates and transactionally reserves a project-unique name; the first available name is Gibbs. Temporary current-process identities are created only by guided setup through the live MCP proxy.</span></div></div><div class="form-actions"><button class="button primary" type="submit">Save AI identity</button></div></form></div></section>
+            <section class="card" style="grid-column:1/-1"><div class="card-head"><h2>Connect workspace rooms</h2><span class="faint small">default relationship: master</span></div><div class="card-body"><form data-form="add-bridge"><div class="field"><label for="bridge-project">Connected workspace</label><select id="bridge-project" name="other_project" required ${otherProjects.length ? "" : "disabled"}><option value="">Choose workspace…</option>${otherProjects.map(project => `<option value="${h(project.project_id)}">${h(project.name)} · ${h(project.project_id)}</option>`).join("")}</select></div><div class="bridge-relationship section-gap"><div class="eyebrow">Authority relationship</div><div class="form-grid section-gap"><div class="field"><label for="bridge-relation">Relationship</label><select id="bridge-relation" name="relation"><option value="master">Master / subordinate (default)</option><option value="peer">Peer</option><option value="advisor">Advisor</option></select></div><div class="field"><label for="bridge-principal">Who is master/advisor?</label><select id="bridge-principal" name="principal_side"><option value="other">Connected workspace (default)</option><option value="current">This workspace</option></select></div></div></div><div class="bridge-relationship section-gap"><div class="eyebrow">Initial room participation</div><p class="muted small">Set access atomically when creating the relationship. This policy does not change which workspace is master, advisor, or peer.</p><div class="form-grid section-gap">${bridgeParticipationFields("new", "local", state.projectId)}${bridgeParticipationFields("new", "peer", "", "all", [], "Connected workspace")}</div></div><div class="form-actions"><button class="button primary" type="submit" ${otherProjects.length ? "" : "disabled"}>Create relationship</button></div></form><div class="notice section-gap"><span>i</span><div>Master directives are binding; advisor messages are advice; peers are equal. Participation independently limits who may read, send, or mutate the named inter-project conversation.</div></div></div></section>
             <section class="card" style="grid-column:1/-1"><div class="card-head"><h2>Connected rooms</h2><span class="faint small">${h(responsePage(bridgeResponse, "bridges", listPage("bridges").offset).unfilteredTotal)} relationship${responsePage(bridgeResponse, "bridges", listPage("bridges").offset).unfilteredTotal === 1 ? "" : "s"}</span></div><div class="card-body"><div class="filterbar"><input id="bridge-search" type="search" value="${h(state.bridgeSearch)}" placeholder="Search all workspace relationships…" aria-label="Search connected workspace rooms">${sortControl("bridges")}</div>${bridges.length ? bridges.map(bridge => `<article class="bridge-panel"><div class="bridge-panel-head"><div><h3>${h(projectName(state.projectId))} ↔ ${h(projectName(bridge.with))}</h3><div class="list-meta"><span>${h(bridge.relation)} relationship</span>${bridge.principal ? `<span>${h(projectName(bridge.principal))} is ${h(bridge.relation === "master" ? "master" : "advisor")}</span>` : `<span>equal authority</span>`}<span>${h(projectName(state.projectId))}: ${h(bridgeParticipationLabel(bridge.participation))}</span><span>${h(projectName(bridge.with))}: ${h(bridgeParticipationLabel(bridge.peer_participation))}</span></div></div><div class="cluster">${bridge.can_participate === false ? `<span class="badge error">panel identity denied</span>` : bridge.can_participate === true ? `<span class="badge accepted">panel identity allowed</span>` : ""}</div></div><div class="grid two section-gap"><div class="bridge-relationship"><div class="eyebrow">Authority relationship</div><p class="muted small"><strong>${h(identityPart(bridge.relation))}</strong> controls authority only. Delete this relationship only when the workspace rooms should be disconnected.</p><div class="cluster section-gap"><button class="button small" data-action="open-connected-room" data-project="${h(bridge.with)}">View conversation</button><button class="button danger small" data-action="remove-bridge" data-project="${h(bridge.with)}">Delete relationship</button></div></div><div class="bridge-relationship"><div class="eyebrow">Room participation</div><form data-form="update-bridge-participation" data-project="${h(bridge.with)}"><div class="form-grid section-gap">${bridgeParticipationFields(bridge.with, "local", state.projectId, bridge.participation, bridge.allowed_agents)}${bridgeParticipationFields(bridge.with, "peer", bridge.with, bridge.peer_participation, bridge.peer_allowed_agents)}</div><div class="form-actions"><button class="button primary small" type="submit">Save participation</button></div></form><span class="help">Saving here changes access only. It never removes or changes the ${h(bridge.relation)} relationship.</span></div></div></article>`).join("") : `<div class="muted">${h(state.bridgeSearch ? "No workspace relationships match this full-network search." : listPage("bridges").offset ? "No relationships are available at this offset." : "No connected workspace rooms yet.")}</div>`}${pageToolbar("bridges", bridgeResponse, "bridges", "workspace relationships")}</div></section>
           </div>`;
       }
@@ -2496,22 +2688,79 @@
           </div>`;
       }
 
-      async function openTaskPlan(taskId, version = null) {
-        state.taskPlan = {
-          taskId, data: null, error: "", loading: true,
-          edit: false, selectedVersion: version
-        };
-        render({ force: true });
+      async function reloadTaskPlan({ showLoading = true } = {}) {
+        const selected = state.taskPlan;
+        if (!selected.taskId) return;
+        state.loadSerial += 1;
+        const taskId = selected.taskId;
+        const requestSerial = (Number(selected.requestSerial) || 0) + 1;
+        selected.requestSerial = requestSerial;
+        selected.error = "";
+        if (showLoading) {
+          selected.loading = true;
+          render({ force: true });
+        }
         try {
-          const suffix = version == null ? "" : `?version=${encodeURIComponent(version)}`;
-          state.taskPlan.data = await api(pathFor(`/tasks/${encodeURIComponent(taskId)}/plan${suffix}`));
-          state.taskPlan.edit = !state.taskPlan.data?.plan;
+          const suffix = taskPlanRequestSuffix(selected);
+          const result = await api(pathFor(
+            `/tasks/${encodeURIComponent(taskId)}/plan${suffix}`));
+          if (state.taskPlan.taskId !== taskId ||
+              state.taskPlan.requestSerial !== requestSerial) return;
+          state.taskPlan.data = result;
+          state.taskPlan.edit = !result?.plan;
         } catch (error) {
+          if (state.taskPlan.taskId !== taskId ||
+              state.taskPlan.requestSerial !== requestSerial) return;
+          state.taskPlan.data = null;
           state.taskPlan.error = error.message;
         } finally {
+          if (state.taskPlan.taskId !== taskId ||
+              state.taskPlan.requestSerial !== requestSerial) return;
           state.taskPlan.loading = false;
           render({ force: true });
         }
+      }
+
+      async function openTaskPlan(taskId, version = null) {
+        const sameTask = state.taskPlan.taskId === taskId;
+        if (!sameTask) {
+          state.taskPlan = newTaskPlanState(taskId, {
+            loading: true, selectedVersion: version
+          });
+        } else {
+          const changedVersion = String(state.taskPlan.selectedVersion ?? "") !==
+            String(version ?? "");
+          state.taskPlan.selectedVersion = version;
+          state.taskPlan.loading = true;
+          state.taskPlan.edit = false;
+          if (changedVersion) state.taskPlan.actionOffset = 0;
+        }
+        render({ force: true });
+        await reloadTaskPlan({ showLoading: false });
+      }
+
+      async function navigateTaskPlanPage(kind, direction) {
+        const selected = state.taskPlan;
+        const page = taskPlanCollectionPage(selected.data || {}, kind);
+        const offsetKey = `${kind}Offset`;
+        selected[offsetKey] = Math.max(0,
+          (Number(selected[offsetKey]) || 0) + Number(direction) * page.limit);
+        await reloadTaskPlan({ showLoading: false });
+      }
+
+      function queueTaskPlanFilterRefresh(target, kind) {
+        rememberControlFocus(target);
+        const selected = state.taskPlan;
+        selected[`${kind}Query`] = target.value;
+        selected[`${kind}Offset`] = 0;
+        selected.requestSerial = (Number(selected.requestSerial) || 0) + 1;
+        state.loadSerial += 1;
+        render({ force: true });
+        clearTimeout(state.filterTimer);
+        state.filterTimer = setTimeout(() => {
+          state.filterTimer = null;
+          reloadTaskPlan({ showLoading: false });
+        }, FILTER_DEBOUNCE_MS);
       }
 
       async function mutate(label, operation) {
@@ -2546,7 +2795,7 @@
         state.searchResults = null;
         state.handoffActor = "";
         state.roleScopeRole = "";
-        state.taskPlan = { taskId: "", data: null, error: "", loading: false, edit: false, selectedVersion: null };
+        state.taskPlan = newTaskPlanState();
         state.errors = {};
         render({ force: true });
         await loadProjectData();
@@ -2650,10 +2899,16 @@
             toast(`Authentication enforcement ${enabled ? "enabled" : "disabled"}`);
           }
           if (action === "select-project") await selectProject(button.dataset.project);
-          if (action === "view-task-plan") await openTaskPlan(button.dataset.task);
+          if (action === "view-task-plan") await openTaskPlan(
+            button.dataset.task,
+            button.dataset.version ? Number(button.dataset.version) : null);
           if (action === "close-task-plan") {
-            state.taskPlan = { taskId: "", data: null, error: "", loading: false, edit: false, selectedVersion: null };
+            state.taskPlan = newTaskPlanState();
             render({ force: true });
+          }
+          if (action === "task-plan-page") {
+            await navigateTaskPlanPage(
+              button.dataset.taskPlanPage, Number(button.dataset.direction));
           }
           if (action === "edit-task-plan") {
             state.taskPlan.edit = true;
@@ -2789,16 +3044,25 @@
           if (event.target.id === "role-scope-role" && event.target.value) {
             state.loadSerial += 1;
             state.roleScopeRole = event.target.value;
+            resetListPage("roleScopeHistory");
             delete state.data.roleScopeHistory;
             delete state.errors.roleScopeHistory;
             render({ force: true });
             await loadProjectData({ quiet: true });
           }
+          if (event.target.id === "bridge-project") {
+            const form = event.target.closest("form");
+            const peerAgents = form?.querySelector('[name="peer_selected_agents"]');
+            if (peerAgents) {
+              peerAgents.dataset.bridgeAgentWorkspace = event.target.value;
+              peerAgents.innerHTML = bridgeAgentOptions(event.target.value, []);
+            }
+          }
           if (event.target.matches("[data-participation-select]")) {
             const form = event.target.closest("form");
             const side = event.target.dataset.participationSide;
             const field = form?.querySelector(`[data-selected-agents-side="${side}"]`);
-            const input = field?.querySelector("input");
+            const input = field?.querySelector("[data-bridge-agent-select]");
             const selectedAgents = event.target.value === "selected_agents";
             if (field) field.hidden = !selectedAgents;
             if (input) {
@@ -2811,8 +3075,15 @@
             const form = event.target.closest("form");
             const isNew = event.target.value === "__new__";
             form.querySelectorAll("[data-new-actor]").forEach(el => { el.hidden = !isNew; });
-            const newId = form.querySelector('[name="agent_id_new"]');
-            if (newId) { newId.required = isNew; if (isNew) newId.focus(); }
+            const runtimeInput = form.querySelector('[name="runtime"]');
+            if (runtimeInput) {
+              runtimeInput.required = isNew;
+              if (isNew) runtimeInput.focus();
+            }
+            if (isNew) {
+              const nameInput = form.querySelector('[name="display_name"]');
+              if (nameInput) nameInput.value = "";
+            }
             if (!isNew) {
               const agent = (state.data.agentOptions?.agents ||
                 state.data.agents?.agents || []).find(a => a.agent_id === event.target.value);
@@ -2844,6 +3115,22 @@
             render({ force: true });
             await refreshPagedView(view);
           }
+          if (event.target.id === "task-plan-revision-filter") {
+            state.taskPlan.revisionFilter = event.target.value;
+            state.taskPlan.revisionOffset = 0;
+            await reloadTaskPlan({ showLoading: false });
+          }
+          if (event.target.id === "task-plan-action-filter") {
+            state.taskPlan.actionFilter = event.target.value;
+            state.taskPlan.actionOffset = 0;
+            await reloadTaskPlan({ showLoading: false });
+          }
+          if (event.target.matches("[data-task-plan-sort]")) {
+            const kind = event.target.dataset.taskPlanSort;
+            state.taskPlan[`${kind}Sort`] = event.target.value;
+            state.taskPlan[`${kind}Offset`] = 0;
+            await reloadTaskPlan({ showLoading: false });
+          }
           if (event.target.matches("[data-plan-version]") && event.target.value) {
             await openTaskPlan(
               event.target.dataset.planVersion,
@@ -2864,6 +3151,14 @@
       });
 
       document.addEventListener("input", event => {
+        if (event.target.id === "task-plan-revision-search") {
+          queueTaskPlanFilterRefresh(event.target, "revision");
+          return;
+        }
+        if (event.target.id === "task-plan-action-search") {
+          queueTaskPlanFilterRefresh(event.target, "action");
+          return;
+        }
         const filters = {
           "workspace-search": ["workspaceSearch", "workspaces", false],
           "task-search": ["taskSearch", "tasks", false],
@@ -2874,6 +3169,7 @@
           "agent-search": ["agentSearch", "agents", false],
           "bridge-search": ["bridgeSearch", "bridges", false],
           "handoff-search": ["handoffSearch", "handoff", false],
+          "role-scope-history-search": ["roleScopeHistorySearch", "roleScopeHistory", false],
           "log-search": ["logSearch", "log", false],
           "client-key-search": ["clientKeySearch", "clientKeys", false]
         };
@@ -2975,6 +3271,9 @@
               submit_for_review: values.submit_for_review === "true"
             };
             if (values.expected_version !== undefined && values.expected_version !== "") body.expected_version = Number(values.expected_version);
+            state.taskPlan.selectedVersion = null;
+            state.taskPlan.revisionOffset = 0;
+            state.taskPlan.actionOffset = 0;
             await mutate(`${form.dataset.task} plan saved`, () => api(pathFor(`/tasks/${encodeURIComponent(form.dataset.task)}/plan`), { method: "PUT", body }));
             state.taskPlan.edit = false;
             render({ force: true });
@@ -3063,9 +3362,9 @@
             const body = {
               other_project: values.other_project,
               participation: values.participation,
-              selected_agents: values.participation === "selected_agents" ? list(values.selected_agents) : [],
+              selected_agents: values.participation === "selected_agents" ? formData.getAll("selected_agents").map(String).filter(Boolean) : [],
               peer_participation: values.peer_participation,
-              peer_selected_agents: values.peer_participation === "selected_agents" ? list(values.peer_selected_agents) : []
+              peer_selected_agents: values.peer_participation === "selected_agents" ? formData.getAll("peer_selected_agents").map(String).filter(Boolean) : []
             };
             const principal = values.principal_side === "other" ? values.other_project : state.projectId;
             if (values.relation === "master") body.boss = principal;
@@ -3075,16 +3374,20 @@
           if (kind === "update-bridge-participation") {
             const body = {
               participation: values.participation,
-              selected_agents: values.participation === "selected_agents" ? list(values.selected_agents) : [],
+              selected_agents: values.participation === "selected_agents" ? formData.getAll("selected_agents").map(String).filter(Boolean) : [],
               peer_participation: values.peer_participation,
-              peer_selected_agents: values.peer_participation === "selected_agents" ? list(values.peer_selected_agents) : []
+              peer_selected_agents: values.peer_participation === "selected_agents" ? formData.getAll("peer_selected_agents").map(String).filter(Boolean) : []
             };
             await mutate(`Participation for ${form.dataset.project} updated`, () => api(pathFor(`/bridges/${encodeURIComponent(form.dataset.project)}`), { method: "PUT", body }));
           }
           if (kind === "register-agent") {
-            const agentId = values.agent_id === "__new__" ? (values.agent_id_new || "").trim() : values.agent_id;
-            if (!agentId) throw new Error("Pick an AI agent, or choose \"Register a new actor\" and enter its canonical ID.");
-            await mutate("AI role saved", () => api(pathFor("/agents"), { method: "POST", body: { agent_id: agentId, display_name: values.display_name || null, role: values.role || null, runtime: values.runtime || null } }));
+            const createGenerated = values.agent_id === "__new__";
+            if (!createGenerated && !values.agent_id) throw new Error("Choose an existing AI identity or create a generated one.");
+            if (createGenerated && !String(values.runtime || "").trim()) throw new Error("Choose the runtime for the generated identity.");
+            const body = createGenerated
+              ? { identity_mode: "new", display_name: values.display_name || null, role: values.role || null, runtime: String(values.runtime || "").trim() }
+              : { agent_id: values.agent_id, display_name: values.display_name || null, role: values.role || null };
+            await mutate(createGenerated ? "Generated AI identity reserved" : "AI role saved", () => api(pathFor("/agents"), { method: "POST", body }));
             form.reset();
           }
         } catch (error) {

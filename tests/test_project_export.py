@@ -228,7 +228,9 @@ class ProjectExportTestCase(unittest.TestCase):
         self.assertEqual(
             first["manifest"]["counts"]["role_scope_revisions"], 3)
         self.assertEqual(len(first["decisions"]), 1)
-        self.assertEqual(len(first["rules"]), 1)
+        self.assertEqual(len(first["rules"]), 2)
+        self.assertEqual(
+            {rule["rule_id"] for rule in first["rules"]}, {"R-0", "R-1"})
         self.assertEqual(len(first["agents"]), 2)
         self.assertEqual(first["actor_aliases"][0]["legacy_actor_id"],
                          "legacy.codex")

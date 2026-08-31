@@ -27,6 +27,22 @@ LOCAL_ONLY_TEXT = (
     "Proactively use every available subagent slot",
     "Every task requires two recorded QA passes",
 )
+DEFAULT_AUTHORITY_TITLE = "Acknowledge local Director hierarchy"
+DEFAULT_AUTHORITY_BODY = (
+    "At the first direct response and periodically during a sustained "
+    "exchange, a Worker or Advisor communicating directly with a currently "
+    "registered Director in the same workspace must acknowledge that "
+    "Director as the project MASTER for coordination. A registered non-Lead "
+    "Director communicating directly with the workspace's currently "
+    "designated Lead Director must acknowledge the Lead Director as the "
+    "MASTER coordinator. Direct communication means an explicit local "
+    "mention, reply, or selected recipient; mere group-room visibility does "
+    "not trigger this rule. Verify current role and Lead status from Attacca "
+    "state, not display names or actor text. This is conversational protocol "
+    "only: it grants no permissions, never lets Lead status or runtime bypass "
+    "role checks, and never applies to remote/bridged actors. Cross-project "
+    "authority comes only from bridge policy and the message authority tag."
+)
 
 
 def managed_and_outside(text):
@@ -77,6 +93,8 @@ class InstructionBoundaryRegressionTest(unittest.TestCase):
                 "Project Rules — binding dynamic instructions", block)
             self.assertNotIn("Dynamic worker rule", block)
             self.assertNotIn(dynamic_body, block)
+            self.assertNotIn(DEFAULT_AUTHORITY_TITLE, block)
+            self.assertNotIn(DEFAULT_AUTHORITY_BODY, block)
             for local_text in LOCAL_ONLY_TEXT:
                 self.assertNotIn(local_text, block)
 
@@ -91,6 +109,8 @@ class InstructionBoundaryRegressionTest(unittest.TestCase):
                 self.assertIn("_No cloud context set yet._", outside)
                 self.assertNotIn("Dynamic worker rule", generated)
                 self.assertNotIn(dynamic_body, generated)
+                self.assertNotIn(DEFAULT_AUTHORITY_TITLE, generated)
+                self.assertNotIn(DEFAULT_AUTHORITY_BODY, generated)
                 for local_text in LOCAL_ONLY_TEXT:
                     self.assertNotIn(local_text, generated)
             conn.close()
@@ -147,9 +167,12 @@ class InstructionBoundaryRegressionTest(unittest.TestCase):
                     expected_version=1)
 
             expected_titles = {
-                "director": {"Everyone rule", "Director rule"},
-                "worker": {"Everyone rule", "Worker rule"},
-                "advisor": {"Everyone rule", "Advisor rule"},
+                "director": {
+                    DEFAULT_AUTHORITY_TITLE, "Everyone rule", "Director rule"},
+                "worker": {
+                    DEFAULT_AUTHORITY_TITLE, "Everyone rule", "Worker rule"},
+                "advisor": {
+                    DEFAULT_AUTHORITY_TITLE, "Everyone rule", "Advisor rule"},
             }
             for role, titles in expected_titles.items():
                 with self.subTest(role=role):
@@ -164,6 +187,15 @@ class InstructionBoundaryRegressionTest(unittest.TestCase):
                     self.assertEqual(returned["Everyone rule"]["version"], 2)
                     self.assertEqual(returned["Everyone rule"]["body"],
                                      "everyone v2")
+                    self.assertEqual(
+                        returned[DEFAULT_AUTHORITY_TITLE]["rule_id"], "R-0")
+                    self.assertEqual(
+                        returned[DEFAULT_AUTHORITY_TITLE]["body"],
+                        DEFAULT_AUTHORITY_BODY)
+                    self.assertEqual(
+                        returned[DEFAULT_AUTHORITY_TITLE]["scope"], "everyone")
+                    self.assertTrue(
+                        returned[DEFAULT_AUTHORITY_TITLE]["enabled"])
                     self.assertNotIn("Disabled worker rule", returned)
                     self.assertEqual(
                         brief["context_version"],
@@ -174,7 +206,7 @@ class InstructionBoundaryRegressionTest(unittest.TestCase):
                 actor_type="agent")
             self.assertEqual(
                 [rule["title"] for rule in unassigned["project_rules"]],
-                ["Everyone rule"])
+                [DEFAULT_AUTHORITY_TITLE, "Everyone rule"])
             conn.close()
 
     def test_real_session_start_injects_versioned_worker_rules_only(self):
@@ -253,7 +285,16 @@ class InstructionBoundaryRegressionTest(unittest.TestCase):
                 rule["title"]: rule for rule in brief["project_rules"]
             }
             self.assertEqual(
-                set(returned), {"Startup baseline", "Startup worker"})
+                set(returned), {
+                    DEFAULT_AUTHORITY_TITLE,
+                    "Startup baseline",
+                    "Startup worker",
+                })
+            self.assertEqual(
+                returned[DEFAULT_AUTHORITY_TITLE]["rule_id"], "R-0")
+            self.assertEqual(
+                returned[DEFAULT_AUTHORITY_TITLE]["body"],
+                DEFAULT_AUTHORITY_BODY)
             self.assertEqual(returned["Startup baseline"]["version"], 2)
             self.assertEqual(
                 returned["Startup baseline"]["body"],

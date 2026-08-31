@@ -60,6 +60,7 @@ def role_scope(scope, role=None, version=1):
 def projection(scope, *, handoffs=None, scopes=None, lead=None):
     handoffs = list(handoffs if handoffs is not None else [
         identity_handoff(scope)])
+    persona = scope["actor_id"].rsplit(".", 1)[-1]
     return {
         "project": {
             "project_id": scope["project_id"],
@@ -90,6 +91,12 @@ def projection(scope, *, handoffs=None, scopes=None, lead=None):
         "actor_aliases": [],
         "cloud_context": None,
         "message_dispositions": [],
+        "persona_reservations": [{
+            "project_id": scope["project_id"],
+            "persona": persona,
+            "persona_name": persona[:1].upper() + persona[1:],
+            "reserved_at": "2026-08-30T00:00:00.000Z",
+        }],
     }
 
 
@@ -295,6 +302,8 @@ class IdentityProjectionServerTests(unittest.TestCase):
                 result["projection"]["identity_handoffs"] = rows
                 result["projection"]["role_scopes"] = [
                     role_scope(self.scope)]
+                result["projection"]["persona_reservations"] = \
+                    projection(self.scope)["persona_reservations"]
             return result
 
         return sync_server.SyncServerEngine(

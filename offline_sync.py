@@ -103,6 +103,10 @@ _RESOURCE_ALIASES = {
     "dispositions": "message_dispositions",
     "message_disposition": "message_dispositions",
     "message_dispositions": "message_dispositions",
+    "persona": "persona_reservations",
+    "personas": "persona_reservations",
+    "persona_reservation": "persona_reservations",
+    "persona_reservations": "persona_reservations",
 }
 _OPERATION_RESOURCE_ALIASES = {
     "message.dispose": "message_dispositions",

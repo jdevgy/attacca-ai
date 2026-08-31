@@ -149,8 +149,7 @@ class HttpTestCase(unittest.TestCase):
         self.assertNotIn("nameFor(", panel)
         self.assertIn("const personaIdentity =", panel)
         self.assertIn(
-            '[workspace, role, runtime, persona].filter(Boolean)'
-            '.map(identityPart).join(" · ")', panel)
+            'if (persona) return `@${identityPart(persona)}`', panel)
         self.assertIn(
             "It authorizes clients but never renames or replaces an AI "
             "identity", panel)
@@ -1176,6 +1175,15 @@ class HttpTestCase(unittest.TestCase):
 
         # The panel sends the current workspace id for its explicit local-only
         # destination. Even structured messages and mentions must not fan out.
+        # Mentions are delivery selectors, so the legacy selector must name a
+        # current registered actor (the registration retains ``rest_bot`` as
+        # an exact compatibility alias).
+        status, _, _ = self.rest(
+            "POST", "/v1/projects/hub/agents",
+            {"agent_id": "rest_bot", "display_name": "REST bot",
+             "role": "worker", "runtime": "rest"},
+            actor="admin", actor_type="human")
+        self.assertEqual(status, 200)
         status, local, _ = self.rest(
             "POST", "/v1/projects/hub/room",
             {"body": "keep this directive local", "msg_type": "directive",
@@ -1234,6 +1242,15 @@ class HttpTestCase(unittest.TestCase):
         self.assertNotIn("mirrored_to_inferred", local)
 
     def test_panel_status_decisions_lead_and_bridges(self):
+        # Compatibility-mode headers still need a registered destination for
+        # explicit inbox mentions. Registration keeps the historic
+        # ``panel-user`` selector as an exact alias of its canonical actor.
+        status, _, _ = self.rest(
+            "POST", "/v1/projects/hub/agents",
+            {"agent_id": "panel-user", "display_name": "Panel user",
+             "role": "director", "runtime": "panel"},
+            actor="admin", actor_type="human")
+        self.assertEqual(status, 200)
         status, overview, _ = self.rest("GET", "/v1/projects/hub/status",
                                         actor="panel-user")
         self.assertEqual(status, 200)
@@ -1335,7 +1352,7 @@ class HttpTestCase(unittest.TestCase):
             actor="admin", actor_type="human")
         self.assertEqual(status, 200)
         actor = registration["agent_id"]
-        self.assertEqual(actor, "hub.director.codex.red")
+        self.assertEqual(actor, "hub.director.codex.gibbs")
         _, before, _ = self.rest(
             "GET", "/v1/projects/hub/handoff", actor=actor,
             actor_type="agent")
@@ -2156,9 +2173,9 @@ class TwoCodexCheckoutFlowTestCase(unittest.TestCase):
                     server.base, setup_a["project_id"], "codex_b", "agent",
                     role="worker", home=home_b)
                 self.assertEqual(network_a["actor"],
-                                 "two-codex-flow.director.codex.red")
+                                 "two-codex-flow.director.codex.gibbs")
                 self.assertEqual(network_b["actor"],
-                                 "two-codex-flow.worker.codex.red")
+                                 "two-codex-flow.worker.codex.turing")
 
                 first = self._proxy(server, db, a, "codex_a", home_a)
                 second = self._proxy(server, db, b, "codex_b", home_b)
@@ -2169,32 +2186,32 @@ class TwoCodexCheckoutFlowTestCase(unittest.TestCase):
                 self.assertEqual(status_a["project"], setup_a["project_id"])
                 self.assertEqual(status_b["project"], setup_a["project_id"])
                 self.assertEqual(status_a["you"]["actor_id"],
-                                 "two-codex-flow.director.codex.red")
+                                 "two-codex-flow.director.codex.gibbs")
                 self.assertEqual(status_b["you"]["actor_id"],
-                                 "two-codex-flow.worker.codex.red")
+                                 "two-codex-flow.worker.codex.turing")
 
                 sent_a = self._call(
                     first, 3, "room_send",
                     {"body": "hello from checkout A",
                      "msg_type": "directive",
-                     "mentions": ["two-codex-flow.worker.codex.red"]})
+                     "mentions": ["two-codex-flow.worker.codex.turing"]})
                 seen_b = self._call(
                     second, 3, "check_inbox", {"mark_read": True})
                 from_a = next(m for m in seen_b["messages"]
                               if m["body"] == "hello from checkout A")
                 self.assertEqual(from_a["actor"],
-                                 "two-codex-flow.director.codex.red")
+                                 "two-codex-flow.director.codex.gibbs")
                 sent_b = self._call(
                     second, 4, "room_send",
                     {"body": "reply from checkout B", "msg_type": "chat",
                      "reply_to": sent_a["event"]["event_id"],
-                     "mentions": ["two-codex-flow.director.codex.red"]})
+                     "mentions": ["two-codex-flow.director.codex.gibbs"]})
                 seen_a = self._call(
                     first, 4, "check_inbox", {"mark_read": True})
                 from_b = next(m for m in seen_a["messages"]
                               if m["body"] == "reply from checkout B")
                 self.assertEqual(from_b["actor"],
-                                 "two-codex-flow.worker.codex.red")
+                                 "two-codex-flow.worker.codex.turing")
                 self.assertEqual(from_b["reply_to"],
                                  sent_a["event"]["event_id"])
                 self.assertEqual(sent_b["delivered_to"], setup_a["project_id"])
@@ -2588,7 +2605,7 @@ class OneShotSetupTestCase(unittest.TestCase):
                     [action["kind"] for action in first["actions"]],
                     ["identity", "identity_binding", "lead", "bridge"])
                 self.assertEqual(first["actor"],
-                                 "current.director.codex.red")
+                                 "current.director.codex.gibbs")
                 self.assertEqual(first["identity_mode"], "new")
                 second = c.apply_remote_network_setup(
                     server.base, "current", actor, "agent",
@@ -2613,7 +2630,7 @@ class OneShotSetupTestCase(unittest.TestCase):
                     home=home)
                 network = discovery["network"]
                 self.assertEqual(network["lead_director"],
-                                 "current.director.codex.red")
+                                 "current.director.codex.gibbs")
                 self.assertEqual(
                     network["current_actor_record"]["role"], "director")
                 self.assertEqual(network["default_relationship"], "master")
@@ -2627,6 +2644,48 @@ class OneShotSetupTestCase(unittest.TestCase):
                     relationship="none", home=home)
                 self.assertEqual(removed["actions"][-1]["kind"],
                                  "bridge_removed")
+            finally:
+                server.stop()
+
+    def test_setup_reuse_options_keep_only_exact_ownerless_current_actor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "reuse-options.db"
+            checkout = Path(tmp) / "checkout"
+            checkout.mkdir()
+            exact_actor = "current.director.codex.gibbs"
+            conn = c.connect(db)
+            try:
+                c.project_init(
+                    conn, "admin", "human", path=str(checkout),
+                    project_id="current", name="Current App")
+                c.agent_register(
+                    conn, "current", "setup", "human",
+                    agent_id=exact_actor, role="director", runtime="codex")
+                c.agent_register(
+                    conn, "current", "setup", "human",
+                    agent_id="current.worker.codex.turing", role="worker",
+                    runtime="codex")
+                c.set_current_owner("mallory")
+                c.agent_register(
+                    conn, "current", "setup", "human",
+                    agent_id="current.director.claude.hopper",
+                    role="director", runtime="claude")
+            finally:
+                c.set_current_owner(None)
+                conn.close()
+
+            server = ServerFixture(db)
+            try:
+                status, payload, _ = server.request(
+                    "GET",
+                    "/v1/projects/current/agents?options=1&reuse_options=1",
+                    headers={"X-Attacca-Actor": exact_actor,
+                             "X-Attacca-Actor-Type": "agent"})
+                self.assertEqual(status, 200, payload)
+                self.assertEqual(
+                    [row["agent_id"] for row in payload["agents"]],
+                    [exact_actor])
+                self.assertTrue(payload["reuse_options"])
             finally:
                 server.stop()
 
@@ -2688,18 +2747,18 @@ class OneShotSetupTestCase(unittest.TestCase):
                 self.assertEqual(
                     [(agent["agent_id"], agent["role"])
                      for agent in agents["agents"]],
-                    [("current-app.director.codex.red", "director")])
+                    [("current-app.director.codex.gibbs", "director")])
                 _, project_status, _ = server.request(
                     "GET", "/v1/projects/current-app/status",
                     headers={"X-Attacca-Actor": "auditor"})
                 self.assertEqual(project_status["lead_director"],
-                                 "current-app.director.codex.red")
+                                 "current-app.director.codex.gibbs")
                 binding = c.machine_actor_binding_get(
                     server.base, "current-app", "codex",
                     client_instance=client_instance, home=home)
                 self.assertIsNotNone(binding)
                 self.assertEqual(binding["actor_id"],
-                                 "current-app.director.codex.red")
+                                 "current-app.director.codex.gibbs")
                 self.assertNotIn(
                     "vscode", [agent["agent_id"] for agent in agents["agents"]])
                 watcher_state = json.loads(

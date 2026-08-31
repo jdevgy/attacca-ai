@@ -24,7 +24,8 @@ workspace:
   declared path scopes, immutable plan revisions, decisions, and evidence-based
   completion keep parallel workers aligned.
 - **Separate identity and authority** — new canonical AI actors use
-  `workspace.role.runtime.persona` (for example, a Red or Blue Codex Director);
+  `workspace.role.runtime.persona` (for example,
+  `engine.director.codex.gibbs`, displayed as **Gibbs** / **@Gibbs**);
   the authenticated human operator, client installation, Git revision,
   runtime, role, and persona remain distinct audit fields. Existing three-part
   actors remain compatibility identities and are never rewritten implicitly.
@@ -83,12 +84,16 @@ full export can substitute for the verified identity-scoped mirror.
 - **One database, many projects.** Default `~/.attacca/attacca.db`
   (override: `ATTACCA_DB`). Claims use single conditional UPDATEs, appends use
   `BEGIN IMMEDIATE` — safe under many concurrent clients (`tests/test_concurrency.py`).
-- **Installation-bound, colored AI identity.** Clients send a runtime hint
+- **Installation-bound, named AI identity.** Clients send a runtime hint
   (`claude`, `codex`, `kimi`, …); setup binds that runtime on this client
   installation to one exact `workspace.role.runtime.persona` actor. New actors
-  receive deterministic colors beginning with Red, then Blue. Normal
-  start/resume silently reuses the binding. Owner is transmitted and stored
-  separately, and no conversation or host-session ID participates in identity.
+  receive short human-friendly names beginning with Gibbs. A name is reserved
+  transactionally and case-insensitively across the entire project, including
+  every role, runtime, and historical identity, and is never issued twice.
+  Normal start/resume silently reuses the binding. Owner is transmitted and
+  stored separately, and no conversation or host-session ID participates in
+  identity. Existing Red/Blue and three-part actors remain compatibility
+  records and are never renamed.
 
 ## Quickstart
 
@@ -165,12 +170,18 @@ regenerate it on each machine rather than using it as workspace identity.
 The same guided run then configures every detected tool, verifies MCP and the
 lifecycle hooks, asks this AI's workspace role (first-run default: Director +
 Lead Director), and confirms its installation identity. A new installation
-creates the next permanent color by default. An explicit setup on an existing
-installation can instead continue its bound color, take over another existing
-color, create the next permanent color, or use a new color only in the current
-MCP process. Taking over intentionally shares that exact actor's handoff, inbox
-cursor, and task leases. User-facing choices show role/runtime/color labels;
-raw project and actor IDs remain internal arguments.
+creates the next permanent generated name by default (the first is **Gibbs**).
+An explicit setup on an existing installation can instead continue its bound
+name, take over another existing named identity, create the next permanent
+name, or use a freshly generated name only in the current MCP process. The
+temporary path is deliberately performed by `agent_register` through that
+already-running, already-bound proxy; it is not offered to a first/unbound
+client because D-17 authentication requires an exact actor first. A setup shell
+subprocess cannot claim to change its parent MCP process. Reuse is selection-only: it shares that
+exact actor's handoff, inbox cursor, and task
+leases without merging, deleting, or renaming the currently active identity.
+User-facing choices show **Gibbs** / **@Gibbs** with role and runtime; raw
+project and actor IDs remain internal arguments.
 
 Normal session start/resume never asks this question: the non-secret binding in
 `~/.attacca/config.json` is keyed by normalized server URL, workspace, runtime,
@@ -226,8 +237,11 @@ own project), `--attach ID`, `--create NAME`, `--discover`, `--stdio`
 (serverless mode: tools open the database
 directly), `--url http://host:port`, `--tools-only` (global tool configs only,
 no project side effects — what install.sh uses),
-`--identity-mode auto|reuse|new|temporary` (normally selected by guided setup;
-an exact reuse target stays an internal argument),
+`--identity-mode auto|reuse|new` (normally selected by guided setup; an exact
+reuse target stays an internal argument). Native guided setup also offers a
+temporary current-proxy identity to an already-bound client and activates it
+only through that current MCP connection. Direct CLI `temporary` is rejected
+because a child process cannot alter its parent,
 `--skip-tools codex,cline` / `--skip-tools all`, and `--no-server`.
 
 ## Hosted authentication (prototype)
@@ -365,11 +379,14 @@ The managed-law refresh runs independently of executable update state. The
 server publishes the current version/hash through `/healthz` and the exact
 project-bound content through `/v1/managed-law`.
 
-Lifecycle briefs include the complete Cloud Context whenever it fits the
-client's configured hook-context budget. That budget is measured in UTF-8
-bytes, so unusually large Unicode-heavy context may be rendered as an explicit
-head/tail compacted view with `cloud_context_get` recovery instructions; the
-authoritative hosted content itself is never shortened or rewritten.
+Session-start lifecycle briefs include the complete Cloud Context whenever it
+fits the client's configured hook-context budget. Subsequent unchanged turn
+briefs rely on that cached/current version; the watcher refetches and injects
+the full text only after its version/hash changes. The session-start budget is
+measured in UTF-8 bytes, so unusually large Unicode-heavy context may be
+rendered as an explicit head/tail compacted view with `cloud_context_get`
+recovery instructions; the authoritative hosted content itself is never
+shortened or rewritten.
 
 ## How a tool connects (three shapes, one server)
 
@@ -392,9 +409,14 @@ absolute directory.
 Each computer keeps a separate installation-scoped outbox and a verified mirror
 scoped to its human-owned client key plus exact project and actor headers. Its
 actor choice is also installation-local: a fresh home/container has no actor
-binding and setup asks whether to take over an existing named color, create the
-next permanent color, or use a temporary current-process color. Two sessions
-sharing the same `~/.attacca` home and runtime silently reuse one binding; two
+binding and setup asks whether to take over an existing named identity, create
+the next permanent generated name, or select another same-owner compatibility
+identity. A temporary current-process name is offered only after an exact
+machine binding already authorizes the running MCP proxy.
+The project reserves each generated name forever, case-insensitively, so a
+retired Gibbs can never collide with a later `gibbs` in another role/runtime.
+Two sessions sharing the same `~/.attacca` home and runtime silently reuse one
+binding; two
 isolated homes make independent choices even in the same checkout. During an
 outage, each can queue its own allowlisted mutations;
 the background watcher reconnects, pulls, replays immutable mutation IDs in
@@ -455,6 +477,19 @@ ownership, and the actor's registered role. The client key never carries the
 AI actor, runtime, or role. Writes return the same payloads (and warnings) as
 the MCP tools.
 
+Long collection reads use one product-wide paging contract across REST, MCP,
+the Control Panel, and the verified offline mirror. A page is capped at 60
+rows and reports exact `total`, `unfiltered_total`, `limit`, `offset`, and
+`has_more`; search, status/filter, and `newest|oldest` sort are applied to the
+complete authorized collection before the slice is taken. `search` likewise
+returns one unified page across result kinds rather than a separate 60-row
+slice per category. `task_show` pages task actions and readable task history
+independently, while `task_plan_get` independently pages immutable plan
+revisions and review actions. Guided setup is the deliberate exception: its
+authenticated `options=1` directories remain complete so a workspace,
+existing same-owner identity, or permanently reserved friendly name is never
+hidden by an arbitrary page boundary.
+
 ## The protocol agents follow
 
 Injected via the managed block and the MCP server's `instructions`:
@@ -470,6 +505,8 @@ Injected via the managed block and the MCP server's `instructions`:
    participant reads every visible non-self message. Mentions/replies route
    attention only; an untargeted chat/directive addresses everyone. Explicit
    bridge participation/access, not mentions, sets the privacy boundary. The
+   sender may address a named identity as `@Gibbs` (case-insensitive); Attacca
+   resolves that project-unique short name and stores the exact canonical actor.
    cursor is lossless: a truncated batch sets `may_have_more` and the next poll
    picks up exactly where the last one ended.
 4. **Decisions for durable choices** — architecture, API, data, security,
@@ -480,10 +517,23 @@ Injected via the managed block and the MCP server's `instructions`:
    the lead. Humans and registered Directors manage it with optimistic
    versions. At a meaningful transition, every registered AI role reports task
    evidence, then updates only its own exact-identity handoff with the handoff
-   version returned by `get_handoff`; one color can never overwrite another
-   color's history. A human identity also owns only its own handoff.
+   version returned by `get_handoff`; Gibbs can never overwrite Turing's
+   history. A human identity also owns only its own handoff.
 6. **Drift Guard** — responses carry `stale_context_warning` when the project moved
    after your briefing; re-run `get_handoff` before writing.
+
+**Product-default rule R-0:** every new workspace receives an ordinary,
+audited Project Rule for the local coordination hierarchy. In a direct local
+exchange, a Worker or Advisor periodically acknowledges the addressed Director
+as the project's **MASTER**; a non-Lead Director addressing the Lead Director
+periodically acknowledges the Lead as **MASTER coordinator**. Only an explicit
+local mention, reply, or selected recipient triggers this conversational
+reminder—ordinary group visibility does not. It grants no permission and never
+bypasses role, Lead, runtime, or bridge authority. It never applies across
+projects, where bridge policy remains the sole authority. Existing workspaces
+receive R-0 once when opened by the upgraded product; because it is a normal
+Project Rule, authorized governance may edit or disable it and Attacca will not
+overwrite that choice.
 
 ## MCP tools (42)
 
@@ -541,7 +591,7 @@ setup --discover | --attach ID | --create NAME  advanced/scripted workspace flag
 setup [--url U] [--stdio] [--no-instructions]  one-shot checkout setup
       [-i|--interactive]
       [--role director|advisor|worker] [--lead keep|current|clear]
-      [--identity-mode auto|reuse|new|temporary]
+      [--identity-mode auto|reuse|new|temporary]             temporary requires current MCP
       [--bridge ID --relationship master|peer|advisor|none --principal current|other]
 setup --details [claude kimi codex gemini opencode glm cli]   full config reference
 install-instructions [--files CLAUDE.md,AGENTS.md]
@@ -577,11 +627,12 @@ python3 attacca.py event verify  # hash-chain + sequence integrity of a real led
   as usual; `base_revision` is recorded at claim/report for later comparison.
 - **Hash chain is tamper-*evident*, not tamper-*proof*** (no signatures yet — §23.3).
 - **One exact actor = one workspace/role/runtime/persona continuity owner.**
-  Two simultaneous sessions that reuse the same colored actor intentionally
-  share its handoff, inbox cursor, and task leases. Separate permanent colors
+  Two simultaneous sessions that reuse the same named actor intentionally
+  share its handoff, inbox cursor, and task leases. Separate permanent names
   have independent handoffs/cursors/leases while receiving the same applicable
   Role Scope. Existing three-part actors remain explicit compatibility choices;
-  new setup-created identities always have a color. Owner remains separately
-  visible on every new event.
+  existing Red/Blue persona records are also preserved without renaming. New
+  setup-created identities always receive a project-unique friendly name and
+  `@ShortName`. Owner remains separately visible on every new event.
 - The room is a projection of `room.message` events in the ledger — chat is not the
   database (blueprint principle, §2.3).

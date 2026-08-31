@@ -293,6 +293,51 @@ class D17SecurityHttpTest(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_setup_reuse_directory_excludes_foreign_owned_identities(self):
+        token = self.create_key()
+        self.activate()
+        conn = c.connect(self.db)
+        try:
+            c.set_current_owner("jack")
+            c.agent_register(
+                conn, "proj", "web.jack", "human",
+                agent_id="proj.worker.claude.gibbs", role="worker",
+                runtime="claude", registration_username="jack")
+            c.set_current_owner("mallory")
+            c.agent_register(
+                conn, "proj", "legacy.setup", "human",
+                agent_id="proj.director.claude.turing", role="director",
+                runtime="claude")
+            c.set_lead_director(
+                conn, "proj", "web.jack", "human",
+                "proj.director.claude.turing")
+        finally:
+            c.set_current_owner(None)
+            conn.close()
+
+        response = self.request(
+            "GET", "/v1/projects/proj/agents?options=1&reuse_options=1",
+            headers=self.client_headers(
+                token, actor="proj.director.codex"))
+        self.assertEqual(response["status"], 200, response["body"])
+        actors = {row["agent_id"] for row in response["body"]["agents"]}
+        self.assertIn("proj.director.codex", actors)
+        self.assertIn("proj.worker.claude.gibbs", actors)
+        self.assertNotIn("proj.director.claude.turing", actors)
+        self.assertTrue(response["body"]["reuse_options"])
+
+        projects = self.request(
+            "GET", "/v1/projects?options=1",
+            headers=self.client_headers(token, actor="proj.director.codex"))
+        self.assertEqual(projects["status"], 200, projects["body"])
+        project = next(row for row in projects["body"]["projects"]
+                       if row["project_id"] == "proj")
+        self.assertEqual(
+            project["lead_director_descriptor"]["short_name"], "@Turing")
+        self.assertNotIn(
+            "proj.director.claude.turing",
+            json.dumps(project["lead_director_descriptor"], sort_keys=True))
+
     def test_fresh_runtime_persists_install_key_before_exact_registration(self):
         token = self.create_key(instance="shared-install")
         self.activate()

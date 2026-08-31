@@ -151,8 +151,9 @@ class ProjectRulesLiveApiTest(unittest.TestCase):
 
         managed = self._rules(
             actor=director, actor_type="agent", management=True)
-        self.assertEqual(self._titles(managed), ["Protect API v2"])
-        self.assertEqual(managed["rules"][0], created)
+        self.assertEqual(self._titles(managed), [
+            c.DEFAULT_AUTHORITY_RULE_TITLE, "Protect API v2"])
+        self.assertEqual(managed["rules"][1], created)
 
         path = "/v1/projects/rulespace/rules/%s" % created["rule_id"]
         updated = self._request(
@@ -172,8 +173,10 @@ class ProjectRulesLiveApiTest(unittest.TestCase):
             actor=director, actor_type="agent", expected=400)
         self.assertIn("rule conflict", conflict["error"])
         self.assertIn("v2", conflict["error"])
-        after_conflict = self._rules(
-            actor=director, actor_type="agent", management=True)["rules"][0]
+        after_conflict = next(
+            rule for rule in self._rules(
+                actor=director, actor_type="agent", management=True)["rules"]
+            if rule["rule_id"] == created["rule_id"])
         self.assertEqual(after_conflict["title"],
                          "Protect advisor API v2")
         self.assertEqual(after_conflict["version"], 2)
@@ -184,12 +187,16 @@ class ProjectRulesLiveApiTest(unittest.TestCase):
             actor=director, actor_type="agent")["rule"]
         self.assertFalse(disabled["enabled"])
         self.assertEqual(disabled["version"], 3)
-        self.assertEqual(self._rules(
-            actor=director, actor_type="agent")["rules"], [])
+        self.assertEqual(self._titles(self._rules(
+            actor=director, actor_type="agent")), [
+                c.DEFAULT_AUTHORITY_RULE_TITLE])
         managed_disabled = self._rules(
             actor=director, actor_type="agent", management=True)["rules"]
-        self.assertEqual(len(managed_disabled), 1)
-        self.assertFalse(managed_disabled[0]["enabled"])
+        self.assertEqual(len(managed_disabled), 2)
+        disabled_custom = next(
+            rule for rule in managed_disabled
+            if rule["rule_id"] == created["rule_id"])
+        self.assertFalse(disabled_custom["enabled"])
 
         enabled = self._request(
             "PUT", path,
@@ -197,14 +204,19 @@ class ProjectRulesLiveApiTest(unittest.TestCase):
             actor=director, actor_type="agent")["rule"]
         self.assertTrue(enabled["enabled"])
         self.assertEqual(enabled["version"], 4)
-        self.assertEqual(self._rules(
-            actor=director, actor_type="agent")["rules"], [])
+        self.assertEqual(self._titles(self._rules(
+            actor=director, actor_type="agent")), [
+                c.DEFAULT_AUTHORITY_RULE_TITLE])
         self.assertEqual(self._titles(self._rules()),
-                         ["Protect advisor API v2"])
+                         [c.DEFAULT_AUTHORITY_RULE_TITLE,
+                          "Protect advisor API v2"])
         managed_enabled = self._rules(
             actor=director, actor_type="agent", management=True)["rules"]
-        self.assertEqual(managed_enabled[0]["version"], 4)
-        self.assertTrue(managed_enabled[0]["enabled"])
+        enabled_custom = next(
+            rule for rule in managed_enabled
+            if rule["rule_id"] == created["rule_id"])
+        self.assertEqual(enabled_custom["version"], 4)
+        self.assertTrue(enabled_custom["enabled"])
 
     def test_role_scopes_handoff_startup_and_repo_text_boundary(self):
         director = self._register("claude", "director")
@@ -218,10 +230,14 @@ class ProjectRulesLiveApiTest(unittest.TestCase):
             self._create_rule(title, scope, priority)
 
         expected = {
-            director: ["Everyone rule", "Director rule"],
-            advisor: ["Everyone rule", "Advisor rule"],
-            worker: ["Everyone rule", "Worker rule"],
-            "rulespace.unassigned.stranger": ["Everyone rule"],
+            director: [c.DEFAULT_AUTHORITY_RULE_TITLE,
+                       "Everyone rule", "Director rule"],
+            advisor: [c.DEFAULT_AUTHORITY_RULE_TITLE,
+                      "Everyone rule", "Advisor rule"],
+            worker: [c.DEFAULT_AUTHORITY_RULE_TITLE,
+                     "Everyone rule", "Worker rule"],
+            "rulespace.unassigned.stranger": [
+                c.DEFAULT_AUTHORITY_RULE_TITLE, "Everyone rule"],
         }
         handoffs = {}
         for actor, titles in expected.items():
@@ -234,11 +250,12 @@ class ProjectRulesLiveApiTest(unittest.TestCase):
             handoffs[actor] = handoff
 
         self.assertEqual(self._titles(self._rules()), [
-            "Everyone rule", "Director rule", "Advisor rule", "Worker rule"])
+            c.DEFAULT_AUTHORITY_RULE_TITLE, "Everyone rule", "Director rule",
+            "Advisor rule", "Worker rule"])
         self.assertEqual(self._titles(self._rules(
             actor=director, actor_type="agent", management=True)), [
-                "Everyone rule", "Director rule", "Advisor rule",
-                "Worker rule"])
+                c.DEFAULT_AUTHORITY_RULE_TITLE, "Everyone rule",
+                "Director rule", "Advisor rule", "Worker rule"])
         denied = self._rules(
             actor=worker, actor_type="agent", management=True, expected=400)
         self.assertIn("registered Director", denied["error"])
@@ -269,9 +286,13 @@ class ProjectRulesLiveApiTest(unittest.TestCase):
         _, startup_context, startup = self._run_startup("codex")
         self.assertEqual(startup["actor"], worker)
         self.assertEqual(self._titles(startup, "project_rules"),
-                         ["Everyone rule", "Worker rule"])
-        self.assertEqual(startup["project_rules"],
-                         handoffs[worker]["project_rules"])
+                         [c.DEFAULT_AUTHORITY_RULE_TITLE,
+                          "Everyone rule", "Worker rule"])
+        self.assertEqual(
+            [rule["rule_id"] for rule in startup["project_rules"]],
+            [rule["rule_id"] for rule in
+             handoffs[worker]["project_rules"]])
+        self.assertIn(c.DEFAULT_AUTHORITY_RULE_BODY, startup_context)
 
         server_rules = self._rules(
             actor=director, actor_type="agent", management=True)

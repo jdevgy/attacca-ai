@@ -2,8 +2,10 @@
 
 This module deliberately has no dependency on :mod:`attacca.py`, which lets
 the HTTP, CLI, and test surfaces integrate it without creating an import
-cycle.  It operates on an already-open SQLite connection and never mutates
-that database.
+cycle.  Export construction operates on an already-open SQLite connection
+without mutating it.  The narrowly-scoped reservation restore helper is the
+only write path: it atomically imports an already-validated, append-only agent
+short-name registry and refuses conflicting history.
 
 The JSON export keeps both a decoded event ``payload`` and the exact stored
 ``payload_json`` used by Attacca's immutable hash chain.  Server-global
@@ -16,6 +18,8 @@ import hashlib
 import io
 import json
 import os
+import re
+import sqlite3
 import tempfile
 import zipfile
 from contextlib import contextmanager
@@ -23,10 +27,38 @@ from pathlib import Path
 
 
 EXPORT_FORMAT = "attacca.project-export"
-EXPORT_SCHEMA_VERSION = 1
+EXPORT_SCHEMA_VERSION = 2
+SUPPORTED_EXPORT_SCHEMA_VERSIONS = frozenset({1, EXPORT_SCHEMA_VERSION})
 OFFLINE_CACHE_FORMAT = "attacca.offline-project-cache"
 OFFLINE_CACHE_SCHEMA_VERSION = 1
 GENESIS_HASH = "0" * 64
+
+_PERSONA_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$", re.ASCII)
+_WIRE_SLUG_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$", re.ASCII)
+_PERSONA_HISTORY_COLUMNS = (
+    ("events", ("actor_id", "payload")),
+    ("agents", ("agent_id",)),
+    ("actor_aliases", ("legacy_actor_id", "canonical_actor_id")),
+    ("projects", ("created_by", "lead_director")),
+    ("bridges", ("created_by", "access_a", "access_b")),
+    ("inbox_cursors", ("actor_id",)),
+    ("message_dispositions", ("actor_id", "updated_by")),
+    ("tasks", ("claimed_by", "created_by")),
+    ("task_plan_revisions", ("authored_by",)),
+    ("handoffs", ("updated_by",)),
+    ("identity_handoffs", ("actor_id", "updated_by")),
+    ("role_scope_revisions", ("updated_by",)),
+    ("decisions", ("proposed_by", "resolved_by")),
+    ("project_rules", ("created_by", "updated_by")),
+    ("project_cloud_context", ("updated_by",)),
+    ("sync_operations", ("actor_id",)),
+    ("auth_tokens", ("actor_id",)),
+    ("auth_token_actor_bindings", ("actor_id",)),
+    ("auth_migration_targets", ("actor_id",)),
+    ("agent_clients", ("agent_id",)),
+)
 
 
 class ProjectExportError(ValueError):
@@ -84,6 +116,180 @@ def _optional_rows(conn, tables, table, sql, params=()):
     if table not in tables:
         return []
     return _query_rows(conn, sql, params)
+
+
+def _valid_persona_slug(value):
+    """Match the durable normalized name contract without importing core."""
+    return bool(
+        isinstance(value, str)
+        and value.isascii()
+        and _PERSONA_RE.fullmatch(value)
+        and "--" not in value
+        and value not in {"default", "none", "unassigned"}
+    )
+
+
+def _canonical_persona_actor(actor_id, project_id):
+    """Return a strict named actor, rejecting canonical-shaped bad history."""
+    if not isinstance(actor_id, str):
+        return None
+    text = actor_id.strip()
+    parts = text.split(".")
+    looks_named = len(parts) == 4 \
+        and parts[0].lower() == str(project_id).lower() \
+        and parts[1].lower() in {
+            "director", "advisor", "worker", "unassigned",
+        }
+    if not looks_named:
+        return None
+    if text != text.lower() or parts[0] != project_id \
+            or not parts[2].isascii() \
+            or not _WIRE_SLUG_RE.fullmatch(parts[2]) \
+            or "--" in parts[2] \
+            or not _valid_persona_slug(parts[3]):
+        raise ProjectExportError(
+            "durable history contains a non-normalized named actor %r" %
+            actor_id)
+    return {"actor_id": text, "persona": parts[3]}
+
+
+def _persona_actors_in_value(value, project_id):
+    """Find strict named actors in identity columns and structured payloads."""
+    if value is None:
+        return []
+    if isinstance(value, (dict, list, tuple)):
+        children = value.values() if isinstance(value, dict) else value
+        result = []
+        for child in children:
+            result.extend(_persona_actors_in_value(child, project_id))
+        return result
+    text = str(value).strip()
+    if not text:
+        return []
+    if text[:1] in ("{", "["):
+        try:
+            return _persona_actors_in_value(json.loads(text), project_id)
+        except (TypeError, ValueError):
+            pass
+    result = []
+    exact = _canonical_persona_actor(text, project_id)
+    if exact:
+        result.append(exact)
+    pattern = re.compile(
+        r"(?<![\w.-])(" + re.escape(project_id) +
+        r"\.(?:director|advisor|worker|unassigned)"
+        r"\.[\w-]+\.[\w-]+)(?![\w.-])",
+        re.IGNORECASE,
+    )
+    for match in pattern.finditer(text):
+        parsed = _canonical_persona_actor(match.group(1), project_id)
+        if parsed and parsed not in result:
+            result.append(parsed)
+    return result
+
+
+def _verify_persona_reservation_coverage(conn, tables, project_id, rows):
+    """Prove the exported registry covers all durable named-actor history.
+
+    A schema-v2 export is an authoritative never-reuse artifact.  A migration
+    marker is not evidence: a raw connection or later maintenance write may
+    have added historical identity state without passing registration.  Scan
+    every supported identity-bearing column on the same read snapshot and
+    refuse to label an incomplete registry as complete.
+    """
+    if "agent_persona_reservations" not in tables:
+        raise ProjectExportError(
+            "schema-v2 export requires the migrated agent persona "
+            "reservation registry")
+    _validate_persona_reservations(rows, project_id)
+    reserved = {row["persona"] for row in rows}
+    discovered = {}
+    for table, requested_columns in _PERSONA_HISTORY_COLUMNS:
+        if table not in tables:
+            continue
+        columns = {row["name"] for row in _query_rows(
+            conn, "PRAGMA table_info(%s)" % table)}
+        selected = [column for column in requested_columns
+                    if column in columns]
+        if "project_id" not in columns or not selected:
+            continue
+        history_rows = _query_rows(
+            conn,
+            "SELECT %s FROM %s WHERE project_id=?" %
+            (",".join(selected), table),
+            (project_id,),
+        )
+        for history_row in history_rows:
+            for column in selected:
+                for actor in _persona_actors_in_value(
+                        history_row.get(column), project_id):
+                    discovered.setdefault(actor["persona"], set()).add(
+                        actor["actor_id"])
+    missing = sorted(set(discovered) - reserved)
+    if missing:
+        raise ProjectExportError(
+            "agent persona reservation coverage is incomplete for: %s; "
+            "open the database through Attacca migration before exporting" %
+            ", ".join("@" + item[:1].upper() + item[1:]
+                      for item in missing))
+    return {
+        "method": "durable_identity_history_scan_v1",
+        "complete": True,
+        "history_personas": len(discovered),
+        "registry_sha256": _sha256(_json_bytes(rows, pretty=False)),
+    }
+
+
+def _validate_persona_reservations(rows, project_id):
+    """Validate the complete append-only reservation section.
+
+    The administrative export deliberately retains the original actor and
+    source for recovery/audit.  Identity-scoped sync uses a separately
+    redacted representation validated in :mod:`sync_protocol`.
+    """
+    required = {
+        "project_id", "persona", "persona_name", "reserved_actor_id",
+        "reserved_at", "source",
+    }
+    seen = set()
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict) or set(row) != required:
+            raise ProjectExportError(
+                "agent_persona_reservations row %d has an invalid shape" %
+                index)
+        if row.get("project_id") != project_id:
+            raise ProjectExportError(
+                "agent_persona_reservations contains a row outside project %s"
+                % project_id)
+        persona = row.get("persona")
+        if not _valid_persona_slug(persona):
+            raise ProjectExportError(
+                "agent_persona_reservations row %d has an invalid persona" %
+                index)
+        folded = persona.casefold()
+        if folded in seen:
+            raise ProjectExportError(
+                "agent_persona_reservations contains duplicate persona %s" %
+                persona)
+        seen.add(folded)
+        expected_name = persona[:1].upper() + persona[1:]
+        if row.get("persona_name") != expected_name:
+            raise ProjectExportError(
+                "agent_persona_reservations row %d has a stale persona_name" %
+                index)
+        for field in ("reserved_actor_id", "reserved_at", "source"):
+            if not isinstance(row.get(field), str) or not row[field].strip():
+                raise ProjectExportError(
+                    "agent_persona_reservations row %d is missing %s" %
+                    (index, field))
+        actor = _canonical_persona_actor(
+            row["reserved_actor_id"], project_id)
+        if actor is None or actor["persona"] != persona:
+            raise ProjectExportError(
+                "agent_persona_reservations row %d reserved_actor_id must "
+                "be a canonical same-project actor ending in .%s" %
+                (index, persona))
+    return rows
 
 
 @contextmanager
@@ -370,6 +576,15 @@ def build_project_export(conn, project_id, log_renderer=None):
             "ORDER BY registered_at, agent_id",
             (project_id,),
         )
+        persona_reservations = _optional_rows(
+            conn, tables, "agent_persona_reservations",
+            "SELECT project_id,persona,persona_name,reserved_actor_id,"
+            "reserved_at,source FROM agent_persona_reservations "
+            "WHERE project_id=? ORDER BY reserved_at,persona",
+            (project_id,),
+        )
+        persona_coverage = _verify_persona_reservation_coverage(
+            conn, tables, project_id, persona_reservations)
         aliases = _optional_rows(
             conn, tables, "actor_aliases",
             "SELECT * FROM actor_aliases WHERE project_id=? "
@@ -431,6 +646,7 @@ def build_project_export(conn, project_id, log_renderer=None):
         "decisions": len(decisions),
         "rules": len(rules),
         "agents": len(agents),
+        "agent_persona_reservations": len(persona_reservations),
         "actor_aliases": len(aliases),
         "bridges": len(bridges),
         "inbox_cursors": len(cursors),
@@ -441,7 +657,8 @@ def build_project_export(conn, project_id, log_renderer=None):
     snapshot_at = _snapshot_at([
         [project], raw_events, raw_tasks, raw_plans, raw_handoffs,
         raw_identity_handoffs, role_scope_revisions, decisions, rules,
-        agents, aliases, raw_bridges, cursors, clients, dispositions,
+        agents, persona_reservations, aliases, raw_bridges, cursors, clients,
+        dispositions,
         cloud_context_rows,
     ])
     export_body = {
@@ -459,6 +676,7 @@ def build_project_export(conn, project_id, log_renderer=None):
         "decisions": decisions,
         "rules": rules,
         "agents": agents,
+        "agent_persona_reservations": persona_reservations,
         "actor_aliases": aliases,
         "bridges": bridges,
         "inbox_cursors": cursors,
@@ -483,6 +701,12 @@ def build_project_export(conn, project_id, log_renderer=None):
                 "canonical_section": "legacy_handoffs",
                 "kind": "retired_project_global_archive",
                 "read_only": True,
+            },
+            "agent_persona_reservations": {
+                "kind": "append_only_workspace_name_registry",
+                "complete": True,
+                "import_policy": "insert_or_reject_conflict",
+                "coverage": persona_coverage,
             },
         },
         "content_sha256": _sha256(_json_bytes(export_body, pretty=False)),
@@ -521,6 +745,97 @@ def project_export_full_log_bytes(project_export):
     return _full_log_bytes(project_export["full_log"])
 
 
+def restore_exported_persona_reservations(conn, project_export):
+    """Atomically restore the complete never-reuse short-name registry.
+
+    This intentionally does not import any other project data.  A broader
+    restore/migration workflow calls it after creating the destination schema
+    and before allowing another agent registration.  Existing identical rows
+    are idempotent; any conflicting reservation aborts the whole operation.
+    Original schema-v1 exports remain readable, but cannot prove names that
+    existed only in the then-unexported registry and are therefore refused as
+    an authoritative reservation import.
+    """
+    validate_project_export(project_export)
+    manifest = project_export["manifest"]
+    if manifest["schema_version"] < 2:
+        raise ProjectExportError(
+            "schema-v1 export has no complete agent persona reservation "
+            "registry")
+    project_id = manifest["project_id"]
+    rows = project_export["agent_persona_reservations"]
+    savepoint = "attacca_persona_reservation_restore"
+    conn.execute("SAVEPOINT %s" % savepoint)
+    inserted = 0
+    preserved = 0
+    try:
+        # Schema/project checks belong to the same atomic unit as inserts.
+        # This matters for caller-owned transactions and connection wrappers
+        # that may fail between inspection and the first write.
+        tables = _table_names(conn)
+        if "agent_persona_reservations" not in tables:
+            raise ProjectExportError(
+                "destination schema has no agent_persona_reservations table")
+        if "projects" in tables and not _query_rows(
+                conn, "SELECT project_id FROM projects WHERE project_id=?",
+                (project_id,)):
+            raise ProjectExportError(
+                "destination does not contain project %s" % project_id)
+        for row in rows:
+            existing_rows = _query_rows(
+                conn,
+                "SELECT project_id,persona,persona_name,reserved_actor_id,"
+                "reserved_at,source FROM agent_persona_reservations "
+                "WHERE project_id=? AND persona=?",
+                (project_id, row["persona"]),
+            )
+            if existing_rows:
+                if existing_rows[0] != row:
+                    raise ProjectExportError(
+                        "destination has a conflicting reservation for @%s" %
+                        row["persona_name"])
+                preserved += 1
+                continue
+            conn.execute(
+                "INSERT INTO agent_persona_reservations "
+                "(project_id,persona,persona_name,reserved_actor_id,"
+                "reserved_at,source) VALUES (?,?,?,?,?,?)",
+                tuple(row[key] for key in (
+                    "project_id", "persona", "persona_name",
+                    "reserved_actor_id", "reserved_at", "source")),
+            )
+            inserted += 1
+        conn.execute("RELEASE %s" % savepoint)
+    except BaseException as error:
+        cleanup_error = None
+        try:
+            conn.execute("ROLLBACK TO %s" % savepoint)
+        except BaseException as caught:
+            cleanup_error = caught
+        try:
+            conn.execute("RELEASE %s" % savepoint)
+        except BaseException as caught:
+            if cleanup_error is None:
+                cleanup_error = caught
+        if isinstance(error, ProjectExportError):
+            raise
+        if isinstance(error, sqlite3.DatabaseError):
+            detail = error if cleanup_error is None else "%s; cleanup: %s" % (
+                error, cleanup_error)
+            raise ProjectExportError(
+                "could not restore agent persona reservations: %s" % detail
+            ) from error
+        # Cancellation/SystemExit/custom BaseException must retain its exact
+        # type after best-effort rollback and release.
+        raise
+    return {
+        "project_id": project_id,
+        "inserted": inserted,
+        "preserved": preserved,
+        "total": len(rows),
+    }
+
+
 def validate_project_export(project_export, require_valid_ledger=True):
     """Validate format, artifact digests, cursor, and the immutable ledger."""
     if not isinstance(project_export, dict):
@@ -528,10 +843,11 @@ def validate_project_export(project_export, require_valid_ledger=True):
     manifest = project_export.get("manifest")
     if not isinstance(manifest, dict) or manifest.get("format") != EXPORT_FORMAT:
         raise ProjectExportError("not an Attacca project export")
-    if manifest.get("schema_version") != EXPORT_SCHEMA_VERSION:
+    schema_version = manifest.get("schema_version")
+    if schema_version not in SUPPORTED_EXPORT_SCHEMA_VERSIONS:
         raise ProjectExportError(
             "unsupported project export schema version %r" %
-            manifest.get("schema_version"))
+            schema_version)
     project_id = manifest.get("project_id")
     if not project_id or (project_export.get("project") or {}).get(
             "project_id") != project_id:
@@ -549,7 +865,8 @@ def validate_project_export(project_export, require_valid_ledger=True):
     collection_sections = (
         "room_messages", "tasks", "handoffs", "legacy_handoffs",
         "identity_handoffs", "role_scope_revisions", "decisions", "rules",
-        "agents", "actor_aliases", "bridges", "inbox_cursors",
+        "agents", "agent_persona_reservations", "actor_aliases", "bridges",
+        "inbox_cursors",
         "agent_clients", "message_dispositions",
     )
     for section in collection_sections:
@@ -598,6 +915,46 @@ def validate_project_export(project_export, require_valid_ledger=True):
                     or not row.get("updated_by"):
                 raise ProjectExportError(
                     "%s row is missing writer attribution" % section)
+
+    reservations = project_export.get("agent_persona_reservations")
+    if schema_version >= 2:
+        if not isinstance(reservations, list):
+            raise ProjectExportError(
+                "schema-v2 export requires agent_persona_reservations")
+        _validate_persona_reservations(reservations, project_id)
+        compatibility = manifest.get("compatibility") or {}
+        marker = compatibility.get("agent_persona_reservations") \
+            if isinstance(compatibility, dict) else None
+        if not isinstance(marker, dict) \
+                or marker.get("kind") != \
+                "append_only_workspace_name_registry" \
+                or marker.get("complete") is not True \
+                or marker.get("import_policy") != \
+                "insert_or_reject_conflict":
+            raise ProjectExportError(
+                "agent persona reservation registry is missing its complete "
+                "append-only import contract")
+        coverage = marker.get("coverage") or {}
+        if not isinstance(coverage, dict) \
+                or coverage.get("method") != \
+                "durable_identity_history_scan_v1" \
+                or coverage.get("complete") is not True \
+                or not isinstance(coverage.get("history_personas"), int) \
+                or isinstance(coverage.get("history_personas"), bool) \
+                or coverage.get("history_personas") < 0 \
+                or coverage.get("registry_sha256") != _sha256(
+                    _json_bytes(reservations, pretty=False)):
+            raise ProjectExportError(
+                "agent persona reservation registry is missing a valid "
+                "durable-history coverage attestation")
+    elif reservations is not None:
+        # Accept transitional schema-v1 writers which included the section,
+        # while retaining compatibility with original v1 exports where it did
+        # not exist at all.
+        if not isinstance(reservations, list):
+            raise ProjectExportError(
+                "project export agent_persona_reservations must be an array")
+        _validate_persona_reservations(reservations, project_id)
 
     counts = manifest.get("counts") or {}
     if not isinstance(counts, dict):
@@ -661,7 +1018,9 @@ def project_export_zip_bytes(project_export):
     ]
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w") as archive:
-        archive.comment = b"Attacca deterministic project export v1"
+        archive.comment = (
+            "Attacca deterministic project export v%d" %
+            project_export["manifest"]["schema_version"]).encode("ascii")
         for name, data in files:
             info, body = _zip_entry(name, data)
             archive.writestr(info, body)
@@ -809,12 +1168,14 @@ def load_offline_cache(path, expected_project_id=None):
 
 
 __all__ = [
-    "EXPORT_FORMAT", "EXPORT_SCHEMA_VERSION", "OFFLINE_CACHE_FORMAT",
+    "EXPORT_FORMAT", "EXPORT_SCHEMA_VERSION",
+    "SUPPORTED_EXPORT_SCHEMA_VERSIONS", "OFFLINE_CACHE_FORMAT",
     "OFFLINE_CACHE_SCHEMA_VERSION", "ProjectExportError", "OfflineCacheError",
     "build_project_export", "build_project_export_zip",
     "project_export_json_bytes", "project_export_zip_bytes",
     "project_export_ledger_ndjson_bytes", "project_export_full_log_bytes",
     "verify_exported_ledger", "validate_project_export",
+    "restore_exported_persona_reservations",
     "build_offline_cache", "validate_offline_cache", "offline_cache_cursor",
     "advance_offline_cache", "save_offline_cache", "load_offline_cache",
 ]
