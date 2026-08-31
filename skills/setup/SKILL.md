@@ -15,27 +15,38 @@ In Claude Code, use its native choice UI for each decision. Codex has no popup
 choice picker for this flow, so present a short numbered list and ask the user
 to type a number or displayed name. Keep exact project and actor ids from
 discovery only as internal arguments; never display, invent, or ask for a raw
-id.
+id. Identity choices use friendly role, runtime, and color labels such as
+**Codex Director · Red**.
 
 ## FAST PATH — this is a DECISION flow, NOT a thinking job
 
-Setup is: pick a workspace, pick a role, apply. Do it fast. Do NOT investigate,
-audit, narrate reasoning, weigh trade-offs, or run extra commands. The single
-`setup --discover` call already returns everything you need.
+Setup is: pick a workspace, pick a role and installation identity, apply. Do it
+fast. Do NOT investigate, audit, narrate reasoning, weigh trade-offs, or run
+extra commands. The single `setup --discover` call already returns everything
+you need. Ordinary startup/resume is not setup: it silently reuses the saved
+installation binding and must never ask an identity question.
 
 On invocation, do exactly this:
 1. Run `setup --discover` **once** (one command). Nothing before it.
 2. **Immediately** present the decisions in a **single** native choice-UI call
-   (Claude Code AskUserQuestion): put the workspace choice and the role choice
-   in the **same** call (add the relationship question only if a bridge
-   decision is actually pending). Do not write prose between discovery and the
-   popup — go straight to the popup.
-3. Apply the confirmed choices in **one** `setup …` command, then one short
+   (Claude Code AskUserQuestion): put workspace, role, and the applicable
+   friendly identity choice in the **same** call (add the relationship question
+   only if a bridge decision is actually pending). When the client cannot make
+   the identity choices conditional on the selected role, ask the identity as
+   one immediate follow-up using the already-discovered per-role options; do
+   not run discovery again. Do not write prose between discovery and the
+   picker — go straight to the choices.
+3. Apply the confirmed choices once. A first/unbound installation uses one
+   `setup …` command. An explicitly requested switch in an already-running MCP
+   process uses that current Attacca MCP's `agent_register` path described in
+   §3 so the active proxy actually adopts the selection. Then give one short
    confirmation line.
 
-Budget: ~2 commands + 1 popup. If discovery shows a valid credential and an
-already-linked/obvious workspace, skip straight to the role choice (or straight
-to apply if the role is already set). If auth is needed, surface the one link
+Budget: ~2 commands + 1 picker (plus one conditional identity follow-up only
+when required). If discovery shows a valid credential and an already-linked/
+obvious workspace, skip straight to role + identity (never silently skip the
+identity decision when the human explicitly invoked setup to switch or create
+an identity). If auth is needed, surface the one link
 from the CLI and stop — do not loop or advise. Never spend a turn "thinking"
 about setup; if you catch yourself investigating, stop and show the popup.
 
@@ -94,14 +105,23 @@ resolve to the same `client_instance`; a distinct client installation or
 configuration root gets its own key even when it opens the same checkout or
 runs the same AI runtime. Never rewrite actor identity during auth repair.
 
+The non-secret AI actor binding is separate from that credential. It is scoped
+by normalized server URL, workspace, runtime, and stable client installation,
+and is stored in the machine-local Attacca configuration. Sessions using the
+same `~/.attacca` home, runtime, and client installation silently reuse it. A
+separate home/container gets a different installation and makes a one-time
+setup choice; mounting the same home deliberately shares the choice. Never add
+a Codex/Claude/Kimi conversation or session ID to the key, and never ask about
+identity during ordinary start/resume.
+
 The private key persists across the separate discovery and apply processes, so
 the AI can list or create an allowed workspace, register the explicitly chosen
 actor and role, and then retry as that actor. Browser cookies remain browser
 only. On success, hot-reload the credential in the current client, run a fresh
 hosted status/sync check, and clear the authentication latch; do not force a
 restart or ask the human to rerun setup. Cached offline data is never proof of
-authentication. Do not repeat Steps 1-4 after setup is already complete;
-continue at verification and Step 5.
+authentication. Do not repeat Steps 1-5 after setup is already complete;
+continue at verification and Step 6.
 
 ## 1. Select the workspace
 
@@ -113,7 +133,8 @@ python3 "ATTACCA_RUNTIME" \
   --json setup --discover
 ```
 
-Report the detected Git remote or local folder and any stale link. Then:
+Report the detected Git remote or local folder and whether a stale link needs
+repair; keep the stale link's raw ID internal. Then:
 
 - `already_linked`: name the workspace and continue without selecting it
   again.
@@ -136,8 +157,9 @@ python3 "ATTACCA_RUNTIME" \
 
 ## 2. Choose this AI's role
 
-Show `network.current_actor_record` and the current Lead Director before the
-role question.
+Use `network.current_actor_record` internally, but show only its friendly
+display name, role, runtime, and color plus the current Lead Director before the
+role question. Never render its raw actor ID.
 
 - On a first setup with no lead, default to **Director + Lead Director**
   (`--role director --lead current`). Also list Director without assigning a
@@ -148,12 +170,62 @@ role question.
 - If this AI is already the lead, recommend keeping it Director and Lead
   Director. Never silently change an existing role or lead.
 
-Label Advisor and Worker clearly: those roles cannot update the shared
-handoff, so they report with `task_report` and `room_send`. Directors can write
-the handoff, but writes are version-checked against the context version from
-`get_handoff`; a stale director must reload and reconcile before retrying.
+Label the authority difference clearly. Every registered role owns and may
+update only its own exact-identity handoff after reporting work; it can never
+overwrite another color's handoff. Advisor and Worker still cannot manage
+Project Rules, Cloud Context, or Role Scope. Humans and registered Directors
+manage the versioned Role Scope shared by each role; the selected Lead Director
+also receives the `lead_director` overlay. Handoff and Role Scope writes use
+their own optimistic versions and stale writes must reload and reconcile.
 
-## 3. Choose the workspace relationship
+## 3. Choose this installation's AI identity
+
+Read `network.machine_actor_binding` and the selected role's entry in
+`network.identity_options_by_role`. The canonical durable shape is internally
+`workspace.role.runtime.persona`, but never show that raw string. New setup-
+created identities always have a color. A discovered three-part actor without a
+persona is a compatibility identity: it may be explicitly reused/taken over,
+but setup must never silently migrate, clone, or rename it.
+
+Offer these friendly choices:
+
+1. When a valid binding exists for the chosen role/runtime, **Continue as
+   <Role> · <Runtime> · <Color> (recommended)**. This keeps the saved exact
+   identity.
+2. For each other same-owner reusable identity, **Take over/reuse <Role> ·
+   <Runtime> · <Color>**. Explain in one short clause that simultaneous clients
+   reusing it intentionally share its handoff, inbox cursor, and task leases.
+   Label a three-part choice **Existing compatibility identity**, never with its
+   raw actor ID.
+3. **Create permanent <next color> identity**. The server allocates the next
+   collision-free color atomically; a preview from discovery is only a label.
+4. **Use temporary <next color> identity in this MCP process**. It creates a
+   separately auditable actor but does not replace the machine binding; a fresh
+   process does not select it automatically.
+
+If there is no binding, recommend **Create permanent <next color> identity**,
+while still offering same-owner reusable identities and the temporary choice.
+Never infer takeover merely because the same runtime is already registered.
+
+For a first/unbound setup, carry the choice into the single CLI apply command as
+`--identity-mode new|reuse|temporary`; only a reuse passes the discovered exact
+actor through hidden `--identity-actor`, and that raw value is never displayed.
+Permanent new/reuse saves the machine binding. Temporary skips watcher/cron
+binding for that selection.
+
+When setup was explicitly invoked to switch an already-linked, already-running
+client, make the switch through the **current Attacca MCP proxy** so it takes
+effect in this process. Call `agent_register` with the selected `role`, current
+`runtime`, and `identity_mode`. For reuse, also pass only the selected
+discovered `persona` internally; never show or ask for the full actor ID. A
+successful `new` or `reuse` response updates the machine binding and hot-switches
+the proxy. A successful `temporary` response hot-switches only this proxy's
+in-memory actor. Never call this path during ordinary startup/resume. If setup
+was also requested to repair tool wiring, perform the idempotent wiring repair
+before this in-process switch so a temporary choice is not overwritten by a
+second setup process.
+
+## 4. Choose the workspace relationship
 
 Explain that one workspace has one room and bridges connect rooms. Before the
 relationship question, show named evidence from
@@ -178,33 +250,38 @@ to `--bridge`, `--relationship`, and `--principal`. If no other workspace
 exists, explain that a relationship cannot be configured rather than
 inventing a target.
 
-## 4. Apply and verify once
+## 5. Apply and verify once
 
 After confirmation, build one shell-quoted command containing exactly one
 workspace action (attach, create, or already-linked default), the selected
-role and lead flags, and only confirmed relationship flags:
+role, identity, and lead flags, and only confirmed relationship flags. This is
+the first/unbound path; an in-process switch follows §3 instead:
 
 ```bash
 python3 "ATTACCA_RUNTIME" \
   --actor "CURRENT_AI_ACTOR" --actor-type "CURRENT_AI_TYPE" \
   setup WORKSPACE_ACTION \
-  --role CONFIRMED_ROLE --lead CONFIRMED_LEAD RELATIONSHIP_FLAGS
+  --role CONFIRMED_ROLE IDENTITY_FLAGS \
+  --lead CONFIRMED_LEAD RELATIONSHIP_FLAGS
 ```
 
 Replace all uppercase tokens, including `ATTACCA_RUNTIME`, with their exact
-internally resolved values; they are not literal arguments. Do not use `-i`,
-because this guided flow already obtained typed choices.
+internally resolved values; they are not literal arguments. `IDENTITY_FLAGS` is
+`--identity-mode new|reuse|temporary` plus hidden `--identity-actor` only for
+reuse. Never display that hidden value. Do not use `-i`, because this guided
+flow already obtained typed choices.
 
 Setup must configure all detected coding tools, MCP, managed instructions, and
 the lifecycle startup hook. Inspect its result for server URL,
 `.attacca/project.json`, tool/MCP wiring, and the hook. State that
 `.attacca/project.json` is the portable, safe-to-commit workspace selection;
 any checkout `.mcp.json` is a machine/site-local endpoint that must be
-regenerated per machine. Then re-brief and verify
-through MCP with `get_handoff`, `attacca_status`, `agent_list`, and
-`bridge_list`. `get_handoff` is required here because role, lead, and
-relationship choices may have advanced the context version; it makes later
-Director writes use the new version instead of an obsolete pre-setup briefing.
+regenerated per machine. Then re-brief and verify through MCP with
+`get_handoff`, `role_scope_get`, `attacca_status`, `agent_list`, and
+`bridge_list`. `get_handoff` must identify the exact selected identity and its
+own handoff version; `role_scope_get` must return that identity's selected role
+background plus the Lead Director overlay when applicable. Role, identity,
+lead, and relationship choices may also have advanced project context.
 If the current MCP host cannot hot-reload the new connection, report the exact
 unverified checks and let its native reconnect mechanism run; never infer
 success from configuration files and never make restart the default recovery.
@@ -219,7 +296,7 @@ use CronDelete only for stale or duplicate jobs containing the
 a host-tool verification step, not another shell command or user decision.
 Skip it when Claude cron is disabled or Attacca background polling is Off.
 
-## 5. Offer project migration into Attacca
+## 6. Offer project migration into Attacca
 
 Read `migration_sources` from discovery (Step 1). If it is non-empty—or the
 checkout otherwise has substantial prior history (a `docs/LOG.md`, CHANGELOG,
@@ -239,7 +316,7 @@ AI's role first (from Step 2); if it is not a Director, have the human run it or
 promote the AI. Never write the migrated project context into the managed
 AGENTS.md/CLAUDE.md block. On No, make no write and continue.
 
-## 6. Offer conversation work as tasks
+## 7. Offer conversation work as tasks
 
 Finally inspect the **CURRENT AI CONVERSATION**—not the repository—for
 concrete unresolved, pending, deferred, or shelved work. Call `task_list` and
@@ -254,7 +331,9 @@ silently import, create, or claim work, and never claim newly created tasks as
 part of setup. With no candidates, report that and make no write.
 
 Finish with a concise summary of the server, Git remote/folder, workspace,
-project link, role/lead, relationship direction, tool/MCP/hook verification,
-and tasks created or skipped. Another checkout joins the same project by
-confirming the same Git workspace or selecting the same named workspace on the
-same server.
+project link, friendly role/runtime/color identity, whether the identity is
+permanently bound or current-process temporary, lead, relationship direction,
+tool/MCP/hook verification, and tasks created or skipped. Another checkout
+joins the same project by confirming the same Git workspace or selecting the
+same named workspace on the same server; its separate client installation then
+makes its own explicit identity choice.

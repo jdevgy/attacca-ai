@@ -12,7 +12,11 @@ Use native choice UI for each decision when it is available. Otherwise show a
 short numbered list and accept the number or displayed name. Always label
 choices with workspace names. Keep exact project and actor ids from discovery
 only as internal tool arguments; never display, invent, or ask the user for a
-raw id. Treat $ARGUMENTS as preferences, not permission to skip confirmation.
+raw id. Identity choices use friendly role/runtime/color labels, never the raw
+canonical actor string. Treat $ARGUMENTS as preferences, not permission to skip
+confirmation. Ordinary Kimi startup/resume silently reuses the installation
+binding and must never ask an identity question; this choice belongs only in an
+explicit setup flow.
 
 ## 0. Resolve the runtime and authenticate before MCP
 
@@ -58,9 +62,17 @@ checks membership, actor ownership, and the actor's registered role. The key
 persists across discovery and apply so Kimi can finish the explicitly confirmed
 workspace, actor, and role setup. Browser cookies never cross into the CLI.
 
+The non-secret AI actor binding is separate from that credential. It is scoped
+by normalized server URL, workspace, runtime, and stable client installation in
+the machine-local Attacca configuration. Kimi sessions using the same
+`~/.attacca` home and client installation silently reuse the same actor. A
+separate home/container gets a separate installation and makes a one-time setup
+choice; mounting the same home deliberately shares it. Never use a Kimi, Claude,
+or Codex conversation/session ID as any part of durable identity.
+
 After authorization, hot-reload and retry MCP/watcher sync in this same client.
 Clear the latch only after verified hosted sync; do not force a restart, alter
-the established actor identity, or repeat completed Steps 1-4. Cached offline
+the established actor identity, or repeat completed Steps 1-5. Cached offline
 data never authorizes recovery.
 
 ## 1. Select the workspace
@@ -78,8 +90,8 @@ python3 "$ATTACCA_PLUGIN_ROOT/attacca.py" \
   --json setup --discover
 ```
 
-Report the detected Git remote or local folder and any stale project link.
-Then resolve `action` conversationally:
+Report the detected Git remote or local folder and whether a stale project link
+needs repair; keep its raw ID internal. Then resolve `action` conversationally:
 
 - `already_linked`: name the linked workspace and continue without asking the
   user to select it again.
@@ -110,8 +122,9 @@ python3 "$ATTACCA_PLUGIN_ROOT/attacca.py" \
 
 ## 2. Choose this AI's role
 
-Show the current AI record and current Lead Director from `network` before
-asking. Ask which role this AI should have:
+Use the current AI record from `network` internally, but show only its friendly
+display name, role, runtime, and color plus the current Lead Director. Never
+render its raw actor ID. Then ask which role this AI should have:
 
 - With no Lead Director on a first setup, recommend **Director + Lead Director**
   (`--role director --lead current`). Also offer **Director without
@@ -123,13 +136,51 @@ asking. Ask which role this AI should have:
 - If this AI is already Lead Director, recommend keeping it as Director and
   Lead Director. Do not silently change an existing role or lead.
 
-State the consequence beside the choices: workers and advisors cannot update
-the shared handoff; they report through `task_report` and `room_send` instead.
-Directors may update it, but director handoff writes are version-checked
-against the context version from `get_handoff`; stale writes must reload and
-reconcile first.
+State the consequence beside the choices. Every registered role owns and may
+update only its own exact-identity handoff after reporting work; it can never
+overwrite another color's handoff. Advisors and Workers still cannot manage
+Project Rules, Cloud Context, or Role Scope. Humans and registered Directors
+manage the versioned Role Scope shared by each role; the selected Lead Director
+also receives the `lead_director` overlay. Handoff and Role Scope writes use
+their own optimistic versions and stale writes must reload and reconcile.
 
-## 3. Choose the workspace relationship
+## 3. Choose this installation's AI identity
+
+Use `network.machine_actor_binding` and the selected role's entry in
+`network.identity_options_by_role`. Internally, new durable actors have the
+shape `workspace.role.runtime.persona`; do not show that string. New setup-
+created actors always have a color. A discovered three-part actor without a
+persona is an **Existing compatibility identity**: it may be explicitly reused,
+but setup never silently migrates, clones, or renames it.
+
+Offer friendly choices:
+
+1. When the chosen role/runtime has a valid binding, **Continue as <Role> ·
+   Kimi · <Color> (recommended)**.
+2. For each other same-owner identity, **Take over/reuse <Role> · Kimi ·
+   <Color>**. State briefly that simultaneous clients reusing it share its
+   handoff, inbox cursor, and task leases.
+3. **Create permanent <next color> identity**. The server allocates the next
+   collision-free color atomically; discovery only previews the label.
+4. **Use temporary <next color> identity in this MCP process**. It remains
+   auditable but does not replace the machine binding, so a fresh process does
+   not select it automatically.
+
+With no binding, recommend the permanent next color. Never infer takeover just
+because another Kimi actor already exists. A first/unbound setup carries the
+choice into the CLI as `--identity-mode new|reuse|temporary`; reuse alone passes
+the discovered exact actor through hidden `--identity-actor`, never in UI text.
+
+For an explicit switch in an already-linked running Kimi client, call
+`agent_register` through the **current Attacca MCP proxy** with the selected
+`role`, current `runtime`, and `identity_mode`. For reuse, also pass only the
+selected discovered `persona` internally. A successful permanent `new` or
+`reuse` updates the machine binding and hot-switches this proxy; `temporary`
+hot-switches only this proxy in memory. Never call this path during ordinary
+startup/resume. If tool wiring also needs repair, run that idempotent repair
+before switching so a temporary choice is not overwritten by another process.
+
+## 4. Choose the workspace relationship
 
 Explain that one workspace has one room and bridges connect rooms. Before
 asking, show:
@@ -153,12 +204,13 @@ Map that decision to `--bridge`, `--relationship`, and `--principal` internally.
 If there is no other workspace, say that no relationship can be configured;
 do not fabricate a target.
 
-## 4. Apply and verify once
+## 5. Apply and verify once
 
 After all choices are confirmed, build and run one shell-quoted setup command.
 It contains exactly one workspace action (attach, create, or the already-linked
-default), the confirmed `--role` and `--lead`, and relationship flags only when
-the user confirmed a connection:
+default), the confirmed role/identity/lead, and relationship flags only when
+the user confirmed a connection. This is the first/unbound path; an explicit
+in-process switch follows §3 instead:
 
 ```bash
 ATTACCA_PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-${KIMI_PLUGIN_ROOT:-${KIMI_CODE_HOME:-$HOME/.kimi-code}/plugins/managed/attacca}}"
@@ -169,26 +221,28 @@ test -f "$ATTACCA_PLUGIN_ROOT/attacca.py" || {
 python3 "$ATTACCA_PLUGIN_ROOT/attacca.py" \
   --actor "CURRENT_AI_ACTOR" --actor-type "CURRENT_AI_TYPE" \
   setup WORKSPACE_ACTION \
-  --role CONFIRMED_ROLE --lead CONFIRMED_LEAD RELATIONSHIP_FLAGS
+  --role CONFIRMED_ROLE IDENTITY_FLAGS \
+  --lead CONFIRMED_LEAD RELATIONSHIP_FLAGS
 ```
 
 Substitute exact discovered values internally; the uppercase tokens above are
-not literal values. Do not use `-i`, because the native guided choices already
+not literal values. `IDENTITY_FLAGS` is `--identity-mode
+new|reuse|temporary`, plus hidden `--identity-actor` only for reuse. Never show
+that hidden value. Do not use `-i`, because the native guided choices already
 collected every decision. Setup must configure all detected tools, MCP, the
 managed project instructions, and the lifecycle startup hook. Check its output
 for the server URL, `.attacca/project.json`, configured tools, MCP wiring, and
 the lifecycle hook. State that `.attacca/project.json` is the portable,
 safe-to-commit workspace selection, while any checkout `.mcp.json` is a
 machine/site-local endpoint that must be regenerated per machine. Then call
-`get_handoff`, `attacca_status`, `agent_list`,
-and `bridge_list` through MCP to verify the selected workspace, current AI
-role/lead, and relationship. `get_handoff` refreshes the context version after
-the governance changes so a later Director handoff does not write from the
-obsolete pre-setup briefing. If the host cannot hot-reload immediately, say
+`get_handoff`, `role_scope_get`, `attacca_status`, `agent_list`, and
+`bridge_list` through MCP to verify the selected workspace, friendly
+role/runtime/color identity, applicable Role Scope, exact-identity handoff,
+role/lead, and relationship. If the host cannot hot-reload immediately, say
 exactly what remains unverified and let its native reconnect path retry; never
 claim success from files alone or make restart the default recovery.
 
-## 5. Offer conversation work as tasks
+## 6. Offer conversation work as tasks
 
 This is the final setup step, not a repository scan. Inspect the **CURRENT AI CONVERSATION**
 for concrete unresolved, pending, deferred, or shelved work.
@@ -205,9 +259,12 @@ import, create, or claim a task, and never claim a newly created task as part
 of setup. If there are no candidates, say so and make no write.
 
 Finish with one concise report: server, Git remote/folder, workspace,
-`.attacca/project.json`, role and Lead Director, relationship direction, tool
-and hook verification, MCP result, and tasks created or skipped. Explain that
-another checkout connects to the same project by confirming the same Git
-workspace or selecting the same named workspace on the same server.
+`.attacca/project.json`, friendly role/runtime/color identity, whether it is
+permanently bound or current-process temporary, Lead Director, relationship
+direction, tool and hook verification, MCP result, and tasks created or
+skipped. Explain that another checkout connects to the same project by
+confirming the same Git workspace or selecting the same named workspace on the
+same server; its separate client installation then makes its own identity
+choice.
 
 $ARGUMENTS

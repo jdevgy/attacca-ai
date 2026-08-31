@@ -18,13 +18,16 @@ workspace:
 - **History that survives sessions** — a per-project, hash-chained event ledger
   and a readable activity log preserve what changed, why, and who ran it.
 - **Cold-resume context** — shared Cloud Context, binding role-scoped Rules,
-  versioned handoffs, and startup briefs restore the state a new worker needs.
+  shared Role Scope, exact-identity handoffs, and startup briefs restore the
+  state a returning worker needs without merging parallel AI identities.
 - **Coordinated work** — rooms, persistent inbox cursors, tasks, expiring claims,
   declared path scopes, immutable plan revisions, decisions, and evidence-based
   completion keep parallel workers aligned.
-- **Separate identity and authority** — canonical AI actors use
-  `workspace.role.runtime`; the authenticated human operator, client
-  installation, Git revision, runtime, and role remain distinct audit fields.
+- **Separate identity and authority** — new canonical AI actors use
+  `workspace.role.runtime.persona` (for example, a Red or Blue Codex Director);
+  the authenticated human operator, client installation, Git revision,
+  runtime, role, and persona remain distinct audit fields. Existing three-part
+  actors remain compatibility identities and are never rewritten implicitly.
 - **Purpose-limited collaboration** — peer, master/subordinate, and advisor
   bridges move only explicit cross-workspace messages under participation and
   routing policy.
@@ -40,7 +43,7 @@ hidden server or database.
 **Start here:** [Quickstart](#quickstart) ·
 [Hosted authentication](#hosted-authentication-prototype) ·
 [Agent protocol](#the-protocol-agents-follow) ·
-[MCP tools](#mcp-tools-39) · [Tests](#demos-and-tests)
+[MCP tools](#mcp-tools-42) · [Tests](#demos-and-tests)
 
 The broader design in [`docs/blueprint.txt`](docs/blueprint.txt) also describes
 future encryption, Project Brain/context packs, capability marketplaces, and
@@ -65,10 +68,10 @@ attacca server — it owns the state and exposes two client surfaces:
 The installed **`connect` stdio client** normally forwards MCP to the configured
 host. If that transport is unavailable, it can continue only from the exact
 schema-v1 mirror previously authenticated for this server, workspace, human
-principal, canonical AI role, checkout, and device. Cached reads are marked
-offline/stale; allowlisted writes are fsynced to a device outbox and replayed
-idempotently after reconnect. Missing, ambiguous, forged, or role-changed mirrors
-fail closed.
+principal, exact canonical AI actor and role, checkout, and device. Cached reads
+are marked offline/stale; allowlisted writes are fsynced to a device outbox and
+replayed idempotently after reconnect. Missing, ambiguous, forged, or role-
+changed mirrors fail closed.
 
 `attacca.py mcp` is a separate, explicitly selected serverless/direct-database
 mode for local development (`setup --stdio`). It is not the installed plugins'
@@ -80,9 +83,12 @@ full export can substitute for the verified identity-scoped mirror.
 - **One database, many projects.** Default `~/.attacca/attacca.db`
   (override: `ATTACCA_DB`). Claims use single conditional UPDATEs, appends use
   `BEGIN IMMEDIATE` — safe under many concurrent clients (`tests/test_concurrency.py`).
-- **Identity per workspace role + AI.** Clients send a runtime hint (`claude`,
-  `codex`, `kimi`, …); after setup the server resolves it to
-  `workspace.role.runtime`. Owner is transmitted and stored separately.
+- **Installation-bound, colored AI identity.** Clients send a runtime hint
+  (`claude`, `codex`, `kimi`, …); setup binds that runtime on this client
+  installation to one exact `workspace.role.runtime.persona` actor. New actors
+  receive deterministic colors beginning with Red, then Blue. Normal
+  start/resume silently reuses the binding. Owner is transmitted and stored
+  separately, and no conversation or host-session ID participates in identity.
 
 ## Quickstart
 
@@ -158,7 +164,25 @@ without the native plugin, contains a machine/site-specific server endpoint;
 regenerate it on each machine rather than using it as workspace identity.
 The same guided run then configures every detected tool, verifies MCP and the
 lifecycle hooks, asks this AI's workspace role (first-run default: Director +
-Lead Director), shows existing relationship/inbox evidence, asks how to connect
+Lead Director), and confirms its installation identity. A new installation
+creates the next permanent color by default. An explicit setup on an existing
+installation can instead continue its bound color, take over another existing
+color, create the next permanent color, or use a new color only in the current
+MCP process. Taking over intentionally shares that exact actor's handoff, inbox
+cursor, and task leases. User-facing choices show role/runtime/color labels;
+raw project and actor IDs remain internal arguments.
+
+Normal session start/resume never asks this question: the non-secret binding in
+`~/.attacca/config.json` is keyed by normalized server URL, workspace, runtime,
+and stable client installation. Sessions using the same Attacca configuration
+home and client installation therefore reuse the same actor. A container or
+machine with a separate home receives a separate client installation and makes
+the one-time choice during setup; mounting the same home deliberately shares the
+binding. Codex/Claude/Kimi conversation and session IDs are never used as the
+durable key. Existing `workspace.role.runtime` actors remain selectable
+compatibility identities, but setup never silently converts or clones them.
+
+Setup also shows existing relationship/inbox evidence, asks how to connect
 another workspace (default: MASTER, with the direction stated explicitly), and
 finally inspects the current AI conversation for pending/deferred work. It
 compares candidates with the task board and asks once before creating anything;
@@ -202,6 +226,8 @@ own project), `--attach ID`, `--create NAME`, `--discover`, `--stdio`
 (serverless mode: tools open the database
 directly), `--url http://host:port`, `--tools-only` (global tool configs only,
 no project side effects — what install.sh uses),
+`--identity-mode auto|reuse|new|temporary` (normally selected by guided setup;
+an exact reuse target stays an internal argument),
 `--skip-tools codex,cline` / `--skip-tools all`, and `--no-server`.
 
 ## Hosted authentication (prototype)
@@ -239,12 +265,14 @@ AI identity or audit history.
 
 Every authenticated AI request still supplies the exact
 `X-Attacca-Project: <workspace>` and
-`X-Attacca-Actor: <workspace>.<role>.<runtime>` headers. The server validates
-the key's workspace scope, the human's workspace membership, and that the
-registered actor belongs to that authenticated human; authorization then comes
-from the actor's registered role. Ledger writes therefore record the canonical
-AI actor and `Run by user` separately. A Codex client key is not a Codex actor
-key: the same installed client can select any valid actor owned by that human.
+`X-Attacca-Actor: <workspace>.<role>.<runtime>.<persona>` headers (or an
+existing three-part compatibility actor). The server validates the key's
+workspace scope, the human's workspace membership, and that the registered
+actor belongs to that authenticated human; authorization then comes from the
+actor's registered role. Ledger writes therefore record the canonical AI actor
+and `Run by user` separately. A Codex client key is not a Codex actor key: the
+same installed client can select any valid actor owned by that human, while its
+machine-local actor binding decides which one normal sessions select.
 
 When a protected server needs authorization, the native setup/update skill or
 lifecycle hook starts the packaged helper inside the active AI terminal. The
@@ -264,6 +292,13 @@ client configuration roots and canonical AI actors. MCP, lifecycle hooks, and
 the watcher hot-reload a repaired key in the current host; authorization repair
 does not require an executable plugin reinstall or a client restart.
 
+The credential registry and actor binding solve different problems. The API
+key proves which human-owned client installation may connect. The non-secret
+actor binding in `~/.attacca/config.json` selects one exact AI actor for the
+normalized server URL, workspace, runtime, and that installation. Neither file
+uses a coding host's conversation/session ID, and repairing authorization never
+changes the actor binding.
+
 The landing page, `/install.sh`, plugin zip/marketplace, health check, auth
 status, bootstrap, and login remain public so a new machine can install and
 connect. This is prototype account security, not a claim of production
@@ -274,8 +309,9 @@ any remotely reachable instance.
 The native plugins bundle lifecycle continuity. Claude/Codex use `SessionStart`,
 `UserPromptSubmit`, and `Stop`; Kimi uses its manifest startup skill plus native
 `UserPromptSubmit` and `Stop` hooks. Once setup writes `.attacca/project.json`,
-each new session loads Project Rules, Cloud Context, handoff, inbox, room, tasks,
-agents, and status. Setup also starts one machine-global background watcher. At the
+each new session loads Project Rules, Cloud Context, its applicable Role Scope,
+its exact-identity handoff, inbox, room, tasks, agents, and status. Setup also
+starts one machine-global background watcher. At the
 server-configured interval (one minute by default, configurable or disableable
 in `/app` Settings), it makes lightweight inbox and append-only event-feed
 checks even while coding clients are idle. A relevant change or pending local
@@ -354,8 +390,13 @@ for confirmation. The link contains no token, user identity, database path, or
 absolute directory.
 
 Each computer keeps a separate installation-scoped outbox and a verified mirror
-scoped to its human-owned client key plus exact project and actor headers. During
-an outage, each can queue its own allowlisted mutations;
+scoped to its human-owned client key plus exact project and actor headers. Its
+actor choice is also installation-local: a fresh home/container has no actor
+binding and setup asks whether to take over an existing named color, create the
+next permanent color, or use a temporary current-process color. Two sessions
+sharing the same `~/.attacca` home and runtime silently reuse one binding; two
+isolated homes make independent choices even in the same checkout. During an
+outage, each can queue its own allowlisted mutations;
 the background watcher reconnects, pulls, replays immutable mutation IDs in
 order, and pulls again. Duplicate retries return the stored receipt, while real
 conflicts remain visible and block dependent work instead of being overwritten.
@@ -382,6 +423,10 @@ GET  /v1/projects/{id}/status              GET  /v1/projects/{id}/inbox
 PUT  /v1/projects/{id}/lead
 GET/POST /v1/projects/{id}/bridges         DELETE /v1/projects/{id}/bridges/{other}
 GET  /v1/projects/{id}/handoff             POST /v1/projects/{id}/handoff
+GET  /v1/projects/{id}/handoff/history
+GET  /v1/projects/{id}/role-scopes
+PUT  /v1/projects/{id}/role-scopes/{role}
+GET  /v1/projects/{id}/role-scopes/{role}/history
 GET  /v1/projects/{id}/log?limit=          GET  /v1/projects/{id}/events?after=&limit=
 POST /v1/projects/{id}/events              GET  /v1/projects/{id}/room?since_seq=&limit=
 POST /v1/projects/{id}/room                GET  /v1/projects/{id}/tasks?status=
@@ -430,15 +475,20 @@ Injected via the managed block and the MCP server's `instructions`:
 4. **Decisions for durable choices** — architecture, API, data, security,
    workflow, or product choices use `decision_propose` / `decision_resolve`,
    not chat; routine implementation details do not need a decision record.
-5. **Handoff at transitions/session end** — report task evidence first, then a
-   Director calls `update_handoff` with the version from `get_handoff`.
-   Advisors/workers report via tasks/room, and stale handoff writes fail.
+5. **Role Scope + identity handoff** — Role Scope is durable background shared
+   by all identities in one role, with an additional Lead Director overlay for
+   the lead. Humans and registered Directors manage it with optimistic
+   versions. At a meaningful transition, every registered AI role reports task
+   evidence, then updates only its own exact-identity handoff with the handoff
+   version returned by `get_handoff`; one color can never overwrite another
+   color's history. A human identity also owns only its own handoff.
 6. **Drift Guard** — responses carry `stale_context_warning` when the project moved
    after your briefing; re-run `get_handoff` before writing.
 
-## MCP tools (39)
+## MCP tools (42)
 
 `attacca_status`, `get_handoff`, `update_handoff`, `get_project_log`,
+`role_scope_get`, `role_scope_set`, `role_scope_history`,
 `room_send`, `room_read`, `check_inbox`, `message_dispose`,
 `set_lead_director`, `bridge_add`, `bridge_update_access`, `bridge_list`,
 `bridge_remove`, `search`, `task_create`, `task_list`, `task_show`,
@@ -491,6 +541,7 @@ setup --discover | --attach ID | --create NAME  advanced/scripted workspace flag
 setup [--url U] [--stdio] [--no-instructions]  one-shot checkout setup
       [-i|--interactive]
       [--role director|advisor|worker] [--lead keep|current|clear]
+      [--identity-mode auto|reuse|new|temporary]
       [--bridge ID --relationship master|peer|advisor|none --principal current|other]
 setup --details [claude kimi codex gemini opencode glm cli]   full config reference
 install-instructions [--files CLAUDE.md,AGENTS.md]
@@ -509,8 +560,9 @@ python3 attacca.py event verify  # hash-chain + sequence integrity of a real led
 
 - **Prototype authentication, not production identity infrastructure.** Account
   sessions, CSRF, hash-only per-install client keys, exact project/actor request
-  selection, human attribution, Director-only handoff/directive rules, and stale
-  versions are enforced. SSO/MFA, login rate
+  selection, human attribution, exact-identity handoff ownership,
+  Director-managed Role Scope/directive rules, and stale versions are enforced.
+  SSO/MFA, login rate
   limits, centralized key rotation, TLS termination, and hostile-host isolation
   remain later layers (blueprint §12.3, §28 "policy bypass").
 - **No encryption.** Everything is plaintext on your machine. The E2E key hierarchy
@@ -524,8 +576,12 @@ python3 attacca.py event verify  # hash-chain + sequence integrity of a real led
 - **Leases are soft locks** for coordination, not Git locking. Use branches/worktrees
   as usual; `base_revision` is recorded at claim/report for later comparison.
 - **Hash chain is tamper-*evident*, not tamper-*proof*** (no signatures yet — §23.3).
-- **One canonical actor = one workspace/role/runtime persona.** Two simultaneous
-  sessions of the same AI in the same role intentionally share its inbox cursor and
-  task leases; owner remains separately visible on every new event.
+- **One exact actor = one workspace/role/runtime/persona continuity owner.**
+  Two simultaneous sessions that reuse the same colored actor intentionally
+  share its handoff, inbox cursor, and task leases. Separate permanent colors
+  have independent handoffs/cursors/leases while receiving the same applicable
+  Role Scope. Existing three-part actors remain explicit compatibility choices;
+  new setup-created identities always have a color. Owner remains separately
+  visible on every new event.
 - The room is a projection of `room.message` events in the ledger — chat is not the
   database (blueprint principle, §2.3).
