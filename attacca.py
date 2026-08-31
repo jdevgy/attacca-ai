@@ -141,6 +141,7 @@ TASK_PLAN_REVIEW_TYPES = ["approval", "suggestion"]
 TASK_PLAN_SUGGESTION_STATUSES = ["open", "addressed", "dismissed"]
 DECISION_RESOLUTIONS = ["accepted", "rejected", "superseded"]
 RULE_SCOPES = ["everyone", "director", "advisor", "worker"]
+ROLE_SCOPE_NAMES = ["director", "advisor", "worker", "lead_director"]
 HANDOFF_FIELDS = ["objective", "what_changed", "active_work", "blockers",
                   "risks", "next_actions", "notes"]
 
@@ -602,25 +603,44 @@ def normalize_agent_runtime(runtime=None, actor=None):
     return fallback or "agent"
 
 
-def canonical_agent_id(project_id, role, runtime):
-    """Stable operational identity: workspace.role.runtime."""
+def normalize_agent_persona(persona=None):
+    """Normalize an optional human-selected durable AI persona suffix."""
+    if persona is None or not str(persona).strip():
+        return None
+    value = slugify(str(persona))
+    if value in ("default", "none", "unassigned"):
+        raise AttaccaError(
+            "persona must be a distinct name, not '%s'" % value)
+    if len(value) > 40:
+        raise AttaccaError("persona is limited to 40 normalized characters")
+    return value
+
+
+def canonical_agent_id(project_id, role, runtime, persona=None):
+    """Stable operational identity: workspace.role.runtime[.persona]."""
     role = (role or "unassigned").lower()
     if role not in AGENT_ROLES + ("unassigned",):
         raise AttaccaError("unknown agent role %r" % role)
-    return "%s.%s.%s" % (
+    base = "%s.%s.%s" % (
         slugify(project_id), role, normalize_agent_runtime(runtime))
+    persona = normalize_agent_persona(persona)
+    return "%s.%s" % (base, persona) if persona else base
 
 
 def parse_canonical_agent_id(actor_id, project_id=None):
     """Return canonical identity parts, or None for a legacy/raw actor id."""
-    text = str(actor_id or "")
-    parts = text.rsplit(".", 2)
-    if len(parts) != 3 or parts[1] not in AGENT_ROLES + ("unassigned",):
+    text = str(actor_id or "").strip().lower()
+    parts = text.split(".")
+    if len(parts) not in (3, 4) \
+            or parts[1] not in AGENT_ROLES + ("unassigned",):
         return None
     if project_id is not None and parts[0] != slugify(project_id):
         return None
+    if any(not part or slugify(part) != part for part in parts):
+        return None
     return {"project_id": parts[0], "role": parts[1],
-            "runtime": normalize_agent_runtime(parts[2])}
+            "runtime": normalize_agent_runtime(parts[2]),
+            "persona": parts[3] if len(parts) == 4 else None}
 
 
 def legacy_actor_role_hint(actor_id):
@@ -649,8 +669,25 @@ def registered_agent_identity(agents, project_id, actor_id, runtime=None):
     role row, then the exact legacy row, then the most recently seen matching
     runtime. Owner never participates in the lookup or authorization.
     """
-    runtime = normalize_agent_runtime(runtime) if runtime else \
-        normalize_agent_runtime(actor=actor_id)
+    parsed_request = parse_canonical_agent_id(actor_id, project_id)
+    runtime = (parsed_request or {}).get("runtime") or (
+        normalize_agent_runtime(runtime) if runtime else
+        normalize_agent_runtime(actor=actor_id))
+    if parsed_request:
+        exact_record = next((a for a in agents
+                             if a.get("agent_id") == actor_id), None)
+        return {
+            "project_id": project_id,
+            "role": parsed_request["role"],
+            "runtime": runtime,
+            "persona": parsed_request.get("persona"),
+            "actor_id": canonical_agent_id(
+                project_id, parsed_request["role"], runtime,
+                parsed_request.get("persona")),
+            "record": exact_record,
+            "conflict_roles": [],
+            "conflict_actors": [],
+        }
     role_rows = [a for a in agents if a.get("role") in AGENT_ROLES and
                  _matching_runtime(a, runtime)]
     roles = sorted({a.get("role") for a in role_rows})
@@ -662,23 +699,43 @@ def registered_agent_identity(agents, project_id, actor_id, runtime=None):
             "actor_id": canonical_agent_id(project_id, None, runtime),
             "record": None,
             "conflict_roles": roles,
+            "conflict_actors": [],
         }
     exact = next((a for a in role_rows if a.get("agent_id") == actor_id), None)
-    canonical = next((a for a in role_rows
-                      if parse_canonical_agent_id(a.get("agent_id"), project_id)),
-                     None)
-    chosen = canonical or exact
+    canonical_rows = [a for a in role_rows
+                      if parse_canonical_agent_id(
+                          a.get("agent_id"), project_id)]
+    default = next((a for a in canonical_rows
+                    if not parse_canonical_agent_id(
+                        a.get("agent_id"), project_id).get("persona")), None)
+    # An exact persona-qualified selector always wins. A raw runtime hint may
+    # use the backwards-compatible default actor, but never silently chooses
+    # one of several named personas.
+    chosen = exact or default
+    conflict_actors = []
+    if chosen is None and len(canonical_rows) == 1:
+        chosen = canonical_rows[0]
+    elif chosen is None and len(canonical_rows) > 1:
+        conflict_actors = sorted(a["agent_id"] for a in canonical_rows)
     if chosen is None and role_rows:
-        chosen = sorted(role_rows,
-                        key=lambda a: a.get("last_seen_at") or "")[-1]
+        legacy_rows = [a for a in role_rows if not parse_canonical_agent_id(
+            a.get("agent_id"), project_id)]
+        if legacy_rows:
+            chosen = sorted(legacy_rows,
+                            key=lambda a: a.get("last_seen_at") or "")[-1]
     role = chosen.get("role") if chosen else None
+    persona = (parse_canonical_agent_id(
+        chosen.get("agent_id"), project_id) or {}).get("persona") \
+        if chosen else (parsed_request or {}).get("persona")
     return {
         "project_id": project_id,
         "role": role,
         "runtime": runtime,
-        "actor_id": canonical_agent_id(project_id, role, runtime),
+        "persona": persona,
+        "actor_id": canonical_agent_id(project_id, role, runtime, persona),
         "record": chosen,
         "conflict_roles": [],
+        "conflict_actors": conflict_actors,
     }
 
 
@@ -960,6 +1017,39 @@ CREATE TABLE IF NOT EXISTS handoffs (
   updated_at TEXT NOT NULL,
   PRIMARY KEY (project_id, version)
 );
+-- ``handoffs`` is the immutable compatibility archive for the retired
+-- project-global handoff.  New operational continuity is owned by one exact
+-- canonical identity and versioned independently per identity.
+CREATE TABLE IF NOT EXISTS identity_handoffs (
+  project_id            TEXT NOT NULL,
+  actor_id               TEXT NOT NULL,
+  version                INTEGER NOT NULL,
+  content                TEXT NOT NULL,
+  updated_by             TEXT NOT NULL,
+  updated_owner          TEXT,
+  updated_at             TEXT NOT NULL,
+  event_id               TEXT,
+  legacy_source_version  INTEGER,
+  PRIMARY KEY (project_id, actor_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_identity_handoff_latest
+  ON identity_handoffs (project_id, actor_id, version DESC);
+-- Role Scope is durable background shared by the identities that actually
+-- hold a role.  The lead_director scope is an additive coordination overlay;
+-- it never changes authorization.
+CREATE TABLE IF NOT EXISTS role_scope_revisions (
+  project_id    TEXT NOT NULL,
+  role          TEXT NOT NULL,
+  version       INTEGER NOT NULL,
+  content       TEXT NOT NULL,
+  updated_by    TEXT NOT NULL,
+  updated_owner TEXT,
+  updated_at    TEXT NOT NULL,
+  event_id      TEXT,
+  PRIMARY KEY (project_id, role, version)
+);
+CREATE INDEX IF NOT EXISTS idx_role_scope_latest
+  ON role_scope_revisions (project_id, role, version DESC);
 CREATE TABLE IF NOT EXISTS decisions (
   project_id  TEXT NOT NULL,
   decision_id TEXT NOT NULL,
@@ -1393,6 +1483,32 @@ def connect(db_path):
                     "INSERT INTO server_settings(setting_key,value,updated_at)"
                     " VALUES ('auth.owner_user_id',?,?)",
                     (json.dumps(first_admin["user_id"]), now_iso()))
+        # One-time purpose-aware migration from the retired project-global
+        # handoff.  Only the latest row with an exact registered canonical
+        # writer can become that writer's identity handoff.  Ambiguous/web
+        # legacy rows remain available solely through ``handoffs`` history;
+        # they are never cloned into every current identity.
+        legacy_rows = conn.execute(
+            "SELECT h.* FROM handoffs h JOIN agents a"
+            " ON a.project_id=h.project_id AND a.agent_id=h.updated_by"
+            " WHERE h.version=(SELECT MAX(h2.version) FROM handoffs h2"
+            " WHERE h2.project_id=h.project_id)").fetchall()
+        for legacy in legacy_rows:
+            event = conn.execute(
+                "SELECT event_id,owner FROM events WHERE project_id=?"
+                " AND event_type='handoff.updated' AND context_version=?"
+                " AND actor_id=? ORDER BY seq DESC LIMIT 1",
+                (legacy["project_id"], legacy["version"],
+                 legacy["updated_by"])).fetchone()
+            conn.execute(
+                "INSERT OR IGNORE INTO identity_handoffs"
+                " (project_id,actor_id,version,content,updated_by,"
+                " updated_owner,updated_at,event_id,legacy_source_version)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (legacy["project_id"], legacy["updated_by"], 1,
+                 legacy["content"], legacy["updated_by"],
+                 event["owner"] if event else None, legacy["updated_at"],
+                 event["event_id"] if event else None, legacy["version"]))
         # Materialize the non-secret hosted identity during the ordinary
         # schema/migration open.  Sync snapshot GETs can then remain genuinely
         # read-only instead of lazily writing this setting on first access.
@@ -4164,9 +4280,180 @@ def project_init(conn, actor_id, actor_type, path=None, project_id=None,
 # --- handoff ---------------------------------------------------------------
 
 def _latest_handoff(conn, project_id):
+    """Latest row in the retired project-global compatibility archive."""
     return conn.execute(
         "SELECT * FROM handoffs WHERE project_id=? ORDER BY version DESC LIMIT 1",
         (project_id,)).fetchone()
+
+
+def _latest_identity_handoff(conn, project_id, actor_id):
+    if not actor_id:
+        return None
+    return conn.execute(
+        "SELECT * FROM identity_handoffs WHERE project_id=? AND actor_id=?"
+        " ORDER BY version DESC LIMIT 1", (project_id, actor_id)).fetchone()
+
+
+def _identity_handoff_dict(row):
+    if not row:
+        return None
+    value = dict(row)
+    value["content"] = json.loads(value["content"])
+    return value
+
+
+def _handoff_read_actor(conn, project_id, actor_id, actor_type,
+                        target_actor_id=None):
+    target = str(target_actor_id or actor_id or "").strip()
+    if not target:
+        raise AttaccaError("handoff read requires an exact identity")
+    if target != actor_id:
+        registered = conn.execute(
+            "SELECT 1 FROM agents WHERE project_id=? AND agent_id=?",
+            (project_id, target)).fetchone()
+        if not registered:
+            raise AttaccaError(
+                "handoff identity '%s' is not registered in workspace '%s'"
+                % (target, project_id))
+    return target
+
+
+def _role_scope_name(role):
+    role = str(role or "").strip().lower()
+    if role not in ROLE_SCOPE_NAMES:
+        raise AttaccaError("role scope must be one of %s" %
+                           ", ".join(ROLE_SCOPE_NAMES))
+    return role
+
+
+def _latest_role_scope(conn, project_id, role):
+    return conn.execute(
+        "SELECT * FROM role_scope_revisions WHERE project_id=? AND role=?"
+        " ORDER BY version DESC LIMIT 1", (project_id, role)).fetchone()
+
+
+def _role_scope_dict(row):
+    if not row:
+        return None
+    value = dict(row)
+    return value
+
+
+def _require_role_scope_manager(conn, project_id, actor_id, actor_type):
+    if actor_type == "human":
+        return "human"
+    role = _registered_actor_role(conn, project_id, actor_id) \
+        if actor_type == "agent" else "unassigned"
+    if actor_type != "agent" or role != "director":
+        raise AttaccaError(
+            "role scopes may only be edited by a human or registered "
+            "Director; '%s' is %s" % (actor_id, role))
+    return role
+
+
+def role_scope_get(conn, project_id, actor_id=None, actor_type="agent",
+                   role=None, include_all=False):
+    """Return the current identity's role background and optional lead overlay.
+
+    A Director/human may request another role (or the complete management
+    view); ordinary AIs always receive only their actual registered role.
+    """
+    project = get_project(conn, project_id)
+    actual = _registered_actor_role(conn, project_id, actor_id) \
+        if actor_type == "agent" else None
+    manager = actor_type == "human" or actual == "director"
+    if include_all and not manager:
+        raise AttaccaError(
+            "only humans and registered Directors may list all role scopes")
+    if role is not None:
+        requested = _role_scope_name(role)
+        if actor_type == "agent" and not manager and requested != actual:
+            raise AttaccaError(
+                "agent '%s' may only read its own %s role scope" %
+                (actor_id, actual or "unassigned"))
+        roles = [requested]
+    elif include_all or actor_type == "human":
+        roles = list(ROLE_SCOPE_NAMES)
+    elif actual in ("director", "advisor", "worker"):
+        roles = [actual]
+        if project.get("lead_director") == actor_id:
+            roles.append("lead_director")
+    else:
+        roles = []
+    scopes = []
+    for name in roles:
+        row = _latest_role_scope(conn, project_id, name)
+        scopes.append(_role_scope_dict(row) or {
+            "project_id": project_id, "role": name, "version": 0,
+            "content": "", "updated_by": None, "updated_owner": None,
+            "updated_at": None, "event_id": None})
+    return {
+        "project": project_id,
+        "actor": actor_id,
+        "actor_role": actual,
+        "lead_director": project.get("lead_director"),
+        "scopes": scopes,
+        "effective_content": "\n\n".join(
+            item["content"] for item in scopes if item.get("content")),
+    }
+
+
+def role_scope_set(conn, project_id, actor_id, actor_type, role, content,
+                   expected_version=None):
+    role = _role_scope_name(role)
+    if content is None:
+        raise AttaccaError("role_scope_set: content is required")
+    content = str(content)
+    if len(content) > 100000:
+        raise AttaccaError("role scope is limited to 100000 characters")
+    if expected_version is not None:
+        try:
+            expected_version = int(expected_version)
+        except (TypeError, ValueError):
+            raise AttaccaError("expected_version must be an integer")
+    with write_tx(conn):
+        get_project(conn, project_id)
+        _require_role_scope_manager(
+            conn, project_id, actor_id, actor_type)
+        row = _latest_role_scope(conn, project_id, role)
+        current_version = row["version"] if row else 0
+        if expected_version is not None and expected_version != current_version:
+            raise AttaccaError(
+                "role scope conflict: expected %s v%d but it is v%d; reload "
+                "and reconcile before writing" %
+                (role, expected_version, current_version))
+        if row is not None and row["content"] == content:
+            return {"ok": True, "already_current": True,
+                    "role_scope": _role_scope_dict(row),
+                    "context_version": get_project(
+                        conn, project_id)["context_version"]}
+        version = current_version + 1
+        context_version = bump_context_version(conn, project_id)
+        event = append_event(
+            conn, project_id, actor_id, actor_type, "role_scope.updated",
+            {"role": role, "version": version,
+             "length": len(content)}, in_tx=True)
+        conn.execute(
+            "INSERT INTO role_scope_revisions"
+            " (project_id,role,version,content,updated_by,updated_owner,"
+            " updated_at,event_id) VALUES (?,?,?,?,?,?,?,?)",
+            (project_id, role, version, content, actor_id, current_owner(),
+             now_iso(), event["event_id"]))
+        result = _role_scope_dict(
+            _latest_role_scope(conn, project_id, role))
+    return {"ok": True, "role_scope": result,
+            "context_version": context_version, "event": event}
+
+
+def role_scope_history(conn, project_id, role, limit=20):
+    get_project(conn, project_id)
+    role = _role_scope_name(role)
+    rows = conn.execute(
+        "SELECT * FROM role_scope_revisions WHERE project_id=? AND role=?"
+        " ORDER BY version DESC LIMIT ?",
+        (project_id, role, max(1, min(int(limit or 20), 200)))).fetchall()
+    return {"project": project_id, "role": role,
+            "versions": [_role_scope_dict(row) for row in rows]}
 
 
 def _event_visible_to_actor(conn, project_id, row, actor_id=None,
@@ -4305,11 +4592,25 @@ def workflow_warnings(conn, project_id, actor_id=None, actor_type="agent"):
     return warnings
 
 
-def get_handoff(conn, project_id, actor_id=None, actor_type="agent"):
+def get_handoff(conn, project_id, actor_id=None, actor_type="agent",
+                target_actor_id=None):
     project = get_project(conn, project_id)
-    row = _latest_handoff(conn, project_id)
+    handoff_actor = _handoff_read_actor(
+        conn, project_id, actor_id, actor_type, target_actor_id)
+    row = _latest_identity_handoff(conn, project_id, handoff_actor)
+    legacy_fallback = row is None
+    if legacy_fallback:
+        # Read-only compatibility during the transition: an identity with no
+        # handoff may see the retired global snapshot so a rolling upgrade
+        # never produces an empty cold start. The row is not copied; the
+        # identity's first write starts its own version history at v1.
+        row = _latest_handoff(conn, project_id)
     handoff_event = None
-    if row:
+    if row and not legacy_fallback and row["event_id"]:
+        handoff_event = conn.execute(
+            "SELECT * FROM events WHERE project_id=? AND event_id=?",
+            (project_id, row["event_id"])).fetchone()
+    elif row:
         handoff_event = conn.execute(
             "SELECT * FROM events WHERE project_id=?"
             " AND event_type='handoff.updated' AND context_version=?"
@@ -4371,9 +4672,17 @@ def get_handoff(conn, project_id, actor_id=None, actor_type="agent"):
             conn, project_id, actor_id, actor_type),
         "project_rules": applicable_rules,
         "cloud_context": cloud_context_get(conn, project_id)["cloud_context"],
+        "role_scope": role_scope_get(
+            conn, project_id, actor_id=actor_id, actor_type=actor_type),
         "handoff": handoff,
+        "handoff_actor": handoff_actor,
+        "handoff_version": (row["version"] if row and not legacy_fallback
+                            else 0),
+        "legacy_handoff_fallback": bool(row and legacy_fallback),
         "handoff_updated_by": row["updated_by"] if row else None,
-        "handoff_updated_owner": (handoff_attribution or {}).get("owner"),
+        "handoff_updated_owner": (
+            row["updated_owner"] if row and not legacy_fallback else
+            (handoff_attribution or {}).get("owner")),
         "handoff_attribution": handoff_attribution,
         "handoff_updated_at": row["updated_at"] if row else None,
         "open_tasks": [_task_brief(t) for t in open_tasks],
@@ -4385,13 +4694,14 @@ def get_handoff(conn, project_id, actor_id=None, actor_type="agent"):
         "git": {"head": git_head(project.get("root_path")),
                 "branch": git_branch(project.get("root_path"))},
         "hint": (None if row else
-                 "No handoff written yet. After your first meaningful work, call "
-                 "update_handoff so the next worker can resume cold."),
+                 "No handoff exists for identity %s. After meaningful work, "
+                 "that exact identity should call update_handoff." %
+                 handoff_actor),
     }
 
 
 def update_handoff(conn, project_id, actor_id, actor_type, updates,
-                   expected_context_version=None):
+                   expected_context_version=None, expected_version=None):
     updates = {k: v for k, v in updates.items()
                if k in HANDOFF_FIELDS and v is not None}
     if not updates:
@@ -4399,29 +4709,18 @@ def update_handoff(conn, project_id, actor_id, actor_type, updates,
             "update_handoff needs at least one of: %s" % ", ".join(HANDOFF_FIELDS))
     with write_tx(conn):
         project = get_project(conn, project_id)
-        lead = project.get("lead_director")
         if actor_type == "agent":
             actor_row = conn.execute(
                 "SELECT role FROM agents WHERE project_id=? AND agent_id=?",
                 (project_id, actor_id)).fetchone()
-            assigned_role_count = conn.execute(
-                "SELECT COUNT(*) AS n FROM agents WHERE project_id=? "
-                "AND role IN ('director','advisor','worker')",
-                (project_id,)).fetchone()["n"]
-            # Legacy projects without role governance keep working until their
-            # first director/lead is designated. Once governed, only directors
-            # write the canonical handoff; workers/advisors report through the
-            # multi-writer task board and room instead.
-            governed = bool(lead or assigned_role_count)
-            # Lead is coordination/tie-break metadata, never an authority
-            # bypass. Every AI permission comes from its role in THIS
-            # workspace; Claude and Codex Directors are therefore peers.
-            is_director = bool(actor_row and actor_row["role"] == "director")
-            if governed and not is_director:
+            if not actor_row:
                 raise AttaccaError(
-                    "handoff is director-only; agent '%s' is not a director. "
-                    "Use task_report/room_send or ask a director to update the "
-                    "canonical handoff" % actor_id)
+                    "identity handoff owner '%s' is not registered in "
+                    "workspace '%s'" % (actor_id, project_id))
+        elif actor_type != "human":
+            raise AttaccaError(
+                "identity handoff writes require an authenticated human or "
+                "registered AI identity")
         if expected_context_version is not None:
             try:
                 expected = int(expected_context_version)
@@ -4432,19 +4731,39 @@ def update_handoff(conn, project_id, actor_id, actor_type, updates,
                     "handoff conflict: expected context v%d but project is now "
                     "v%d; reload get_handoff and reconcile before writing"
                     % (expected, project["context_version"]))
-        row = _latest_handoff(conn, project_id)
+        row = _latest_identity_handoff(conn, project_id, actor_id)
+        current_version = row["version"] if row else 0
+        if expected_version is not None:
+            try:
+                expected_version = int(expected_version)
+            except (TypeError, ValueError):
+                raise AttaccaError("expected_version must be an integer")
+            if current_version != expected_version:
+                raise AttaccaError(
+                    "identity handoff conflict for %s: expected v%d but it "
+                    "is v%d; reload get_handoff and reconcile before writing"
+                    % (actor_id, expected_version, current_version))
         content = json.loads(row["content"]) if row else {}
         content.update(updates)
+        handoff_version = current_version + 1
         new_version = bump_context_version(conn, project_id)
-        conn.execute(
-            "INSERT INTO handoffs (project_id, version, content, updated_by, updated_at)"
-            " VALUES (?,?,?,?,?)",
-            (project_id, new_version, canonical_json(content), actor_id, now_iso()))
         event = append_event(conn, project_id, actor_id, actor_type,
-                             "handoff.updated",
+                             "identity_handoff.updated",
                              {"fields": sorted(updates.keys()),
-                              "handoff": content}, in_tx=True)
+                              "handoff": content,
+                              "handoff_actor": actor_id,
+                              "handoff_version": handoff_version}, in_tx=True)
+        conn.execute(
+            "INSERT INTO identity_handoffs"
+            " (project_id,actor_id,version,content,updated_by,updated_owner,"
+            " updated_at,event_id,legacy_source_version)"
+            " VALUES (?,?,?,?,?,?,?,?,NULL)",
+            (project_id, actor_id, handoff_version,
+             canonical_json(content), actor_id, current_owner(), now_iso(),
+             event["event_id"]))
     return {"ok": True, "context_version": new_version,
+            "handoff_actor": actor_id,
+            "handoff_version": handoff_version,
             "updated_fields": sorted(updates.keys()), "event": event}
 
 
@@ -4690,6 +5009,84 @@ def room_read(conn, project_id, since_seq=None, limit=30, actor_id=None,
                      "since_seq=next_since_seq now" if may_have_more else
                      "poll again with since_seq=next_since_seq to read only "
                      "new messages"))}
+
+
+def room_history(conn, project_id, actor_id=None, actor_type="agent",
+                 conversation="local", query=None, limit=60, offset=0,
+                 sort="newest", known_latest_seq=None):
+    """Server-filtered, visibility-safe room history for the Control Panel."""
+    get_project(conn, project_id)
+    limit = max(1, min(int(limit or 60), 60))
+    offset = max(0, int(offset or 0))
+    conversation = str(conversation or "local").strip()
+    if conversation != "local":
+        if not _bridge_row(conn, project_id, conversation):
+            raise AttaccaError(
+                "workspace '%s' has no bridge conversation with '%s'" %
+                (project_id, conversation))
+    rows = conn.execute(
+        "SELECT * FROM events WHERE project_id=?"
+        " AND event_type='room.message' ORDER BY seq ASC",
+        (project_id,)).fetchall()
+    payloads = _room_policy_payloads(conn, project_id, rows)
+    actor_ids = _actor_alias_ids(conn, project_id, actor_id)
+    authorized = []
+    for row, payload in zip(rows, payloads):
+        if not _bridge_message_visible(
+                conn, project_id, payload, actor_id, actor_type):
+            continue
+        origin = payload.get("origin_project")
+        mirrored = payload.get("mirrored_to") or []
+        if conversation == "local":
+            if origin or mirrored:
+                continue
+        elif origin != conversation and conversation not in mirrored:
+            continue
+        authorized.append((row, payload))
+    unfiltered_total = len(authorized)
+    terms = _search_query_terms(query)
+    if terms:
+        authorized = [(row, payload) for row, payload in authorized
+                      if all(term in canonical_json({
+                          "body": payload.get("body"),
+                          "actor": row["actor_id"],
+                          "owner": row["owner"],
+                          "type": payload.get("msg_type"),
+                          "task": row["task_id"],
+                          "mentions": payload.get("mentions"),
+                          "reply_to": payload.get("reply_to"),
+                      }).casefold() for term in terms)]
+    total = len(authorized)
+    reverse = str(sort or "newest").lower() != "oldest"
+    authorized.sort(key=lambda item: int(item[0]["seq"]), reverse=reverse)
+    latest_seq = max((int(row["seq"]) for row, _ in authorized), default=0)
+    if known_latest_seq is None:
+        new_count = 0
+    else:
+        known = int(known_latest_seq or 0)
+        new_count = sum(int(row["seq"]) > known for row, _ in authorized)
+    selected = authorized[offset:offset + limit]
+    messages = []
+    for row, payload in selected:
+        message = _room_message_dict(row, payload)
+        if message.get("mirrored_to") and actor_id is not None:
+            message["mirrored_to"] = _visible_bridge_peers(
+                conn, project_id, message, actor_id, actor_type)
+        identity_project = message.get("origin_project") or project_id
+        attribution = immutable_event_attribution(
+            conn, identity_project, message["actor"], message["actor_type"],
+            message.get("owner"))
+        message["ledger_actor"] = message["actor"]
+        message["actor"] = attribution["actor_id"]
+        message["identity"] = attribution["identity"]
+        message["attribution"] = attribution
+        message.update(_inbox_message_attention(conn, actor_ids, message))
+        messages.append(message)
+    return {"project": project_id, "conversation": conversation,
+            "messages": messages, "total": total,
+            "unfiltered_total": unfiltered_total, "limit": limit,
+            "offset": offset, "has_more": offset + len(messages) < total,
+            "latest_seq": latest_seq, "new_count": new_count}
 
 
 # --- inbox -----------------------------------------------------------------
@@ -5829,14 +6226,53 @@ def task_create(conn, project_id, actor_id, actor_type, title, description=None,
             "plan_required": plan_required, "event": event}
 
 
-def task_list(conn, project_id, status=None):
+def task_list(conn, project_id, status=None, query=None, limit=None, offset=0,
+              sort=None):
     get_project(conn, project_id)
-    if status:
-        if status not in TASK_STATUSES:
-            raise AttaccaError("status must be one of %s" % ", ".join(TASK_STATUSES))
+    status = str(status or "").strip().lower() or None
+    if status == "all":
+        status = None
+    if status and status not in TASK_STATUSES + ["active"]:
+        raise AttaccaError(
+            "status must be one of active, all, %s" %
+            ", ".join(TASK_STATUSES))
+    paged = limit is not None
+    if paged:
+        limit = max(1, min(int(limit or 60), 60))
+        offset = max(0, int(offset or 0))
+    terms = _search_query_terms(query)
+    where = ["project_id=?"]
+    params = [project_id]
+    if status == "active":
+        where.append("status NOT IN ('done','cancelled')")
+    elif status:
+        where.append("status=?")
+        params.append(status)
+    if terms:
+        predicate, search_params = _search_predicate(
+            ["task_id", "title", "description", "status", "claimed_by",
+             "last_report", "expected_scope", "dependencies"], terms)
+        where.append(predicate)
+        params.extend(search_params)
+    where_sql = " AND ".join(where)
+    unfiltered_total = conn.execute(
+        "SELECT COUNT(*) AS n FROM tasks WHERE project_id=?",
+        (project_id,)).fetchone()["n"]
+    total = conn.execute(
+        "SELECT COUNT(*) AS n FROM tasks WHERE " + where_sql,
+        params).fetchone()["n"]
+    if paged:
+        direction = "ASC" if str(sort or "newest").lower() == "oldest" \
+            else "DESC"
         rows = conn.execute(
-            "SELECT * FROM tasks WHERE project_id=? AND status=? ORDER BY task_id",
-            (project_id, status)).fetchall()
+            "SELECT * FROM tasks WHERE " + where_sql +
+            " ORDER BY updated_at %s, CAST(SUBSTR(task_id,3) AS INTEGER) %s"
+            " LIMIT ? OFFSET ?" % (direction, direction),
+            params + [limit, offset]).fetchall()
+    elif status:
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE " + where_sql + " ORDER BY task_id",
+            params).fetchall()
     else:
         rows = conn.execute(
             "SELECT * FROM tasks WHERE project_id=? ORDER BY "
@@ -5855,10 +6291,15 @@ def task_list(conn, project_id, status=None):
         " WHERE q.project_id=p.project_id AND q.task_id=p.task_id)",
         (project_id,)).fetchall()
     plans = {row["task_id"]: row for row in plan_rows}
-    return {"project": project_id,
-            "tasks": [_task_dict(row, by_task.get(row["task_id"], []),
-                                 conn, project_id, plans.get(row["task_id"]))
-                      for row in rows]}
+    result = {"project": project_id,
+              "tasks": [_task_dict(row, by_task.get(row["task_id"], []),
+                                   conn, project_id, plans.get(row["task_id"]))
+                        for row in rows]}
+    if paged:
+        result.update({"total": total, "unfiltered_total": unfiltered_total,
+                       "limit": limit, "offset": offset,
+                       "has_more": offset + len(rows) < total})
+    return result
 
 
 def task_show(conn, project_id, task_id):
@@ -6972,6 +7413,7 @@ def _migrate_actor_references_in_tx(conn, project_id, aliases, canonical_id,
 
 def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
                    display_name=None, role=None, runtime=None,
+                   persona=None,
                    canonical_identity=False, registration_username=None,
                    allow_foreign_owner=False,
                    authorized_owner_labels=None):
@@ -7031,6 +7473,8 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
         if canonical_identity:
             records = [dict(row) for row in conn.execute(
                 "SELECT * FROM agents WHERE project_id=?", (project_id,))]
+            requested_parts = parse_canonical_agent_id(
+                requested_id, project_id)
             identity = registered_agent_identity(
                 records, project_id, requested_id, runtime=runtime)
             runtime = identity["runtime"]
@@ -7043,11 +7487,25 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
                         "changed" % (runtime, project_id, ", ".join(
                             identity["conflict_roles"])))
                 role = identity["role"]
-            agent_id = canonical_agent_id(project_id, role, runtime)
+            if identity.get("conflict_actors") and persona is None:
+                raise AttaccaError(
+                    "AI runtime '%s' has multiple %s identities in workspace "
+                    "'%s': %s. Select an exact existing identity or choose a "
+                    "new persona; no identity was changed" %
+                    (runtime, role or "unassigned", project_id,
+                     ", ".join(identity["conflict_actors"])))
+            persona = normalize_agent_persona(
+                persona if persona is not None else
+                ((requested_parts or {}).get("persona") or
+                 identity.get("persona")))
+            agent_id = canonical_agent_id(
+                project_id, role, runtime, persona)
             matching = [record["agent_id"] for record in records
                         if _matching_runtime(record, runtime)
                         and (record.get("role") in (None, role)
                              or not explicit_role)
+                        and not parse_canonical_agent_id(
+                            record.get("agent_id"), project_id)
                         and record["agent_id"] != agent_id]
             if explicit_role:
                 # Some older sessions claimed tasks or wrote events without
@@ -7112,8 +7570,9 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
                 actor_id = agent_id
             project = get_project(conn, project_id)
             if display_name is None:
-                display_name = "%s · %s · %s" % (
-                    project["name"], role or "unassigned", runtime)
+                display_name = "%s · %s · %s%s" % (
+                    project["name"], role or "unassigned", runtime,
+                    " · %s" % persona if persona else "")
         else:
             agent_id = requested_id
         row = conn.execute(
@@ -7155,6 +7614,7 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
                       "identity": {"workspace": project_id,
                                    "role": role if role is not None else previous_role,
                                    "runtime": runtime,
+                                   "persona": persona,
                                    "owner": effective_owner},
                       "migration": migration}
             # MCP startup may have discovered this actor before guided setup
@@ -7199,13 +7659,15 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
                              {"agent_id": agent_id,
                               "display_name": display_name or agent_id,
                               "role": role, "runtime": runtime,
+                              "persona": persona,
                               "owner": owner,
                               "migrated_from": migration["aliases"]},
                              in_tx=True)
     result = {"ok": True, "agent_id": agent_id,
               "already_registered": False, "role": role, "event": event,
               "identity": {"workspace": project_id, "role": role,
-                           "runtime": runtime, "owner": owner},
+                           "runtime": runtime, "persona": persona,
+                           "owner": owner},
               "migration": migration}
     if context_version is not None:
         result["context_version"] = context_version
@@ -7227,10 +7689,13 @@ def agent_list(conn, project_id):
             "workspace": project_id,
             "role": agent.get("role") or "unassigned",
             "runtime": runtime,
+            "persona": (parse_canonical_agent_id(
+                agent.get("agent_id"), project_id) or {}).get("persona"),
             "owner": agent.get("owner"),
         }
-        agent["operational_actor_id"] = canonical_agent_id(
-            project_id, agent.get("role"), runtime)
+        parsed = parse_canonical_agent_id(agent.get("agent_id"), project_id)
+        agent["operational_actor_id"] = (agent.get("agent_id") if parsed else
+            canonical_agent_id(project_id, agent.get("role"), runtime))
         agents.append(agent)
     return {"project": project_id, "agents": agents}
 
@@ -7283,6 +7748,7 @@ def project_actor_identity(conn, project_id, actor_id, actor_type="agent",
         runtime = normalize_agent_runtime(actor=actor_id)
         canonical_id = canonical_agent_id(project_id, role, runtime)
     return {"workspace": project_id, "role": role, "runtime": runtime,
+            "persona": (parsed or {}).get("persona"),
             "owner": owner or (row["owner"] if row else None),
             "actor_id": canonical_id, "ledger_actor_id": actor_id}
 
@@ -9117,6 +9583,81 @@ def _api_events_sync(conn, project_id, after, limit, actor_id=None,
             "latest_seq": latest, "may_have_more": next_after < latest}
 
 
+def activity_history(conn, project_id, actor_id=None, actor_type="agent",
+                     query=None, limit=60, offset=0, sort="newest",
+                     known_latest_seq=None):
+    """Visibility-filtered full-ledger search, then stable 60-row paging."""
+    get_project(conn, project_id)
+    limit = max(1, min(int(limit or 60), 60))
+    offset = max(0, int(offset or 0))
+    rows = conn.execute(
+        "SELECT * FROM events WHERE project_id=? ORDER BY seq ASC",
+        (project_id,)).fetchall()
+    raw_payloads = [json.loads(row["payload"]) for row in rows]
+    room_rows = [row for row in rows
+                 if row["event_type"] == "room.message"]
+    room_payloads = _room_policy_payloads(
+        conn, project_id, room_rows,
+        payloads=[payload for row, payload in zip(rows, raw_payloads)
+                  if row["event_type"] == "room.message"])
+    room_iter = iter(room_payloads)
+    authorized = []
+    for row, raw in zip(rows, raw_payloads):
+        payload = next(room_iter) if row["event_type"] == "room.message" \
+            else raw
+        if row["event_type"] == "room.message" and not \
+                _bridge_message_visible(
+                    conn, project_id, payload, actor_id, actor_type):
+            continue
+        authorized.append((row, payload))
+    unfiltered_total = len(authorized)
+    terms = _search_query_terms(query)
+    if terms:
+        authorized = [(row, payload) for row, payload in authorized
+                      if all(term in canonical_json({
+                          "event_type": row["event_type"],
+                          "actor": row["actor_id"],
+                          "owner": row["owner"],
+                          "task": row["task_id"],
+                          "created_at": row["created_at"],
+                          "payload": payload,
+                      }).casefold() for term in terms)]
+    total = len(authorized)
+    reverse = str(sort or "newest").lower() != "oldest"
+    authorized.sort(key=lambda item: int(item[0]["seq"]), reverse=reverse)
+    latest_seq = max((int(row["seq"]) for row, _ in authorized), default=0)
+    if known_latest_seq is None:
+        new_count = 0
+    else:
+        known = int(known_latest_seq or 0)
+        new_count = sum(int(row["seq"]) > known for row, _ in authorized)
+    selected = authorized[offset:offset + limit]
+    events = []
+    actor_aliases = _actor_alias_ids(conn, project_id, actor_id)
+    for row, payload in selected:
+        event = dict(row)
+        event["payload"] = dict(payload)
+        if event["event_type"] == "room.message":
+            event["payload"].update(_inbox_message_attention(
+                conn, actor_aliases, event["payload"]))
+            if event["payload"].get("mirrored_to") and actor_id is not None:
+                event["payload"]["mirrored_to"] = _visible_bridge_peers(
+                    conn, project_id, event["payload"], actor_id, actor_type)
+        identity_project = event["payload"].get("origin_project") \
+            if event["event_type"] == "room.message" else None
+        attribution = immutable_event_attribution(
+            conn, identity_project or project_id, event["actor_id"],
+            event["actor_type"], event.get("owner"))
+        event["identity"] = attribution["identity"]
+        event["attribution"] = attribution
+        event["operational_actor_id"] = attribution["actor_id"]
+        events.append(event)
+    return {"project": project_id, "events": events, "total": total,
+            "unfiltered_total": unfiltered_total, "limit": limit,
+            "offset": offset, "has_more": offset + len(events) < total,
+            "latest_seq": latest_seq, "new_count": new_count}
+
+
 # Complete project backups are intentionally separate from the lightweight
 # offline agent mirror.  These helpers build one consistent export snapshot,
 # then serialize exactly one requested human/admin download artifact.
@@ -9927,6 +10468,7 @@ PLUGIN_FILES = [
     "tools/repair_codex_config.py",
     "requirements.txt",
     "README.md",
+    "docs/assets/attacca-architecture.svg",
     "plugin-mcp.json",
     "kimi.plugin.json",
     ".mcp.json",
@@ -13150,6 +13692,16 @@ def _r_events_sync(h, m, q):
         actor_type=atype))
 
 
+def _r_activity_history(h, m, q):
+    actor, atype = h._actor()
+    known = q.get("known_latest_seq")
+    h._reply_json(200, activity_history(
+        h._conn(), m.group(1), actor_id=actor, actor_type=atype,
+        query=q.get("q"), limit=int(q.get("limit") or 60),
+        offset=int(q.get("offset") or 0), sort=q.get("sort") or "newest",
+        known_latest_seq=int(known) if known is not None else None))
+
+
 def _r_events_append(h, m, q):
     actor, atype = h._actor()
     body = h._body_json()
@@ -13175,6 +13727,17 @@ def _r_room_read(h, m, q):
                                  since_seq=int(since) if since is not None else None,
                                  limit=int(q.get("limit") or 30),
                                  actor_id=actor, actor_type=atype))
+
+
+def _r_room_history(h, m, q):
+    actor, atype = h._actor()
+    known = q.get("known_latest_seq")
+    h._reply_json(200, room_history(
+        h._conn(), m.group(1), actor_id=actor, actor_type=atype,
+        conversation=q.get("conversation") or "local", query=q.get("q"),
+        limit=int(q.get("limit") or 60), offset=int(q.get("offset") or 0),
+        sort=q.get("sort") or "newest",
+        known_latest_seq=int(known) if known is not None else None))
 
 
 def _r_room_send(h, m, q):
@@ -13214,7 +13777,10 @@ def _r_room_send(h, m, q):
 
 
 def _r_task_list(h, m, q):
-    h._reply_json(200, task_list(h._conn(), m.group(1), status=q.get("status")))
+    h._reply_json(200, task_list(
+        h._conn(), m.group(1), status=q.get("status"), query=q.get("q"),
+        limit=int(q.get("limit") or 60), offset=int(q.get("offset") or 0),
+        sort=q.get("sort") or "newest"))
 
 
 def _r_task_create(h, m, q):
@@ -13541,8 +14107,12 @@ ROUTES = [
     (*_route_def("PUT", "/v1/projects/%s/handoff" % _PID), _r_handoff_set),
     (*_route_def("GET", "/v1/projects/%s/log" % _PID), _r_log),
     (*_route_def("GET", "/v1/projects/%s/events" % _PID), _r_events_sync),
+    (*_route_def("GET", "/v1/projects/%s/activity" % _PID),
+     _r_activity_history),
     (*_route_def("POST", "/v1/projects/%s/events" % _PID), _r_events_append),
     (*_route_def("GET", "/v1/projects/%s/room" % _PID), _r_room_read),
+    (*_route_def("GET", "/v1/projects/%s/room/history" % _PID),
+     _r_room_history),
     (*_route_def("POST", "/v1/projects/%s/room" % _PID), _r_room_send),
     (*_route_def("GET", "/v1/projects/%s/tasks" % _PID), _r_task_list),
     (*_route_def("POST", "/v1/projects/%s/tasks" % _PID), _r_task_create),
