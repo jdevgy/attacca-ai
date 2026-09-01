@@ -290,7 +290,7 @@ class TemporaryIdentityProxyContractTest(unittest.TestCase):
         self.assertNotIn(
             'context.get("project") or parsed["workspace"]', source)
 
-    def test_new_and_reuse_modes_rebind_then_survive_proxy_restart(self):
+    def test_reuse_is_session_only_until_explicitly_made_default(self):
         proxy = self._start_proxy()
         self.assertEqual(self._status_actor(proxy, 2), self.permanent_actor)
 
@@ -313,11 +313,23 @@ class TemporaryIdentityProxyContractTest(unittest.TestCase):
         }, request_id=6)
         self.assertEqual(reused["agent_id"], self.permanent_actor)
         self.assertEqual(self._status_actor(proxy, 7), self.permanent_actor)
-        self.assertEqual(self._binding_actor(), self.permanent_actor)
+        self.assertEqual(self._binding_actor(), new_actor)
 
         after_reuse_restart = self._start_proxy()
         self.assertEqual(
-            self._status_actor(after_reuse_restart, 8), self.permanent_actor)
+            self._status_actor(after_reuse_restart, 8), new_actor)
+
+        made_default = self._tool(proxy, "agent_register", {
+            "agent_id": self.permanent_actor,
+            "role": "director", "runtime": "codex", "persona": "red",
+            "identity_mode": "reuse", "make_default": True,
+        }, request_id=81)
+        self.assertTrue(made_default["make_default"])
+        self.assertEqual(self._binding_actor(), self.permanent_actor)
+        after_default_restart = self._start_proxy()
+        self.assertEqual(
+            self._status_actor(after_default_restart, 82),
+            self.permanent_actor)
 
         compatibility = self._tool(proxy, "agent_register", {
             "agent_id": self.compatibility_actor,
@@ -328,12 +340,12 @@ class TemporaryIdentityProxyContractTest(unittest.TestCase):
             compatibility["agent_id"], self.compatibility_actor)
         self.assertEqual(
             self._status_actor(proxy, 10), self.compatibility_actor)
-        self.assertEqual(self._binding_actor(), self.compatibility_actor)
+        self.assertEqual(self._binding_actor(), self.permanent_actor)
 
         after_compatibility_restart = self._start_proxy()
         self.assertEqual(
             self._status_actor(after_compatibility_restart, 11),
-            self.compatibility_actor)
+            self.permanent_actor)
 
 
 if __name__ == "__main__":

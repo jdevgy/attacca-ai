@@ -87,13 +87,14 @@ class ColoredIdentityBindingContractTest(unittest.TestCase):
 
     def _select(self, *, mode, role="director", runtime="codex",
                 actor_id=None, client_instance="client-a", home=None,
-                session=None):
+                session=None, make_default=None):
         select = self._require("select_setup_identity")
         return select(
             self.conn, PROJECT, role, runtime, mode=mode,
             actor_id=actor_id, server_url=SERVER_A_INPUT,
             client_instance=client_instance,
-            home=home or self.home_a, session=session)
+            home=home or self.home_a, session=session,
+            make_default=make_default)
 
     def test_catalog_and_next_name_are_deterministic_and_global(self):
         palette = getattr(c, "AGENT_PERSONA_NAMES", None)
@@ -317,15 +318,27 @@ class ColoredIdentityBindingContractTest(unittest.TestCase):
             SERVER_A, PROJECT, "codex", "client-container-b",
             home=self.home_b))
 
-    def test_setup_reuse_new_and_temporary_modes_have_distinct_persistence(self):
+    def test_setup_selection_scope_is_independent_from_registry_action(self):
         gibbs = self._select(
             mode="new", client_instance="client-a", home=self.home_a)
         reused = self._select(
             mode="reuse", actor_id=gibbs["actor_id"],
             client_instance="client-b", home=self.home_b)
         self.assertEqual(reused["actor_id"], gibbs["actor_id"])
-        self.assertTrue(reused["binding_saved"])
+        self.assertFalse(reused["binding_saved"])
+        self.assertEqual(reused["selection_scope"], "current_mcp_process")
         self.assertFalse(reused.get("temporary", False))
+        binding_get = self._require("machine_actor_binding_get")
+        self.assertIsNone(binding_get(
+            SERVER_A, PROJECT, "codex", "client-b", home=self.home_b))
+
+        made_default = self._select(
+            mode="reuse", actor_id=gibbs["actor_id"],
+            client_instance="client-b", home=self.home_b,
+            make_default=True)
+        self.assertTrue(made_default["binding_saved"])
+        self.assertEqual(made_default["selection_scope"],
+                         "installation_default")
 
         turing = self._select(
             mode="new", client_instance="client-c", home=self.home_c)
@@ -346,7 +359,6 @@ class ColoredIdentityBindingContractTest(unittest.TestCase):
         self.assertFalse(temporary["binding_saved"])
         self.assertEqual(session.actor, temporary["actor_id"])
 
-        binding_get = self._require("machine_actor_binding_get")
         self.assertIsNone(binding_get(
             SERVER_A, PROJECT, "codex", "client-temp",
             home=temporary_home))
@@ -417,6 +429,15 @@ class ColoredIdentityBindingContractTest(unittest.TestCase):
         self.assertEqual(reused["actor_id"], legacy)
         self.assertIsNone(c.parse_canonical_agent_id(
             reused["actor_id"], PROJECT)["persona"])
+        self.assertFalse(reused["binding_saved"])
+        self.assertIsNone(self._require("machine_actor_binding_get")(
+            SERVER_A, PROJECT, "codex", "client-legacy",
+            home=self.home_b))
+        persistent = self._select(
+            mode="reuse", actor_id=legacy,
+            client_instance="client-legacy", home=self.home_b,
+            make_default=True)
+        self.assertTrue(persistent["binding_saved"])
         self.assertEqual(self._binding_actor(
             self._require("machine_actor_binding_get")(
             SERVER_A, PROJECT, "codex", "client-legacy",

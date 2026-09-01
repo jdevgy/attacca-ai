@@ -526,9 +526,9 @@ class CloudContextBlockTestCase(unittest.TestCase):
             "watcher-refetched context",
             instruction.read_text())
 
-    def test_managed_law_v13_describes_identity_handoffs_and_auto_sync(self):
+    def test_managed_law_describes_identity_handoffs_and_auto_sync(self):
         block = c.managed_instruction_block("p1", None)
-        self.assertEqual(c.MANAGED_BLOCK_VERSION, 13)
+        self.assertEqual(c.MANAGED_BLOCK_VERSION, 14)
         self.assertIn("workspace.role.runtime.persona", block)
         self.assertIn("legacy three-part", block)
         self.assertIn("exact identity handoff", block)

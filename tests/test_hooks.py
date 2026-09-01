@@ -1216,8 +1216,8 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             self.assertEqual(agents.read_text(), before + desired + after)
             self.assertIn("AGENTS.md", notice["context"])
 
-    def test_previous_managed_law_auto_refreshes_to_v13_without_touching_user_bytes(self):
-        self.assertEqual(c.MANAGED_BLOCK_VERSION, 13)
+    def test_previous_managed_law_auto_refreshes_to_latest_without_touching_user_bytes(self):
+        self.assertEqual(c.MANAGED_BLOCK_VERSION, 14)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             checkout = root / "repo"

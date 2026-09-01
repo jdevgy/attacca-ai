@@ -87,13 +87,17 @@ full export can substitute for the verified identity-scoped mirror.
 - **Installation-bound, named AI identity.** Clients send a runtime hint
   (`claude`, `codex`, `kimi`, …); setup binds that runtime on this client
   installation to one exact `workspace.role.runtime.persona` actor. New actors
-  receive short human-friendly names beginning with Gibbs. A name is reserved
-  transactionally and case-insensitively across the entire project, including
-  every role, runtime, and historical identity, and is never issued twice.
-  Normal start/resume silently reuses the binding. Owner is transmitted and
+  receive short human-friendly names beginning with Gibbs. New names are
+  reserved transactionally and case-insensitively across every workspace on
+  the server, including historical identities, and are never issued twice.
+  An upgrade preserves grandfathered duplicates; rerunning setup detects the
+  later duplicate, aliases its old actor for audit, assigns the next unique
+  name, and repairs that installation's binding. Normal start/resume silently
+  reuses the binding. Selecting an existing identity in explicit native setup
+  changes only that MCP process unless **Make default** is also chosen. Owner is transmitted and
   stored separately, and no conversation or host-session ID participates in
   identity. Existing Red/Blue and three-part actors remain compatibility
-  records and are never renamed.
+  records; only an explicit duplicate-name repair migrates one safely.
 
 ## Quickstart
 
@@ -237,8 +241,10 @@ own project), `--attach ID`, `--create NAME`, `--discover`, `--stdio`
 (serverless mode: tools open the database
 directly), `--url http://host:port`, `--tools-only` (global tool configs only,
 no project side effects — what install.sh uses),
-`--identity-mode auto|reuse|new` (normally selected by guided setup; an exact
-reuse target stays an internal argument). Native guided setup also offers a
+`--identity-mode auto|reuse|new|repair` (normally selected by guided setup; an exact
+reuse/repair target stays an internal argument), plus `--make-default` when an
+existing identity should replace the installation default. Reuse without that
+choice is current-process only. Native guided setup also offers a
 temporary current-proxy identity to an already-bound client and activates it
 only through that current MCP connection. Direct CLI `temporary` is rejected
 because a child process cannot alter its parent,
@@ -506,7 +512,8 @@ Injected via the managed block and the MCP server's `instructions`:
    attention only; an untargeted chat/directive addresses everyone. Explicit
    bridge participation/access, not mentions, sets the privacy boundary. The
    sender may address a named identity as `@Gibbs` (case-insensitive); Attacca
-   resolves that project-unique short name and stores the exact canonical actor.
+   resolves that server-unique short name in the destination workspace and
+   stores the exact canonical actor.
    cursor is lossless: a truncated batch sets `may_have_more` and the next poll
    picks up exactly where the last one ended.
 4. **Decisions for durable choices** — architecture, API, data, security,
@@ -591,7 +598,8 @@ setup --discover | --attach ID | --create NAME  advanced/scripted workspace flag
 setup [--url U] [--stdio] [--no-instructions]  one-shot checkout setup
       [-i|--interactive]
       [--role director|advisor|worker] [--lead keep|current|clear]
-      [--identity-mode auto|reuse|new|temporary]             temporary requires current MCP
+      [--identity-mode auto|reuse|new|temporary|repair] [--make-default|--session-only]
+                                                            temporary/session-only require current MCP
       [--bridge ID --relationship master|peer|advisor|none --principal current|other]
 setup --details [claude kimi codex gemini opencode glm cli]   full config reference
 install-instructions [--files CLAUDE.md,AGENTS.md]
@@ -631,8 +639,9 @@ python3 attacca.py event verify  # hash-chain + sequence integrity of a real led
   share its handoff, inbox cursor, and task leases. Separate permanent names
   have independent handoffs/cursors/leases while receiving the same applicable
   Role Scope. Existing three-part actors remain explicit compatibility choices;
-  existing Red/Blue persona records are also preserved without renaming. New
-  setup-created identities always receive a project-unique friendly name and
-  `@ShortName`. Owner remains separately visible on every new event.
+  existing Red/Blue persona records are preserved unless an explicit setup
+  repair resolves a grandfathered duplicate. New setup-created identities
+  always receive a server-unique friendly name and `@ShortName`. Owner remains
+  separately visible on every new event.
 - The room is a projection of `room.message` events in the ledger — chat is not the
   database (blueprint principle, §2.3).

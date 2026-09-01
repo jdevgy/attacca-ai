@@ -155,7 +155,7 @@ LOG_EXCLUDED_MSG_TYPES = {"chat", "status"}
 
 MANAGED_BEGIN = "<!-- MANAGED_ATTACCA:BEGIN"
 MANAGED_END = "<!-- MANAGED_ATTACCA:END -->"
-MANAGED_BLOCK_VERSION = 13
+MANAGED_BLOCK_VERSION = 14
 _CLOUD_CONTEXT_UNSET = object()
 _INSTRUCTION_FILE_ABSENT = object()
 _INSTRUCTION_WRITE_THREAD_LOCK = threading.RLock()
@@ -579,7 +579,7 @@ def qualify_actor(actor, owner=None):
 
 AGENT_ROLES = ("director", "advisor", "worker")
 # Human-friendly installation identities are allocated from one deterministic
-# workspace-global namespace.  The normalized lower-case value is stored in
+# server-global namespace.  The normalized lower-case value is stored in
 # the canonical actor id; clients present the title-cased form (``Gibbs``) and
 # may address it as ``@Gibbs``.  Keep the old color constant below solely for
 # compatibility with actors created by 0.5.1 and earlier -- colors are never
@@ -696,8 +696,33 @@ def agent_persona_fields(persona):
             "short_name": "@" + friendly}
 
 
+def identity_make_default(identity_mode, requested=None):
+    """Resolve identity selection scope without conflating reuse and default.
+
+    Creating a permanent identity keeps the historical default of saving it.
+    Selecting an existing identity is process-local unless the operator
+    explicitly asks to replace the installation default. Temporary identities
+    are process-local by definition.
+    """
+    mode = str(identity_mode or "").strip().lower()
+    if mode not in ("reuse", "new", "temporary", "repair"):
+        raise AttaccaError(
+            "identity mode must be reuse, new, temporary, or repair")
+    if requested is not None and not isinstance(requested, bool):
+        raise AttaccaError("make_default must be true or false")
+    persist = (mode in ("new", "repair")) \
+        if requested is None else requested
+    if mode == "temporary" and persist:
+        raise AttaccaError(
+            "temporary identity cannot become the installation default")
+    if mode == "repair" and not persist:
+        raise AttaccaError(
+            "repaired identity must replace the stale installation default")
+    return bool(persist)
+
+
 def next_agent_persona(agents_or_conn, project_id, role, runtime):
-    """Return the next deterministic project-global friendly persona.
+    """Return the next deterministic server-global friendly persona.
 
     Callers that create the actor must hold the same database write
     transaction while selecting and inserting it.  Accepting either a
@@ -709,21 +734,21 @@ def next_agent_persona(agents_or_conn, project_id, role, runtime):
         raise AttaccaError("agent role must be director, advisor, or worker")
     # Role/runtime are validated because they remain part of the actor id, but
     # they deliberately do not partition the persona namespace. ``@Gibbs``
-    # must identify at most one current actor anywhere in this workspace.
+    # must identify at most one newly allocated actor on this Attacca server.
+    # Pre-0.5.3 duplicates in different workspaces are grandfathered so an
+    # upgrade never invalidates an existing canonical actor.
     normalize_agent_runtime(runtime)
     if hasattr(agents_or_conn, "execute"):
         records = [dict(row) for row in agents_or_conn.execute(
-            "SELECT * FROM agents WHERE project_id=?", (project_id,))]
+            "SELECT * FROM agents")]
         reserved = {row["persona"] for row in agents_or_conn.execute(
-            "SELECT persona FROM agent_persona_reservations"
-            " WHERE project_id=?", (project_id,))}
+            "SELECT persona FROM agent_persona_reservations")}
     else:
         records = [dict(row) for row in (agents_or_conn or [])]
         reserved = set()
     used = set(reserved)
     for record in records:
-        parsed = parse_canonical_agent_id(
-            record.get("agent_id"), project_id)
+        parsed = parse_canonical_agent_id(record.get("agent_id"))
         if not parsed:
             continue
         if parsed.get("persona"):
@@ -910,6 +935,52 @@ def _seed_project_persona_reservations(conn, project_id, force=False):
     return inserted
 
 
+def _seed_all_persona_reservations(conn, force=False):
+    """Reconcile historical names in every workspace before allocation.
+
+    Existing cross-workspace duplicates are deliberately recorded as legacy
+    facts.  The allocator then treats their shared name as consumed globally,
+    while exact actors in either workspace continue to work unchanged.
+    """
+    inserted = 0
+    for row in conn.execute(
+            "SELECT project_id FROM projects ORDER BY created_at,project_id"):
+        inserted += _seed_project_persona_reservations(
+            conn, row["project_id"], force=force)
+    return inserted
+
+
+def _persona_reservation_projects(conn, persona):
+    """Return deterministic legacy owners of one friendly name."""
+    persona = normalize_agent_persona(persona)
+    if not persona:
+        return []
+    return [dict(row) for row in conn.execute(
+        "SELECT r.project_id,r.reserved_actor_id,r.reserved_at,"
+        " p.created_at AS project_created_at"
+        " FROM agent_persona_reservations r JOIN projects p"
+        " ON p.project_id=r.project_id WHERE r.persona=?"
+        " ORDER BY p.created_at,r.reserved_at,r.project_id",
+        (persona,))]
+
+
+def agent_persona_repair_status(conn, project_id, actor_id):
+    """Describe whether an existing actor has a grandfathered name clash."""
+    parsed = parse_canonical_agent_id(actor_id, project_id)
+    persona = parsed.get("persona") if parsed else None
+    owners = _persona_reservation_projects(conn, persona)
+    required = bool(len(owners) > 1 and
+                    owners[0]["project_id"] != project_id)
+    return {
+        "repair_required": required,
+        "persona": persona,
+        "persona_name": agent_persona_name(persona),
+        "legacy_duplicate_count": len(owners),
+        # Do not expose other workspace identifiers through setup metadata.
+        "keeps_legacy_name": bool(len(owners) > 1 and not required),
+    }
+
+
 def _persona_reservation_actor_matches(conn, project_id, reserved_actor_id,
                                        target_actor_id):
     """Follow immutable migration aliases without changing the reservation."""
@@ -960,6 +1031,15 @@ def _reserve_agent_persona_in_tx(conn, project_id, persona, actor_id,
                 (agent_persona_name(persona), project_id,
                  row["reserved_actor_id"]))
         return dict(row)
+    global_row = conn.execute(
+        "SELECT * FROM agent_persona_reservations"
+        " WHERE persona=? ORDER BY reserved_at,project_id LIMIT 1",
+        (persona,)).fetchone()
+    if global_row:
+        raise AttaccaError(
+            "persona_name_reserved: @%s has already been used on this "
+            "Attacca server; new friendly names are unique across all "
+            "workspaces" % agent_persona_name(persona))
     nowi = now_iso()
     conn.execute(
         "INSERT INTO agent_persona_reservations"
@@ -1433,7 +1513,8 @@ CREATE TABLE IF NOT EXISTS agents (
   last_seen_at  TEXT,
   PRIMARY KEY (project_id, agent_id)
 );
--- A short persona name is a workspace-global identity resource. Reservations
+-- A short persona name is a server-global identity resource for new
+-- allocations. Reservations
 -- outlive agent rows and aliases so a deleted/migrated Gibbs can never become
 -- a different actor later. Product code only inserts; triggers make the
 -- append-only invariant explicit even for accidental maintenance SQL.
@@ -1860,15 +1941,12 @@ def connect(db_path):
             set_current_git_context(
                 previous_git["branch"], previous_git["revision"],
                 previous_git["device_id"])
-        # One-time migration for the project-global, never-reused short-name
+        # One-time migration for the server-global, never-reused short-name
         # namespace. This scans immutable history as well as current actor
         # rows, so deleting or migrating an old colored/named actor cannot
         # release its persona for a different identity.
         with write_tx(conn):
-            for project_row in conn.execute(
-                    "SELECT project_id FROM projects ORDER BY created_at"):
-                _seed_project_persona_reservations(
-                    conn, project_row["project_id"])
+            _seed_all_persona_reservations(conn)
         # One-time purpose-aware migration from the retired project-global
         # handoff.  Only the latest row with an exact registered canonical
         # writer can become that writer's identity handoff.  Ambiguous/web
@@ -8404,6 +8482,7 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
                    display_name=None, role=None, runtime=None,
                    persona=None,
                    allocate_persona=False, distinct_identity=False,
+                   repair_identity=False,
                    canonical_identity=False, registration_username=None,
                    allow_foreign_owner=False,
                    authorized_owner_labels=None):
@@ -8536,18 +8615,35 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
                     raise AttaccaError(
                         "automatic name allocation requires an explicit "
                         "director, advisor, or worker role")
+                if repair_identity:
+                    if not requested_parts or not requested_parts.get(
+                            "persona"):
+                        raise AttaccaError(
+                            "identity repair requires one exact existing "
+                            "named canonical actor")
+                    existing_repair_actor = conn.execute(
+                        "SELECT 1 FROM agents WHERE project_id=?"
+                        " AND agent_id=?", (project_id, requested_id)
+                    ).fetchone()
+                    if not existing_repair_actor:
+                        raise AttaccaError(
+                            "identity repair target is not registered")
                 # The migration marker proves only that history was scanned
                 # once. Raw maintenance/import writes may have added a named
                 # historical actor afterward, so every *creation* boundary
                 # performs an explicit safe rescan before choosing a name.
-                _seed_project_persona_reservations(
-                    conn, project_id, force=True)
+                _seed_all_persona_reservations(conn, force=True)
+                if repair_identity and not agent_persona_repair_status(
+                        conn, project_id, requested_id)["repair_required"]:
+                    raise AttaccaError(
+                        "identity repair is not required for '%s'" %
+                        requested_id)
                 persona = next_agent_persona(
                     conn, project_id, role, runtime)
                 # A new installation identity is deliberately independent.
                 # Never migrate the currently selected actor's inbox, claims,
                 # handoff, aliases, or lead pointer into the new name.
-                distinct_identity = True
+                distinct_identity = not repair_identity
             persona = normalize_agent_persona(
                 persona if persona is not None else
                 ((requested_parts or {}).get("persona") or
@@ -8560,8 +8656,7 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
                 # Explicit/recovered named identity creation is the other
                 # reuse boundary. Reconcile post-marker durable history before
                 # attempting to reserve the requested short name.
-                _seed_project_persona_reservations(
-                    conn, project_id, force=True)
+                _seed_all_persona_reservations(conn, force=True)
             matching = [] if distinct_identity else [
                 record["agent_id"] for record in records
                 if _matching_runtime(record, runtime)
@@ -8783,6 +8878,15 @@ def agent_list(conn, project_id, query=None, limit=None, offset=0, sort=None,
         return {"project": project_id, "agents": agents}
     identity_metadata = {}
     if options:
+        persona_conflicts = {}
+        for agent in agents:
+            parsed = parse_canonical_agent_id(
+                agent.get("agent_id"), project_id)
+            if parsed and parsed.get("persona"):
+                status = agent_persona_repair_status(
+                    conn, project_id, agent["agent_id"])
+                if status["legacy_duplicate_count"] > 1:
+                    persona_conflicts[agent["agent_id"]] = status
         agents = [{key: agent.get(key) for key in (
             "agent_id", "display_name", "role", "runtime",
             "persona_name", "short_name")}
@@ -8797,6 +8901,7 @@ def agent_list(conn, project_id, query=None, limit=None, offset=0, sort=None,
                 (project_id,))],
             "next_persona": next_agent_persona(
                 conn, project_id, "director", "codex"),
+            "persona_conflicts": persona_conflicts,
         }
     result = _collection_page(
         agents, "agents", query=query, limit=limit, offset=offset, sort=sort,
@@ -10141,9 +10246,15 @@ MCP_TOOLS = [
             "runtime": _s("e.g. claude-code, codex-cli, glm, human."),
             "persona": _s("Existing short name (for example Gibbs) for selection-only reuse."),
             "identity_mode": _s(
-                "reuse | new | temporary. New/temporary allocate the next "
-                "project-global never-reused friendly name; reuse never "
-                "migrates or rewrites identity state. Guided setup only."),
+                "reuse | new | temporary | repair. New/temporary allocate the next "
+                "server-global never-reused friendly name; reuse never "
+                "migrates or rewrites identity state; repair safely aliases "
+                "a grandfathered duplicate to a new unique name. Guided "
+                "setup only."),
+            "make_default": _b(
+                "Persist this selection as the installation default. "
+                "Omitted defaults to true for new and false for reuse; "
+                "temporary can never be made default."),
             "project": PROJECT_PROP,
         }},
     },
@@ -10925,9 +11036,12 @@ class McpSession:
             project, actor = self._project_actor(args)
             identity_mode = str(args.get("identity_mode") or "").lower()
             if identity_mode and identity_mode not in (
-                    "reuse", "new", "temporary"):
+                    "reuse", "new", "temporary", "repair"):
                 raise AttaccaError(
-                    "identity mode must be reuse, new, or temporary")
+                    "identity mode must be reuse, new, temporary, or repair")
+            make_default = identity_make_default(
+                identity_mode, args.get("make_default")) \
+                if identity_mode else False
             principal = self._authenticated_principal_context()
             registration_username = principal.get("username") \
                 if principal else None
@@ -10948,17 +11062,19 @@ class McpSession:
                     display_name=args.get("display_name"),
                     role=args.get("role"), runtime=args.get("runtime"),
                     persona=args.get("persona"),
-                    allocate_persona=identity_mode in ("new", "temporary"),
+                    allocate_persona=identity_mode in (
+                        "new", "temporary", "repair"),
                     distinct_identity=identity_mode in ("new", "temporary"),
+                    repair_identity=identity_mode == "repair",
                     canonical_identity=atype == "agent",
                     registration_username=registration_username,
                     authorized_owner_labels=authorized_owner_labels)
             if identity_mode:
                 # This is the server-side half of the explicit setup choice.
-                # A connect proxy mirrors the selected id into either its
-                # process-only override or durable machine binding after the
-                # successful response. Direct stdio MCP keeps it in this
-                # session object and never keys it to a host conversation id.
+                # A connect proxy always selects it for this process, then
+                # changes the durable binding only when make_default is true.
+                # Direct stdio MCP keeps it in this session object and never
+                # keys it to a host conversation id.
                 self.actor = result["agent_id"]
                 self.actor_type = "agent"
                 self.preserve_actor_identity = True
@@ -10966,6 +11082,10 @@ class McpSession:
                 result.update({
                     "identity_mode": identity_mode,
                     "temporary": identity_mode == "temporary",
+                    "make_default": make_default,
+                    "selection_scope": (
+                        "installation_default" if make_default
+                        else "current_mcp_process"),
                     "current_mcp_process_selected": True,
                 })
             return result
@@ -15804,9 +15924,12 @@ def _r_agent_register(h, m, q):
     authorized_owner_labels = auth_principal_owner_labels(
         h._conn(), principal) if principal and principal.get("user_id") else []
     identity_mode = str(body.get("identity_mode") or "").strip().lower()
-    if identity_mode and identity_mode not in ("reuse", "new", "temporary"):
+    if identity_mode and identity_mode not in (
+            "reuse", "new", "temporary", "repair"):
         raise AttaccaError(
-            "identity mode must be reuse, new, or temporary")
+            "identity mode must be reuse, new, temporary, or repair")
+    make_default = identity_make_default(
+        identity_mode, body.get("make_default")) if identity_mode else False
     admin_override = bool(
         principal and principal.get("auth_kind") == "session"
         and principal.get("is_admin"))
@@ -15826,9 +15949,11 @@ def _r_agent_register(h, m, q):
             display_name=body.get("display_name"), role=body.get("role"),
             runtime=body.get("runtime"), persona=body.get("persona"),
             allocate_persona=(body.get("allocate_persona") is True or
-                              identity_mode in ("new", "temporary")),
+                              identity_mode in (
+                                  "new", "temporary", "repair")),
             distinct_identity=(body.get("distinct_identity") is True or
                                identity_mode in ("new", "temporary")),
+            repair_identity=identity_mode == "repair",
             canonical_identity=(atype == "agent" or
                                 bool(principal and
                                      principal.get("token_kind") == "client") or
@@ -15837,6 +15962,13 @@ def _r_agent_register(h, m, q):
             registration_username=registration_username,
             allow_foreign_owner=admin_override,
             authorized_owner_labels=authorized_owner_labels)
+    if identity_mode:
+        result.update({
+            "make_default": make_default,
+            "selection_scope": (
+                "installation_default" if make_default
+                else "current_mcp_process"),
+        })
     h._reply_json(200, result)
 
 
@@ -17739,10 +17871,10 @@ def run_connect_proxy(url=None, actor=None, actor_type=None, project=None,
     def apply_identity_selection(message, decoded, context):
         """Adopt an explicit setup identity in this one connect process.
 
-        The hosted tool performs the authorized registry mutation.  Only after
-        that success does the local proxy either save a permanent binding or
-        keep a temporary in-memory override.  A different Codex/Claude host
-        process therefore cannot inherit a temporary selection.
+        The hosted tool performs the authorized registry mutation. Only after
+        that success does the local proxy select the actor for this process.
+        The durable installation binding changes solely when make_default is
+        true; ordinary reuse therefore disappears when this proxy exits.
         """
         if not isinstance(message, dict) \
                 or message.get("method") != "tools/call":
@@ -17752,8 +17884,10 @@ def run_connect_proxy(url=None, actor=None, actor_type=None, project=None,
             return
         arguments = params.get("arguments") or {}
         mode = str(arguments.get("identity_mode") or "").strip().lower()
-        if mode not in ("reuse", "new", "temporary"):
+        if mode not in ("reuse", "new", "temporary", "repair"):
             return
+        make_default = identity_make_default(
+            mode, arguments.get("make_default"))
         if not isinstance(decoded, dict):
             return
         rpc_result = decoded.get("result")
@@ -17776,13 +17910,13 @@ def run_connect_proxy(url=None, actor=None, actor_type=None, project=None,
             return
         selected_project = context.get("project") or parsed["project_id"]
         state["project"] = selected_project
-        if mode == "temporary":
-            state["temporary_actor"] = selected
-        else:
+        if make_default:
             machine_actor_binding_set(
                 context["url"], selected_project, context["runtime"],
                 selected, client_instance=context.get("client_instance"))
             state["temporary_actor"] = None
+        else:
+            state["temporary_actor"] = selected
         # The hosted session was initialized under the prior request actor.
         # Recreate it lazily under the selected exact identity next call.
         reset_remote()
@@ -20346,6 +20480,8 @@ def _remote_setup_network(url, project_id, workspaces, actor_id, actor_type):
     relationship_inbox = []
     agents = []
     persona_names_reserved = []
+    next_persona_preview = None
+    persona_conflicts = {}
     if candidate:
         encoded = urllib.parse.quote(project_id, safe="")
         bridges = (remote_json(
@@ -20363,6 +20499,8 @@ def _remote_setup_network(url, project_id, workspaces, actor_id, actor_type):
         agents = agent_payload.get("agents") or []
         persona_names_reserved = agent_payload.get(
             "persona_names_reserved") or []
+        next_persona_preview = agent_payload.get("next_persona")
+        persona_conflicts = agent_payload.get("persona_conflicts") or {}
     other = [p for p in workspaces if p["project_id"] != project_id]
     suggested_master = next(
         (m.get("origin_project") for m in relationship_inbox
@@ -20403,6 +20541,8 @@ def _remote_setup_network(url, project_id, workspaces, actor_id, actor_type):
         "current_actor_record": identity["record"],
         "agents": agents,
         "persona_names_reserved": persona_names_reserved,
+        "next_persona": next_persona_preview,
+        "persona_conflicts": persona_conflicts,
         "existing_relationships": named_bridges,
         "relationship_inbox": named_inbox,
         "available_workspaces": [
@@ -20416,7 +20556,9 @@ def _remote_setup_network(url, project_id, workspaces, actor_id, actor_type):
 
 
 def setup_identity_options(agents, project_id, role, runtime,
-                           bound_actor_id=None, reserved_personas=None):
+                           bound_actor_id=None, reserved_personas=None,
+                           next_persona_preview=None,
+                           persona_conflicts=None):
     """Build the one-time guided choice without selecting an actor.
 
     This helper is intentionally pure: discovery may preview the next name,
@@ -20428,6 +20570,7 @@ def setup_identity_options(agents, project_id, role, runtime,
         raise AttaccaError("agent role must be director, advisor, or worker")
     runtime = normalize_agent_runtime(runtime)
     records = [dict(item) for item in (agents or [])]
+    persona_conflicts = persona_conflicts or {}
     reusable = []
     for record in records:
         parsed = parse_canonical_agent_id(
@@ -20445,6 +20588,7 @@ def setup_identity_options(agents, project_id, role, runtime,
             "owner": record.get("owner"),
             "compatibility_identity": parsed.get("persona") is None,
             "currently_bound": record["agent_id"] == bound_actor_id,
+            "repair": persona_conflicts.get(record["agent_id"]),
         })
     reusable.sort(key=lambda item: (
         not item["currently_bound"], item.get("persona") is None,
@@ -20453,13 +20597,30 @@ def setup_identity_options(agents, project_id, role, runtime,
         {"agent_id": canonical_agent_id(
             project_id, "unassigned", "reserved", item)}
         for item in (reserved_personas or [])]
-    next_persona = next_agent_persona(
-        preview_records, project_id, role, runtime)
+    next_persona = normalize_agent_persona(next_persona_preview) \
+        if next_persona_preview else next_agent_persona(
+            preview_records, project_id, role, runtime)
     preview_fields = agent_persona_fields(next_persona)
     return {
         "project_id": project_id, "role": role, "runtime": runtime,
         "bound_actor_id": bound_actor_id,
         "selection_required": not bool(bound_actor_id),
+        "repair_required": bool(
+            bound_actor_id and
+            (persona_conflicts.get(bound_actor_id) or {}).get(
+                "repair_required")),
+        "repair_identity": ({
+            "mode": "repair",
+            "actor_id": bound_actor_id,
+            "persona_preview": next_persona,
+            "persona_name": preview_fields["persona_name"],
+            "short_name": preview_fields["short_name"],
+            "actor_id_preview": canonical_agent_id(
+                project_id, role, runtime, next_persona),
+            "persistent": True,
+        } if bound_actor_id and
+            (persona_conflicts.get(bound_actor_id) or {}).get(
+                "repair_required") else None),
         "reusable_identities": reusable,
         "new_identity": {
             "mode": "new", "persona_preview": next_persona,
@@ -20573,23 +20734,26 @@ def select_registered_agent_identity(conn, project_id, current_actor_id,
 def select_setup_identity(conn, project_id, role, runtime, *, mode,
                           actor_id=None, server_url=None,
                           client_instance=None, home=None, session=None,
+                          make_default=None,
                           requested_by=None, actor_type="agent",
                           registration_username=None,
                           authorized_owner_labels=None):
-    """Apply one explicit reuse/new/temporary setup identity choice.
+    """Apply one explicit reuse/new/temporary/repair setup identity choice.
 
-    ``temporary`` changes only the supplied live MCP session and deliberately
-    omits the machine binding.  Its registry row remains as immutable audit
-    history, but no later process selects it implicitly.
+    Every choice changes the supplied live MCP session. Reuse is process-only
+    unless ``make_default=True``; new identities remain default-persistent
+    when the flag is omitted. Temporary is always process-only. Registry rows
+    remain immutable audit history and can be explicitly selected later.
     """
     mode = str(mode or "").strip().lower()
-    if mode not in ("reuse", "new", "temporary"):
+    if mode not in ("reuse", "new", "temporary", "repair"):
         raise AttaccaError(
-            "identity mode must be reuse, new, or temporary")
+            "identity mode must be reuse, new, temporary, or repair")
     role = str(role or "").strip().lower()
     if role not in AGENT_ROLES:
         raise AttaccaError("agent role must be director, advisor, or worker")
     runtime = normalize_agent_runtime(runtime)
+    persist_default = identity_make_default(mode, make_default)
     get_project(conn, project_id)
     if mode == "reuse":
         registration = select_registered_agent_identity(
@@ -20602,8 +20766,10 @@ def select_setup_identity(conn, project_id, role, runtime, *, mode,
         caller = str(requested_by or actor_id or runtime).strip()
         registration = agent_register(
             conn, project_id, caller, actor_type,
+            agent_id=actor_id if mode == "repair" else None,
             role=role, runtime=runtime, canonical_identity=True,
             allocate_persona=True, distinct_identity=True,
+            repair_identity=mode == "repair",
             registration_username=registration_username,
             authorized_owner_labels=authorized_owner_labels)
         selected = registration["agent_id"]
@@ -20616,13 +20782,17 @@ def select_setup_identity(conn, project_id, role, runtime, *, mode,
             session._registered = set()
 
     binding = None
-    if mode in ("reuse", "new") and server_url:
+    if persist_default and server_url:
         binding = machine_actor_binding_set(
             server_url, project_id, runtime, selected,
             client_instance=client_instance, home=home)
     result = {
         "ok": True, "project_id": project_id, "actor_id": selected,
         "mode": mode, "temporary": mode == "temporary",
+        "make_default": persist_default,
+        "selection_scope": (
+            "installation_default" if persist_default
+            else "current_mcp_process"),
         "binding_saved": bool(binding), "registration": registration,
     }
     if binding:
@@ -20714,7 +20884,9 @@ def discover_remote_setup(url=None, path=None, here=False,
             selected_role: setup_identity_options(
                 network.get("agents") or [], network_project, selected_role,
                 runtime, bound_actor_id=(actor_binding or {}).get("actor_id"),
-                reserved_personas=network.get("persona_names_reserved") or [])
+                reserved_personas=network.get("persona_names_reserved") or [],
+                next_persona_preview=network.get("next_persona"),
+                persona_conflicts=network.get("persona_conflicts") or {})
             for selected_role in AGENT_ROLES
         }
     return {"server_url": url,
@@ -20735,6 +20907,7 @@ def apply_remote_network_setup(url, project_id, actor_id, actor_type,
                                role="keep", lead="keep", bridge=None,
                                relationship=None, principal_side="other",
                                identity_mode="auto", identity_actor=None,
+                               make_default=None,
                                client_instance=None, home=None):
     """Apply the explicitly confirmed governance part of guided setup.
 
@@ -20743,9 +20916,10 @@ def apply_remote_network_setup(url, project_id, actor_id, actor_type,
     or churning ledger events.
     """
     url = configured_server_url(url)
-    if identity_mode not in ("auto", "reuse", "new", "temporary"):
+    if identity_mode not in (
+            "auto", "reuse", "new", "temporary", "repair"):
         raise AttaccaError(
-            "identity mode must be auto, reuse, new, or temporary")
+            "identity mode must be auto, reuse, new, temporary, or repair")
     if identity_mode == "temporary":
         raise AttaccaError(
             "temporary_identity_requires_current_mcp: a shell/setup "
@@ -20775,11 +20949,28 @@ def apply_remote_network_setup(url, project_id, actor_id, actor_type,
     binding = machine_actor_binding_get(
         url, project_id, runtime, client_instance=client_instance, home=home)
     selected_mode = identity_mode
+    bound_repair = None
+    if binding:
+        option_payload = remote_json(
+            url, "GET", "/v1/projects/%s/agents?options=1&reuse_options=1" %
+            encoded, actor=binding["actor_id"], actor_type=actor_type)
+        bound_repair = (option_payload.get("persona_conflicts") or {}).get(
+            binding["actor_id"])
     if selected_mode == "auto":
-        selected_mode = "reuse" if binding else (
+        selected_mode = "repair" if (
+            binding and (bound_repair or {}).get("repair_required")) else (
+            "reuse" if binding else (
             "new" if role != "keep" else "auto")
+        )
     if role == "keep" and binding:
         effective_actor = binding["actor_id"]
+        if selected_mode == "repair":
+            bound_parts = parse_canonical_agent_id(
+                effective_actor, project_id)
+            if not bound_parts:
+                raise AttaccaError(
+                    "identity repair requires a canonical machine binding")
+            role = bound_parts["role"]
     if role != "keep":
         workspace_name = next(
             p["name"] for p in projects if p["project_id"] == project_id)
@@ -20804,8 +20995,24 @@ def apply_remote_network_setup(url, project_id, actor_id, actor_type,
                 "identity_mode": "reuse",
             }
             registration_actor = effective_actor
+        elif selected_mode == "repair":
+            effective_actor = str(
+                identity_actor or (binding or {}).get("actor_id") or "")
+            parsed = parse_canonical_agent_id(effective_actor, project_id)
+            if not parsed or parsed["role"] != role \
+                    or parsed["runtime"] != runtime:
+                raise AttaccaError(
+                    "repair requires the exact currently bound named actor")
+            registration_body = {
+                "agent_id": effective_actor,
+                "role": role, "runtime": runtime,
+                "canonical_identity": True,
+                "identity_mode": "repair",
+                "make_default": True,
+            }
+            registration_actor = effective_actor
         else:
-            # Color selection is repeated atomically by the hosted store;
+            # Name selection is repeated atomically by the hosted store;
             # discovery previews are deliberately not trusted for allocation.
             registration_body = {
                 "agent_id": actor_id,
@@ -20816,8 +21023,18 @@ def apply_remote_network_setup(url, project_id, actor_id, actor_type,
                 "allocate_persona": True,
                 "distinct_identity": True,
                 "identity_mode": selected_mode,
+                "make_default": identity_make_default(
+                    selected_mode, make_default),
             }
             registration_actor = actor_id
+        persist_default = identity_make_default(
+            selected_mode, make_default)
+        if selected_mode == "reuse" and not persist_default and (
+                not binding or effective_actor != binding["actor_id"]):
+            raise AttaccaError(
+                "session_only_identity_requires_current_mcp: shell setup "
+                "cannot switch the already-running parent coding client; "
+                "use native setup or explicitly choose make_default")
         registered = remote_json(
             url, "POST", "/v1/projects/%s/agents" % encoded,
             registration_body,
@@ -20830,7 +21047,7 @@ def apply_remote_network_setup(url, project_id, actor_id, actor_type,
                             "persona"),
                         "already_registered": bool(
                             registered.get("already_registered"))})
-        if selected_mode in ("reuse", "new"):
+        if persist_default:
             saved = machine_actor_binding_set(
                 url, project_id, runtime, effective_actor,
                 client_instance=client_instance, home=home)
@@ -20840,9 +21057,11 @@ def apply_remote_network_setup(url, project_id, actor_id, actor_type,
                                 "client_instance"],
                             "changed": saved["changed"]})
         else:
-            raise AttaccaError(
-                "temporary_identity_requires_current_mcp: no persistent "
-                "binding was written")
+            actions.append({
+                "kind": "identity_selection", "actor_id": effective_actor,
+                "selection_scope": "current_setup_process",
+                "binding_changed": False,
+            })
 
     status = remote_json(
         url, "GET", "/v1/projects/%s/status" % encoded,
@@ -20879,6 +21098,11 @@ def apply_remote_network_setup(url, project_id, actor_id, actor_type,
             return {"ok": True, "project": project_id,
                     "actor": effective_actor,
                     "identity_mode": selected_mode,
+                    "make_default": (identity_make_default(
+                        selected_mode, make_default)
+                        if selected_mode in (
+                            "reuse", "new", "temporary", "repair")
+                        else False),
                     "actions": actions}
         principal = None if relationship == "peer" else (
             project_id if principal_side == "current" else bridge)
@@ -20913,6 +21137,10 @@ def apply_remote_network_setup(url, project_id, actor_id, actor_type,
                             "unchanged": False})
     return {"ok": True, "project": project_id, "actor": effective_actor,
             "identity_mode": selected_mode,
+            "make_default": (identity_make_default(
+                selected_mode, make_default)
+                if selected_mode in (
+                    "reuse", "new", "temporary", "repair") else False),
             "actions": actions}
 
 
@@ -21211,11 +21439,13 @@ def managed_instruction_block(project_id, db_path):
     lines.append("markers, and reports the exact files changed.")
     lines.append("")
     lines.append("New agent identities use `workspace.role.runtime.persona` (for example,")
-    lines.append("`analytics-engine.director.codex.gibbs`) and expose a project-unique")
+    lines.append("`analytics-engine.director.codex.gibbs`) and expose a server-unique")
     lines.append("friendly address such as `@Gibbs`. Existing legacy three-part identities")
-    lines.append("and earlier colored persona identities remain valid for compatibility or")
-    lines.append("explicit migration. The client installation binding selects the exact")
-    lines.append("identity; a normal startup or resumed session silently reuses that binding.")
+    lines.append("and grandfathered duplicate/colored personas remain valid for compatibility")
+    lines.append("until explicit setup repair aliases them safely. The client installation")
+    lines.append("binding selects the exact default identity; normal startup/resume silently")
+    lines.append("reuses it. Explicit reuse changes only the current MCP process unless the")
+    lines.append("human separately chooses to make that identity the installation default.")
     lines.append("The authenticated human operator is")
     lines.append("recorded separately on every mutation as `Run by user`; never combine or")
     lines.append("substitute the human and AI identities. Git branch and revision describe the")
@@ -22910,13 +23140,22 @@ def build_parser():
                    default="keep",
                    help="confirmed role for this AI in the selected workspace")
     p.add_argument("--identity-mode",
-                   choices=("auto", "reuse", "new", "temporary"),
+                   choices=("auto", "reuse", "new", "temporary", "repair"),
                    default="auto",
                    help="reuse an exact actor, allocate a permanent unique "
-                        "name; temporary identities can only be activated "
-                        "through an already-authorized current MCP proxy")
+                        "name, or repair a grandfathered duplicate; temporary "
+                        "identities can only be activated through an already-"
+                        "authorized current MCP proxy")
     p.add_argument("--identity-actor", default=None, metavar="ACTOR_ID",
                    help=argparse.SUPPRESS)
+    identity_scope = p.add_mutually_exclusive_group()
+    identity_scope.add_argument(
+        "--make-default", dest="make_default", action="store_true",
+        default=None,
+        help="persist the selected identity as this installation's default")
+    identity_scope.add_argument(
+        "--session-only", dest="make_default", action="store_false",
+        help="select an existing identity only for the current MCP process")
     p.add_argument("--lead", choices=("keep", "current", "clear"),
                    default="keep",
                    help="preserve the lead, make this actor lead, or clear it")
@@ -23697,10 +23936,9 @@ def cli_main(argv=None):
                         else:
                             raise AttaccaError("choose role 1, 2, 3, or 4")
 
-                    # Identity is an installation choice, not a host-session
-                    # choice. Ordinary starts never prompt; explicit setup
-                    # offers takeover/reuse, a permanent next name, or a
-                    # temporary name for only the current MCP process.
+                    # Ordinary starts never prompt. Explicit setup separates
+                    # this process's selection from the saved installation
+                    # default and also repairs legacy duplicate short names.
                     identity_options = (
                         network.get("identity_options_by_role") or {}).get(
                             args.role) or {}
@@ -23711,13 +23949,21 @@ def cli_main(argv=None):
                     bound = next((item for item in reusable
                                   if item["actor_id"] == bound_id), None)
                     choices = []
+                    repair = identity_options.get("repair_identity")
+                    if repair:
+                        choices.append((
+                            "repair", repair["actor_id"],
+                            "Repair duplicate identity as %s — recommended" %
+                            (repair.get("short_name") or
+                             repair.get("persona_name") or "next name")))
                     if bound:
                         choices.append((
                             "reuse", bound["actor_id"],
-                            "Continue as %s (%s) — recommended" % (
+                            "Continue as %s (%s)%s" % (
                                 bound["display_name"],
                                 bound.get("persona_name") or
-                                "legacy compatibility identity")))
+                                "legacy compatibility identity",
+                                " — recommended" if not repair else "")))
                     else:
                         choices.append((
                             "new", None,
@@ -23755,6 +24001,14 @@ def cli_main(argv=None):
                             "choose one of the listed identity numbers")
                     args.identity_mode = selected_identity[0]
                     args.identity_actor = selected_identity[1]
+                    if args.identity_mode in ("new", "repair"):
+                        args.make_default = True
+                    elif args.identity_mode == "reuse" and \
+                            args.identity_actor != bound_id:
+                        make_default = ask(
+                            "  make this the installation default? [y/N]: "
+                        ).lower()
+                        args.make_default = make_default in ("y", "yes")
 
                 keep_relationships = bool(network["existing_relationships"])
                 if keep_relationships:
@@ -23829,7 +24083,8 @@ def cli_main(argv=None):
                     relationship=args.relationship,
                     principal_side=args.principal,
                     identity_mode=args.identity_mode,
-                    identity_actor=args.identity_actor)
+                    identity_actor=args.identity_actor,
+                    make_default=args.make_default)
         credential_result = None
         if info["mode"] == "server" and actor_type == "agent":
             token_actor = (network_result or {}).get("actor") or actor

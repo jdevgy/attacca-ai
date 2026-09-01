@@ -57,7 +57,7 @@ class NamedIdentityUiDocsTests(unittest.TestCase):
         self.assertNotIn('id="agent-id-new"', self.panel)
         self.assertNotIn('name="agent_id_new"', self.panel)
 
-    def test_guides_preserve_project_wide_never_reuse_and_setup_lifecycle(self):
+    def test_guides_preserve_server_wide_never_reuse_and_setup_lifecycle(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         skill = (ROOT / "skills" / "setup" / "SKILL.md").read_text(
             encoding="utf-8")
@@ -69,9 +69,13 @@ class NamedIdentityUiDocsTests(unittest.TestCase):
             self.assertIn("case-insensitive", guide)
             self.assertIn("historical", guide)
             self.assertIn("temporary", guide)
+            self.assertIn("server", guide.lower())
         self.assertIn("selection-only", readme)
-        self.assertIn("Reuse is selection-only", skill)
-        self.assertIn("reuse is selection-only", kimi)
+        self.assertIn("Make default", readme)
+        self.assertIn("current MCP process", skill)
+        self.assertIn("current MCP process", kimi)
+        self.assertIn("identity_mode=repair", skill)
+        self.assertIn("identity_mode=repair", kimi)
 
 
 if __name__ == "__main__":

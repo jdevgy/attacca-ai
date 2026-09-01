@@ -15,7 +15,7 @@ In Claude Code, use its native choice UI for each decision. Codex has no popup
 choice picker for this flow, so present a short numbered list and ask the user
 to type a number or displayed name. Keep exact project and actor ids from
 discovery only as internal arguments; never display, invent, or ask for a raw
-id. Identity choices use the generated project-unique name and short address,
+id. Identity choices use the generated server-unique name and short address,
 such as **Gibbs · @Gibbs · Director · Codex**.
 
 ## FAST PATH — this is a DECISION flow, NOT a thinking job
@@ -185,8 +185,10 @@ Read `network.machine_actor_binding` and the selected role's entry in
 `workspace.role.runtime.persona`, but never show that raw string. New setup-
 created identities receive human-friendly names such as **Gibbs** with short
 address **@Gibbs**. The server transactionally reserves each name
-case-insensitively across the entire project—every role, runtime, current
-identity, and historical identity—so a name is never issued twice. A discovered
+case-insensitively across the entire Attacca server—every workspace, role,
+runtime, current identity, and historical identity—so a new name is never
+issued twice. Setup flags grandfathered cross-workspace duplicates and offers
+an idempotent repair that preserves the old actor as an audit alias. A discovered
 three-part actor or an existing Red/Blue persona is a compatibility identity: it
 may be explicitly reused/taken over, but setup must never silently migrate,
 clone, or rename it.
@@ -203,7 +205,7 @@ Offer these friendly choices:
    raw actor ID.
 3. **Create permanent <next generated name> identity**. The server allocates and
    forever reserves the name atomically; `persona_name` / `short_name` from
-   discovery are previews only (the first available project name is Gibbs).
+   discovery are previews only (the first available server name is Gibbs).
 4. When a valid machine binding already authorizes this running proxy, **Use
    temporary <next generated name> identity in this MCP process**. It creates a
    separately auditable actor but does not replace the machine binding; a fresh
@@ -214,12 +216,20 @@ identity** and offer same-owner reusable identities, but do not offer temporary:
 D-17 requires an exact registered actor before MCP can authorize the selection.
 Never infer takeover merely because the same runtime is already registered.
 
+When `repair_required` is true for the bound identity, recommend **Repair
+duplicate <old name> as <next name>** and apply `identity_mode=repair`. The
+server reserves the replacement atomically, retains the old reservation and
+immutable events, records an alias, migrates mutable identity pointers, and the
+client saves the replacement as its default. A healthy rerun is a no-op.
+
 For a first/unbound permanent setup, carry the choice into the single CLI apply
 command as `--identity-mode new|reuse`; only a reuse passes the discovered exact
 actor through hidden `--identity-actor`, and that raw value is never displayed.
-Permanent new/reuse saves the machine binding. Reuse is selection-only: it
-never merges, deletes, renames, or otherwise mutates the identity that was
-active before the selection.
+New saves the machine binding. Reuse is registry-selection-only and, on an
+already-bound live client, changes only the current MCP process by default: it
+never merges, deletes, renames, or changes the saved default. A first/unbound
+reuse must explicitly choose **Make default** because no process can restart
+without one. Pass `make_default=true` only after that explicit choice.
 
 When setup was explicitly invoked to switch an already-linked, already-running
 client with a valid binding, make the switch through the **current Attacca MCP
@@ -228,11 +238,13 @@ selected `role`, current `runtime`, and `identity_mode` (`identity_mode=temporar
 for the process-only choice). For reuse, pass the selected discovered `persona`
 for a named identity. A persona-less three-part compatibility choice instead
 passes its exact discovered `agent_id` as a hidden tool argument; never show or
-ask the human for that raw value. A
-successful `new` or `reuse` response updates the machine binding and hot-switches
-the proxy. A successful `temporary` response hot-switches only this proxy's
-in-memory actor. Never call this path during ordinary startup/resume. If setup
-was also requested to repair tool wiring, perform the idempotent wiring repair
+ask the human for that raw value. A successful `new` response updates the
+machine binding and hot-switches the proxy. A successful `reuse` hot-switches
+only this proxy unless the human explicitly chose **Make default**; pass
+`make_default=true` for that choice. A successful `temporary` response
+hot-switches only this proxy's in-memory actor. Never call this path during
+ordinary startup/resume. If setup was also requested to repair tool wiring,
+perform the idempotent wiring repair
 before this in-process switch so a temporary choice is not overwritten by a
 second setup process.
 

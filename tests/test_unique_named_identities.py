@@ -103,6 +103,64 @@ class NamedIdentityTestCase(unittest.TestCase):
             reserved["reserved_actor_id"],
             "engine.worker.claude.turing")
 
+    def test_setup_repairs_grandfathered_cross_workspace_duplicate(self):
+        original = self.new_identity()
+        c.project_init(
+            self.conn, "setup", "human", path=str(self.root / "target"),
+            project_id="target", name="Target")
+        duplicate = "target.director.codex.gibbs"
+        nowi = c.now_iso()
+        self.conn.execute(
+            "INSERT INTO agents"
+            " (project_id,agent_id,display_name,role,runtime,owner,actor_type,"
+            " registered_at,last_seen_at) VALUES"
+            " ('target',?,'Legacy duplicate Gibbs','director','codex','jack',"
+            " 'agent',?,?)", (duplicate, nowi, nowi))
+        # Upgrade discovery records both historical facts without invalidating
+        # either actor. The later workspace is then offered a safe repair.
+        c._seed_project_persona_reservations(
+            self.conn, "target", force=True)
+        self.conn.execute(
+            "INSERT INTO inbox_cursors"
+            " (project_id,actor_id,last_read_seq,updated_at)"
+            " VALUES ('target',?,7,?)", (duplicate, nowi))
+        status = c.agent_persona_repair_status(
+            self.conn, "target", duplicate)
+        self.assertTrue(status["repair_required"])
+        self.assertFalse(c.agent_persona_repair_status(
+            self.conn, "engine", original["agent_id"])["repair_required"])
+
+        repaired = c.select_setup_identity(
+            self.conn, "target", "director", "codex", mode="repair",
+            actor_id=duplicate, server_url="https://attacca.example",
+            client_instance="repair-client", home=self.root / "repair-home")
+        self.assertEqual(repaired["actor_id"],
+                         "target.director.codex.turing")
+        self.assertTrue(repaired["binding_saved"])
+        self.assertEqual(repaired["selection_scope"],
+                         "installation_default")
+        self.assertIsNone(self.conn.execute(
+            "SELECT 1 FROM agents WHERE project_id='target' AND agent_id=?",
+            (duplicate,)).fetchone())
+        alias = self.conn.execute(
+            "SELECT canonical_actor_id FROM actor_aliases"
+            " WHERE project_id='target' AND legacy_actor_id=?",
+            (duplicate,)).fetchone()
+        self.assertEqual(alias["canonical_actor_id"], repaired["actor_id"])
+        cursor = self.conn.execute(
+            "SELECT last_read_seq FROM inbox_cursors"
+            " WHERE project_id='target' AND actor_id=?",
+            (repaired["actor_id"],)).fetchone()
+        self.assertEqual(cursor["last_read_seq"], 7)
+        # The old reservation remains append-only for audit; only new active
+        # identities receive the server-wide unique replacement.
+        self.assertEqual({
+            (row["project_id"], row["persona"])
+            for row in self.conn.execute(
+                "SELECT project_id,persona FROM agent_persona_reservations")
+        }, {("engine", "gibbs"), ("target", "gibbs"),
+            ("target", "turing")})
+
     def test_unicode_persona_input_and_post_marker_history_fail_closed(self):
         before = self.conn.execute(
             "SELECT COUNT(*) AS n FROM agents WHERE project_id='engine'"
@@ -375,7 +433,7 @@ class NamedIdentityTestCase(unittest.TestCase):
             allocate_persona=True, distinct_identity=True,
             registration_username="jack", authorized_owner_labels=["jack"])
         self.assertEqual(source["identity"]["persona"], "gibbs")
-        self.assertEqual(target["identity"]["persona"], "gibbs")
+        self.assertEqual(target["identity"]["persona"], "turing")
 
         # Resolve no target identity data until bridge existence is proven.
         c.project_init(
@@ -424,7 +482,7 @@ class NamedIdentityTestCase(unittest.TestCase):
 
         sent = c.room_send(
             self.conn, "engine", source["agent_id"], "agent",
-            "@gIbBs Do this", target_project="target")
+            "@tUrInG Do this", target_project="target")
         self.assertEqual(sent["mirrored_to"], ["target"])
         mirrored = self.conn.execute(
             "SELECT payload FROM events WHERE project_id='target'"
@@ -462,7 +520,7 @@ class NamedIdentityTestCase(unittest.TestCase):
         with self.assertRaisesRegex(c.AttaccaError, "room_mention_inactive"):
             c.room_send(
                 self.conn, "engine", source["agent_id"], "agent",
-                "@Gibbs still there?", target_project="target")
+                "@Turing still there?", target_project="target")
 
 
 if __name__ == "__main__":

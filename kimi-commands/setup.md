@@ -12,7 +12,7 @@ Use native choice UI for each decision when it is available. Otherwise show a
 short numbered list and accept the number or displayed name. Always label
 choices with workspace names. Keep exact project and actor ids from discovery
 only as internal tool arguments; never display, invent, or ask the user for a
-raw id. Identity choices use the generated project-unique name and short
+raw id. Identity choices use the generated server-unique name and short
 address, such as **Gibbs · @Gibbs · Director · Kimi**, never the raw canonical
 actor string. Treat $ARGUMENTS as preferences, not permission to skip
 confirmation. Ordinary Kimi startup/resume silently reuses the installation
@@ -152,8 +152,10 @@ Use `network.machine_actor_binding` and the selected role's entry in
 shape `workspace.role.runtime.persona`; do not show that string. New setup-
 created actors receive human-friendly names such as **Gibbs** with short address
 **@Gibbs**. The server transactionally reserves each name case-insensitively
-across the entire project—every role, runtime, current identity, and historical
-identity—so it can never be issued twice. A discovered three-part actor or an
+across the entire Attacca server—every workspace, role, runtime, current
+identity, and historical identity—so a new name can never be issued twice.
+Setup flags grandfathered cross-workspace duplicates and offers a safe repair
+that retains the old actor as an audit alias. A discovered three-part actor or an
 existing Red/Blue persona is an **Existing compatibility identity**: it may be
 explicitly reused, but setup never silently migrates, clones, or renames it.
 
@@ -166,20 +168,28 @@ Offer friendly choices:
    handoff, inbox cursor, and task leases.
 3. **Create permanent <next generated name> identity**. The server allocates and
    forever reserves the name atomically; `persona_name` / `short_name` from
-   discovery are previews only (the first available project name is Gibbs).
+   discovery are previews only (the first available server name is Gibbs).
 4. When a valid machine binding already authorizes this running proxy, **Use
    temporary <next generated name> identity in this MCP process**. It remains
    auditable but does not replace the machine binding, so a fresh process does
    not select it automatically.
 
+When `repair_required` is true for the bound identity, recommend repair and
+apply `identity_mode=repair`. The server preserves immutable history and the
+old reservation, records an alias, migrates mutable identity pointers, and
+saves the unique replacement as the installation default. A healthy rerun is
+a no-op.
+
 With no binding, recommend the permanent next generated name and do not offer a
 temporary identity: authenticated MCP requires an exact registered actor first.
 Never infer takeover just because another Kimi actor already exists. A
 first/unbound permanent setup carries the choice into the CLI as
-`--identity-mode new|reuse`; reuse alone
-passes the discovered exact actor through hidden `--identity-actor`, never in
-UI text. Permanent reuse is selection-only: it never merges, deletes, renames,
-or otherwise mutates the identity that was active before the selection.
+`--identity-mode new|reuse`; reuse alone passes the discovered exact actor
+through hidden `--identity-actor`, never in UI text. New saves the default.
+Reuse changes only the current MCP process unless the human explicitly chooses
+**Make default**; then pass `make_default=true`. A first/unbound reuse must make
+that explicit choice because it has no restart-safe default. Reuse never merges,
+deletes, or renames either identity.
 
 For an explicit switch in an already-linked running Kimi client with a valid
 binding, call `agent_register` through the **current Attacca MCP proxy** with
@@ -187,9 +197,10 @@ the selected `role`, current `runtime`, and `identity_mode`
 (`identity_mode=temporary` for the process-only choice). For reuse, pass the
 selected discovered `persona` for a named identity. A persona-less three-part
 compatibility choice instead passes its exact discovered `agent_id` as a hidden
-tool argument, never visible or requested as UI text. A successful permanent `new` or
-`reuse` updates the machine binding and hot-switches this proxy; `temporary`
-hot-switches only this proxy in memory. Never call this path during ordinary
+tool argument, never visible or requested as UI text. A successful permanent
+`new` updates the binding; `reuse` hot-switches only this proxy unless
+`make_default=true`; `temporary` hot-switches only this proxy in memory. Never
+call this path during ordinary
 startup/resume. If tool wiring also needs repair, run that idempotent repair
 before switching so a temporary choice is not overwritten by another process.
 
