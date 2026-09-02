@@ -250,7 +250,7 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
         self.assertEqual(set(hooks),
                          {"SessionStart", "UserPromptSubmit", "Stop"})
         self.assertEqual(hooks["SessionStart"][0]["matcher"],
-                         "startup|resume|clear|compact")
+                         "startup|resume|clear|compact|fork")
         commands = []
         for event in ("SessionStart", "UserPromptSubmit", "Stop"):
             command = hooks[event][0]["hooks"][0]
