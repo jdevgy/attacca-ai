@@ -46,6 +46,7 @@ _PERSONA_HISTORY_COLUMNS = (
     ("bridges", ("created_by", "access_a", "access_b")),
     ("inbox_cursors", ("actor_id",)),
     ("message_dispositions", ("actor_id", "updated_by")),
+    ("message_disposition_baselines", ("actor_id", "set_by")),
     ("tasks", ("claimed_by", "created_by")),
     ("task_plan_revisions", ("authored_by",)),
     ("handoffs", ("updated_by",)),
@@ -617,6 +618,15 @@ def build_project_export(conn, project_id, log_renderer=None):
             "ORDER BY actor_id, message_event_id",
             (project_id,),
         )
+        # Each actor's reconciliation baseline is durable project-authored
+        # state: without it an import would recompute the baseline from a
+        # newer cursor and silently close history that is genuinely open.
+        disposition_baselines = _optional_rows(
+            conn, tables, "message_disposition_baselines",
+            "SELECT * FROM message_disposition_baselines WHERE project_id=? "
+            "ORDER BY actor_id",
+            (project_id,),
+        )
         cloud_context_rows = _optional_rows(
             conn, tables, "project_cloud_context",
             "SELECT * FROM project_cloud_context WHERE project_id=?",
@@ -653,13 +663,14 @@ def build_project_export(conn, project_id, log_renderer=None):
         "inbox_cursors": len(cursors),
         "agent_clients": len(clients),
         "message_dispositions": len(dispositions),
+        "message_disposition_baselines": len(disposition_baselines),
         "cloud_context": 1 if cloud_context is not None else 0,
     }
     snapshot_at = _snapshot_at([
         [project], raw_events, raw_tasks, raw_plans, raw_handoffs,
         raw_identity_handoffs, role_scope_revisions, decisions, rules,
         agents, persona_reservations, aliases, raw_bridges, cursors, clients,
-        dispositions,
+        dispositions, disposition_baselines,
         cloud_context_rows,
     ])
     export_body = {
@@ -681,6 +692,7 @@ def build_project_export(conn, project_id, log_renderer=None):
         "inbox_cursors": cursors,
         "agent_clients": clients,
         "message_dispositions": dispositions,
+        "message_disposition_baselines": disposition_baselines,
         "cloud_context": cloud_context,
     }
     manifest = {
@@ -892,6 +904,7 @@ def validate_project_export(project_export, require_valid_ledger=True):
         "agents", "agent_persona_reservations", "actor_aliases", "bridges",
         "inbox_cursors",
         "agent_clients", "message_dispositions",
+        "message_disposition_baselines",
     )
     for section in collection_sections:
         if section in project_export \
@@ -958,6 +971,43 @@ def validate_project_export(project_export, require_valid_ledger=True):
                 raise ProjectExportError(
                     "%s row is missing writer attribution" % section)
 
+    for row in project_export.get("message_disposition_baselines") or []:
+        if not isinstance(row, dict) or row.get("project_id") != project_id:
+            raise ProjectExportError(
+                "message_disposition_baselines contains a row outside "
+                "project %s" % project_id)
+        if not isinstance(row.get("actor_id"), str) or not row.get("actor_id"):
+            raise ProjectExportError(
+                "message_disposition_baselines row is missing its exact "
+                "actor")
+        baseline_seq = row.get("baseline_seq")
+        if not isinstance(baseline_seq, int) \
+                or isinstance(baseline_seq, bool) or baseline_seq < 0:
+            raise ProjectExportError(
+                "message_disposition_baselines row has an invalid "
+                "baseline_seq")
+        if not isinstance(row.get("source"), str) or not row.get("source"):
+            raise ProjectExportError(
+                "message_disposition_baselines row is missing its source")
+
+    # ``project_cloud_context`` stores exactly one current row per project,
+    # so the export carries the record itself rather than a collection.
+    cloud_context = project_export.get("cloud_context")
+    if cloud_context is not None:
+        if not isinstance(cloud_context, dict):
+            raise ProjectExportError(
+                "project export cloud_context must be an object")
+        if cloud_context.get("project_id") != project_id:
+            raise ProjectExportError(
+                "cloud_context contains a row outside project %s" % project_id)
+        version = cloud_context.get("version")
+        if not isinstance(version, int) or isinstance(version, bool) \
+                or version <= 0:
+            raise ProjectExportError("cloud_context has an invalid version")
+        if not isinstance(cloud_context.get("content"), str):
+            raise ProjectExportError(
+                "cloud_context content must be exported as text")
+
     reservations = project_export.get("agent_persona_reservations")
     if schema_version >= 2:
         if not isinstance(reservations, list):
@@ -1012,6 +1062,10 @@ def validate_project_export(project_export, require_valid_ledger=True):
                 and counts[section] != len(project_export[section]):
             raise ProjectExportError(
                 "manifest count does not match %s" % section)
+    if "cloud_context" in project_export and "cloud_context" in counts \
+            and counts["cloud_context"] != (
+                0 if project_export.get("cloud_context") is None else 1):
+        raise ProjectExportError("manifest count does not match cloud_context")
 
     verification = verify_exported_ledger(events, project_id=project_id)
     if ledger.get("verification") != verification \

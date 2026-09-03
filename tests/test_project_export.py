@@ -158,6 +158,16 @@ class ProjectExportTestCase(unittest.TestCase):
             "(project_id, legacy_actor_id, canonical_actor_id, migrated_at) "
             "VALUES (?,?,?,?)",
             ("p1", "legacy.codex", "director", now))
+        # Reconciliation baselines are durable project-authored state.  One
+        # belongs to an actor that also keeps a read cursor; the other belongs
+        # to an actor whose ONLY durable row is the baseline, so no other
+        # exported section can stand in for it.
+        c.pending_message_dispositions(
+            self.conn, "p1", "director", "agent",
+            allow_baseline_write=True, baseline_source_seq=1)
+        c.pending_message_dispositions(
+            self.conn, "p1", "auditor", "agent",
+            allow_baseline_write=True, baseline_source_seq=2)
         latest_seq = self.conn.execute(
             "SELECT MAX(seq) AS seq FROM events WHERE project_id='p1'"
         ).fetchone()["seq"]
@@ -180,6 +190,34 @@ class ProjectExportTestCase(unittest.TestCase):
     def build(self):
         return exporter.build_project_export(
             self.conn, "p1", log_renderer=c.render_log_line)
+
+    def restore(self, project_export):
+        """Import the portable rows into a fresh, empty temp database.
+
+        ``project_export.py`` deliberately exposes no general import path --
+        only the narrow append-only persona registry restore -- so this helper
+        replays the exact exported rows and never invents a domain write.
+        """
+        conn = c.connect(self.root / "restored.db")
+        self.addCleanup(conn.close)
+        cloud_context = project_export.get("cloud_context")
+        sections = (
+            ("projects", [project_export["project"]]),
+            ("message_disposition_baselines",
+             project_export["message_disposition_baselines"]),
+            ("project_cloud_context",
+             [cloud_context] if cloud_context is not None else []),
+        )
+        for table, rows in sections:
+            for row in rows:
+                columns = sorted(row)
+                conn.execute(
+                    "INSERT INTO %s (%s) VALUES (%s)" % (
+                        table, ",".join(columns),
+                        ",".join("?" for _ in columns)),
+                    [row[column] for column in columns])
+        conn.commit()
+        return conn
 
     def test_complete_export_is_deterministic_and_read_only(self):
         event_count = self.conn.execute(
@@ -394,6 +432,129 @@ class ProjectExportTestCase(unittest.TestCase):
         project_export = exporter.build_project_export(self.conn, "p1")
         self.assertEqual(project_export["project"]["name"], "Project One")
         self.assertTrue(project_export["ledger"]["verification"]["ok"])
+
+    def test_baselines_and_cloud_context_round_trip_to_fresh_db(self):
+        first = self.build()
+        second = self.build()
+        self.assertEqual(
+            exporter.project_export_json_bytes(first),
+            exporter.project_export_json_bytes(second))
+
+        baselines = first["message_disposition_baselines"]
+        self.assertEqual([row["actor_id"] for row in baselines],
+                         ["auditor", "director"])
+        self.assertEqual(
+            first["manifest"]["counts"]["message_disposition_baselines"],
+            len(baselines))
+        self.assertEqual(first["manifest"]["counts"]["cloud_context"], 1)
+        for row in baselines:
+            self.assertEqual(row["project_id"], "p1")
+            self.assertEqual(row["source"], "upgrade")
+            self.assertIsInstance(row["baseline_seq"], int)
+            self.assertEqual(row["set_by"], row["actor_id"])
+        self.assertEqual(first["cloud_context"]["project_id"], "p1")
+        self.assertEqual(first["cloud_context"]["version"], 1)
+
+        restored = self.restore(first)
+        self.assertEqual(
+            [dict(row) for row in restored.execute(
+                "SELECT * FROM message_disposition_baselines"
+                " WHERE project_id='p1' ORDER BY actor_id")],
+            baselines)
+        self.assertEqual(
+            dict(restored.execute(
+                "SELECT * FROM project_cloud_context WHERE project_id='p1'"
+            ).fetchone()),
+            first["cloud_context"])
+
+        # Re-exporting the imported database reproduces both sections exactly.
+        again = exporter.build_project_export(restored, "p1")
+        self.assertEqual(again["message_disposition_baselines"], baselines)
+        self.assertEqual(again["cloud_context"], first["cloud_context"])
+        self.assertEqual(
+            again["manifest"]["counts"]["message_disposition_baselines"],
+            len(baselines))
+        self.assertTrue(exporter.validate_project_export(again)["ok"])
+
+    def test_baseline_survives_without_a_cursor_or_disposition_row(self):
+        first = self.build()
+        lone = next(row for row in first["message_disposition_baselines"]
+                    if row["actor_id"] == "auditor")
+        self.assertEqual(lone["baseline_seq"], 2)
+        # Nothing else in the export mentions this identity, so the baseline
+        # cannot be folded into the cursor or disposition sections.
+        self.assertNotIn("auditor",
+                         [row["actor_id"] for row in first["inbox_cursors"]])
+        self.assertNotIn(
+            "auditor",
+            [row["actor_id"] for row in first["message_dispositions"]])
+
+        # Losing the row would re-baseline the identity from a newer cursor
+        # and silently close history that is genuinely still open.
+        restored = self.restore(first)
+        self.assertEqual(
+            restored.execute(
+                "SELECT baseline_seq FROM message_disposition_baselines"
+                " WHERE project_id='p1' AND actor_id='auditor'"
+            ).fetchone()["baseline_seq"],
+            2)
+
+    def test_new_sections_are_validated_and_leak_no_server_tables(self):
+        first = self.build()
+        self.assertIn("message_disposition_baselines", first)
+        self.assertNotIn("server_settings", first)
+        self.assertEqual(
+            [key for key in first if key.startswith("auth_")], [])
+        for table in ("auth_sessions", "auth_tokens", "auth_users",
+                      "server_settings"):
+            self.assertIn(table,
+                          first["manifest"]["excluded_server_tables"])
+
+        outside = copy.deepcopy(first)
+        outside["message_disposition_baselines"][0]["project_id"] = "peer"
+        with self.assertRaisesRegex(exporter.ProjectExportError,
+                                    "outside project p1"):
+            exporter.validate_project_export(outside)
+
+        negative = copy.deepcopy(first)
+        negative["message_disposition_baselines"][0]["baseline_seq"] = -1
+        with self.assertRaisesRegex(exporter.ProjectExportError,
+                                    "invalid baseline_seq"):
+            exporter.validate_project_export(negative)
+
+        miscounted = copy.deepcopy(first)
+        miscounted["manifest"]["counts"][
+            "message_disposition_baselines"] = 99
+        with self.assertRaisesRegex(
+                exporter.ProjectExportError,
+                "count does not match message_disposition_baselines"):
+            exporter.validate_project_export(miscounted)
+
+        stale_cloud_count = copy.deepcopy(first)
+        stale_cloud_count["manifest"]["counts"]["cloud_context"] = 0
+        with self.assertRaisesRegex(exporter.ProjectExportError,
+                                    "count does not match cloud_context"):
+            exporter.validate_project_export(stale_cloud_count)
+
+        bad_cloud_version = copy.deepcopy(first)
+        bad_cloud_version["cloud_context"]["version"] = 0
+        with self.assertRaisesRegex(exporter.ProjectExportError,
+                                    "cloud_context has an invalid version"):
+            exporter.validate_project_export(bad_cloud_version)
+
+    def test_baseline_rows_join_the_named_identity_coverage_scan(self):
+        # A persona that exists only on a baseline row must still be covered
+        # by the exported append-only reservation registry.
+        self.conn.execute(
+            "INSERT INTO message_disposition_baselines"
+            " (project_id,actor_id,baseline_seq,source,set_by,set_owner,"
+            "note,at) VALUES (?,?,?,?,?,?,?,?)",
+            ("p1", "p1.director.codex.hopper", 3, "manual",
+             "p1.director.codex.hopper", "owner", None,
+             "2026-08-24T00:00:00.000Z"))
+        with self.assertRaisesRegex(exporter.ProjectExportError,
+                                    "coverage is incomplete.*@Hopper"):
+            self.build()
 
 
 def latest(events):
