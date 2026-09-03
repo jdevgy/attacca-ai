@@ -449,7 +449,16 @@ class WatcherNoLossDeliveryTestCase(unittest.TestCase):
         first = hook._watcher_attention_notice(self.status, self.config)
         second = hook._watcher_attention_notice(self.status, self.config)
         self.assertIn("AUTOMATIC-MAIL-MUST-BE-SEEN", first["context"])
-        self.assertIn("AUTOMATIC-MAIL-MUST-BE-SEEN", second["context"])
+        # SHOW ONCE = READ (owner ruling / D-24): the second boundary keeps
+        # the row pinned and counted, but repeats no body and no per-item
+        # reminder line. The retired one-liner assertion is replaced by the
+        # count line; the durable row itself is checked below.
+        self.assertNotIn("AUTOMATIC-MAIL-MUST-BE-SEEN", second["context"])
+        self.assertIn("UNREAD GROUP MAIL: 1 staged (0 new)",
+                      second["context"])
+        self.assertEqual(
+            self.state()["subscriptions"][key]["attention"][0]["body"],
+            "AUTOMATIC-MAIL-MUST-BE-SEEN")
 
         with mock.patch.object(
                 hook, "_watcher_inbox_page",
@@ -557,24 +566,33 @@ class WatcherNoLossDeliveryTestCase(unittest.TestCase):
         # Every later boundary keeps it pinned as ONE reminder line until
         # the host clears it; the old behaviour re-dumped the body each turn.
         first = hook._watcher_attention_notice(self.status, self.config)
-        self.assertIn("PENDING DISPOSITIONS (1 total · 1 new · 0 collapsed)",
+        self.assertIn("PENDING DISPOSITIONS: 1 total (1 new)",
                       first["context"])
         self.assertIn("- [DISPOSITION REQUIRED] Event assign-72",
                       first["context"])
         self.assertIn("ASSIGNMENT-MUST-STAY-PINNED", first["context"])
         self.assertIn("message_dispose", first["context"])
+        # The instruction must not tell an agent to disposition ordinary
+        # EVERYONE/BRIDGE chat: the server accepts message_dispose only for
+        # its requires_disposition rows, which render as DISPOSITION REQUIRED.
+        self.assertIn("rows rendered as [DISPOSITION REQUIRED]",
+                      first["context"])
+        self.assertNotIn("disposition messages marked", first["context"])
         for _ in range(2):
             notice = hook._watcher_attention_notice(
                 self.status, self.config)
+            # SHOW ONCE = READ: no body, no per-item reminder line — one
+            # count line is the whole remaining trace (retired assertion:
+            # "- [PENDING · none] assign-72 …").
             self.assertIn(
-                "PENDING DISPOSITIONS (1 total · 0 new · 1 collapsed)",
-                notice["context"])
-            self.assertIn(
-                "- [PENDING · none] assign-72 · Room #72 · directive · "
-                "shared.director.claude: ASSIGNMENT-MUST-STAY-PINNED",
-                notice["context"])
-            self.assertNotIn("DISPOSITION REQUIRED", notice["context"])
+                "PENDING DISPOSITIONS: 1 total (0 new)", notice["context"])
+            self.assertNotIn("assign-72", notice["context"])
+            self.assertNotIn("ASSIGNMENT-MUST-STAY-PINNED",
+                             notice["context"])
+            self.assertNotIn("DISPOSITION REQUIRED] Event",
+                             notice["context"])
             self.assertIn("message_dispose", notice["context"])
+            self.assertLess(len(notice["context"].encode("utf-8")), 400)
         self.assertIn("assign-72",
                       self.state()["subscriptions"][key]["rendered"])
 
@@ -711,6 +729,13 @@ class WatcherNoLossDeliveryTestCase(unittest.TestCase):
                 self.assertIn(
                     "TOP-MAIL-%s-%s" % (runtime, event_name), context)
                 self.assertIn("no user needs to type", context)
+                # message_dispose is accepted only for requires_disposition
+                # rows. The brief must name that rendering, and must not tell
+                # the agent to disposition EVERYONE/BRIDGE group chat.
+                self.assertIn("rows rendered as [DISPOSITION REQUIRED]",
+                              context)
+                self.assertNotIn(
+                    "disposition messages marked YOUR ATTENTION", context)
 
     def test_unicode_room_bodies_survive_attention_pages_fifo(self):
         self.assertEqual(hook.WATCHER_DELTA_CHUNK_SIZE, 10)
@@ -932,12 +957,14 @@ class WatcherNoLossDeliveryTestCase(unittest.TestCase):
         self.assertIn("QUIET-MAIL-BODY filler filler", first_stop["reason"])
         self.assertIsNone(second_stop)
         context = prompt["hookSpecificOutput"]["additionalContext"]
-        self.assertIn(
-            "- [PENDING · none] quiet-mail-3 · Room #3 · chat · "
-            "peer.director.claude: QUIET-MAIL-BODY", context)
-        self.assertIn("room_read since_seq=2 for the full body", context)
-        # The 80-character excerpt survives; the multi-KB body does not.
-        self.assertNotIn("filler " * 20, context)
+        # SHOW ONCE = READ: the delivered row leaves one count line and no
+        # per-item excerpt at all (retired assertion: the
+        # "- [PENDING · none] quiet-mail-3 …" reminder).
+        self.assertIn("UNREAD GROUP MAIL: 1 staged (0 new)", context)
+        self.assertNotIn("quiet-mail-3", context)
+        self.assertNotIn("QUIET-MAIL-BODY", context)
+        self.assertNotIn("filler " * 2, context)
+        self.assertLess(len(context.encode("utf-8")), 400)
 
 
 if __name__ == "__main__":

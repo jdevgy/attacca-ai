@@ -79,13 +79,28 @@ STARTUP_RULE_PAGE_SIZE = 60
 # snapshot closed instead of presenting a partial rules banner as complete.
 STARTUP_RULE_MAX_PAGES = 64
 WATCHER_ROOM_BODY_LIMIT = 600
-# Render-once budget: a pinned/staged row is injected in full exactly once
-# per session, then only as one reminder line. Rows the actor already
-# deferred/blocked/claimed are always compact. Collapsed reminders share
-# one small byte budget so 25 pinned rows cannot re-cost a full page.
+# SHOW ONCE = READ (owner ruling, D-24): a pinned/staged row is injected in
+# full exactly once per session and afterwards leaves NO per-item trace at
+# all — only one count line naming the total and how many are new. Rows the
+# actor already deferred/blocked/claimed count toward the total but never
+# render. The durable FIFO/pinned set is never reduced by rendering.
 WATCHER_OPEN_DISPOSITIONS = frozenset({"deferred", "blocked", "claimed"})
-WATCHER_COLLAPSED_BODY_CHARACTERS = 80
-WATCHER_COLLAPSED_REMINDER_BYTES = 1_600
+# A11 · the mandatory rules banner is pinned on EVERY prompt turn, but its
+# full text is re-sent only on a rule change, on SessionStart, and every
+# WATCHER_RULES_BANNER_FULL_EVERY prompt turns. Otherwise one compact line
+# per rule plus the fingerprint is enough to keep the law addressable.
+WATCHER_RULES_BANNER_FULL_EVERY = 10
+WATCHER_RULES_FINGERPRINT_CHARACTERS = 12
+# A13 · Codex caps hook additionalContext at 65536 bytes and kills the hook
+# at 8s. Trim the lowest-priority brief sections to fit, and fall back to the
+# verified local mirror rather than emitting nothing when the live snapshot
+# fails or eats the timeout budget.
+SESSION_BRIEF_MAX_BYTES = 60_000
+SESSION_BRIEF_DEADLINE_SECONDS = 6.0
+# A10 · Claude's managed one-minute job carries this marker in its prompt.
+# A boundary whose prompt contains it is a machine pulse, not a user turn.
+MANAGED_PULSE_MARKER = "ATTACCA_MANAGED_INBOX_LOOP_V1"
+PULSE_MARKER_PREFIX = "ATTACCA_PULSE:"
 
 # A watcher process keeps executing the Python code which was imported when it
 # started even if install.sh later atomically replaces the stable plugin tree.
@@ -1625,6 +1640,10 @@ class HostedAuthenticationRequired(RuntimeError):
         self.http_status = http_status
 
 
+class HostedSnapshotDeadline(RuntimeError):
+    """The live brief did not arrive inside the client's hook timeout."""
+
+
 def _settings_interval(config, entry=None):
     """Read the live server cadence with this exact AI credential.
 
@@ -2827,8 +2846,32 @@ def _watcher_event_actor(event):
             "unknown")
 
 
+def _watcher_own_actor_ids(entry):
+    """Every id that means 'this subscription's own actor'.
+
+    A7: the receiving actor must never be told about its own writes. The
+    canonical id is authoritative; the runtime hint and any recorded legacy
+    alias are included so a pre-canonical or renamed persona still matches.
+    """
+    entry = entry if isinstance(entry, dict) else {}
+    own = {str(value) for value in (
+        entry.get("canonical_actor_id"), entry.get("actor")) if value}
+    for alias in entry.get("actor_aliases") or []:
+        if isinstance(alias, dict):
+            for field in ("legacy_actor_id", "actor_id", "alias"):
+                if alias.get(field):
+                    own.add(str(alias[field]))
+        elif alias:
+            own.add(str(alias))
+    scope = entry.get("sync_scope") if isinstance(
+        entry.get("sync_scope"), dict) else {}
+    if scope.get("actor_id"):
+        own.add(str(scope["actor_id"]))
+    return own
+
+
 def _watcher_event_is_self(event, entry):
-    """Reject the subscription's own room writes from its unread FIFO."""
+    """Reject the subscription's own writes from its unread FIFO/deltas."""
     identity = event.get("identity") \
         if isinstance(event.get("identity"), dict) else {}
     attribution = event.get("attribution") \
@@ -2839,11 +2882,7 @@ def _watcher_event_is_self(event, entry):
             identity.get("actor_id"), attribution.get("actor_id"))
         if value
     }
-    own = {
-        str(value) for value in (
-            entry.get("canonical_actor_id"), entry.get("actor")) if value
-    }
-    return bool(candidates.intersection(own))
+    return bool(candidates.intersection(_watcher_own_actor_ids(entry)))
 
 
 def _watcher_attention_projection(value, entry):
@@ -3088,10 +3127,10 @@ def _watcher_render_ledger(entry):
 def _watcher_render_plan(ledger, rows, consume, rendered_at):
     """Classify every selected row against the session render ledger.
 
-    ``full``      never delivered this session, or its disposition/body changed
-    ``compact``   never delivered (or changed) but already deferred/blocked/
-                  claimed by this actor, so only the one-line reminder is due
-    ``collapsed`` already delivered this session and unchanged since
+    ``full``    never delivered this session, or its disposition/body changed
+    ``counted`` already delivered this session and unchanged since, or already
+                deferred/blocked/claimed by this actor. SHOW ONCE = READ: such
+                a row contributes to the count line and renders NOTHING.
     """
     plan = []
     for row in rows:
@@ -3104,9 +3143,11 @@ def _watcher_render_plan(ledger, rows, consume, rendered_at):
             previous.get("disposition_state") != state or
             previous.get("body_sha256") != digest)
         if not (unseen or changed):
-            mode = "collapsed"
+            mode = "counted"
         elif state in WATCHER_OPEN_DISPOSITIONS:
-            mode = "compact"
+            # A4: this actor already deferred/blocked/claimed the row. It is
+            # being handled, so it counts but never renders and never blocks.
+            mode = "counted"
         else:
             mode = "full"
         plan.append((row, mode, state))
@@ -3130,50 +3171,30 @@ def _watcher_prune_render_ledger(ledger, *row_lists):
     return {key: value for key, value in ledger.items() if key in live}
 
 
-def _watcher_collapsed_line(row, state, default_type, pointer):
-    """One reminder line for a row already delivered in full this session."""
-    body = " ".join(str(row.get("body") or "").split())
-    limit = WATCHER_COLLAPSED_BODY_CHARACTERS
-    cut = len(body) > limit
-    excerpt = body[:limit].rstrip() + "…" if cut else body
-    try:
-        seq = int(row.get("seq") or 0)
-    except (TypeError, ValueError):
-        seq = 0
-    line = "- [PENDING · %s] %s · Room #%s · %s · %s: %s" % (
-        state or "none",
-        row.get("event_id") or row.get("message_key") or "?",
-        row.get("seq") or "?", row.get("msg_type") or default_type,
-        row.get("actor") or "unknown", excerpt)
-    if pointer or cut:
-        line += " · room_read since_seq=%d for the full body" % max(
-            0, seq - 1)
-    return line
-
-
 def _watcher_reset_session_rendering(status, config, runtime=None):
     """A fresh/resumed/compacted session must see every pinned row in full once.
 
     SessionStart is the only boundary at which the model context is known to
-    be new. Clearing the render ledger (and the once-per-session login marker)
-    makes the next render complete without touching the durable FIFO or the
-    pinned disposition set.
+    be new. Clearing the render ledger (and the once-per-session login marker
+    plus the rules-banner fingerprint) makes the next render complete without
+    touching the durable FIFO or the pinned disposition set.
     """
+    fields = ("rendered", "auth_login_surfaced_at",
+              "rules_banner_fingerprint", "rules_banner_prompt_turns")
     try:
         key = _watcher_subscription_key(status, config, runtime=runtime)
         current = ((_read_state(_watcher_state_path()).get("subscriptions")
                     or {}).get(key)) or {}
     except Exception:
         return False
-    if not any(field in current for field in (
-            "rendered", "auth_login_surfaced_at")):
+    if not any(field in current for field in fields):
         return False
 
     def mutate(state):
         entry = (state.get("subscriptions") or {}).get(key)
         if entry:
-            entry.pop("rendered", None)
-            entry.pop("auth_login_surfaced_at", None)
+            for field in fields:
+                entry.pop(field, None)
 
     try:
         _mutate_state(_watcher_state_path(), mutate)
@@ -3182,21 +3203,55 @@ def _watcher_reset_session_rendering(status, config, runtime=None):
     return True
 
 
+# SHOW ONCE = READ. The header is emitted only when this boundary actually
+# carries a body; a quiet boundary leaves the short marker line instead.
+WATCHER_ATTENTION_HEADER = (
+    "ATTACCA PENDING ASSIGNMENTS + UNREAD GROUP MAIL · %s",
+    "ATTACCA AUTOMATIC UPDATE · group-mail check completed",
+    "Automatically checked by Attacca. Read every YOUR ATTENTION, EVERYONE, "
+    "BRIDGE, or GROUP CONTEXT item below before yielding; no user needs to "
+    "type ‘check messages’. Call message_dispose ONLY for rows "
+    "rendered as [DISPOSITION REQUIRED] — the server accepts a "
+    "disposition only for its requires_disposition rows; every other message "
+    "is read-only group context.",
+)
+WATCHER_ATTENTION_QUIET_HEADER = "ATTACCA PINNED STATE · %s"
+
+
+def _watcher_shown_suffix(shown, new_total):
+    """Name an overflow honestly: new rows beyond the page follow next time."""
+    if new_total <= shown:
+        return ""
+    return (" %d of the %d new rows are shown here; the rest follow at the "
+            "next boundary." % (shown, new_total))
+
+
+def _watcher_fresh_first_page(plan, size=WATCHER_ATTENTION_PAGE_SIZE):
+    """Rows never delivered (or changed) this session claim the page first."""
+    fresh = [item for item in plan if item[1] == "full"]
+    seen = [item for item in plan if item[1] != "full"]
+    return (fresh + seen)[:size]
+
+
 def _watcher_attention_notice(status, config, runtime=None, consume=True,
-                              new_only=False):
+                              fresh_only=False, delta_label=None):
     """Pin unresolved assignments and staged unread mail at every boundary.
 
-    Delivery is render-once per session: a row is injected in full the first
-    time this session sees it and afterwards collapses to one reminder line
-    until its disposition or body changes. The durable FIFO and the pinned
-    disposition set are never reduced here; only the rendering collapses.
-    Rows this actor already deferred, blocked, or claimed are always compact.
-    With ``new_only`` (the Stop boundary) only never-delivered rows are listed
-    and ``None`` is returned when there are none, so Stop stays quiet.
+    Delivery is show-once-per-session: a row is injected in full the first
+    time this session sees it and afterwards leaves NO per-item trace — the
+    only remaining signal is one count line naming the totals. A full
+    re-render happens only when the row's disposition state or body changes.
+    Rows this actor already deferred, blocked, or claimed count toward the
+    total but never render. The durable FIFO and the pinned disposition set
+    are never reduced here; only the rendering collapses.
+    With ``fresh_only`` (Stop / managed pulse) only never-delivered rows are
+    rendered and ``None`` is returned when there are none, so those boundaries
+    stay silent.
     """
     key = _watcher_subscription_key(status, config, runtime=runtime)
     captured = {"rows": [], "remaining": 0, "dispositions": [],
                 "disposition_total": 0, "disposition_more": False,
+                "disposition_new": 0, "mail_new": 0,
                 "disposition_plan": [], "row_plan": []}
 
     def mutate(state):
@@ -3205,40 +3260,61 @@ def _watcher_attention_notice(status, config, runtime=None, consume=True,
             return
         # A row acknowledged by the hosted inbox and delivered on a previous
         # lifecycle boundary is complete. Failed acknowledgements deliberately
-        # repeat (compactly, after their first full render).
+        # repeat (as a count only, after their first full render).
         pending = [row for row in (entry.get("attention") or [])
                    if not (row.get("acknowledged") and
                            row.get("delivered_at"))]
         entry["attention"] = pending
         all_dispositions = list(entry.get("pending_dispositions") or [])
-        captured["dispositions"] = all_dispositions[
-            :WATCHER_ATTENTION_PAGE_SIZE]
-        captured["disposition_total"] = max(
-            len(captured["dispositions"]),
-            int(entry.get("pending_disposition_total") or 0))
-        captured["disposition_more"] = bool(
-            entry.get("pending_disposition_may_have_more") or
-            captured["disposition_total"] >
-            len(captured["dispositions"]))
-        disposition_keys = {
-            row.get("message_key") for row in captured["dispositions"]}
-        selected = pending[:WATCHER_ATTENTION_PAGE_SIZE]
-        captured["rows"] = [
-            row for row in selected
-            if row.get("message_key") not in disposition_keys]
-        captured["remaining"] = max(
-            0, len(pending) - len(selected))
         rendered_at = datetime.now(timezone.utc).isoformat()
         ledger = _watcher_render_ledger(entry)
-        captured["disposition_plan"] = _watcher_render_plan(
-            ledger, captured["dispositions"], consume, rendered_at)
-        captured["row_plan"] = _watcher_render_plan(
-            ledger, captured["rows"], consume, rendered_at)
+        # Classify EVERY pinned/staged row before paging, then let rows never
+        # delivered this session claim the page first. Cutting the page ahead
+        # of classification left a genuinely new assignment stuck behind 25
+        # already-delivered rows while the count line reported "0 new".
+        disposition_all = _watcher_render_plan(
+            ledger, all_dispositions, False, rendered_at)
+        disposition_page = _watcher_fresh_first_page(disposition_all)
+        captured["dispositions"] = [row for row, _, _ in disposition_page]
+        captured["disposition_total"] = max(
+            len(all_dispositions),
+            int(entry.get("pending_disposition_total") or 0))
+        captured["disposition_new"] = sum(
+            1 for _, mode, _ in disposition_all if mode == "full")
+        captured["disposition_more"] = bool(
+            entry.get("pending_disposition_may_have_more") or
+            captured["disposition_total"] > len(disposition_page))
+        disposition_keys = {
+            row.get("message_key") for row in all_dispositions}
+        mail_rows = [row for row in pending
+                     if row.get("message_key") not in disposition_keys]
+        mail_all = _watcher_render_plan(ledger, mail_rows, False, rendered_at)
+        mail_page = _watcher_fresh_first_page(mail_all)
+        captured["rows"] = [row for row, _, _ in mail_page]
+        captured["mail_new"] = sum(
+            1 for _, mode, _ in mail_all if mode == "full")
+        captured["remaining"] = max(0, len(mail_rows) - len(mail_page))
+        captured["disposition_plan"] = disposition_page
+        captured["row_plan"] = mail_page
         if consume:
+            # Only rows that actually reached the page are recorded as
+            # delivered; an unseen row left for a later boundary stays unseen.
+            for row, mode, state in disposition_page + mail_page:
+                row_key = _watcher_rendered_key(row)
+                if row_key:
+                    ledger[row_key] = {
+                        "disposition_state": state,
+                        "body_sha256": _watcher_body_sha256(row.get("body")),
+                        "rendered_at": rendered_at,
+                    }
             entry["rendered"] = _watcher_prune_render_ledger(
                 ledger, all_dispositions, pending)
-            for row in selected:
-                row["delivered_at"] = rendered_at
+            paged_keys = {
+                row.get("message_key") for row in captured["dispositions"]}
+            for row in pending:
+                if row in captured["rows"] or \
+                        row.get("message_key") in paged_keys:
+                    row["delivered_at"] = rendered_at
 
     if consume:
         _mutate_state(_watcher_state_path(), mutate)
@@ -3248,37 +3324,14 @@ def _watcher_attention_notice(status, config, runtime=None, consume=True,
     row_plan = captured["row_plan"]
     if not disposition_plan and not row_plan:
         return None
-    fresh = [item for item in disposition_plan + row_plan
-             if item[1] == "full"]
-    if new_only and not fresh:
+    fresh_dispositions = [item for item in disposition_plan
+                          if item[1] == "full"]
+    fresh_rows = [item for item in row_plan if item[1] == "full"]
+    fresh = fresh_dispositions + fresh_rows
+    if fresh_only and not fresh:
         # Everything pinned/staged was already injected in full this session;
-        # repeating it as a Stop reason was the measured token flood.
+        # repeating it was the measured token flood.
         return None
-    listed_modes = ("full", "compact") if new_only else (
-        "full", "compact", "collapsed")
-    reminder_budget = [WATCHER_COLLAPSED_REMINDER_BYTES]
-
-    def render(plan, full_line, default_type, pointer):
-        lines, omitted = [], 0
-        for row, mode, state in plan:
-            if mode not in listed_modes:
-                continue
-            if mode == "full":
-                lines.append(full_line(row, state))
-                continue
-            line = _watcher_collapsed_line(row, state, default_type, pointer)
-            if mode == "collapsed":
-                cost = len(line.encode("utf-8")) + 1
-                if cost > reminder_budget[0]:
-                    omitted += 1
-                    continue
-                reminder_budget[0] -= cost
-            lines.append(line)
-        return lines, omitted
-
-    def counts(plan):
-        new = sum(1 for item in plan if item[1] != "collapsed")
-        return new, len(plan) - new
 
     def recovery(row):
         return "call room_read with since_seq=%s for the complete message" % (
@@ -3314,74 +3367,50 @@ def _watcher_attention_notice(status, config, runtime=None, consume=True,
             row.get("msg_type") or "chat", row.get("actor") or "unknown",
             body)
 
-    lines = [
-        "ATTACCA PENDING ASSIGNMENTS + UNREAD GROUP MAIL · %s" %
-        status["project_id"],
-        "ATTACCA AUTOMATIC UPDATE · group-mail check completed",
-        "Automatically checked by Attacca. Read and disposition messages "
-        "marked YOUR ATTENTION, EVERYONE, or BRIDGE before yielding; no user "
-        "needs to type ‘check messages’.",
-    ]
-    if new_only:
+    if fresh:
+        lines = [WATCHER_ATTENTION_HEADER[0] % status["project_id"]]
+        lines.extend(WATCHER_ATTENTION_HEADER[1:])
+    else:
+        lines = [WATCHER_ATTENTION_QUIET_HEADER % status["project_id"]]
+    if fresh_only and delta_label:
         lines.append(
-            "STOP DELTA: only rows never delivered in this session are "
-            "listed; earlier rows stay pinned in your context and in "
-            "check_inbox.")
-    disposition_new, disposition_collapsed = counts(disposition_plan)
+            "%s: only rows never delivered in this session are listed; "
+            "earlier rows stay pinned in your context and in check_inbox."
+            % delta_label)
     if disposition_plan:
+        # SHOW ONCE = READ: already-delivered assignments leave no per-item
+        # line at all. Only requires_disposition rows are counted here, so
+        # the instruction cannot ask for an unsupported disposition.
         lines.append(
-            "PENDING DISPOSITIONS (%d total · %d new · %d collapsed): "
-            "these stay pinned even after the read cursor advances. Handle "
-            "each assignment, then record its outcome with message_dispose; "
-            "rendering alone does not clear it." % (
-                captured["disposition_total"], disposition_new,
-                disposition_collapsed))
-        if any(item[1] != "full" for item in disposition_plan):
-            lines.append(
-                "[PENDING · …] rows were already delivered in full this "
-                "session or carry your own deferred/blocked/claimed "
-                "disposition; they re-render in full only when their "
-                "disposition or body changes.")
-    rendered_dispositions, omitted_dispositions = render(
-        disposition_plan, disposition_full, "directive", pointer=False)
-    lines.extend(rendered_dispositions)
-    if omitted_dispositions:
-        lines.append(
-            "- %d more already-delivered pending disposition(s) fit only as "
-            "a count here; every id is unchanged — call check_inbox for "
-            "the complete current set." % omitted_dispositions)
-    if captured["disposition_more"]:
-        lines.append(
-            "- %d additional pending disposition(s) exist on the host; call "
-            "check_inbox for the complete current assignment set." % max(
-                0, captured["disposition_total"] -
-                len(captured["dispositions"])))
-    row_new, row_collapsed = counts(row_plan)
+            "PENDING DISPOSITIONS: %d total (%d new) — call check_inbox for "
+            "the list. Each stays pinned after the read cursor advances until "
+            "message_dispose records its outcome; rendering never clears "
+            "one.%s" % (
+                captured["disposition_total"], captured["disposition_new"],
+                _watcher_shown_suffix(
+                    len(fresh_dispositions), captured["disposition_new"])))
+        lines.extend(disposition_full(row, state)
+                     for row, mode, state in disposition_plan
+                     if mode == "full")
     if row_plan:
+        staged = len(row_plan) + captured["remaining"]
         lines.append(
-            "UNREAD GROUP MAIL (%d staged · %d new · %d collapsed)" % (
-                len(row_plan), row_new, row_collapsed))
-    rendered_rows, omitted_rows = render(
-        row_plan, mail_full, "chat", pointer=True)
-    lines.extend(rendered_rows)
-    if omitted_rows:
+            "UNREAD GROUP MAIL: %d staged (%d new) — read-only group "
+            "context unless a row is marked [DISPOSITION REQUIRED]; call "
+            "check_inbox or room_read for the list.%s" % (
+                staged, captured["mail_new"],
+                _watcher_shown_suffix(len(fresh_rows), captured["mail_new"])))
+        lines.extend(mail_full(row, state)
+                     for row, mode, state in row_plan if mode == "full")
+    if fresh:
         lines.append(
-            "- %d more already-delivered staged message(s) fit only as a "
-            "count here; they remain in the lossless FIFO — call "
-            "check_inbox or room_read for the complete set." % omitted_rows)
-    if captured["remaining"]:
-        lines.append(
-            "- %d additional staged message(s) remain in lossless FIFO and "
-            "will be pinned on subsequent turn boundaries." %
-            captured["remaining"])
-    lines.append(
-        "These rows were durably staged before the hosted read cursor was "
-        "acknowledged. A failed acknowledgement keeps them pinned and retries "
-        "automatically.")
-    if new_only:
+            "These rows were durably staged before the hosted read cursor was "
+            "acknowledged. A failed acknowledgement keeps them pinned and "
+            "retries automatically.")
+    if fresh_only:
         system_message = (
-            "Attacca assignments/mail · %d new pinned row(s) delivered at "
-            "Stop, %d already delivered" % (
+            "Attacca assignments/mail · %d new pinned row(s) delivered, "
+            "%d already delivered" % (
                 len(fresh),
                 len(disposition_plan) + len(row_plan) - len(fresh)))
     else:
@@ -4209,8 +4238,12 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
     room_events = [event for event in relevant
                    if event.get("event_type") == "room.message"
                    and not _watcher_event_is_self(event, entry)]
+    # A7: an entity revision this actor wrote itself is not news for it. It
+    # is dropped before staging so it can never render as a CURRENT ENTITY
+    # UPDATE row or keep a Stop boundary busy.
     entity_events = [event for event in relevant
-                     if event.get("event_type") != "room.message"]
+                     if event.get("event_type") != "room.message"
+                     and not _watcher_event_is_self(event, entry)]
     notification_summary = _watcher_delta_summary(
         status, (room_events + entity_events)[-WATCHER_DELTA_CHUNK_SIZE:],
         interval)
@@ -4291,6 +4324,7 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
                         entry["project_id"], line, entity_key, seq)),
                 "kind": "project_entity_delta",
                 "entity_key": entity_key,
+                "actor": _watcher_event_actor(event),
                 "after": max(cursor, seq - 1),
                 "through": seq,
                 "event_count": 1,
@@ -4366,24 +4400,198 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
             "cursor_initialized": initialized or not may_have_more}
 
 
-def _watcher_pending_notice(status, config, runtime=None, consume=True):
-    key = _watcher_subscription_key(status, config, runtime=runtime)
-    captured = {"rows": [], "remaining": 0}
+def _outage_signature(err):
+    """Identify one outage state: the error class plus its exact message."""
+    if err is None:
+        return None
+    return "%s|%s" % (type(err).__name__, _trim(err, 200))
+
+
+def _watcher_outage_notice(key, err):
+    """A9 · surface a hosted-unreachable notice once per distinct state.
+
+    The measured failure was one 'AUTOMATIC INBOX CHECK FAILED' block per
+    turn for twelve hours. The state is unchanged between those turns, so
+    only the first turn (and any turn whose error class/message differs)
+    carries the notice; recovery clears the latch and reports once.
+    """
+    signature = _outage_signature(err)
+    if not signature:
+        return None
+    seen = False
+
+    def mutate(state):
+        nonlocal seen
+        entry = (state.get("subscriptions") or {}).get(key)
+        if not entry:
+            return
+        seen = entry.get("outage_notice_signature") == signature
+        if not seen:
+            entry["outage_notice_signature"] = signature
+            entry["outage_notice_at"] = datetime.now(timezone.utc).isoformat()
+
+    try:
+        _mutate_state(_watcher_state_path(), mutate)
+    except Exception:
+        pass
+    if seen:
+        return None
+    return {
+        "system_message": "Attacca automatic inbox check will retry",
+        "context": (
+            "ATTACCA AUTOMATIC INBOX CHECK FAILED: %s. Previously staged "
+            "mail remains pinned and the watcher retries with back-off; do "
+            "not assume an empty inbox. This is reported once until the "
+            "connection state changes." % _trim(err, 240)),
+    }
+
+
+def _watcher_outage_recovered_notice(key):
+    """One 'hosted connection restored' line after a surfaced outage."""
+    recovered = False
+
+    def mutate(state):
+        nonlocal recovered
+        entry = (state.get("subscriptions") or {}).get(key)
+        if not entry:
+            return
+        recovered = bool(entry.get("outage_notice_signature") or
+                         entry.get("pulse_probe_failures"))
+        entry.pop("outage_notice_signature", None)
+        entry.pop("outage_notice_at", None)
+        entry.pop("pulse_probe_failures", None)
+        entry.pop("pulse_probe_next_at_epoch", None)
+
+    try:
+        _mutate_state(_watcher_state_path(), mutate)
+    except Exception:
+        return None
+    if not recovered:
+        return None
+    return {
+        "system_message": "Attacca hosted connection restored",
+        "context": ("ATTACCA HOSTED CONNECTION RESTORED: the automatic inbox "
+                    "check succeeded again and the managed pulse resumed its "
+                    "normal one-minute probe."),
+    }
+
+
+# The managed pulse keeps its `* * * * *` cron. Only the network probe backs
+# off, so a dead endpoint cannot burn one model turn per minute for hours.
+PULSE_PROBE_FAILURE_THRESHOLD = 3
+PULSE_PROBE_BACKOFF_START_SECONDS = 60
+PULSE_PROBE_BACKOFF_MAX_SECONDS = 15 * 60
+
+
+def _pulse_probe_backoff_seconds(failures):
+    steps = max(0, int(failures) - PULSE_PROBE_FAILURE_THRESHOLD)
+    return min(PULSE_PROBE_BACKOFF_START_SECONDS * (2 ** steps),
+               PULSE_PROBE_BACKOFF_MAX_SECONDS)
+
+
+def _pulse_probe_blocked(entry, now):
+    """True while a backed-off pulse must perform zero network work."""
+    if not isinstance(entry, dict):
+        return False
+    if int(entry.get("pulse_probe_failures") or 0) < \
+            PULSE_PROBE_FAILURE_THRESHOLD:
+        return False
+    try:
+        return float(now) < float(entry.get("pulse_probe_next_at_epoch") or 0)
+    except (TypeError, ValueError):
+        return False
+
+
+def _record_pulse_probe_failure(key, now):
+    """Count one consecutive transport failure and schedule the next probe."""
+    captured = {"failures": 0, "backoff": 0}
 
     def mutate(state):
         entry = (state.get("subscriptions") or {}).get(key)
         if not entry:
             return
-        pending = list(entry.get("pending") or [])
-        captured["rows"] = pending[:WATCHER_NOTICE_BATCH_SIZE]
-        captured["remaining"] = max(
-            0, len(pending) - len(captured["rows"]))
-        if consume and captured["rows"]:
+        failures = int(entry.get("pulse_probe_failures") or 0) + 1
+        entry["pulse_probe_failures"] = failures
+        captured["failures"] = failures
+        if failures >= PULSE_PROBE_FAILURE_THRESHOLD:
+            backoff = _pulse_probe_backoff_seconds(failures)
+            captured["backoff"] = backoff
+            entry["pulse_probe_next_at_epoch"] = float(now) + backoff
+
+    try:
+        _mutate_state(_watcher_state_path(), mutate)
+    except Exception:
+        pass
+    return captured
+
+
+# A8/A9 · rows that must never be dripped 1-2 per turn, and never block Stop.
+WATCHER_ENTITY_KINDS = frozenset({"project_entity_delta"})
+WATCHER_OUTAGE_KINDS = frozenset({
+    "connection_error", "offline_connection_error"})
+
+
+def _watcher_pending_notice(status, config, runtime=None, consume=True,
+                            event_name=None):
+    """Deliver the durable watcher FIFO for one lifecycle boundary.
+
+    A8: supersedable entity rows (task/decision/rule/handoff/plan/bridge) are
+    already stored newest-per-entity, so the whole set is delivered in ONE
+    prompt-time injection instead of two per turn with "N queued remain".
+    They never appear at Stop, so they can never block one by themselves.
+    A9: a hosted-unreachable notice is queued once per distinct error state
+    and is likewise prompt-only, never a per-turn Stop block.
+    Room mail keeps its lossless FIFO batch semantics.
+    """
+    key = _watcher_subscription_key(status, config, runtime=runtime)
+    prompt_turn = event_name != "Stop"
+    captured = {"rows": [], "remaining": 0, "entities": 0}
+
+    def selectable(row):
+        kind = row.get("kind")
+        if kind in WATCHER_ENTITY_KINDS or kind in WATCHER_OUTAGE_KINDS:
+            return prompt_turn
+        return True
+
+    def mutate(state):
+        entry = (state.get("subscriptions") or {}).get(key)
+        if not entry:
+            return
+        own = _watcher_own_actor_ids(entry)
+        pending = []
+        for row in entry.get("pending") or []:
+            # A7: never echo this actor's own writes back at it. Dropping the
+            # row here consumes it; it was authored by the reader.
+            if row.get("actor") and str(row["actor"]) in own:
+                continue
+            pending.append(row)
+        coalesced = []
+        batched = 0
+        for row in pending:
+            if not selectable(row):
+                continue
+            if row.get("kind") in WATCHER_ENTITY_KINDS or \
+                    row.get("kind") in WATCHER_OUTAGE_KINDS:
+                coalesced.append(row)
+                continue
+            if batched < WATCHER_NOTICE_BATCH_SIZE:
+                coalesced.append(row)
+                batched += 1
+        captured["rows"] = coalesced
+        captured["entities"] = sum(
+            1 for row in coalesced if row.get("kind") in WATCHER_ENTITY_KINDS)
+        delivered = {id(row) for row in coalesced}
+        captured["remaining"] = sum(
+            1 for row in pending if id(row) not in delivered)
+        if consume:
             # Deliver oldest-first and retain every undisplayed update for the
             # next lifecycle turn. Clearing the full queue after rendering a
             # five-row suffix used to lose group-room content silently.
-            entry["pending"] = pending[len(captured["rows"]):]
-            entry["last_delivered_at"] = datetime.now(timezone.utc).isoformat()
+            entry["pending"] = [row for row in pending
+                                if id(row) not in delivered]
+            if coalesced:
+                entry["last_delivered_at"] = datetime.now(
+                    timezone.utc).isoformat()
 
     if consume:
         _mutate_state(_watcher_state_path(), mutate)
@@ -4414,20 +4622,20 @@ def _watcher_pending_notice(status, config, runtime=None, consume=True):
                     "were cleared or coalesced." % captured["remaining"])
     context += ("\n\nThe background watcher captured these ledger deltas while "
                 "the coding client was idle. Supersedable entity rows were "
-                "collapsed to their newest observed revision; room mail uses "
-                "a separate lossless FIFO. Refresh the affected handoff, "
-                "task, plan, rule, decision, or bridge when full current "
-                "detail is required.")
+                "collapsed to their newest observed revision and are all "
+                "delivered here at once; room mail uses a separate lossless "
+                "FIFO. Refresh the affected handoff, task, plan, rule, "
+                "decision, or bridge when full current detail is required.")
     return {"system_message": "Attacca background watcher · %d delivered, %d queued"
                               % (len(rows), captured["remaining"]),
             "context": context}
 
 
-def _watcher_consume_pending(status, config, preview):
+def _watcher_consume_pending(status, config, preview, event_name=None):
     """Consume the previewed FIFO rows only when they are delivered."""
     if not preview:
         return None
-    return _watcher_pending_notice(status, config)
+    return _watcher_pending_notice(status, config, event_name=event_name)
 
 
 def _watcher_launch_fields_match(record, identity):
@@ -5200,6 +5408,126 @@ def _mandatory_rules_banner(rules, pre_omitted=0, pre_omitted_ids=None):
     return banner
 
 
+def _rules_fingerprint(rules, pre_omitted_ids=None):
+    """Stable identity of the applicable rule set: ids + versions + text."""
+    applicable = [rule for rule in (rules or []) if rule.get("enabled", True)]
+    material = sorted(
+        [str(rule.get("rule_id") or ""),
+         str(rule.get("version") if rule.get("version") is not None else ""),
+         str(rule.get("priority") if rule.get("priority") is not None else ""),
+         str(rule.get("scope") or ""),
+         hashlib.sha256(
+             (" ".join(str(rule.get("title") or "").split()) + "\n" +
+              " ".join(str(rule.get("body") or "").split())
+              ).encode("utf-8")).hexdigest()]
+        for rule in applicable)
+    material.append(sorted(str(value) for value in (pre_omitted_ids or [])))
+    return hashlib.sha256(json.dumps(
+        material, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")).hexdigest()[:WATCHER_RULES_FINGERPRINT_CHARACTERS]
+
+
+def _compact_rules_banner(rules, fingerprint, pre_omitted=0,
+                          pre_omitted_ids=None):
+    """One line per binding rule while its full text is already in context.
+
+    The banner stays pinned on EVERY prompt turn — that contract is not
+    negotiable — but re-sending identical multi-KB rule bodies on every turn
+    was measured token waste. The compact form keeps every binding rule_id
+    addressable, names the exact fingerprint, and says where the full text
+    is; a change, SessionStart, or the periodic full re-pin restores it.
+    """
+    applicable = [rule for rule in (rules or []) if rule.get("enabled", True)]
+    omitted_ids = [str(value) for value in (pre_omitted_ids or []) if value]
+    missing = max(0, int(pre_omitted or 0) - len(omitted_ids))
+    omitted_ids.extend("<legacy-omitted-%d>" % (index + 1)
+                       for index in range(missing))
+    if not applicable and not omitted_ids:
+        return None
+    applicable = sorted(
+        applicable,
+        key=lambda rule: (rule.get("priority", 100),
+                          str(rule.get("rule_id") or "")))
+    lines = [
+        "===================== ATTACCA MANDATORY PROJECT RULES ====================",
+        "BINDING on EVERY response — do not bypass. Unchanged since the full",
+        "text was pinned in this session; if this section is ever missing from",
+        "your context, call rule_list before acting.",
+        "",
+    ]
+    for rule in applicable:
+        lines.append("• %s · %s" % (
+            str(rule.get("rule_id") or "<missing-rule-id>"),
+            " ".join(str(rule.get("title") or "").split()) or "(untitled)"))
+    if omitted_ids:
+        lines.append(
+            "• Omitted binding rule_ids: %s" % ", ".join(omitted_ids))
+        lines.append(
+            "    STOP before other work and call rule_list for those exact "
+            "rule_ids; every omitted rule remains binding.")
+    lines.append(
+        "version %s — call rule_list for full text" % fingerprint)
+    lines.append(
+        "==========================================================================")
+    return "\n".join(lines)
+
+
+def _rules_banner_state(status, config, runtime=None):
+    try:
+        key = _watcher_subscription_key(status, config, runtime=runtime)
+    except Exception:
+        return None, {}
+    try:
+        entry = ((_read_state(_watcher_state_path()).get("subscriptions")
+                  or {}).get(key)) or {}
+    except Exception:
+        entry = {}
+    return key, entry
+
+
+def _record_rules_banner(key, fingerprint, full):
+    if not key:
+        return
+
+    def mutate(state):
+        entry = (state.get("subscriptions") or {}).get(key)
+        if not entry:
+            return
+        if full:
+            entry["rules_banner_fingerprint"] = fingerprint
+            entry["rules_banner_prompt_turns"] = 0
+        else:
+            entry["rules_banner_prompt_turns"] = int(
+                entry.get("rules_banner_prompt_turns") or 0) + 1
+
+    try:
+        _mutate_state(_watcher_state_path(), mutate)
+    except Exception:
+        # Banner accounting is an optimization; a read-only watcher directory
+        # must never suppress the binding rules themselves.
+        pass
+
+
+def _turn_rules_banner(status, config, rules, event_name, pre_omitted=0,
+                       pre_omitted_ids=None, runtime=None):
+    """A11 · full banner on change/SessionStart/every Nth turn, else compact."""
+    fingerprint = _rules_fingerprint(rules, pre_omitted_ids)
+    key, entry = _rules_banner_state(status, config, runtime=runtime)
+    turns = int(entry.get("rules_banner_prompt_turns") or 0)
+    full = bool(
+        event_name == "SessionStart" or
+        entry.get("rules_banner_fingerprint") != fingerprint or
+        turns + 1 >= WATCHER_RULES_BANNER_FULL_EVERY)
+    banner = _mandatory_rules_banner(
+        rules, pre_omitted=pre_omitted, pre_omitted_ids=pre_omitted_ids) \
+        if full else _compact_rules_banner(
+            rules, fingerprint, pre_omitted=pre_omitted,
+            pre_omitted_ids=pre_omitted_ids)
+    if banner:
+        _record_rules_banner(key, fingerprint, full)
+    return banner
+
+
 def _poll_view(snapshot):
     """Stable shared-state markers used to suppress no-change hook output."""
     handoff = snapshot.get("handoff") or {}
@@ -5380,6 +5708,64 @@ def _compact_snapshot(snapshot):
         "actor_role": actor_record.get("role"),
         "counts": status.get("counts"),
     }
+
+
+def _fit_session_brief(brief, overhead=0, budget=None):
+    """Trim the lowest-priority brief sections until the host cap is met.
+
+    Codex refuses additionalContext over 65536 bytes, so an over-budget brief
+    reaches the model as nothing at all. Rules, Cloud Context, handoff, unread
+    inbox and the open task ids are the resume-critical core and are never
+    dropped: recent activity goes first, then decision detail, then task
+    detail, each replaced by an explicit pointer to the tool that returns it.
+    """
+    budget = SESSION_BRIEF_MAX_BYTES if budget is None else budget
+
+    def size(value):
+        return len(json.dumps(
+            value, indent=2, ensure_ascii=False).encode("utf-8")) + overhead
+
+    trimmed = []
+    if size(brief) <= budget:
+        return brief, trimmed
+    brief = dict(brief)
+    if brief.get("recent_activity"):
+        brief["recent_activity"] = []
+        brief["recent_activity_next_action"] = (
+            "Trimmed to fit the client context limit; call get_project_log "
+            "for the recent activity feed.")
+        trimmed.append("recent_activity")
+        if size(brief) <= budget:
+            return brief, trimmed
+    if brief.get("decisions"):
+        brief["decisions"] = [
+            {"decision_id": item.get("decision_id"),
+             "status": item.get("status")}
+            for item in brief["decisions"]]
+        brief["decisions_next_action"] = (
+            "Detail trimmed to fit the client context limit; call "
+            "decision_list for the full records.")
+        trimmed.append("decisions_detail")
+        if size(brief) <= budget:
+            return brief, trimmed
+    if brief.get("recent_room"):
+        brief["recent_room"] = []
+        brief["recent_room_next_action"] = (
+            "Trimmed to fit the client context limit; call room_read for the "
+            "recent group conversation. Unread mail above is complete.")
+        trimmed.append("recent_room")
+        if size(brief) <= budget:
+            return brief, trimmed
+    if brief.get("tasks"):
+        brief["tasks"] = [
+            {"task_id": item.get("task_id"), "status": item.get("status"),
+             "claimed_by": item.get("claimed_by")}
+            for item in brief["tasks"]]
+        brief["tasks_next_action"] = (
+            "Detail trimmed to fit the client context limit; call task_list "
+            "or task_show for the open work.")
+        trimmed.append("tasks_detail")
+    return brief, trimmed
 
 
 def _mcp_snapshot(status, plugin_root, config, mark_inbox_read=True):
@@ -6054,8 +6440,14 @@ def _offline_failure_output(status, config, event_name, err, adapter,
         latched = HostedAuthenticationRequired(
             entry.get("last_error") or
             "the last hosted request revoked this credential/AI scope")
-        return _authentication_required_output(
-            status, config, event_name, latched)
+        # Route through the once-per-session gate: a latched credential must
+        # not re-block every Stop with the same login wall.
+        try:
+            key, _ = _watcher_subscription_entry(status, config)
+        except Exception:
+            key = None
+        return _authentication_gate_output(
+            status, config, event_name, latched, key=key, entry=entry)
     try:
         brief = _offline_session_payload(
             status, adapter, entry=entry, failure=err)
@@ -6298,6 +6690,96 @@ CLAUDE_INBOX_LOOP_MARKER_PREFIX = "ATTACCA_MANAGED_INBOX_LOOP_V1:"
 CLAUDE_INBOX_LOOP_CRONS = {"* * * * *", "*/1 * * * *"}
 
 
+def _is_managed_pulse(payload):
+    """A10 · a prompt carrying the managed marker is a machine ping.
+
+    The one-minute job submits `/attacca:inbox [ATTACCA_MANAGED_INBOX_LOOP_V1:
+    <project>]`. That boundary is not a user turn: it must not receive the
+    rules banner, status chatter, or already-delivered mail — only genuinely
+    new content and exactly one machine-readable marker line.
+    """
+    prompt = (payload or {}).get("prompt")
+    return bool(prompt) and MANAGED_PULSE_MARKER in str(prompt)
+
+
+def _pulse_marker_line(new_count):
+    return "%s %s" % (
+        PULSE_MARKER_PREFIX,
+        "new=%d" % new_count if new_count else "nothing_new")
+
+
+def _rebrief_session_key(payload):
+    return str((payload or {}).get("session_id") or "").strip() or "default"
+
+
+def _mark_rebrief_pending(status, config, payload, runtime=None):
+    """Kimi PreCompact/PostCompact: remember that the brief must be re-sent.
+
+    Kimi Code discards compaction-hook stdout and never emits a SessionStart
+    with source=compact, so the compacted session would silently lose the
+    project brief. Record the intent locally (no network, no output) and let
+    the next prompt boundary deliver the same full brief SessionStart sends.
+    """
+    try:
+        key = _watcher_subscription_key(status, config, runtime=runtime)
+    except Exception:
+        return False
+    session_key = _rebrief_session_key(payload)
+    marked = {"ok": False}
+
+    def mutate(state):
+        entry = (state.get("subscriptions") or {}).get(key)
+        if not entry:
+            return
+        pending = entry.get("rebrief_pending")
+        if not isinstance(pending, dict):
+            pending = {}
+        pending[session_key] = datetime.now(timezone.utc).isoformat()
+        if len(pending) > 32:
+            for stale in sorted(pending, key=lambda item: pending[item])[:-32]:
+                pending.pop(stale, None)
+        entry["rebrief_pending"] = pending
+        marked["ok"] = True
+
+    try:
+        _mutate_state(_watcher_state_path(), mutate)
+    except Exception:
+        return False
+    return marked["ok"]
+
+
+def _consume_rebrief_pending(status, config, payload, runtime=None):
+    """True once per recorded compaction, for the next prompt boundary."""
+    try:
+        key = _watcher_subscription_key(status, config, runtime=runtime)
+        entry = ((_read_state(_watcher_state_path()).get("subscriptions")
+                  or {}).get(key)) or {}
+    except Exception:
+        return False
+    pending = entry.get("rebrief_pending")
+    session_key = _rebrief_session_key(payload)
+    if not isinstance(pending, dict) or session_key not in pending:
+        return False
+
+    def mutate(state):
+        live = (state.get("subscriptions") or {}).get(key)
+        if not live:
+            return
+        rows = live.get("rebrief_pending")
+        if isinstance(rows, dict):
+            rows.pop(session_key, None)
+            if rows:
+                live["rebrief_pending"] = rows
+            else:
+                live.pop("rebrief_pending", None)
+
+    try:
+        _mutate_state(_watcher_state_path(), mutate)
+    except Exception:
+        return False
+    return True
+
+
 def _claude_inbox_loop_marker(project_id):
     return "%s%s" % (CLAUDE_INBOX_LOOP_MARKER_PREFIX, project_id)
 
@@ -6437,7 +6919,13 @@ def _claude_stop_loop_notice(status, payload, interval):
 
 
 def _active_output(status, offline_adapter=None, offline_factory=None,
-                   hook_payload=None):
+                   hook_payload=None, event_name="SessionStart"):
+    """Assemble the full session brief.
+
+    ``event_name`` is normally SessionStart. A Kimi compaction rebrief runs
+    the identical assembly at the next UserPromptSubmit, so the output shape
+    must follow the real boundary rather than the label of this function.
+    """
     plugin_root, config = _plugin_and_config()
     # startup/resume/clear/compact: the model context is new, so every
     # pinned row is due in full exactly once more.
@@ -6474,25 +6962,24 @@ def _active_output(status, offline_adapter=None, offline_factory=None,
                         "The immediate SessionStart sync still runs; repair "
                         "the watcher so idle checks resume." % _trim(err, 240)),
         }
+    # A7/ruling 7: the ESTABLISH NOW instruction is a SessionStart-only
+    # one-shot. It is never emitted on a prompt rebrief or at Stop.
     claude_loop_notice = _claude_session_loop_notice(
-        status, interval, payload=hook_payload)
+        status, interval, payload=hook_payload) \
+        if event_name == "SessionStart" else None
     # Peek only: the durable FIFO is consumed at delivery, so a boundary
     # that ends in the authentication gate never drops queued deltas.
-    pending_preview = _watcher_pending_notice(status, config, consume=False)
+    pending_preview = _watcher_pending_notice(
+        status, config, consume=False, event_name=event_name)
     offline_key, offline_entry = _watcher_subscription_entry(status, config)
     inbox_check_notice = None
     try:
         _watcher_refresh_inbox_attention(status, config)
+        inbox_check_notice = _watcher_outage_recovered_notice(offline_key)
     except Exception as err:
-        inbox_check_notice = {
-            "system_message": "Attacca automatic inbox check will retry",
-            "context": (
-                "ATTACCA AUTOMATIC INBOX CHECK FAILED: %s. Previously staged "
-                "mail remains pinned and the per-minute watcher will retry; "
-                "do not assume an empty inbox." % _trim(err, 240)),
-        }
+        inbox_check_notice = _watcher_outage_notice(offline_key, err)
     terminal_notice = _terminal_migration_notice(
-        status, config, "SessionStart", offline_entry)
+        status, config, event_name, offline_entry)
     if offline_adapter is None:
         try:
             offline_adapter = _watcher_build_offline_adapter(
@@ -6503,7 +6990,16 @@ def _active_output(status, offline_adapter=None, offline_factory=None,
     # may be exactly what repairs a stale link or older protocol client.
     update_notice = _update_offer(status, plugin_root, config)
     try:
+        snapshot_started = time.time()
         snapshot = _mcp_snapshot(status, plugin_root, config)
+        if _runtime_name() == "codex" and (
+                time.time() - snapshot_started
+        ) > SESSION_BRIEF_DEADLINE_SECONDS:
+            # A13: Codex kills the hook at 8s. Spending the remaining budget
+            # assembling a live brief that will never be read is worse than
+            # the fast verified mirror, which is labeled stale on delivery.
+            raise HostedSnapshotDeadline(
+                "the hosted snapshot used the client hook timeout budget")
         # Sync activation is additive. A missing token/route/mirror or an
         # unwritable watcher directory can never break this healthy MCP brief.
         _watcher_activate_after_mcp(status, config, snapshot)
@@ -6516,6 +7012,9 @@ def _active_output(status, offline_adapter=None, offline_factory=None,
             output = _role_setup_output(status, snapshot)
         else:
             brief = _compact_snapshot(snapshot)
+            brief, brief_trimmed = _fit_session_brief(brief, overhead=1_200)
+            if brief_trimmed:
+                brief["brief_trimmed_sections"] = brief_trimmed
             context = """ATTACCA ACTIVE SESSION BRIEF — AUTHORITATIVE PROJECT STATE
 The installed SessionStart hook has already called get_handoff, check_inbox,
 rule_list, room_read, task_list, agent_list, and attacca_status
@@ -6531,12 +7030,16 @@ assigned. If any later Attacca response reports stale_context_warning, reload th
 handoff before further writes.
 
 %s""" % json.dumps(brief, indent=2, ensure_ascii=False)
-            _rules_banner = _mandatory_rules_banner(
-                (snapshot.get("rules") or {}).get("rules"))
+            # SessionStart always re-pins the FULL banner: the model
+            # context is new, so a compact banner would reference text this
+            # session has never seen.
+            _rules_banner = _turn_rules_banner(
+                status, config, (snapshot.get("rules") or {}).get("rules"),
+                "SessionStart")
             if _rules_banner:
                 context = _rules_banner + "\n\n" + context
             output = _event_context_output(
-                "SessionStart",
+                event_name,
                 "Attacca active · %s · MCP startup rules, handoff, inbox, room and tasks checked"
                 % status["project_id"], context)
         # These are additive: neither version discovery nor managed-block
@@ -6544,7 +7047,9 @@ handoff before further writes.
         # Deliver the durable watcher FIFO first so lower-priority update and
         # migration notices cannot consume its reserved context budget.
         output = _append_notice(
-            output, _watcher_consume_pending(status, config, pending_preview))
+            output, _watcher_consume_pending(
+                status, config, pending_preview,
+                event_name=event_name))
         output = _append_notice(
             output, _refresh_managed_laws(status, plugin_root, config=config))
         output = _append_notice(output, cloud_context_notice)
@@ -6562,12 +7067,15 @@ handoff before further writes.
         return output
     except StaleProjectLink as err:
         set_offered(status["root"], stale_project_id=status["project_id"])
-        output = _hook_output(status, recovery_reason=str(err))
+        output = _hook_output(status, recovery_reason=str(err),
+                              event_name=event_name)
         return _append_notices(
-            output, "SessionStart",
+            output, event_name,
             (update_notice, watcher_notice, claude_loop_notice,
              terminal_notice,
-             _watcher_consume_pending(status, config, pending_preview),
+             _watcher_consume_pending(
+                status, config, pending_preview,
+                event_name=event_name),
              inbox_check_notice))
     except Exception as err:
         auth_blocked = _authentication_required_error(err) or bool(
@@ -6587,17 +7095,19 @@ handoff before further writes.
             # instruction are all withheld until the binding is repaired.
             # The unconsumed FIFO delivers after re-authentication.
             return _authentication_gate_output(
-                status, config, "SessionStart", auth_error,
+                status, config, event_name, auth_error,
                 key=offline_key, entry=offline_entry)
         attention_notice = _watcher_attention_notice(status, config)
         output = _offline_failure_output(
-            status, config, "SessionStart", err, offline_adapter,
+            status, config, event_name, err, offline_adapter,
             entry=offline_entry)
         if output is None:
-            output = _failure_output(status, config, "SessionStart", err)
+            output = _failure_output(status, config, event_name, err)
         return _append_notices(
-            output, "SessionStart",
-            (_watcher_consume_pending(status, config, pending_preview),
+            output, event_name,
+            (_watcher_consume_pending(
+                status, config, pending_preview,
+                event_name=event_name),
              update_notice, watcher_notice, claude_loop_notice,
              terminal_notice, inbox_check_notice, attention_notice))
 
@@ -6752,10 +7262,11 @@ def _deliver_periodic_notices(status, config, event_name, output,
     inbox-check retry, update, terminal) are prompt-turn context only, so a
     Stop with nothing new returns None and the client stops quietly.
     """
-    pending_notice = _watcher_consume_pending(status, config, pending_preview)
+    pending_notice = _watcher_consume_pending(
+        status, config, pending_preview, event_name=event_name)
     attention_notice = _watcher_attention_notice(
-        status, config, new_only=(event_name == "Stop")) \
-        if include_attention else None
+        status, config, fresh_only=(event_name == "Stop"),
+        delta_label="STOP DELTA") if include_attention else None
     if event_name == "Stop":
         notices = (pending_notice,) + tuple(delta_notices) + (
             attention_notice,)
@@ -6822,6 +7333,19 @@ def _periodic_output(status, event_name, offline_adapter=None,
         elapsed is not None and 0 <= elapsed < interval)
     auth_latched = bool(isinstance(offline_entry, dict) and
                         offline_entry.get("auth_required"))
+    # A10 · a managed pulse is a machine ping, not a user turn: it never
+    # polls the host itself and never receives the rules banner or status
+    # chatter. Its only guaranteed output is one marker line.
+    is_pulse = (event_name == "UserPromptSubmit" and
+                _is_managed_pulse(hook_payload))
+    if is_pulse:
+        poll_due = False
+        if auth_latched and offline_entry.get("auth_login_surfaced_at"):
+            # The login path was already surfaced this session; repeating it
+            # every minute was the flood. Answer the ping and stay silent.
+            return _event_context_output(
+                event_name, "Attacca pulse · authentication still required",
+                _pulse_marker_line(0))
     if auth_latched and not poll_due:
         # The watcher proved a hosted 401/403 and owns the retry. No pinned
         # mail, FIFO delta, inbox check, update, or loop instruction is
@@ -6835,22 +7359,64 @@ def _periodic_output(status, event_name, offline_adapter=None,
             key=offline_key, entry=offline_entry)
     # Peek only: the durable FIFO is consumed at delivery, never before an
     # authentication rejection can withhold it.
-    pending_preview = _watcher_pending_notice(status, config, consume=False)
-    claude_loop_notice = _claude_stop_loop_notice(
-        status, hook_payload, interval) if event_name == "Stop" else None
+    pending_preview = _watcher_pending_notice(
+        status, config, consume=False, event_name=event_name)
+    # Ruling 7: the Claude session-loop instruction belongs to SessionStart
+    # alone. Re-asking for it at every Stop was pure repeated context.
+    claude_loop_notice = None
     inbox_check_notice = None
-    if not polling_disabled:
+    probe_blocked = is_pulse and _pulse_probe_blocked(offline_entry, checked_at)
+    if not polling_disabled and not probe_blocked:
         try:
             _watcher_refresh_inbox_attention(status, config)
+            # A9 · the once-per-state latch may only be consumed by a
+            # boundary that can actually deliver the line. Stop drops status
+            # notices, so recording there would silence the outage forever.
+            if event_name != "Stop":
+                inbox_check_notice = _watcher_outage_recovered_notice(
+                    offline_key)
         except Exception as err:
-            inbox_check_notice = {
-                "system_message": "Attacca automatic inbox check will retry",
-                "context": (
-                    "ATTACCA AUTOMATIC INBOX CHECK FAILED: %s. Previously "
-                    "staged mail remains pinned and the per-minute watcher "
-                    "will retry; do not assume an empty inbox." %
-                    _trim(err, 240)),
-            }
+            if event_name != "Stop":
+                inbox_check_notice = _watcher_outage_notice(offline_key, err)
+            if is_pulse:
+                _record_pulse_probe_failure(offline_key, checked_at)
+    if is_pulse:
+        # (a) never-shown mail/dispositions, (b) a version/managed-law change
+        # notice, and exactly one marker line. Nothing else — no banner, no
+        # watcher/terminal/update chatter, no already-delivered rows.
+        attention_notice = _watcher_attention_notice(
+            status, config, fresh_only=True, delta_label="PULSE DELTA")
+        law_notice = None
+        version_notice = None
+        if not probe_blocked:
+            try:
+                law_notice = _refresh_managed_laws(
+                    status, plugin_root, config=config)
+            except Exception:
+                law_notice = None
+            try:
+                version_notice = _update_offer(
+                    status, plugin_root, config,
+                    check_interval_seconds=UPDATE_CHECK_INTERVAL_SECONDS)
+            except Exception:
+                version_notice = None
+        new_rows = 0
+        if attention_notice:
+            new_rows = sum(
+                1 for line in attention_notice["context"].splitlines()
+                if line.startswith("- ["))
+        marker = _pulse_marker_line(
+            new_rows or bool(law_notice or version_notice or
+                             inbox_check_notice))
+        output = _event_context_output(
+            event_name,
+            "Attacca pulse · %s" % (
+                "%d new item(s)" % new_rows if new_rows else "nothing new"),
+            marker)
+        return _append_notices(
+            output, event_name,
+            (attention_notice, law_notice, version_notice,
+             inbox_check_notice))
     terminal_notice = _terminal_migration_notice(
         status, config, event_name, offline_entry)
     if offline_adapter is None:
@@ -6880,8 +7446,8 @@ def _periodic_output(status, event_name, offline_adapter=None,
     rules_output = None
     if event_name == "UserPromptSubmit" and not poll_due:
         cached_poll = (entry or {}).get("snapshot") or {}
-        cached_banner = _mandatory_rules_banner(
-            cached_poll.get("project_rules"),
+        cached_banner = _turn_rules_banner(
+            status, config, cached_poll.get("project_rules"), event_name,
             pre_omitted=cached_poll.get("project_rules_omitted_count"),
             pre_omitted_ids=cached_poll.get("project_rules_omitted_ids"))
         if cached_banner:
@@ -6907,8 +7473,9 @@ def _periodic_output(status, event_name, offline_adapter=None,
         previous = entry.get("snapshot") if entry else None
         _record_poll(status, identity, interval, checked_at, current)
         if event_name == "UserPromptSubmit":
-            rules_banner = _mandatory_rules_banner(
-                (snapshot.get("rules") or {}).get("rules"))
+            rules_banner = _turn_rules_banner(
+                status, config, (snapshot.get("rules") or {}).get("rules"),
+                event_name)
             if rules_banner:
                 rules_output = _event_context_output(
                     event_name,
@@ -6958,7 +7525,8 @@ def _periodic_output(status, event_name, offline_adapter=None,
         output = _offline_failure_output(
             status, config, event_name, err, offline_adapter,
             entry=offline_entry)
-        if output is None:
+        if output is None and not (isinstance(offline_entry, dict) and
+                                   offline_entry.get("auth_required")):
             output = _failure_output(status, config, event_name, err)
         return deliver(output)
 
@@ -7091,10 +7659,37 @@ def main(argv=None):
         if output:
             print(json.dumps(output))
     elif result["status"] == "linked" and event_name in (
+            "PreCompact", "PostCompact"):
+        # Kimi Code discards compaction-hook stdout and never emits a
+        # SessionStart with source=compact. Do no network work and print
+        # nothing; only record that the next prompt boundary owes this
+        # session the same full brief SessionStart would have sent.
+        try:
+            plugin_root, config = _plugin_and_config()
+            _register_watcher_subscription(result, plugin_root, config)
+            _mark_rebrief_pending(result, config, payload)
+        except Exception:
+            # A compaction hook must never fail the client's compaction.
+            pass
+    elif result["status"] == "linked" and event_name in (
             "SessionStart", "UserPromptSubmit", "Stop"):
-        output = _active_output(
-            result, hook_payload=payload) if event_name == "SessionStart" \
-            else _periodic_output(result, event_name, hook_payload=payload)
+        rebrief = False
+        if event_name == "UserPromptSubmit" and not _is_managed_pulse(payload):
+            try:
+                _, rebrief_config = _plugin_and_config()
+                rebrief = _consume_rebrief_pending(
+                    result, rebrief_config, payload)
+            except Exception:
+                rebrief = False
+        if event_name == "SessionStart":
+            output = _active_output(result, hook_payload=payload)
+        elif rebrief:
+            # Same assembly as SessionStart, emitted at the boundary the
+            # compacted client actually supports.
+            output = _active_output(
+                result, hook_payload=payload, event_name=event_name)
+        else:
+            output = _periodic_output(result, event_name, hook_payload=payload)
         if output:
             output = _with_migration_notice(output, migration)
             print(json.dumps(output))

@@ -7,11 +7,19 @@ group mail re-sent IN FULL on every boundary even when nothing was new, and a
 login prompt. These tests pin the five product rules that fix it:
 
 A1 auth gate      · only the login path on SessionStart/UserPromptSubmit/Stop
-A2 render-once    · a pinned/staged row is delivered in full exactly once per
-                    session, then as one reminder line
+A2 show once=read · a pinned/staged row is delivered in full exactly once per
+                    session; afterwards ONLY a count line remains (owner
+                    ruling / D-24 — the per-item reminder lines are retired)
 A3 Stop = delta   · Stop blocks only for never-delivered rows / real changes
-A4 open collapse  · deferred/blocked/claimed rows are always the one-liner
-A5 long mail      · staged bridged mail collapses to one line + room_read hint
+A4 open collapse  · deferred/blocked/claimed rows count but never render
+A5 long mail      · staged bridged mail leaves no excerpt after its first render
+A7 no self-echo   · watcher deltas authored by the receiving actor are dropped
+A8 coalesce       · entity updates arrive in one prompt-time injection
+A9 outage once    · a hosted-unreachable notice is surfaced once per state
+A10 pulse = ping  · a managed pulse injects only new mail + one marker line,
+                    and its network probe backs off during an outage
+A11 rules banner  · pinned every prompt turn, full only on change/start/10th
+A13 compaction    · source parity, Kimi PostCompact rebrief, brief budget
 """
 
 import contextlib
@@ -130,7 +138,7 @@ class TokenBudgetTestCase(unittest.TestCase):
 
     @contextlib.contextmanager
     def lifecycle_mocks(self, runtime, watcher=None, refresh=None,
-                        update=None, mcp=None):
+                        update=None, mcp=None, poll=None):
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.dict(
                 os.environ, {"ATTACCA_RUNTIME": runtime}, clear=False))
@@ -141,14 +149,14 @@ class TokenBudgetTestCase(unittest.TestCase):
                 hook, "_ensure_background_watcher",
                 return_value=watcher or {"ok": True,
                                          "already_running": True}))
-            if isinstance(refresh, Exception):
-                stack.enter_context(mock.patch.object(
-                    hook, "_watcher_refresh_inbox_attention",
-                    side_effect=refresh))
-            else:
+            if refresh is None:
                 stack.enter_context(mock.patch.object(
                     hook, "_watcher_refresh_inbox_attention",
                     return_value={"ok": True}))
+            else:
+                stack.enter_context(mock.patch.object(
+                    hook, "_watcher_refresh_inbox_attention",
+                    side_effect=refresh))
             stack.enter_context(mock.patch.object(
                 hook, "_terminal_migration_notice", return_value=None))
             stack.enter_context(mock.patch.object(
@@ -165,7 +173,9 @@ class TokenBudgetTestCase(unittest.TestCase):
                     hook, "_mcp_snapshot", return_value=mcp))
             stack.enter_context(mock.patch.object(
                 hook, "_poll_entry",
-                return_value=({"key": "actor"},
+                return_value=({"key": "actor", "runtime": runtime,
+                               "actor": "codex"},
+                              poll if poll is not None else
                               {"snapshot": {},
                                "last_poll_at": hook.time.time()})))
             yield snapshot
@@ -179,9 +189,85 @@ class TokenBudgetTestCase(unittest.TestCase):
         return output
 
     def session_start(self, runtime="codex", payload=None, **mocks):
-        with self.lifecycle_mocks(runtime, **mocks):
-            return hook._active_output(
+        with self.lifecycle_mocks(runtime, **mocks) as snapshot:
+            output = hook._active_output(
                 self.status, offline_adapter=object(), hook_payload=payload)
+        self.snapshot_calls = snapshot.call_count
+        return output
+
+    def stage_entity(self, entity_key, summary,
+                     actor="peer.director.claude", key=None):
+        """Queue one supersedable CURRENT ENTITY UPDATE row (A7/A8)."""
+        target = key or self.key
+
+        def mutate(state):
+            entry = state["subscriptions"][target]
+            entry.setdefault("pending", []).append({
+                "fingerprint": "fp-%s" % entity_key,
+                "kind": "project_entity_delta",
+                "entity_key": entity_key,
+                "actor": actor,
+                "summary": ("ATTACCA CURRENT ENTITY UPDATE · shared\n- %s"
+                            % summary),
+                "created_at": "2026-09-03T00:00:00+00:00",
+            })
+
+        hook._mutate_state(hook._watcher_state_path(), mutate)
+
+    def set_entry_fields(self, key=None, **fields):
+        target = key or self.key
+
+        def mutate(state):
+            state["subscriptions"][target].update(fields)
+
+        hook._mutate_state(hook._watcher_state_path(), mutate)
+
+    def pulse_payload(self, session_id="pulse-session"):
+        return {"session_id": session_id,
+                "prompt": "/attacca:inbox [%s:shared]" %
+                          hook.MANAGED_PULSE_MARKER}
+
+    def hosted_snapshot(self, rules=None, tasks=0, decisions=0, activity=0,
+                        room=0):
+        return {
+            "project": "shared",
+            "checked_at": "2026-09-03T00:00:00+00:00",
+            "handoff": {
+                "context_version": 7,
+                "handoff": {"objective": "HANDOFF-OBJECTIVE-MUST-SURVIVE"},
+                "decisions": [
+                    {"decision_id": "D-%02d" % index, "status": "accepted",
+                     "title": "Decision %02d" % index,
+                     "rationale": "RATIONALE-%02d " % index + ("d" * 400)}
+                    for index in range(decisions)],
+                "recent_activity": [
+                    {"event_id": "ev%03d" % index, "seq": index,
+                     "event_type": "task.updated",
+                     "actor": "peer.director.claude",
+                     "summary": "ACTIVITY-%03d " % index + ("a" * 260)}
+                    for index in range(activity)],
+            },
+            "rules": {"rules": rules or []},
+            "inbox": {"messages": [], "unread_total": 0,
+                      "may_have_more": False},
+            "room": {"messages": [
+                {"event_id": "room%03d" % index, "seq": index,
+                 "actor": "peer.director.claude", "msg_type": "chat",
+                 "body": "ROOM-%03d " % index + ("m" * 200)}
+                for index in range(room)]},
+            "tasks": {"tasks": [
+                {"task_id": "T-%02d" % index, "status": "queued",
+                 "title": "TASK-%02d " % index + ("t" * 300),
+                 "claimed_by": None}
+                for index in range(tasks)]},
+            "status": {
+                "counts": {"events": 12},
+                "you": {"actor_id": "shared.director.codex",
+                        "actor_type": "agent",
+                        "identity": {"role": "director",
+                                     "runtime": "codex"}},
+            },
+        }
 
     # ---------------------------------------------------------- A1 · auth
     def test_auth_gate_all_three_events_emit_only_login(self):
@@ -287,8 +373,8 @@ class TokenBudgetTestCase(unittest.TestCase):
         self.assertFalse(hook._watcher_reset_session_rendering(
             self.status, self.config))
 
-    # ---------------------------------------------------- A2 · render once
-    def test_render_once_second_render_is_one_line(self):
+    # ------------------------------------------- A2 · show once = read
+    def test_render_once_second_render_is_only_a_count_line(self):
         long_body = "DISPOSITION-HEAD " + ("directive filler " * 28) + \
             "DISPOSITION-TAIL"
         mail_body = "MAIL-HEAD " + ("mail filler " * 30) + "MAIL-TAIL"
@@ -298,45 +384,35 @@ class TokenBudgetTestCase(unittest.TestCase):
         self.stage_mail([mail(3, mail_body)])
 
         first = self.notice()
-        self.assertIn("PENDING DISPOSITIONS (1 total · 1 new · 0 collapsed)",
+        self.assertIn("PENDING DISPOSITIONS: 1 total (1 new)",
                       first["context"])
-        self.assertIn("UNREAD GROUP MAIL (1 staged · 1 new · 0 collapsed)",
+        self.assertIn("UNREAD GROUP MAIL: 1 staged (1 new)",
                       first["context"])
         self.assertIn("- [DISPOSITION REQUIRED] Event ev_assign007 · Room "
                       "#107 · directive · shared.director.claude: " +
                       long_body, first["context"])
         self.assertIn("- [YOUR ATTENTION] Room #503 · chat · "
                       "peer.director.claude: " + mail_body, first["context"])
-        self.assertNotIn("[PENDING ·", first["context"])
 
+        # SHOW ONCE = READ: an already-injected row leaves NO per-item line.
         second = self.notice()
-        self.assertIn("PENDING DISPOSITIONS (1 total · 0 new · 1 collapsed)",
+        self.assertIn("PENDING DISPOSITIONS: 1 total (0 new)",
                       second["context"])
-        self.assertIn("UNREAD GROUP MAIL (1 staged · 0 new · 1 collapsed)",
+        self.assertIn("UNREAD GROUP MAIL: 1 staged (0 new)",
                       second["context"])
-        self.assertNotIn("DISPOSITION REQUIRED", second["context"])
+        self.assertNotIn("DISPOSITION REQUIRED] Event", second["context"])
+        self.assertNotIn("DISPOSITION-HEAD", second["context"])
         self.assertNotIn("DISPOSITION-TAIL", second["context"])
+        self.assertNotIn("MAIL-HEAD", second["context"])
         self.assertNotIn("MAIL-TAIL", second["context"])
-        lines = second["context"].splitlines()
-        assignment = [line for line in lines
-                      if line.startswith("- [PENDING · none] ev_assign007")]
-        self.assertEqual(len(assignment), 1)
-        self.assertTrue(assignment[0].startswith(
-            "- [PENDING · none] ev_assign007 · Room #107 · directive · "
-            "shared.director.claude: DISPOSITION-HEAD directive filler"))
-        self.assertIn("…", assignment[0])
-        unread = [line for line in lines
-                  if line.startswith("- [PENDING · none] ev_mail003")]
-        self.assertEqual(len(unread), 1)
-        self.assertTrue(unread[0].startswith(
-            "- [PENDING · none] ev_mail003 · Room #503 · chat · "
-            "peer.director.claude: MAIL-HEAD mail filler"))
-        self.assertTrue(unread[0].endswith(
-            "room_read since_seq=502 for the full body"))
+        self.assertNotIn("ev_assign007", second["context"])
+        self.assertNotIn("ev_mail003", second["context"])
+        self.assertEqual(
+            [line for line in second["context"].splitlines()
+             if line.startswith("- ")], [])
+        self.assertLess(len(second["context"].encode("utf-8")), 400)
         self.assertLess(len(second["context"].encode("utf-8")),
                         len(first["context"].encode("utf-8")))
-        for line in (assignment[0], unread[0]):
-            self.assertLessEqual(len(line.encode("utf-8")), 240)
         self.assertEqual(self.notice()["context"], second["context"])
 
         # The ledger tracks disposition state + body hash; the durable data
@@ -352,6 +428,54 @@ class TokenBudgetTestCase(unittest.TestCase):
         self.assertEqual(entry["attention"][0]["body"], mail_body)
         self.assertFalse(entry["attention"][0]["acknowledged"])
 
+    def test_new_row_behind_a_full_page_is_delivered_and_counted(self):
+        # QA regression (Lead, 2026-09-03): 25 delivered rows filled the
+        # page; a 26th, genuinely new row must still render at the next
+        # boundary and be counted as new instead of hiding behind the page.
+        old = [disposition(i, "OLD-%02d " % i + "filler " * 10)
+               for i in range(1, 26)]
+        self.stage_dispositions(old)
+        first = self.notice()
+        self.assertIn("PENDING DISPOSITIONS: 25 total (25 new)",
+                      first["context"])
+        self.assertIsNone(self.notice(fresh_only=True))
+
+        new_body = "NEW-ROW-HEAD " + ("fresh " * 20) + "NEW-ROW-TAIL"
+        self.stage_dispositions(old + [disposition(26, new_body)])
+        stop = self.notice(fresh_only=True, delta_label="STOP DELTA")
+        self.assertIsNotNone(stop)
+        self.assertIn("PENDING DISPOSITIONS: 26 total (1 new)",
+                      stop["context"])
+        self.assertIn("ev_assign026", stop["context"])
+        self.assertIn(new_body, stop["context"])
+        self.assertNotIn("OLD-01", stop["context"])
+        self.assertEqual(
+            len([line for line in stop["context"].splitlines()
+                 if line.startswith("- ")]), 1)
+        self.assertIsNone(self.notice(fresh_only=True))
+        self.assertIn("PENDING DISPOSITIONS: 26 total (0 new)",
+                      self.notice()["context"])
+
+    def test_more_new_rows_than_a_page_are_delivered_across_boundaries(self):
+        rows = [disposition(i, "BULK-%02d " % i + "filler " * 5)
+                for i in range(1, 31)]
+        self.stage_dispositions(rows)
+        first = self.notice()
+        self.assertIn("PENDING DISPOSITIONS: 30 total (30 new)",
+                      first["context"])
+        self.assertIn("25 of the 30 new rows are shown here", first["context"])
+        self.assertEqual(
+            len([line for line in first["context"].splitlines()
+                 if line.startswith("- ")]), hook.WATCHER_ATTENTION_PAGE_SIZE)
+        second = self.notice(fresh_only=True)
+        self.assertIsNotNone(second)
+        self.assertIn("PENDING DISPOSITIONS: 30 total (5 new)",
+                      second["context"])
+        self.assertEqual(
+            len([line for line in second["context"].splitlines()
+                 if line.startswith("- ")]), 5)
+        self.assertIsNone(self.notice(fresh_only=True))
+
     def test_session_start_renders_in_full_once_more(self):
         body = "SESSION-RESET-BODY " + ("filler " * 40)
         self.stage_dispositions([disposition(4, body)])
@@ -363,8 +487,7 @@ class TokenBudgetTestCase(unittest.TestCase):
         context = output["hookSpecificOutput"]["additionalContext"]
         self.assertIn("- [DISPOSITION REQUIRED] Event ev_assign004", context)
         self.assertIn(body, context)
-        self.assertIn("PENDING DISPOSITIONS (1 total · 1 new · 0 collapsed)",
-                      context)
+        self.assertIn("PENDING DISPOSITIONS: 1 total (1 new)", context)
         self.assertNotIn(body, self.notice()["context"])
 
     # ------------------------------------------------------- A3 · Stop delta
@@ -379,11 +502,14 @@ class TokenBudgetTestCase(unittest.TestCase):
         stop = self.periodic("Stop")
         self.assertTrue(stop is None or stop.get("decision") != "block",
                         stop)
-        # The reminder still reaches the next prompt turn (no loss).
+        # The count still reaches the next prompt turn (no loss), with no
+        # per-item line at all.
         again = context_of(self.periodic("UserPromptSubmit"),
                            "UserPromptSubmit")
-        self.assertIn("- [PENDING · none] ev_assign001", again)
-        self.assertIn("- [PENDING · none] ev_mail001", again)
+        self.assertIn("PENDING DISPOSITIONS: 1 total (0 new)", again)
+        self.assertIn("UNREAD GROUP MAIL: 1 staged (0 new)", again)
+        self.assertNotIn("ev_assign001", again)
+        self.assertNotIn("ev_mail001", again)
         self.assertNotIn(body, again)
 
     def test_stop_blocks_with_only_the_new_item(self):
@@ -398,8 +524,7 @@ class TokenBudgetTestCase(unittest.TestCase):
         reason = stop["reason"]
         self.assertIn("- [DISPOSITION REQUIRED] Event ev_assign002", reason)
         self.assertIn(new_body, reason)
-        self.assertIn("PENDING DISPOSITIONS (2 total · 1 new · 1 collapsed)",
-                      reason)
+        self.assertIn("PENDING DISPOSITIONS: 2 total (1 new)", reason)
         self.assertIn("STOP DELTA", reason)
         # Already-delivered rows are never repeated in a Stop reason, not
         # even as the one-line reminder.
@@ -409,8 +534,7 @@ class TokenBudgetTestCase(unittest.TestCase):
         self.assertIsNone(self.periodic("Stop"))
         prompt = context_of(self.periodic("UserPromptSubmit"),
                             "UserPromptSubmit")
-        self.assertIn("PENDING DISPOSITIONS (2 total · 0 new · 2 collapsed)",
-                      prompt)
+        self.assertIn("PENDING DISPOSITIONS: 2 total (0 new)", prompt)
 
     def test_stop_blocks_for_never_delivered_staged_mail_only(self):
         self.stage_mail([mail(1, "FIRST-MAIL " + ("filler " * 40))])
@@ -426,7 +550,7 @@ class TokenBudgetTestCase(unittest.TestCase):
         self.assertNotIn("ev_mail001", second["reason"])
 
     # ------------------------------------------- A4 · open dispositions
-    def test_open_dispositions_collapse_even_on_first_render(self):
+    def test_open_dispositions_are_counted_and_never_rendered(self):
         filler = " " + ("detail " * 40) + "TAIL"
         rows = [
             disposition(1, "DEFERRED-BODY" + filler, state="deferred"),
@@ -436,34 +560,29 @@ class TokenBudgetTestCase(unittest.TestCase):
         ]
         self.stage_dispositions(rows)
         first = self.notice()["context"]
-        self.assertIn("PENDING DISPOSITIONS (4 total · 4 new · 0 collapsed)",
-                      first)
-        for state, index, head in (("deferred", 1, "DEFERRED-BODY"),
-                                   ("claimed", 2, "CLAIMED-BODY"),
-                                   ("blocked", 3, "BLOCKED-BODY")):
-            self.assertIn(
-                "- [PENDING · %s] ev_assign%03d · Room #%d · directive · "
-                "shared.director.claude: %s detail" % (
-                    state, index, 100 + index, head), first)
-            self.assertNotIn("current=%s" % state, first)
-        self.assertNotIn("DEFERRED-BODY" + filler, first)
-        self.assertNotIn("CLAIMED-BODY" + filler, first)
-        self.assertNotIn("BLOCKED-BODY" + filler, first)
+        # Only the one open assignment renders; the three this actor already
+        # deferred/claimed/blocked count toward the total and render nothing.
+        self.assertIn("PENDING DISPOSITIONS: 4 total (1 new)", first)
+        for index, head in ((1, "DEFERRED-BODY"), (2, "CLAIMED-BODY"),
+                            (3, "BLOCKED-BODY")):
+            self.assertNotIn("ev_assign%03d" % index, first)
+            self.assertNotIn(head, first)
         self.assertIn("- [DISPOSITION REQUIRED] Event ev_assign004", first)
         self.assertIn("OPEN-BODY" + filler, first)
-        self.assertEqual(first.count("DISPOSITION REQUIRED"), 1)
+        self.assertEqual(first.count("DISPOSITION REQUIRED] Event"), 1)
         second = self.notice()["context"]
-        self.assertIn("PENDING DISPOSITIONS (4 total · 0 new · 4 collapsed)",
-                      second)
-        self.assertIn("- [PENDING · none] ev_assign004", second)
+        self.assertIn("PENDING DISPOSITIONS: 4 total (0 new)", second)
+        self.assertNotIn("ev_assign004", second)
         # A never-seen row that this actor already deferred is not a reason
-        # to block Stop: it is being handled, and only the reminder is due.
+        # to block Stop: it is being handled, so it only raises the count.
         self.stage_dispositions(rows + [
             disposition(5, "LATE-DEFERRED" + filler, state="deferred")])
         self.assertIsNone(self.periodic("Stop"))
         prompt = context_of(self.periodic("UserPromptSubmit"),
                             "UserPromptSubmit")
-        self.assertIn("- [PENDING · deferred] ev_assign005", prompt)
+        self.assertIn("PENDING DISPOSITIONS: 5 total (0 new)", prompt)
+        self.assertNotIn("ev_assign005", prompt)
+        self.assertNotIn("LATE-DEFERRED", prompt)
 
     def test_changed_disposition_or_body_re_renders_in_full_once(self):
         body = "CHANGE-TRACKED-BODY " + ("filler " * 40)
@@ -473,13 +592,13 @@ class TokenBudgetTestCase(unittest.TestCase):
         # Host reports a different (non-open) disposition state → full once.
         self.stage_dispositions([disposition(1, body, state="acknowledged")])
         changed = self.notice()["context"]
-        self.assertIn("PENDING DISPOSITIONS (1 total · 1 new · 0 collapsed)",
-                      changed)
+        self.assertIn("PENDING DISPOSITIONS: 1 total (1 new)", changed)
         self.assertIn("- [DISPOSITION REQUIRED · current=acknowledged] Event "
                       "ev_assign001", changed)
         self.assertIn(body, changed)
         settled = self.notice()["context"]
-        self.assertIn("- [PENDING · acknowledged] ev_assign001", settled)
+        self.assertIn("PENDING DISPOSITIONS: 1 total (0 new)", settled)
+        self.assertNotIn("ev_assign001", settled)
         self.assertNotIn(body, settled)
         # Body change → full once more.
         amended = body + " AMENDED-BODY"
@@ -490,15 +609,16 @@ class TokenBudgetTestCase(unittest.TestCase):
         # A transition INTO an open disposition renders compact, never full.
         self.stage_dispositions([disposition(1, amended, state="deferred")])
         deferred = self.notice()["context"]
-        self.assertIn("- [PENDING · deferred] ev_assign001", deferred)
+        self.assertIn("PENDING DISPOSITIONS: 1 total (0 new)", deferred)
         self.assertNotIn("DISPOSITION REQUIRED", deferred)
+        self.assertNotIn("ev_assign001", deferred)
         self.assertNotIn(amended, deferred)
         self.assertEqual(
             self.entry()["rendered"]["ev_assign001"]["disposition_state"],
             "deferred")
 
     # ---------------------------------------------------- A5 · long mail
-    def test_staged_long_mail_collapses_after_first_full_render(self):
+    def test_staged_long_mail_leaves_no_excerpt_after_its_first_render(self):
         body = "LONG-MAIL-HEAD " + ("🌍" * 1_500) + " LONG-MAIL-TAIL"
         self.stage_mail([mail(9, body, seq=909, origin_project="peer",
                               authority="master-directive")])
@@ -509,25 +629,25 @@ class TokenBudgetTestCase(unittest.TestCase):
         self.assertIn("LONG-MAIL-TAIL", first)
         self.assertIn("ATTACCA COMPACTED TEXT", first)
         second = self.notice()["context"]
-        lines = [line for line in second.splitlines()
-                 if line.startswith("- [PENDING · none] ev_mail009")]
-        self.assertEqual(len(lines), 1)
-        line = lines[0]
-        self.assertTrue(line.startswith(
-            "- [PENDING · none] ev_mail009 · Room #909 · chat · "
-            "peer.director.claude: LONG-MAIL-HEAD 🌍"))
-        self.assertTrue(line.endswith(
-            "… · room_read since_seq=908 for the full body"))
-        self.assertLessEqual(line.count("🌍"),
-                             hook.WATCHER_COLLAPSED_BODY_CHARACTERS)
+        # SHOW ONCE = READ: not even a truncated excerpt survives — the row
+        # is one number in the count line.
+        self.assertIn("UNREAD GROUP MAIL: 1 staged (0 new)", second)
+        self.assertNotIn("ev_mail009", second)
+        self.assertNotIn("LONG-MAIL-HEAD", second)
         self.assertNotIn("LONG-MAIL-TAIL", second)
+        self.assertNotIn("🌍", second)
         self.assertNotIn("ATTACCA COMPACTED TEXT", second)
-        self.assertLess(len(second.encode("utf-8")), 1_200)
+        self.assertLess(len(second.encode("utf-8")), 400)
         # The lossless FIFO still holds the exact body for room_read/recovery.
         self.assertEqual(self.entry()["attention"][0]["body"], body)
 
     # -------------------------------------------------------- measurement
-    def test_measurement_25_pinned_items_second_turn_under_3000_bytes(self):
+    RULE = {"rule_id": "R-1", "version": 3, "priority": 1,
+            "scope": "everyone", "title": "Coordinate before writing",
+            "body": "RULE-BODY-FULL-TEXT " + ("rule detail " * 40),
+            "enabled": True}
+
+    def test_measurement_pinned_rows_entity_deltas_and_quiet_turns(self):
         rows = []
         for index in range(25):
             head = "PIN-%02d-HEAD" % index
@@ -539,34 +659,457 @@ class TokenBudgetTestCase(unittest.TestCase):
             self.assertGreaterEqual(len(body.encode("utf-8")), 560)
             rows.append(disposition(index + 1, body))
         self.stage_dispositions(rows)
+        self.set_entry_fields(canonical_actor_id="shared.director.codex")
+        for index in range(3):
+            self.stage_entity("task:T-%d" % index,
+                              "PEER-ENTITY-%d task queued" % index)
+        for index in range(2):
+            self.stage_entity("task:S-%d" % index,
+                              "SELF-ENTITY-%d task queued" % index,
+                              actor="shared.director.codex")
+        poll = {"snapshot": {"project_rules": [self.RULE],
+                             "project_rules_omitted_count": 0,
+                             "project_rules_omitted_ids": []},
+                "last_poll_at": hook.time.time()}
 
-        first = context_of(self.periodic("UserPromptSubmit"),
+        first = context_of(self.periodic("UserPromptSubmit", poll=poll),
                            "UserPromptSubmit")
         for row in rows:
             self.assertIn(row["body"], first)
-        self.assertIn("PENDING DISPOSITIONS (25 total · 25 new · 0 collapsed)",
-                      first)
-        self.assertGreater(len(first.encode("utf-8")), 15_000)
+        self.assertIn("PENDING DISPOSITIONS: 25 total (25 new)", first)
+        self.assertIn("RULE-BODY-FULL-TEXT", first)
+        # A8: every supersedable entity row arrives in ONE injection.
+        for index in range(3):
+            self.assertIn("PEER-ENTITY-%d" % index, first)
+        self.assertNotIn("queued update(s) remain", first)
+        # A7: the two rows this actor authored are never echoed back.
+        self.assertNotIn("SELF-ENTITY", first)
+        turn_one_bytes = len(first.encode("utf-8"))
+        self.assertGreater(turn_one_bytes, 15_000)
 
-        second_output = self.periodic("UserPromptSubmit")
+        second_output = self.periodic("UserPromptSubmit", poll=poll)
         second = context_of(second_output, "UserPromptSubmit")
-        self.assertLess(len(second.encode("utf-8")), 3_000)
-        self.assertIn("PENDING DISPOSITIONS (25 total · 0 new · 25 collapsed)",
-                      second)
+        quiet_prompt_bytes = len(second.encode("utf-8"))
+        self.assertLess(quiet_prompt_bytes, 1_000)
+        self.assertIn("PENDING DISPOSITIONS: 25 total (0 new)", second)
+        self.assertIn("call rule_list for full text", second)
+        self.assertNotIn("RULE-BODY-FULL-TEXT", second)
+        self.assertNotIn("PEER-ENTITY", second)
         for row in rows:
             self.assertNotIn(row["body"], second)
             self.assertNotIn(row["body"][-40:], second)
-        self.assertIn("- [PENDING · none] ev_assign001 · Room #101", second)
-        self.assertIn("check_inbox for the complete current set", second)
         self.assertNotIn("decision", second_output)
         # Nothing was dropped: all 25 remain pinned and tracked.
         entry = self.entry()
         self.assertEqual(len(entry["pending_dispositions"]), 25)
         self.assertEqual(len(entry["rendered"]), 25)
+        self.assertEqual(entry["pending"], [])
+
+        stop = self.periodic("Stop", poll=poll)
+        self.assertIsNone(stop)
+
+        pulse_output = self.periodic(
+            "UserPromptSubmit", payload=self.pulse_payload(), poll=poll)
+        pulse = context_of(pulse_output, "UserPromptSubmit")
+        pulse_bytes = len(pulse.encode("utf-8"))
+        self.assertLess(pulse_bytes, 300)
+        self.assertEqual(pulse.strip(), "ATTACCA_PULSE: nothing_new")
+        print("\nMEASURED · turn-1 prompt %d B · turn-2 quiet prompt %d B · "
+              "turn-2 Stop %d B · quiet pulse %d B" % (
+                  turn_one_bytes, quiet_prompt_bytes,
+                  len(json.dumps(stop or "").encode("utf-8")) if stop else 0,
+                  pulse_bytes))
+
+    # ------------------------------------------------------ A7 · self echo
+    def test_watcher_never_echoes_this_actors_own_writes(self):
+        self.set_entry_fields(canonical_actor_id="shared.director.codex",
+                              actor_aliases=["legacy.codex"])
+        entry = self.entry()
+        self.assertTrue(hook._watcher_event_is_self(
+            {"event_type": "task.updated",
+             "operational_actor_id": "shared.director.codex"}, entry))
+        self.assertTrue(hook._watcher_event_is_self(
+            {"event_type": "task.updated",
+             "actor_id": "legacy.codex"}, entry))
+        self.assertFalse(hook._watcher_event_is_self(
+            {"event_type": "task.updated",
+             "operational_actor_id": "peer.director.claude"}, entry))
+
+        events = [
+            {"seq": 11, "event_id": "ev-self", "event_type": "task.updated",
+             "operational_actor_id": "shared.director.codex",
+             "task_id": "T-1", "created_at": "2026-09-03T00:00:00+00:00",
+             "payload": {"title": "SELF-TASK-EDIT"}},
+            {"seq": 12, "event_id": "ev-peer", "event_type": "task.updated",
+             "operational_actor_id": "peer.director.claude",
+             "task_id": "T-2", "created_at": "2026-09-03T00:00:01+00:00",
+             "payload": {"title": "PEER-TASK-EDIT"}},
+        ]
+        with mock.patch.object(hook, "_settings_interval", return_value=60), \
+             mock.patch.object(hook, "_watcher_refresh_inbox_entry",
+                               return_value={"ok": True, "staged": 0}):
+            hook._watcher_tick(
+                self.key, now=0, force=True,
+                delta_loader=lambda after: {
+                    "events": [], "next_after": 0, "may_have_more": False},
+                offline_factory=lambda *_: None, notifier=lambda *_: None)
+            hook._watcher_tick(
+                self.key, now=60, force=True,
+                delta_loader=lambda after: {
+                    "events": events, "next_after": 12,
+                    "may_have_more": False},
+                offline_factory=lambda *_: None, notifier=lambda *_: None)
+        staged = json.dumps(self.entry()["pending"])
+        self.assertIn("PEER-TASK-EDIT", staged)
+        self.assertNotIn("SELF-TASK-EDIT", staged)
+
+        # A self-authored row already queued by an older build is dropped at
+        # render and never blocks Stop.
+        self.stage_entity("task:T-9", "STALE-SELF-ROW",
+                          actor="shared.director.codex")
         self.assertIsNone(self.periodic("Stop"))
-        third = context_of(self.periodic("UserPromptSubmit"),
-                           "UserPromptSubmit")
-        self.assertEqual(third, second)
+        prompt = context_of(self.periodic("UserPromptSubmit"),
+                            "UserPromptSubmit")
+        self.assertNotIn("STALE-SELF-ROW", prompt)
+        self.assertIn("PEER-TASK-EDIT", prompt)
+
+    # ------------------------------------------------ A8 · coalesced deltas
+    def test_entity_updates_are_one_injection_and_never_block_stop(self):
+        for index in range(6):
+            self.stage_entity("rule:R-%d" % index,
+                              "ENTITY-ROW-%d rule updated" % index)
+        # Stop carries no entity row at all: it is not a new-mail delta.
+        self.assertIsNone(self.periodic("Stop"))
+        self.assertEqual(len(self.entry()["pending"]), 6)
+        prompt = context_of(self.periodic("UserPromptSubmit"),
+                            "UserPromptSubmit")
+        for index in range(6):
+            self.assertIn("ENTITY-ROW-%d" % index, prompt)
+        self.assertNotIn("queued update(s) remain", prompt)
+        self.assertEqual(self.entry()["pending"], [])
+
+    # ----------------------------------------------------- A9 · outage once
+    def test_hosted_outage_is_surfaced_once_per_state(self):
+        outage = ConnectionRefusedError("hosted endpoint refused")
+        # A Stop boundary drops status notices, so it must not consume the
+        # once-per-state latch: the outage would otherwise never be shown.
+        self.assertIsNone(self.periodic("Stop", refresh=outage))
+        first = context_of(
+            self.periodic("UserPromptSubmit", refresh=outage),
+            "UserPromptSubmit")
+        self.assertEqual(first.count("ATTACCA AUTOMATIC INBOX CHECK FAILED"),
+                         1)
+        self.assertIn("ATTACCA AUTOMATIC INBOX CHECK FAILED", first)
+        for _ in range(3):
+            repeat = self.periodic("UserPromptSubmit", refresh=outage)
+            self.assertTrue(
+                repeat is None or "INBOX CHECK FAILED" not in
+                context_of(repeat, "UserPromptSubmit"), repeat)
+        # A different error class is a different state and is reported once.
+        changed = context_of(
+            self.periodic("UserPromptSubmit",
+                          refresh=RuntimeError("gateway rejected the probe")),
+            "UserPromptSubmit")
+        self.assertIn("ATTACCA AUTOMATIC INBOX CHECK FAILED", changed)
+        self.assertIn("gateway rejected the probe", changed)
+        # Recovery clears the latch and reports exactly once — and a Stop
+        # that happens to see the recovery first cannot swallow that line.
+        self.assertIsNone(self.periodic("Stop"))
+        restored = context_of(self.periodic("UserPromptSubmit"),
+                              "UserPromptSubmit")
+        self.assertIn("ATTACCA HOSTED CONNECTION RESTORED", restored)
+        again = self.periodic("UserPromptSubmit")
+        self.assertTrue(
+            again is None or "CONNECTION RESTORED" not in
+            context_of(again, "UserPromptSubmit"), again)
+        # Stop never carries the outage notice.
+        self.assertIsNone(self.periodic("Stop", refresh=outage))
+
+    def test_pulse_probe_backs_off_after_three_failures_and_resets(self):
+        attempts = []
+
+        def probe(*_args, **_kwargs):
+            attempts.append(1)
+            raise ConnectionRefusedError("hosted endpoint down")
+
+        outage_lines = 0
+        for _ in range(5):
+            output = self.periodic(
+                "UserPromptSubmit", payload=self.pulse_payload(),
+                refresh=probe)
+            context = context_of(output, "UserPromptSubmit")
+            self.assertIn("ATTACCA_PULSE:", context)
+            if "INBOX CHECK FAILED" in context:
+                outage_lines += 1
+        # Five pulses, three network probes: the fourth and fifth are backed
+        # off, and the outage was reported exactly once (A9).
+        self.assertEqual(len(attempts), hook.PULSE_PROBE_FAILURE_THRESHOLD)
+        self.assertEqual(outage_lines, 1)
+        entry = self.entry()
+        self.assertEqual(entry["pulse_probe_failures"],
+                         hook.PULSE_PROBE_FAILURE_THRESHOLD)
+        self.assertGreater(entry["pulse_probe_next_at_epoch"],
+                           hook.time.time())
+        self.assertEqual(hook._pulse_probe_backoff_seconds(3), 60)
+        self.assertEqual(hook._pulse_probe_backoff_seconds(4), 120)
+        self.assertEqual(hook._pulse_probe_backoff_seconds(20),
+                         hook.PULSE_PROBE_BACKOFF_MAX_SECONDS)
+
+        # The backed-off window expires; the first success resets everything
+        # and emits one restored line.
+        self.set_entry_fields(pulse_probe_next_at_epoch=0)
+        restored = context_of(
+            self.periodic("UserPromptSubmit", payload=self.pulse_payload()),
+            "UserPromptSubmit")
+        self.assertIn("ATTACCA HOSTED CONNECTION RESTORED", restored)
+        entry = self.entry()
+        self.assertNotIn("pulse_probe_failures", entry)
+        self.assertNotIn("outage_notice_signature", entry)
+
+    # -------------------------------------------------------- A10 · pulse
+    def test_managed_pulse_injects_only_new_items_and_one_marker(self):
+        poll = {"snapshot": {"project_rules": [self.RULE],
+                             "project_rules_omitted_count": 0,
+                             "project_rules_omitted_ids": []},
+                "last_poll_at": hook.time.time()}
+        self.stage_dispositions([disposition(1, "PULSE-ASSIGNMENT-BODY")])
+        self.stage_entity("task:T-5", "PULSE-ENTITY-ROW")
+        payload = self.pulse_payload()
+
+        first_output = self.periodic(
+            "UserPromptSubmit", payload=payload, poll=poll)
+        first = context_of(first_output, "UserPromptSubmit")
+        # (a) never-shown mail/dispositions arrive in full, first sight.
+        self.assertIn("PULSE-ASSIGNMENT-BODY", first)
+        self.assertIn("ATTACCA_PULSE: new=1", first)
+        self.assertEqual(first.count("ATTACCA_PULSE:"), 1)
+        # No rules banner and no entity drip on a machine ping.
+        self.assertNotIn("MANDATORY PROJECT RULES", first)
+        self.assertNotIn("PULSE-ENTITY-ROW", first)
+        self.assertEqual(self.snapshot_calls, 0)
+
+        quiet_output = self.periodic(
+            "UserPromptSubmit", payload=payload, poll=poll)
+        quiet = context_of(quiet_output, "UserPromptSubmit")
+        self.assertEqual(quiet.strip(), "ATTACCA_PULSE: nothing_new")
+        self.assertNotIn("check_inbox", quiet)
+        self.assertNotIn("MANDATORY PROJECT RULES", quiet)
+        self.assertLess(len(quiet.encode("utf-8")), 300)
+        # The pulse consumed nothing durable: the entity row still waits for
+        # the next real prompt turn.
+        self.assertIn("PULSE-ENTITY-ROW", json.dumps(self.entry()["pending"]))
+        prompt = context_of(self.periodic("UserPromptSubmit", poll=poll),
+                            "UserPromptSubmit")
+        self.assertIn("PULSE-ENTITY-ROW", prompt)
+
+    def test_session_loop_instruction_is_session_start_only(self):
+        payload = {"session_id": "loop-session", "session_crons": []}
+        start = self.session_start(
+            "claude", payload=payload, mcp=ConnectionRefusedError("offline"))
+        self.assertIn("ATTACCA CLAUDE SESSION LOOP",
+                      json.dumps(start))
+        for event_name in ("UserPromptSubmit", "Stop"):
+            output = self.periodic(event_name, "claude", payload=payload)
+            self.assertNotIn("ATTACCA CLAUDE SESSION LOOP",
+                             json.dumps(output or {}))
+        pulse = self.periodic(
+            "UserPromptSubmit", "claude", payload=self.pulse_payload())
+        self.assertNotIn("ATTACCA CLAUDE SESSION LOOP",
+                         json.dumps(pulse or {}))
+
+    # ------------------------------------------------- A11 · rules banner
+    def test_rules_banner_is_compact_until_change_or_tenth_turn(self):
+        poll = {"snapshot": {"project_rules": [self.RULE],
+                             "project_rules_omitted_count": 0,
+                             "project_rules_omitted_ids": []},
+                "last_poll_at": hook.time.time()}
+
+        def banner(**kwargs):
+            return context_of(
+                self.periodic("UserPromptSubmit", poll=poll, **kwargs),
+                "UserPromptSubmit")
+
+        first = banner()
+        self.assertTrue(first.startswith(
+            "===================== ATTACCA MANDATORY PROJECT RULES"))
+        self.assertIn("RULE-BODY-FULL-TEXT", first)
+        self.assertNotIn("call rule_list for full text", first)
+
+        for turn in range(2, 11):
+            compact = banner()
+            self.assertTrue(compact.startswith(
+                "===================== ATTACCA MANDATORY PROJECT RULES"),
+                turn)
+            self.assertIn("• R-1 · Coordinate before writing", compact)
+            self.assertIn("call rule_list for full text", compact)
+            self.assertNotIn("RULE-BODY-FULL-TEXT", compact)
+            self.assertLess(len(compact.encode("utf-8")),
+                            len(first.encode("utf-8")))
+        # Every tenth prompt turn re-pins the complete binding text.
+        self.assertIn("RULE-BODY-FULL-TEXT", banner())
+
+        # A rule change always restores the full banner immediately.
+        self.assertNotIn("RULE-BODY-FULL-TEXT", banner())
+        changed_rule = dict(self.RULE, version=4,
+                            body="RULE-BODY-V4 " + ("changed detail " * 20))
+        poll = {"snapshot": {"project_rules": [changed_rule],
+                             "project_rules_omitted_count": 0,
+                             "project_rules_omitted_ids": []},
+                "last_poll_at": hook.time.time()}
+        self.assertIn("RULE-BODY-V4", banner())
+
+    def test_compact_banner_keeps_the_omitted_rule_warning(self):
+        fingerprint = hook._rules_fingerprint([self.RULE], ["R-9"])
+        compact = hook._compact_rules_banner(
+            [self.RULE], fingerprint, pre_omitted=1, pre_omitted_ids=["R-9"])
+        self.assertIn("Omitted binding rule_ids: R-9", compact)
+        self.assertIn("STOP before other work and call rule_list for those "
+                      "exact rule_ids", compact)
+        self.assertIn("version %s" % fingerprint, compact)
+        # Full renders keep their existing truncation/omission guarantees.
+        full = hook._mandatory_rules_banner(
+            [self.RULE], pre_omitted=1, pre_omitted_ids=["R-9"])
+        self.assertIn("RULE-BODY-FULL-TEXT", full)
+        self.assertIn("Omitted binding rule_ids: R-9", full)
+        self.assertNotEqual(
+            hook._rules_fingerprint([self.RULE]),
+            hook._rules_fingerprint([dict(self.RULE, body="edited")]))
+
+    # -------------------------------------------------- A13 · compaction
+    def test_session_start_brief_is_identical_for_every_source(self):
+        snapshot = self.hosted_snapshot(rules=[self.RULE], tasks=2,
+                                        decisions=1, activity=2, room=1)
+        self.stage_dispositions([disposition(1, "COMPACT-SOURCE-BODY")])
+        rendered = {}
+        for source in ("startup", "resume", "clear", "compact", "fork"):
+            output = self.session_start(
+                payload={"source": source, "session_id": "s-%s" % source},
+                mcp=snapshot)
+            rendered[source] = output[
+                "hookSpecificOutput"]["additionalContext"]
+            self.assertIn("ATTACCA ACTIVE SESSION BRIEF", rendered[source])
+            self.assertIn("COMPACT-SOURCE-BODY", rendered[source])
+        self.assertEqual(len(set(rendered.values())), 1, rendered.keys())
+
+    def test_kimi_compaction_marks_a_rebrief_for_the_next_prompt(self):
+        payload = {"session_id": "kimi-session",
+                   "hook_event_name": "PostCompact"}
+        key = self.register("kimi")
+        with mock.patch.dict(os.environ, {"ATTACCA_RUNTIME": "kimi"}), \
+             mock.patch.object(hook, "_plugin_and_config",
+                               return_value=(ROOT, self.config)):
+            self.assertTrue(hook._mark_rebrief_pending(
+                self.status, self.config, payload))
+            self.assertIn("kimi-session",
+                          self.entry(key)["rebrief_pending"])
+            # A managed pulse must not consume a compaction rebrief.
+            self.assertTrue(hook._consume_rebrief_pending(
+                self.status, self.config, payload))
+            self.assertFalse(hook._consume_rebrief_pending(
+                self.status, self.config, payload))
+        manifest = json.loads((ROOT / "kimi.plugin.json").read_text())
+        events = [row["event"] for row in manifest["hooks"]]
+        self.assertIn("PostCompact", events)
+        self.assertEqual(
+            [row["command"] for row in manifest["hooks"]
+             if row["event"] == "PostCompact"],
+            ["python3 ./hooks/session_start.py"])
+
+    def test_rebriefed_prompt_turn_emits_the_full_session_brief(self):
+        snapshot = self.hosted_snapshot(rules=[self.RULE], tasks=1)
+        with self.lifecycle_mocks("kimi", mcp=snapshot):
+            output = hook._active_output(
+                self.status, offline_adapter=object(),
+                hook_payload={"session_id": "kimi-session"},
+                event_name="UserPromptSubmit")
+        # Kimi's prompt hook shape, carrying the SessionStart assembly.
+        self.assertIn("ATTACCA ACTIVE SESSION BRIEF", output["message"])
+        self.assertIn("RULE-BODY-FULL-TEXT", output["message"])
+
+    def test_session_brief_is_trimmed_to_the_client_budget(self):
+        brief = {
+            "project_rules": [self.RULE],
+            "cloud_context": {"content": "CLOUD-MUST-SURVIVE"},
+            "handoff": {"objective": "HANDOFF-MUST-SURVIVE"},
+            "unread_room": [{"seq": 1, "body": "UNREAD-MUST-SURVIVE"}],
+            "recent_activity": [{"summary": "ACTIVITY-" + "a" * 400}],
+            "decisions": [{"decision_id": "D-1", "status": "accepted",
+                           "rationale": "DECISION-" + "d" * 400}],
+            "recent_room": [{"seq": 2, "body": "ROOM-" + "m" * 400}],
+            "tasks": [{"task_id": "T-1", "status": "queued",
+                       "claimed_by": None, "title": "TASK-" + "t" * 400}],
+        }
+        trimmed, sections = hook._fit_session_brief(brief, budget=1_500)
+        self.assertEqual(sections,
+                         ["recent_activity", "decisions_detail",
+                          "recent_room", "tasks_detail"])
+        for marker in ("CLOUD-MUST-SURVIVE", "HANDOFF-MUST-SURVIVE",
+                       "UNREAD-MUST-SURVIVE", "RULE-BODY-FULL-TEXT"):
+            self.assertIn(marker, json.dumps(trimmed))
+        for marker in ("ACTIVITY-a", "DECISION-d", "ROOM-m", "TASK-t"):
+            self.assertNotIn(marker, json.dumps(trimmed))
+        self.assertEqual(trimmed["tasks"],
+                         [{"task_id": "T-1", "status": "queued",
+                           "claimed_by": None}])
+        self.assertEqual(trimmed["decisions"],
+                         [{"decision_id": "D-1", "status": "accepted"}])
+        # An already-small brief is returned untouched.
+        small = {"handoff": {"objective": "small"}}
+        self.assertEqual(hook._fit_session_brief(small), (small, []))
+
+        snapshot = self.hosted_snapshot(rules=[self.RULE], tasks=8,
+                                        decisions=6, activity=8, room=8)
+        with mock.patch.object(hook, "SESSION_BRIEF_MAX_BYTES", 2_000):
+            context = self.session_start(mcp=snapshot)[
+                "hookSpecificOutput"]["additionalContext"]
+        brief = json.loads(context.rsplit("\n\n", 1)[1])
+        self.assertIn("recent_activity", brief["brief_trimmed_sections"])
+        self.assertEqual(brief["recent_activity"], [])
+        self.assertIn("HANDOFF-OBJECTIVE-MUST-SURVIVE", context)
+        self.assertIn("RULE-BODY-FULL-TEXT", context)
+
+    def test_slow_or_failed_snapshot_falls_back_instead_of_emitting_nothing(
+            self):
+        snapshot = self.hosted_snapshot(rules=[self.RULE])
+        with mock.patch.object(hook, "SESSION_BRIEF_DEADLINE_SECONDS", -1):
+            output = self.session_start(mcp=snapshot)
+        self.assertIsNotNone(output)
+        context = output["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("ATTACCA ACTIVE SESSION BRIEF —", context)
+        self.assertIn("ATTACCA OFFLINE STATE", context)
+        # A live snapshot inside the deadline still produces the live brief.
+        self.assertIn("ATTACCA ACTIVE SESSION BRIEF",
+                      self.session_start(mcp=snapshot)[
+                          "hookSpecificOutput"]["additionalContext"])
+
+    # ------------------------------------------------------- hardening
+    def test_offline_failure_auth_fallback_uses_the_once_marker_gate(self):
+        hook._watcher_queue_auth_required(
+            self.key, self.entry(),
+            hook.HostedAuthenticationRequired("revoked", http_status=401), 0)
+        entry = self.entry()
+        self.assertTrue(entry["auth_required"])
+        with mock.patch.object(hook, "_plugin_and_config",
+                               return_value=(ROOT, self.config)):
+            stop = hook._offline_failure_output(
+                self.status, self.config, "Stop",
+                ConnectionRefusedError("offline"), object(), entry=entry)
+            self.assertEqual(stop["decision"], "block")
+            self.assertIn("ATTACCA AUTHENTICATION REQUIRED", stop["reason"])
+            self.assertTrue(self.entry()["auth_login_surfaced_at"])
+            # Second Stop of the same session is silent, and the caller must
+            # not replace it with a generic sync-failure notice.
+            self.assertIsNone(hook._offline_failure_output(
+                self.status, self.config, "Stop",
+                ConnectionRefusedError("offline"), object(),
+                entry=self.entry()))
+            prompt = hook._offline_failure_output(
+                self.status, self.config, "UserPromptSubmit",
+                ConnectionRefusedError("offline"), object(),
+                entry=self.entry())
+        self.assertIn("ATTACCA AUTHENTICATION REQUIRED",
+                      prompt["hookSpecificOutput"]["additionalContext"])
+        self.assertIsNone(self.periodic("Stop"))
 
 
 if __name__ == "__main__":

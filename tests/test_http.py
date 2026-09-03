@@ -386,7 +386,7 @@ class HttpTestCase(unittest.TestCase):
                          "attacca-session")
         self.assertEqual(
             [hook["event"] for hook in kimi_manifest["hooks"]],
-            ["UserPromptSubmit", "Stop"])
+            ["UserPromptSubmit", "Stop", "PostCompact"])
         self.assertFalse({"SessionStart", "SessionHeartbeat"}.intersection(
             hook["event"] for hook in kimi_manifest["hooks"]))
         self.assertTrue(all(

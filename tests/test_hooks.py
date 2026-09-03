@@ -426,7 +426,7 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
         self.assertEqual(manifest["sessionStart"]["skill"],
                          "attacca-session")
         events = [hook["event"] for hook in manifest["hooks"]]
-        self.assertEqual(events, ["UserPromptSubmit", "Stop"])
+        self.assertEqual(events, ["UserPromptSubmit", "Stop", "PostCompact"])
         self.assertNotIn("SessionStart", events)
         self.assertNotIn("SessionHeartbeat", events)
         for hook in manifest["hooks"]:
@@ -790,7 +790,7 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                 second = self._hook(
                     checkout, root / "unused", home, url=url,
                     runtime="kimi", event="UserPromptSubmit")
-                self.assertIn(c.DEFAULT_AUTHORITY_RULE_BODY, second.stdout)
+                self.assertIn("ATTACCA MANDATORY PROJECT RULES", second.stdout)
                 self.assertNotIn("ATTACCA UPDATE CHOICE", second.stdout)
                 still_seeded = next(iter(
                     self._poll_state(plugin_data)["polls"].values()))
@@ -801,7 +801,7 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                 skipped = self._hook(
                     checkout, root / "unused", home, url=url,
                     runtime="kimi", event="UserPromptSubmit")
-                self.assertIn(c.DEFAULT_AUTHORITY_RULE_BODY, skipped.stdout)
+                self.assertIn("ATTACCA MANDATORY PROJECT RULES", skipped.stdout)
                 self.assertNotIn("ATTACCA UPDATE CHOICE", skipped.stdout)
             finally:
                 c.VERSION = original_version
@@ -1620,7 +1620,7 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                 conn.close()
                 periodic = self._hook(
                     checkout, data, home, url=url, event="UserPromptSubmit")
-                self.assertIn(c.DEFAULT_AUTHORITY_RULE_BODY, periodic.stdout)
+                self.assertIn("ATTACCA MANDATORY PROJECT RULES", periodic.stdout)
                 self.assertNotIn("ATTACCA AUTOMATIC UPDATE", periodic.stdout)
                 conn = c.connect(db)
                 unread = c.inbox_read(
@@ -1662,7 +1662,7 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
 
                 throttled = self._hook(
                     checkout, data, home, url=url, event="UserPromptSubmit")
-                self.assertIn(c.DEFAULT_AUTHORITY_RULE_BODY, throttled.stdout)
+                self.assertIn("ATTACCA MANDATORY PROJECT RULES", throttled.stdout)
                 self.assertNotIn("ATTACCA AUTOMATIC UPDATE", throttled.stdout)
                 still_seeded = next(iter(
                     self._poll_state(data)["polls"].values()))
@@ -1671,7 +1671,7 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                 self._expire_polls(data)
                 unchanged = self._hook(
                     checkout, data, home, url=url, event="UserPromptSubmit")
-                self.assertIn(c.DEFAULT_AUTHORITY_RULE_BODY, unchanged.stdout)
+                self.assertIn("ATTACCA MANDATORY PROJECT RULES", unchanged.stdout)
                 self.assertNotIn("ATTACCA AUTOMATIC UPDATE", unchanged.stdout)
                 refreshed = next(iter(
                     self._poll_state(data)["polls"].values()))
