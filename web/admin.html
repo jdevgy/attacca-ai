@@ -671,8 +671,8 @@
       function resetListPage(view) { listPage(view).offset = 0; }
 
       function resetProjectPages() {
-        ["tasks", "decisions", "rules", "agents", "bridges", "handoff",
-          "roleScopeHistory", "log", "search"].forEach(resetListPage);
+        ["tasks", "decisions", "rules", "agents", "bridges", "sharedHandoff",
+          "handoff", "roleScopeHistory", "log", "search"].forEach(resetListPage);
       }
 
       function listQuery(view, extra = {}) {
@@ -851,6 +851,7 @@
         decisionSearch: "",
         agentSearch: "",
         bridgeSearch: "",
+        sharedHandoffSearch: "",
         handoffSearch: "",
         handoffActor: "",
         roleScopeRole: "",
@@ -861,7 +862,8 @@
         listPages: {
           workspaces: newListPage(), tasks: newListPage(), decisions: newListPage(),
           rules: newListPage(), agents: newListPage(), bridges: newListPage(),
-          handoff: newListPage(), roleScopeHistory: newListPage(),
+          sharedHandoff: newListPage(), handoff: newListPage(),
+          roleScopeHistory: newListPage(),
           log: newListPage(), search: newListPage(),
           clientKeys: newListPage()
         },
@@ -1051,8 +1053,30 @@
 
       function canManageRoleScopes() { return canManageProjectRules(); }
 
+      function registeredAiAgents() {
+        const agents = state.data.agentOptions?.agents ||
+          state.data.agents?.agents || state.workspaceAgents?.[state.projectId] || [];
+        return agents.filter(agent => {
+          const actor = String(agent.agent_id || agent.operational_actor_id || "").trim();
+          const actorType = String(agent.actor_type || "agent").toLowerCase();
+          return actor && actorType === "agent" && !/^(?:web|console)\./i.test(actor);
+        });
+      }
+
+      function canManageSharedHandoff() {
+        return state.prefs.actorType === "agent" &&
+          panelAgentRecord()?.role === "director";
+      }
+
       function selectedHandoffActor() {
-        return String(state.handoffActor || state.prefs.actor || "").trim();
+        const agents = registeredAiAgents();
+        const ids = new Set(agents.map(agent =>
+          String(agent.agent_id || agent.operational_actor_id || "").trim()));
+        const selected = String(state.handoffActor || "").trim();
+        if (selected && ids.has(selected)) return selected;
+        const current = String(state.prefs.actor || "").trim();
+        if (state.prefs.actorType === "agent" && ids.has(current)) return current;
+        return String(agents[0]?.agent_id || agents[0]?.operational_actor_id || "").trim();
       }
 
       function selectedRoleScope() {
@@ -1797,7 +1821,8 @@
         const dataKey = {
           workspaces: "projectPage", tasks: "tasks", decisions: "decisions",
           rules: "rules", agents: "agents", bridges: "bridges",
-          handoff: "handoffHistory", roleScopeHistory: "roleScopeHistory",
+          sharedHandoff: "sharedHandoffHistory",
+          handoff: "identityHandoffHistory", roleScopeHistory: "roleScopeHistory",
           log: "log", room: "room",
           activity: "events"
         }[view];
@@ -1957,9 +1982,9 @@
           const roleScopeManager = canManageRoleScopes();
           const endpoints = {
             projectPage: `/v1/projects${listQuery("workspaces", { q: state.workspaceSearch })}`,
-            handoff: pathFor(`/handoff?target_actor_id=${encodeURIComponent(handoffActor)}`),
-            handoffHistory: pathFor(`/handoff/history${listQuery("handoff", {
-              q: state.handoffSearch, target_actor_id: handoffActor
+            sharedHandoff: pathFor("/handoff"),
+            sharedHandoffHistory: pathFor(`/handoff/history${listQuery("sharedHandoff", {
+              q: state.sharedHandoffSearch
             })}`),
             overviewHandoff: pathFor("/handoff"),
             roleScopes: pathFor(`/role-scopes${roleScopeManager ? "?include_all=1" : ""}`),
@@ -1990,6 +2015,14 @@
             })}`),
             verify: pathFor("/verify")
           };
+          if (handoffActor) {
+            endpoints.identityHandoff = pathFor(
+              `/identity-handoff?actor=${encodeURIComponent(handoffActor)}`);
+            endpoints.identityHandoffHistory = pathFor(
+              `/identity-handoff/history${listQuery("handoff", {
+                q: state.handoffSearch, actor: handoffActor
+              })}`);
+          }
           if (roleScopeManager || ROLE_SCOPE_NAMES.includes(panelAgentRecord()?.role)) {
             endpoints.roleScopeHistory = pathFor(
               `/role-scopes/${encodeURIComponent(roleScope)}/history${listQuery("roleScopeHistory", {
@@ -2029,7 +2062,8 @@
             state.workspaceAgents[projectAtStart] = state.data.agentOptions.agents;
             delete state.workspaceAgentErrors[projectAtStart];
           }
-          const contextVersion = state.data.handoff?.context_version;
+          const contextVersion = state.data.sharedHandoff?.context_version ??
+            state.data.overviewHandoff?.context_version;
           try {
             const freshness = await api(pathFor(`/freshness${contextVersion == null ? "" : `?context_version=${encodeURIComponent(contextVersion)}`}`));
             if (!requestIsCurrent()) return;
@@ -2391,26 +2425,24 @@
       }
 
       function handoffIdentityChoices(response) {
-        const agents = state.data.agentOptions?.agents ||
-          state.data.agents?.agents || state.workspaceAgents?.[state.projectId] || [];
-        const choices = [{
-          actor_id: state.prefs.actor,
-          label: `${actorDisplay(state.prefs.actor)} · this panel identity`
-        }, {
-          actor_id: selectedHandoffActor(),
-          label: actorDisplay(selectedHandoffActor())
-        }];
-        agents.forEach(agent => choices.push({
-          actor_id: agent.agent_id,
-          label: agentChoiceLabel(agent)
-        }));
-        if (response?.handoff_actor) choices.push({
-          actor_id: response.handoff_actor,
-          label: actorDisplay(response.handoff_actor)
+        const responseActor = String(response?.identity_handoff_actor ||
+          response?.handoff_actor || "").trim();
+        const choices = registeredAiAgents().map(agent => {
+          const actorId = String(agent.agent_id || agent.operational_actor_id || "").trim();
+          return {
+            actor_id: actorId,
+            label: `${agentChoiceLabel(agent)}${actorId === state.prefs.actor &&
+              state.prefs.actorType === "agent" ? " · this panel identity" : ""}`
+          };
         });
-        const seen = new Set();
-        return choices.filter(choice => choice.actor_id &&
-          !seen.has(choice.actor_id) && seen.add(choice.actor_id));
+        const knownIds = new Set(choices.map(choice => choice.actor_id));
+        // The server may answer for an identity the visible agent list does not
+        // contain (a legacy alias, or a row filtered out of this reader's view).
+        // Offer it rather than silently dropping the identity being displayed.
+        if (responseActor && !knownIds.has(responseActor)) {
+          choices.push({ actor_id: responseActor, label: actorDisplay(responseActor) });
+        }
+        return choices;
       }
 
       function roleScopeLabel(role) {
@@ -2450,39 +2482,60 @@
       }
 
       function renderHandoff() {
-        const response = state.data.handoff || {};
-        const history = state.data.handoffHistory || {};
+        const sharedResponse = state.data.sharedHandoff || {};
+        const sharedHistory = state.data.sharedHandoffHistory || {};
+        const response = state.data.identityHandoff || {};
+        const history = state.data.identityHandoffHistory || {};
         const requestedActor = selectedHandoffActor();
-        const hasHandoff = Object.prototype.hasOwnProperty.call(state.data, "handoff");
-        const hasHistory = Object.prototype.hasOwnProperty.call(state.data, "handoffHistory");
+        const responseActor = String(response.identity_handoff_actor ||
+          response.handoff_actor || "");
+        const historyActor = String(history.identity_handoff_actor ||
+          history.handoff_actor || "");
+        const hasShared = Object.prototype.hasOwnProperty.call(state.data, "sharedHandoff");
+        const hasHandoff = Object.prototype.hasOwnProperty.call(state.data, "identityHandoff");
+        const hasHistory = Object.prototype.hasOwnProperty.call(state.data, "identityHandoffHistory");
         const handoffMismatch = hasHandoff &&
-          String(response.handoff_actor || "") !== requestedActor;
+          responseActor !== requestedActor;
         const historyMismatch = hasHistory &&
-          String(history.handoff_actor || "") !== requestedActor;
-        const handoff = handoffMismatch ? {} : response.handoff || {};
+          historyActor !== requestedActor;
+        const sharedHandoff = sharedResponse.shared_handoff || sharedResponse.handoff || {};
+        const handoff = handoffMismatch ? {} :
+          response.identity_handoff || response.handoff || {};
+        const sharedVersions = responseRows(sharedHistory, "versions");
         const versions = historyMismatch ? [] : responseRows(history, "versions");
-        const ownIdentity = requestedActor === state.prefs.actor;
+        const ownIdentity = requestedActor && requestedActor === state.prefs.actor &&
+          state.prefs.actorType === "agent";
         const registeredAgent = Boolean(panelAgentRecord());
-        const canWrite = ownIdentity && hasHandoff && !handoffMismatch && !state.errors.handoff &&
-          (state.prefs.actorType === "human" ||
-           (state.prefs.actorType === "agent" && registeredAgent));
+        const canWriteShared = canManageSharedHandoff() && hasShared &&
+          !state.errors.sharedHandoff;
+        const canWriteIdentity = ownIdentity && registeredAgent && hasHandoff &&
+          !handoffMismatch && !state.errors.identityHandoff;
+        const sharedVersion = sharedResponse.handoff_version ?? 0;
+        const identityVersion = response.identity_handoff_version ??
+          response.handoff_version ?? 0;
         const labels = { objective: "Objective", what_changed: "What changed", active_work: "Active work", blockers: "Blockers", risks: "Risks", next_actions: "Next actions", notes: "Notes" };
         const identityChoices = handoffIdentityChoices(response);
-        const errors = [state.errors.handoff, state.errors.handoffHistory,
+        const errors = [state.errors.sharedHandoff, state.errors.sharedHandoffHistory,
+          state.errors.identityHandoff, state.errors.identityHandoffHistory,
           handoffMismatch ? "The current-handoff response did not match the requested exact identity; no handoff was rendered." : "",
           historyMismatch ? "The handoff-history response did not match the requested exact identity; no revisions were rendered." : ""
         ].filter(Boolean);
-        return pageHead("Exact-identity continuity", "Handoff", "Read any known identity's cold-start brief. Only the exact current identity may update its own independent history.") +
+        return pageHead("Project and identity continuity", "Handoff", "Resume from the project-wide brief, then inspect one exact AI identity and its shared role background.") +
           (errors.length ? errorNotice(errors.join(" · ")) : "") +
-          `<section class="card"><div class="card-body"><div class="form-grid"><div class="field wide"><label for="handoff-identity">Exact identity</label><select id="handoff-identity">${identityChoices.map(choice => `<option value="${h(choice.actor_id)}" ${choice.actor_id === requestedActor ? "selected" : ""}>${h(choice.label)}</option>`).join("")}</select><span class="help">Named personas are separate continuity owners. Selecting another identity is always read-only and never changes this panel's authenticated actor; canonical IDs stay internal.</span></div></div></div></section>
-          <div class="grid main-side section-gap"><section class="card"><div class="card-head"><div><h2>Current handoff · ${h(actorDisplay(requestedActor))}</h2><span class="faint small">identity v${h(response.handoff_version ?? 0)} · context v${h(response.context_version ?? "—")}</span></div><span class="faint small">${response.handoff_updated_by ? h(attributionText(response.handoff_updated_by, response.handoff_attribution?.actor_type || (String(response.handoff_updated_by).startsWith("web.") ? "human" : "agent"), response.handoff_updated_owner, response.handoff_attribution)) : "not written"} · ${h(fmtTime(response.handoff_updated_at))}</span></div><div class="card-body">
-            ${response.legacy_handoff_fallback ? `<div class="notice"><span>i</span><div><strong>Legacy project snapshot shown as a compatibility starting point.</strong><br>The archive remains read-only; the first update by ${h(actorDisplay(requestedActor))} creates identity handoff v1 without merging another identity's history.</div></div>` : ""}
-            ${canWrite ? `<div class="notice"><span>✓</span><div><strong>You are editing your own exact identity handoff.</strong><br>This write cannot target or replace another identity, even when the signed-in human manages the workspace.</div></div>` : `<div class="notice error"><span>i</span><div><strong>Read only for this selection.</strong><br>${ownIdentity && !hasHandoff ? "The exact-identity handoff must load successfully before an update can be submitted." : ownIdentity ? `${h(actorDisplay(state.prefs.actor))} must be a registered AI identity or authenticated human to write its own handoff.` : `Switch back to ${h(actorDisplay(state.prefs.actor))} to edit. Another identity's handoff can only be updated by that exact identity.`}</div></div>`}
-            <form data-form="update-handoff" class="section-gap"><input type="hidden" name="expected_handoff_version" value="${h(response.handoff_version ?? 0)}"><div class="form-grid">${HANDOFF_FIELDS.map((field, index) => `<div class="field ${field === "objective" || field === "notes" ? "wide" : ""}"><label for="handoff-${field}">${h(labels[field])}</label><textarea id="handoff-${field}" name="${field}" ${index === 0 ? "required" : ""} ${canWrite ? "" : "disabled"} placeholder="${field === "blockers" ? "None" : "Write a concise, durable update…"}">${h(handoff[field] || "")}</textarea></div>`).join("")}</div><div class="form-actions"><button class="button primary" type="submit" ${canWrite ? "" : "disabled"}>Update my identity handoff</button></div></form>
+          `<div class="notice"><span>i</span><div><strong>Three continuity layers, kept separate.</strong><br>The shared project handoff is the current workspace objective and status for everyone. An identity handoff records one registered AI's own continuity. Role Scope supplies durable background to every AI registered in that role. Humans remain attributed operators, not handoff identities.</div></div>
+          <div class="grid main-side section-gap"><section class="card"><div class="card-head"><div><h2>Shared project handoff</h2><span class="faint small">project v${h(sharedVersion)} · context v${h(sharedResponse.context_version ?? "—")}</span></div><span class="faint small">${sharedResponse.handoff_updated_by ? h(attributionText(sharedResponse.handoff_updated_by, sharedResponse.handoff_attribution?.actor_type || "agent", sharedResponse.handoff_updated_owner, sharedResponse.handoff_attribution)) : "not written"} · ${h(fmtTime(sharedResponse.handoff_updated_at))}</span></div><div class="card-body">
+            ${canWriteShared ? `<div class="notice"><span>✓</span><div><strong>Registered Director project brief.</strong><br>Your update becomes the shared cold-start state for every AI in this workspace; optimistic versions prevent silent Director overwrites.</div></div>` : `<div class="notice error"><span>i</span><div><strong>Shared handoff is read only.</strong><br>Only an exact registered AI Director may edit it. Signed-in web/console humans, Advisors, Workers, and unregistered actors may read it but cannot write it.</div></div>`}
+            <form data-form="update-shared-handoff" class="section-gap"><input type="hidden" name="expected_handoff_version" value="${h(sharedVersion)}"><div class="form-grid">${HANDOFF_FIELDS.map((field, index) => `<div class="field ${field === "objective" || field === "notes" ? "wide" : ""}"><label for="shared-handoff-${field}">${h(labels[field])}</label><textarea id="shared-handoff-${field}" name="${field}" ${index === 0 ? "required" : ""} ${canWriteShared ? "" : "disabled"} placeholder="${field === "blockers" ? "None" : "Write a concise, durable project update…"}">${h(sharedHandoff[field] || "")}</textarea></div>`).join("")}</div><div class="form-actions"><button class="button primary" type="submit" ${canWriteShared ? "" : "disabled"}>Update shared project handoff</button></div></form>
           </div></section>
-          <aside class="stack"><div class="card pad"><div class="eyebrow">Repository snapshot</div><div class="list section-gap"><div class="list-row"><span class="muted">Branch</span><code>${h(response.git?.branch || "—")}</code></div><div class="list-row"><span class="muted">Revision</span><code>${h(response.git?.head || "—")}</code></div><div class="list-row"><span class="muted">Open tasks</span><strong>${h(response.open_tasks?.length || 0)}</strong></div><div class="list-row"><span class="muted">Live decisions</span><strong>${h(response.decisions?.length || 0)}</strong></div></div></div><div class="notice"><span>i</span><div><strong>Two independent versions</strong><br>Identity handoff v${h(response.handoff_version ?? 0)} belongs only to ${h(actorDisplay(requestedActor))}. Project context v${h(response.context_version ?? "—")} advances when shared context changes.</div></div></aside></div>
+          <aside class="stack"><div class="card pad"><div class="eyebrow">Repository snapshot</div><div class="list section-gap"><div class="list-row"><span class="muted">Branch</span><code>${h(sharedResponse.git?.branch || "—")}</code></div><div class="list-row"><span class="muted">Revision</span><code>${h(sharedResponse.git?.head || "—")}</code></div><div class="list-row"><span class="muted">Open tasks</span><strong>${h(sharedResponse.open_tasks?.length || 0)}</strong></div><div class="list-row"><span class="muted">Live decisions</span><strong>${h(sharedResponse.decisions?.length || 0)}</strong></div></div></div><div class="notice"><span>i</span><div><strong>Project-wide, not a pseudo-identity</strong><br>Shared handoff v${h(sharedVersion)} has no web.jack, console.jack, or AI owner namespace. Each revision still records the exact Director and human operator that ran it.</div></div></aside></div>
+          <section class="card section-gap"><div class="card-head"><h2>Shared handoff history</h2><span class="faint small">Project-wide Director revisions</span></div><div class="card-body"><div class="filterbar"><input id="shared-handoff-search" type="search" value="${h(state.sharedHandoffSearch)}" placeholder="Search shared handoff versions…" aria-label="Search shared handoff history">${sortControl("sharedHandoff")}</div><div class="list">${sharedVersions.length ? sharedVersions.map(version => `<details class="list-row" style="display:block"><summary><span class="list-title">v${h(version.version)}</span> <span class="faint small">${h(attributionText(version.updated_by || "unknown", "agent", version.updated_owner))} · ${h(fmtTime(version.updated_at))}</span></summary><div class="message-body section-gap">${HANDOFF_FIELDS.map(field => (version.content && version.content[field]) ? `<div><strong>${h(labels[field])}:</strong> ${h(version.content[field])}</div>` : "").join("")}</div></details>`).join("") : empty(state.sharedHandoffSearch ? "No matching shared handoff versions" : listPage("sharedHandoff").offset ? "No shared handoff versions at this offset" : "No shared handoff history yet", state.sharedHandoffSearch ? "Change or clear the project-wide history search." : listPage("sharedHandoff").offset ? "Use Previous to return to an available page." : "The first registered Director update will create shared handoff v1.")}</div>${pageToolbar("sharedHandoff", sharedHistory, "versions", "shared handoff versions")}</div></section>
+          <section class="card section-gap"><div class="card-head"><div><h2>Exact AI identity handoff</h2><span class="faint small">Independent continuity after the shared project brief</span></div></div><div class="card-body">${identityChoices.length ? `<div class="form-grid"><div class="field wide"><label for="handoff-identity">Registered AI identity</label><select id="handoff-identity">${identityChoices.map(choice => `<option value="${h(choice.actor_id)}" ${choice.actor_id === requestedActor ? "selected" : ""}>${h(choice.label)}</option>`).join("")}</select><span class="help">Only registered AI identities appear here; web and console human operators never receive identity handoffs. Selecting another AI is read-only and never changes this panel's authenticated actor.</span></div></div>` : empty("No registered AI identities", "Register an AI before an exact identity handoff can be selected. Human web/console actors are intentionally excluded.")}</div></section>
+          ${identityChoices.length ? `<div class="grid main-side section-gap"><section class="card"><div class="card-head"><div><h2>Current identity handoff · ${h(actorDisplay(requestedActor))}</h2><span class="faint small">identity v${h(identityVersion)} · context v${h(response.context_version ?? sharedResponse.context_version ?? "—")}</span></div><span class="faint small">${(response.identity_handoff_updated_by || response.handoff_updated_by) ? h(attributionText(response.identity_handoff_updated_by || response.handoff_updated_by, "agent", response.identity_handoff_updated_owner || response.handoff_updated_owner)) : "not written"} · ${h(fmtTime(response.identity_handoff_updated_at || response.handoff_updated_at))}</span></div><div class="card-body">
+            ${canWriteIdentity ? `<div class="notice"><span>✓</span><div><strong>You are editing your own exact AI identity handoff.</strong><br>This write cannot target or replace another AI's history and does not modify the shared project brief.</div></div>` : `<div class="notice error"><span>i</span><div><strong>Read only for this identity.</strong><br>${ownIdentity && !hasHandoff ? "The exact identity handoff must load successfully before an update can be submitted." : ownIdentity ? `${h(actorDisplay(state.prefs.actor))} must remain a registered AI to write this history.` : "Only the exact selected AI may update its own identity handoff; human operators cannot own or impersonate it."}</div></div>`}
+            <form data-form="update-identity-handoff" class="section-gap"><input type="hidden" name="expected_handoff_version" value="${h(identityVersion)}"><div class="form-grid">${HANDOFF_FIELDS.map((field, index) => `<div class="field ${field === "objective" || field === "notes" ? "wide" : ""}"><label for="identity-handoff-${field}">${h(labels[field])}</label><textarea id="identity-handoff-${field}" name="${field}" ${index === 0 ? "required" : ""} ${canWriteIdentity ? "" : "disabled"} placeholder="${field === "blockers" ? "None" : "Write this AI's concise continuity update…"}">${h(handoff[field] || "")}</textarea></div>`).join("")}</div><div class="form-actions"><button class="button primary" type="submit" ${canWriteIdentity ? "" : "disabled"}>Update my AI identity handoff</button></div></form>
+          </div></section><aside class="notice"><span>i</span><div><strong>Independent identity version</strong><br>Identity handoff v${h(identityVersion)} belongs only to ${h(actorDisplay(requestedActor))}. It supplements shared project handoff v${h(sharedVersion)} and the selected role's scope; none overwrites another.</div></aside></div>` : ""}
           ${renderRoleScopes()}
-          <section class="card section-gap"><div class="card-head"><h2>Handoff history · ${h(actorDisplay(requestedActor))}</h2><span class="faint small">Exact-identity revisions only</span></div><div class="card-body"><div class="filterbar"><input id="handoff-search" type="search" value="${h(state.handoffSearch)}" placeholder="Search this identity's handoff versions…" aria-label="Search handoff history">${sortControl("handoff")}</div><div class="list">${versions.length ? versions.map(version => `<details class="list-row" style="display:block"><summary><span class="list-title">v${h(version.version)}</span> <span class="faint small">${h(attributionText(version.updated_by || requestedActor, String(version.updated_by || requestedActor).startsWith("web.") ? "human" : "agent", version.updated_owner))} · ${h(fmtTime(version.updated_at))}</span></summary><div class="message-body section-gap">${HANDOFF_FIELDS.map(field => (version.content && version.content[field]) ? `<div><strong>${h(labels[field])}:</strong> ${h(version.content[field])}</div>` : "").join("")}</div></details>`).join("") : empty(state.handoffSearch ? "No matching handoff versions" : listPage("handoff").offset ? "No handoff versions at this offset" : "No handoff history yet", state.handoffSearch ? "Change or clear this identity's full-history search." : listPage("handoff").offset ? "Use Previous to return to an available page." : `The first update by ${actorDisplay(requestedActor)} will create identity handoff v1.`)}</div>${pageToolbar("handoff", historyMismatch ? {} : history, "versions", "handoff versions")}</div></section>
+          ${identityChoices.length ? `<section class="card section-gap"><div class="card-head"><h2>Identity handoff history · ${h(actorDisplay(requestedActor))}</h2><span class="faint small">Exact registered-AI revisions only</span></div><div class="card-body"><div class="filterbar"><input id="handoff-search" type="search" value="${h(state.handoffSearch)}" placeholder="Search this AI's identity handoff versions…" aria-label="Search identity handoff history">${sortControl("handoff")}</div><div class="list">${versions.length ? versions.map(version => `<details class="list-row" style="display:block"><summary><span class="list-title">v${h(version.version)}</span> <span class="faint small">${h(attributionText(version.updated_by || requestedActor, "agent", version.updated_owner))} · ${h(fmtTime(version.updated_at))}</span></summary><div class="message-body section-gap">${HANDOFF_FIELDS.map(field => (version.content && version.content[field]) ? `<div><strong>${h(labels[field])}:</strong> ${h(version.content[field])}</div>` : "").join("")}</div></details>`).join("") : empty(state.handoffSearch ? "No matching identity handoff versions" : listPage("handoff").offset ? "No identity handoff versions at this offset" : "No identity handoff history yet", state.handoffSearch ? "Change or clear this AI's full-history search." : listPage("handoff").offset ? "Use Previous to return to an available page." : `The first update by ${actorDisplay(requestedActor)} will create identity handoff v1.`)}</div>${pageToolbar("handoff", historyMismatch ? {} : history, "versions", "identity handoff versions")}</div></section>` : ""}
           `;
       }
 
@@ -3034,10 +3087,10 @@
             state.loadSerial += 1;
             state.handoffActor = event.target.value;
             resetListPage("handoff");
-            delete state.data.handoff;
-            delete state.data.handoffHistory;
-            delete state.errors.handoff;
-            delete state.errors.handoffHistory;
+            delete state.data.identityHandoff;
+            delete state.data.identityHandoffHistory;
+            delete state.errors.identityHandoff;
+            delete state.errors.identityHandoffHistory;
             render({ force: true });
             await loadProjectData({ quiet: true });
           }
@@ -3168,6 +3221,7 @@
           "decision-search": ["decisionSearch", "decisions", false],
           "agent-search": ["agentSearch", "agents", false],
           "bridge-search": ["bridgeSearch", "bridges", false],
+          "shared-handoff-search": ["sharedHandoffSearch", "sharedHandoff", false],
           "handoff-search": ["handoffSearch", "handoff", false],
           "role-scope-history-search": ["roleScopeHistorySearch", "roleScopeHistory", false],
           "log-search": ["logSearch", "log", false],
@@ -3309,16 +3363,30 @@
           if (kind === "save-cloud-context") {
             await mutate("Cloud context saved", () => api(pathFor("/cloud-context"), { method: "PUT", body: { content: values.content || "", expected_version: Number(values.expected_version) } }));
           }
-          if (kind === "update-handoff") {
-            if (selectedHandoffActor() !== state.prefs.actor) {
-              throw new Error("An identity handoff can only be updated by that exact current identity.");
+          if (kind === "update-shared-handoff") {
+            if (!canManageSharedHandoff()) {
+              throw new Error("The shared project handoff may only be updated by a registered AI Director.");
             }
             const body = {
-              expected_context_version: state.data.handoff?.context_version,
+              expected_context_version: state.data.sharedHandoff?.context_version,
               expected_handoff_version: Number(values.expected_handoff_version || 0)
             };
             HANDOFF_FIELDS.forEach(field => { body[field] = values[field] || ""; });
-            await mutate("Handoff updated", () => api(pathFor("/handoff"), { method: "PUT", body }));
+            await mutate("Shared project handoff updated", () => api(
+              pathFor("/handoff"), { method: "PUT", body }));
+          }
+          if (kind === "update-identity-handoff") {
+            if (selectedHandoffActor() !== state.prefs.actor) {
+              throw new Error("An identity handoff can only be updated by that exact registered AI.");
+            }
+            const body = {
+              expected_context_version: state.data.identityHandoff?.context_version,
+              expected_handoff_version: Number(values.expected_handoff_version || 0)
+            };
+            HANDOFF_FIELDS.forEach(field => { body[field] = values[field] || ""; });
+            await mutate("AI identity handoff updated", () => api(
+              pathFor(`/identity-handoff?actor=${encodeURIComponent(selectedHandoffActor())}`),
+              { method: "PUT", body }));
           }
           if (kind === "save-role-scope") {
             if (!canManageRoleScopes()) {

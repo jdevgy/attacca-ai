@@ -31,7 +31,7 @@ PAGE_SIZE = 60
 ROW_COUNT = 137
 DIRECTOR = "hub.director.codex.red"
 WORKER = "hub.worker.codex.blue"
-MAIL_RECIPIENT = "mailbox.worker.codex.red"
+MAIL_RECIPIENT = "mailbox.worker.codex.teal"
 
 
 def stamp(index: int) -> str:
@@ -662,11 +662,11 @@ class PanelServerPaginationContracts(unittest.TestCase):
             "space-cobalt-000",
             {row["project_id"] for row in discovered["workspaces"]})
 
-    def test_handoff_history_filters_and_sorts_before_offset(self):
+    def test_identity_handoff_history_filters_and_sorts_before_offset(self):
         query = "handoff cobalt"
         matches = [row for row in self.handoff_rows if terms_match(row, query)]
         body = self.get_json(
-            "/v1/projects/hub/handoff/history?target_actor_id=%s&q=%s"
+            "/v1/projects/hub/identity-handoff/history?actor=%s&q=%s"
             "&limit=9&offset=4&sort=oldest"
             % (urllib.parse.quote(DIRECTOR), urllib.parse.quote_plus(query)),
             self.actor_headers(),
@@ -685,7 +685,7 @@ class PanelServerPaginationContracts(unittest.TestCase):
             [row["version"] for row in matches[4:13]],
         )
         capped = self.get_json(
-            "/v1/projects/hub/handoff/history?target_actor_id=%s&limit=999"
+            "/v1/projects/hub/identity-handoff/history?actor=%s&limit=999"
             % urllib.parse.quote(DIRECTOR),
             self.actor_headers(),
         )

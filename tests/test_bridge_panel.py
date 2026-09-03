@@ -84,7 +84,7 @@ class BridgePanelSourceContractTests(unittest.TestCase):
         self.assertIn('method: "POST"', create_handler)
 
         update_start = create_end
-        update_end = self.panel.index('if (kind === "update-handoff")',
+        update_end = self.panel.index('if (kind === "update-shared-handoff")',
                                       update_start)
         update_handler = self.panel[update_start:update_end]
         self.assertIn('method: "PUT"', update_handler)

@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import unittest
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -91,6 +92,9 @@ class OfflineConnectProxyBlackBoxTests(unittest.TestCase):
             attacca.update_handoff(
                 conn, "proj", "proj.director.codex", "agent",
                 {"objective": "Cached sentinel handoff objective"})
+            attacca.update_identity_handoff(
+                conn, "proj", "proj.director.codex", "agent",
+                {"objective": "Cached identity handoff objective"})
             attacca.room_send(
                 conn, "proj", "web.owner1", "human",
                 "Cached addressed inbox sentinel",
@@ -403,7 +407,8 @@ class OfflineConnectProxyBlackBoxTests(unittest.TestCase):
         listed = self._rpc(process, "tools/list", {}, request_id=3)
         names = {item["name"] for item in listed["result"]["tools"]}
         for name in (
-                "attacca_status", "get_handoff", "check_inbox",
+                "attacca_status", "get_handoff", "get_identity_handoff",
+                "identity_handoff_history", "check_inbox",
                 "room_read", "search", "get_project_log", "task_list",
                 "task_show", "task_plan_get", "rule_list", "decision_list",
                 "agent_list", "bridge_list", "list_projects",
@@ -413,6 +418,10 @@ class OfflineConnectProxyBlackBoxTests(unittest.TestCase):
         calls = [
             ("attacca_status", {}, "verified_local_mirror"),
             ("get_handoff", {}, "Cached sentinel handoff objective"),
+            ("get_identity_handoff", {},
+             "Cached identity handoff objective"),
+            ("identity_handoff_history", {},
+             "Cached identity handoff objective"),
             ("rule_list", {}, "Always log"),
             ("task_list", {}, "Cached sentinel task"),
             ("task_show", {"task_id": self.task_id},
@@ -437,6 +446,65 @@ class OfflineConnectProxyBlackBoxTests(unittest.TestCase):
             self.assertIn(sentinel, serialized, name)
             self.assertIn("verified_local_mirror", serialized, name)
             self.assertIn('"offline": true', serialized.lower(), name)
+
+        # The shared project handoff and this identity's own handoff are two
+        # separate cached records, and a verified mirror is bound to exactly
+        # one identity: a coordination read of a peer must not be answered
+        # from it.
+        brief = self._tool(process, "get_handoff", {}, request_id=90)
+        self.assertEqual(brief["handoff_scope"], "project")
+        self.assertIsNone(brief["handoff_actor"])
+        self.assertEqual(brief["identity_handoff"]["objective"],
+                         "Cached identity handoff objective")
+        # This mirror negotiated the legacy schema-v1 resource set, which has
+        # no shared project handoff. It must say so instead of relabelling
+        # this identity's own cached rows as the project-wide document.
+        self.assertIsNone(brief["handoff"]["objective"])
+        self.assertIn("reconnect to re-seed", brief["hint"])
+        own = self._tool(process, "get_identity_handoff", {}, request_id=91)
+        self.assertEqual(own["handoff_actor"], "proj.director.codex")
+        self.assertEqual(own["handoff_version"], 1)
+        history = self._tool(
+            process, "identity_handoff_history", {}, request_id=92)
+        self.assertEqual(history["handoff_actor"], "proj.director.codex")
+        self.assertEqual(
+            [item["version"] for item in history["versions"]], [1])
+        # A verified mirror is bound to exactly one identity: a coordination
+        # read of a peer must not be answered from it.
+        refused = self._tool(
+            process, "get_identity_handoff",
+            {"target_actor_id": "proj.worker.claude.turing"},
+            request_id=93, expect_error=True)
+        self.assertIn("require the hosted server", refused)
+        self._stop_process(process)
+
+    def test_negotiated_v3_mirror_serves_the_shared_project_handoff(self):
+        query = protocol.projection_capabilities_query()
+        status, snapshot, _ = self.fx.request(
+            "GET", "/v1/projects/proj/sync/snapshot?%s" %
+            urllib.parse.urlencode(query),
+            token=self.fx.director_token, device="device_v3")
+        self.assertEqual(status, 200)
+        self.assertIn(
+            "project_handoffs", snapshot["projection"])
+        checkout = self._checkout("v3")
+        watcher = Path(self.fx.temp.name) / "watcher-v3"
+        watcher.mkdir(mode=0o700)
+        client = self._seed_subscription(
+            checkout, "device_v3", snapshot, watcher=watcher)
+        client["watcher"] = watcher
+        self._stop_hosted_server()
+        process = self._start_proxy(client=client)
+        self._initialize(process)
+        brief = self._tool(process, "get_handoff", {}, request_id=40)
+        self.assertEqual(brief["handoff_scope"], "project")
+        self.assertIsNone(brief["handoff_actor"])
+        self.assertEqual(brief["handoff"]["objective"],
+                         "Cached sentinel handoff objective")
+        self.assertEqual(brief["shared_handoff"], brief["handoff"])
+        self.assertEqual(brief["handoff_version"], 1)
+        self.assertEqual(brief["identity_handoff"]["objective"],
+                         "Cached identity handoff objective")
         self._stop_process(process)
 
     def test_offline_room_and_inbox_pagination_attention_and_handoff_parity(

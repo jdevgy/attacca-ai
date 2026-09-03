@@ -80,7 +80,7 @@ class IdentityHandoffRoleScopeStoreTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def _update(self, actor, actor_type, updates, expected):
-        return c.update_handoff(
+        return c.update_identity_handoff(
             self.conn, "p1", actor, actor_type, updates,
             expected_version=expected)
 
@@ -207,11 +207,11 @@ class IdentityHandoffRoleScopeStoreTest(unittest.TestCase):
             # The first real identity write in a project with only ambiguous
             # legacy history starts from an empty identity document. It never
             # clones unrelated fallback fields from the global archive.
-            first = c.update_handoff(
+            first = c.update_identity_handoff(
                 migrated, "ambiguous", "ambiguous.director.codex", "agent",
                 {"objective": "fresh exact identity"}, expected_version=0)
             self.assertEqual(first["handoff_version"], 1)
-            current = c.get_handoff(
+            current = c.get_identity_handoff(
                 migrated, "ambiguous",
                 actor_id="ambiguous.director.codex", actor_type="agent")
             self.assertEqual(current["handoff"]["objective"],
@@ -240,23 +240,32 @@ class IdentityHandoffRoleScopeStoreTest(unittest.TestCase):
             DIRECTOR_RED: "red director",
             WORKER: "worker",
             ADVISOR: "advisor",
-            HUMAN: "human",
         }
         for actor, objective in expected.items():
-            actor_type = "human" if actor == HUMAN else "agent"
             result = self._update(
-                actor, actor_type, {"objective": objective}, expected=0)
+                actor, "agent", {"objective": objective}, expected=0)
             self.assertEqual(result["handoff_actor"], actor)
             self.assertEqual(result["handoff_version"], 1)
 
         for actor, objective in expected.items():
-            own = c.get_handoff(
-                self.conn, "p1", actor_id=actor,
-                actor_type="human" if actor == HUMAN else "agent")
+            own = c.get_identity_handoff(
+                self.conn, "p1", actor_id=actor, actor_type="agent")
             self.assertEqual(own["handoff_actor"], actor)
             self.assertEqual(own["handoff"]["objective"], objective)
             self.assertEqual(own["handoff_version"], 1)
+            # The exact identity handoff is also embedded in the brief.
+            brief = c.get_handoff(
+                self.conn, "p1", actor_id=actor, actor_type="agent")
+            self.assertEqual(brief["identity_handoff_actor"], actor)
+            self.assertEqual(
+                brief["identity_handoff"]["objective"], objective)
+            self.assertEqual(brief["identity_handoff_version"], 1)
 
+        # Humans and console identities own no identity handoff at all.
+        with self.assertRaisesRegex(
+                c.AttaccaError, "registered AI|identity handoff owner"):
+            self._update(
+                HUMAN, "human", {"objective": "human"}, expected=0)
         # A human identity cannot select the id of a registered AI and mutate
         # that AI's continuity record by changing only actor_type.
         with self.assertRaisesRegex(
@@ -264,32 +273,41 @@ class IdentityHandoffRoleScopeStoreTest(unittest.TestCase):
             self._update(
                 DIRECTOR_RED, "human", {"objective": "impersonated"},
                 expected=1)
-        self.assertEqual(c.get_handoff(
+        self.assertEqual(c.get_identity_handoff(
             self.conn, "p1", actor_id=DIRECTOR_RED,
             actor_type="agent")["handoff"]["objective"], "red director")
 
     def test_coordination_reads_foreign_identity_without_granting_write(self):
         self._update(
             DIRECTOR_RED, "agent", {"active_work": "red work"}, 0)
-        self._update(HUMAN, "human", {"active_work": "owner work"}, 0)
 
-        foreign_ai = c.get_handoff(
+        foreign_ai = c.get_identity_handoff(
             self.conn, "p1", actor_id=WORKER, actor_type="agent",
             target_actor_id=DIRECTOR_RED)
         self.assertEqual(foreign_ai["handoff_actor"], DIRECTOR_RED)
         self.assertEqual(foreign_ai["handoff"]["active_work"], "red work")
-        # Role scope and authority in a coordination read remain the reader's,
-        # not the target handoff owner's.
-        self.assertEqual(foreign_ai["role_scope"]["actor"], WORKER)
+        # The same coordination read is available through the full brief, and
+        # role scope/authority remain the reader's, not the target owner's.
+        brief = c.get_handoff(
+            self.conn, "p1", actor_id=WORKER, actor_type="agent",
+            target_actor_id=DIRECTOR_RED)
+        self.assertEqual(brief["identity_handoff_actor"], DIRECTOR_RED)
+        self.assertEqual(
+            brief["identity_handoff"]["active_work"], "red work")
+        self.assertEqual(brief["role_scope"]["actor"], WORKER)
 
-        foreign_human = c.get_handoff(
-            self.conn, "p1", actor_id=DIRECTOR_BLUE, actor_type="agent",
-            target_actor_id=HUMAN)
-        self.assertEqual(foreign_human["handoff_actor"], HUMAN)
-        self.assertEqual(foreign_human["handoff"]["active_work"],
-                         "owner work")
-        with self.assertRaisesRegex(c.AttaccaError, "not registered|unknown"):
-            c.get_handoff(
+        # Humans own no identity handoff, so they are not a coordination
+        # target either.
+        with self.assertRaisesRegex(c.AttaccaError, "not a registered AI"):
+            c.get_identity_handoff(
+                self.conn, "p1", actor_id=DIRECTOR_BLUE, actor_type="agent",
+                target_actor_id=HUMAN)
+        human_read = c.get_identity_handoff(
+            self.conn, "p1", actor_id=HUMAN, actor_type="human")
+        self.assertIsNone(human_read["handoff_actor"])
+        with self.assertRaisesRegex(c.AttaccaError, "not registered|unknown|"
+                                    "not a registered AI"):
+            c.get_identity_handoff(
                 self.conn, "p1", actor_id=WORKER, actor_type="agent",
                 target_actor_id="p1.worker.ghost")
 
@@ -316,7 +334,7 @@ class IdentityHandoffRoleScopeStoreTest(unittest.TestCase):
             DIRECTOR_BLUE, "agent", {"objective": "blue v2"}, 1)
         self.assertEqual(blue_v2["handoff_version"], 2)
 
-        history = c.handoff_history(
+        history = c.identity_handoff_history(
             self.conn, "p1", actor_id=WORKER, actor_type="agent",
             target_actor_id=DIRECTOR_RED, limit=20)
         self.assertEqual(history["handoff_actor"], DIRECTOR_RED)
@@ -432,25 +450,25 @@ class IdentityHandoffRoleScopeStoreTest(unittest.TestCase):
             project_id=persona_project, name="Personas")
         red = c.agent_register(
             self.conn, persona_project,
-            "personas.director.codex.red", "agent",
-            agent_id="personas.director.codex.red", role="director",
+            "personas.director.codex.amber", "agent",
+            agent_id="personas.director.codex.amber", role="director",
             runtime="codex", canonical_identity=True)
         blue = c.agent_register(
             self.conn, persona_project,
-            "personas.director.codex.blue", "agent",
-            agent_id="personas.director.codex.blue", role="director",
+            "personas.director.codex.cyan", "agent",
+            agent_id="personas.director.codex.cyan", role="director",
             runtime="codex", canonical_identity=True)
-        self.assertEqual(red["agent_id"], "personas.director.codex.red")
-        self.assertEqual(blue["agent_id"], "personas.director.codex.blue")
+        self.assertEqual(red["agent_id"], "personas.director.codex.amber")
+        self.assertEqual(blue["agent_id"], "personas.director.codex.cyan")
 
         self._update(
             DIRECTOR_RED, "agent", {"objective": "red continuity"}, 0)
         self._update(
             DIRECTOR_BLUE, "agent", {"objective": "blue continuity"}, 0)
-        self.assertEqual(c.get_handoff(
+        self.assertEqual(c.get_identity_handoff(
             self.conn, "p1", actor_id=DIRECTOR_RED,
             actor_type="agent")["handoff"]["objective"], "red continuity")
-        self.assertEqual(c.get_handoff(
+        self.assertEqual(c.get_identity_handoff(
             self.conn, "p1", actor_id=DIRECTOR_BLUE,
             actor_type="agent")["handoff"]["objective"], "blue continuity")
 
@@ -510,7 +528,7 @@ class IdentityHandoffRoleScopeMcpTest(unittest.TestCase):
                 (DIRECTOR_BLUE, "director", "codex"),
                 (WORKER, "worker", "claude")):
             register_exact(conn, "p1", actor, role, runtime)
-        c.update_handoff(
+        c.update_identity_handoff(
             conn, "p1", DIRECTOR_BLUE, "agent",
             {"objective": "blue over MCP"}, expected_version=0)
         conn.close()
@@ -544,52 +562,86 @@ class IdentityHandoffRoleScopeMcpTest(unittest.TestCase):
         tools = {item["name"]: item for item in c.MCP_TOOLS}
         self.assertIn("target_actor_id",
                       tools["get_handoff"]["inputSchema"]["properties"])
-        self.assertIn(
-            "expected_handoff_version",
-            tools["update_handoff"]["inputSchema"]["properties"])
-        self.assertNotIn(
-            "target_actor_id",
-            tools["update_handoff"]["inputSchema"]["properties"])
+        self.assertIn("target_actor_id",
+                      tools["get_identity_handoff"]["inputSchema"][
+                          "properties"])
+        for name in ("update_handoff", "update_identity_handoff"):
+            self.assertIn(
+                "expected_handoff_version",
+                tools[name]["inputSchema"]["properties"])
+            self.assertNotIn(
+                "target_actor_id", tools[name]["inputSchema"]["properties"])
         self.assertIn("identity", tools["get_handoff"]["description"].lower())
+        self.assertIn("shared", tools["update_handoff"]["description"].lower())
         self.assertIn(
-            "own", tools["update_handoff"]["description"].lower())
-        self.assertNotIn(
-            "shared document", tools["update_handoff"]["description"].lower())
-        for name in ("role_scope_get", "role_scope_set",
-                     "role_scope_history"):
+            "director", tools["update_handoff"]["description"].lower())
+        self.assertIn(
+            "own", tools["update_identity_handoff"]["description"].lower())
+        for name in ("role_scope_get", "role_scope_set", "role_scope_history",
+                     "get_identity_handoff", "update_identity_handoff",
+                     "identity_handoff_history"):
             self.assertIn(name, tools)
 
         red = self._session(DIRECTOR_RED)
         foreign = red.dispatch_tool(
-            "get_handoff", {"target_actor_id": DIRECTOR_BLUE})
+            "get_identity_handoff", {"target_actor_id": DIRECTOR_BLUE})
         self.assertEqual(foreign["handoff_actor"], DIRECTOR_BLUE)
         self.assertEqual(foreign["handoff"]["objective"], "blue over MCP")
+        foreign_brief = red.dispatch_tool(
+            "get_handoff", {"target_actor_id": DIRECTOR_BLUE})
+        self.assertEqual(
+            foreign_brief["identity_handoff_actor"], DIRECTOR_BLUE)
+        self.assertIsNone(foreign_brief["handoff_actor"])
+        self.assertEqual(foreign_brief["handoff_scope"], "project")
 
         # Coordination targeting is a read-only feature. Surface client misuse
         # instead of silently pretending a foreign-targeted update succeeded.
-        with self.assertRaisesRegex(
-                c.AttaccaError, "target_actor_id.*read|cannot target"):
-            red.dispatch_tool("update_handoff", {
-                "target_actor_id": DIRECTOR_BLUE,
-                "objective": "must be rejected",
-                "expected_handoff_version": 0,
-            })
-        own = red.dispatch_tool("update_handoff", {
+        for tool in ("update_handoff", "update_identity_handoff"):
+            with self.assertRaisesRegex(
+                    c.AttaccaError, "target_actor_id.*read|cannot target"):
+                red.dispatch_tool(tool, {
+                    "target_actor_id": DIRECTOR_BLUE,
+                    "objective": "must be rejected",
+                    "expected_handoff_version": 0,
+                })
+        own = red.dispatch_tool("update_identity_handoff", {
             "objective": "red over MCP",
             "expected_handoff_version": 0,
         })
         self.assertEqual(own["handoff_actor"], DIRECTOR_RED)
         self.assertEqual(red.dispatch_tool(
-            "get_handoff", {})["handoff"]["objective"], "red over MCP")
+            "get_identity_handoff", {})["handoff"]["objective"],
+            "red over MCP")
         self.assertEqual(red.dispatch_tool(
-            "get_handoff", {"target_actor_id": DIRECTOR_BLUE})[
+            "get_handoff", {})["identity_handoff"]["objective"],
+            "red over MCP")
+        self.assertEqual(red.dispatch_tool(
+            "get_identity_handoff", {"target_actor_id": DIRECTOR_BLUE})[
                 "handoff"]["objective"], "blue over MCP")
         with self.assertRaisesRegex(
                 c.AttaccaError, "identity handoff conflict"):
-            red.dispatch_tool("update_handoff", {
+            red.dispatch_tool("update_identity_handoff", {
                 "objective": "stale red MCP overwrite",
                 "expected_handoff_version": 0,
             })
+        history = red.dispatch_tool(
+            "identity_handoff_history", {"target_actor_id": DIRECTOR_BLUE})
+        self.assertEqual(history["handoff_actor"], DIRECTOR_BLUE)
+        self.assertEqual(
+            [item["content"]["objective"] for item in history["versions"]],
+            ["blue over MCP"])
+
+        # The shared project handoff is a separate, Director-only record.
+        shared = red.dispatch_tool("update_handoff", {
+            "objective": "shared over MCP",
+            "expected_handoff_version": 0,
+        })
+        self.assertIsNone(shared["handoff_actor"])
+        self.assertEqual(shared["handoff_scope"], "project")
+        brief = red.dispatch_tool("get_handoff", {})
+        self.assertEqual(brief["handoff"]["objective"], "shared over MCP")
+        self.assertEqual(brief["identity_handoff"]["objective"],
+                         "red over MCP")
 
         scope = red.dispatch_tool("role_scope_set", {
             "role": "worker", "content": "MCP worker background",
@@ -605,12 +657,18 @@ class IdentityHandoffRoleScopeMcpTest(unittest.TestCase):
         applicable = worker.dispatch_tool("role_scope_get", {})
         self.assertEqual(
             [item["role"] for item in applicable["scopes"]], ["worker"])
-        worker_handoff = worker.dispatch_tool("update_handoff", {
+        worker_handoff = worker.dispatch_tool("update_identity_handoff", {
             "objective": "worker-owned MCP continuity",
             "expected_handoff_version": 0,
         })
         self.assertEqual(worker_handoff["handoff_actor"], WORKER)
         self.assertEqual(worker_handoff["handoff_version"], 1)
+        with self.assertRaisesRegex(
+                c.AttaccaError, "may only be edited by a registered Director"):
+            worker.dispatch_tool("update_handoff", {
+                "objective": "worker cannot own the shared handoff",
+                "expected_handoff_version": 1,
+            })
         with self.assertRaisesRegex(
                 c.AttaccaError, "human or registered Director"):
             worker.dispatch_tool("role_scope_set", {
@@ -659,13 +717,13 @@ class IdentityHandoffRoleScopeRestTest(unittest.TestCase):
         return payload
 
     def test_rest_identity_handoff_target_history_and_owner_only_update(self):
-        red = self.request("POST", "/v1/projects/p1/handoff", {
+        red = self.request("PUT", "/v1/projects/p1/identity-handoff", {
             "objective": "REST red",
             "expected_handoff_version": 0,
         })
         self.assertEqual(red["handoff_actor"], DIRECTOR_RED)
         blue = self.request(
-            "POST", "/v1/projects/p1/handoff", {
+            "PUT", "/v1/projects/p1/identity-handoff", {
                 "objective": "REST blue",
                 "expected_handoff_version": 0,
             }, actor=DIRECTOR_BLUE)
@@ -673,13 +731,21 @@ class IdentityHandoffRoleScopeRestTest(unittest.TestCase):
 
         target = urllib.parse.quote(DIRECTOR_RED, safe="")
         foreign = self.request(
-            "GET", "/v1/projects/p1/handoff?target_actor_id=" + target,
+            "GET", "/v1/projects/p1/identity-handoff?actor=" + target,
             actor=WORKER)
         self.assertEqual(foreign["handoff_actor"], DIRECTOR_RED)
+        self.assertEqual(foreign["identity_handoff_actor"], DIRECTOR_RED)
         self.assertEqual(foreign["handoff"]["objective"], "REST red")
 
+        brief = self.request(
+            "GET", "/v1/projects/p1/handoff?target_actor_id=" + target,
+            actor=WORKER)
+        self.assertEqual(brief["identity_handoff_actor"], DIRECTOR_RED)
+        self.assertEqual(brief["identity_handoff"]["objective"], "REST red")
+        self.assertIsNone(brief["handoff_actor"])
+
         history = self.request(
-            "GET", "/v1/projects/p1/handoff/history?target_actor_id=" +
+            "GET", "/v1/projects/p1/identity-handoff/history?actor=" +
             target, actor=WORKER)
         self.assertEqual(history["handoff_actor"], DIRECTOR_RED)
         self.assertEqual(history["versions"][0]["content"]["objective"],
@@ -687,7 +753,7 @@ class IdentityHandoffRoleScopeRestTest(unittest.TestCase):
 
         # A body-supplied target is rejected rather than silently ignored.
         rejected_target = self.request(
-            "POST", "/v1/projects/p1/handoff", {
+            "PUT", "/v1/projects/p1/identity-handoff", {
                 "target_actor_id": DIRECTOR_RED,
                 "objective": "must be rejected",
                 "expected_handoff_version": 1,
@@ -695,18 +761,18 @@ class IdentityHandoffRoleScopeRestTest(unittest.TestCase):
         self.assertRegex(
             rejected_target["error"], "target_actor_id.*read|cannot target")
         blue_v2 = self.request(
-            "POST", "/v1/projects/p1/handoff", {
+            "PUT", "/v1/projects/p1/identity-handoff", {
                 "objective": "REST blue v2",
                 "expected_handoff_version": 1,
             }, actor=DIRECTOR_BLUE)
         self.assertEqual(blue_v2["handoff_actor"], DIRECTOR_BLUE)
         red_after = self.request(
-            "GET", "/v1/projects/p1/handoff?target_actor_id=" + target,
+            "GET", "/v1/projects/p1/identity-handoff?actor=" + target,
             actor=WORKER)
         self.assertEqual(red_after["handoff"]["objective"], "REST red")
 
         worker_own = self.request(
-            "POST", "/v1/projects/p1/handoff", {
+            "PUT", "/v1/projects/p1/identity-handoff", {
                 "objective": "worker-owned REST continuity",
                 "expected_handoff_version": 0,
             }, actor=WORKER)
@@ -714,11 +780,46 @@ class IdentityHandoffRoleScopeRestTest(unittest.TestCase):
         self.assertEqual(worker_own["handoff_version"], 1)
 
         conflict = self.request(
-            "POST", "/v1/projects/p1/handoff", {
+            "PUT", "/v1/projects/p1/identity-handoff", {
                 "objective": "stale REST red",
                 "expected_handoff_version": 0,
             }, expected=400)
         self.assertIn("identity handoff conflict", conflict["error"])
+
+    def test_rest_shared_handoff_is_director_only_and_project_wide(self):
+        written = self.request("PUT", "/v1/projects/p1/handoff", {
+            "objective": "REST shared objective",
+            "expected_handoff_version": 0,
+        })
+        self.assertIsNone(written["handoff_actor"])
+        self.assertEqual(written["handoff_scope"], "project")
+        self.assertEqual(written["handoff_version"], 1)
+
+        seen = self.request("GET", "/v1/projects/p1/handoff", actor=WORKER)
+        self.assertEqual(seen["handoff"]["objective"], "REST shared objective")
+        self.assertEqual(seen["shared_handoff"], seen["handoff"])
+        self.assertEqual(seen["handoff_scope"], "project")
+
+        history = self.request(
+            "GET", "/v1/projects/p1/handoff/history", actor=WORKER)
+        self.assertEqual(history["handoff_scope"], "project")
+        self.assertEqual(history["versions"][0]["content"]["objective"],
+                         "REST shared objective")
+
+        refused = self.request(
+            "PUT", "/v1/projects/p1/handoff", {
+                "objective": "worker overwrite",
+                "expected_handoff_version": 1,
+            }, actor=WORKER, expected=400)
+        self.assertIn("registered Director", refused["error"])
+        rejected_target = self.request(
+            "PUT", "/v1/projects/p1/handoff", {
+                "target_actor_id": DIRECTOR_BLUE,
+                "objective": "must be rejected",
+                "expected_handoff_version": 1,
+            }, expected=400)
+        self.assertRegex(
+            rejected_target["error"], "target_actor_id.*read|cannot target")
 
     def test_rest_role_scope_crud_authority_and_history(self):
         created = self.request(

@@ -138,7 +138,9 @@ class McpTestCase(unittest.TestCase):
             for req in tool["inputSchema"].get("required", []):
                 self.assertIn(req, tool["inputSchema"]["properties"])
         for expected in ("get_handoff", "room_send", "room_read", "task_claim",
-                         "task_report", "update_handoff", "decision_propose",
+                         "task_report", "update_handoff",
+                         "get_identity_handoff", "update_identity_handoff",
+                         "identity_handoff_history", "decision_propose",
                          "check_freshness", "list_projects", "bridge_remove"):
             self.assertIn(expected, names)
 
@@ -204,7 +206,8 @@ class McpTestCase(unittest.TestCase):
         # Someone else advances project context after alice's briefing.
         bob = self.client(actor="bob")
         bob.initialize()
-        bob.call_tool("update_handoff", {"objective": "new objective"})
+        bob.call_tool(
+            "update_identity_handoff", {"objective": "new objective"})
         # Alice's next write carries a drift warning.
         is_err, _, report = alice.call_tool("task_report", {
             "task_id": task["task_id"], "summary": "done"})
@@ -286,7 +289,8 @@ class McpTestCase(unittest.TestCase):
         self.assertFalse(is_err)
         # her own done-bump must not read as drift, now or on the next write
         self.assertNotIn("stale_context_warning", report)
-        _, _, handoff = alice.call_tool("update_handoff", {"what_changed": "solo"})
+        _, _, handoff = alice.call_tool(
+            "update_identity_handoff", {"what_changed": "solo"})
         self.assertNotIn("stale_context_warning", handoff)
 
     def test_exact_identity_revision_stays_stale_until_rebrief(self):
@@ -296,12 +300,12 @@ class McpTestCase(unittest.TestCase):
         bob = self.client(actor="bob")
         bob.initialize()
         is_err, _, bob_write = bob.call_tool(
-            "update_handoff", {"objective": "bob's new direction"})
+            "update_identity_handoff", {"objective": "bob's new direction"})
         self.assertFalse(is_err)
 
-        # Bob's independent handoff version does not stale Alice's v0.
+        # Bob's independent identity handoff version does not stale Alice's v0.
         is_err, _, first = alice.call_tool(
-            "update_handoff", {"risks": "some risk"})
+            "update_identity_handoff", {"risks": "some risk"})
         self.assertFalse(is_err)
         self.assertEqual(first["handoff_version"], 1)
         self.assertNotEqual(first["handoff_actor"],
@@ -312,23 +316,23 @@ class McpTestCase(unittest.TestCase):
         alice_peer = self.client(actor="alice")
         alice_peer.initialize()
         _, _, peer_brief = alice_peer.call_tool("get_handoff", {})
-        self.assertEqual(peer_brief["handoff_version"], 1)
+        self.assertEqual(peer_brief["identity_handoff_version"], 1)
         is_err, _, second = alice.call_tool(
-            "update_handoff", {"blockers": "none"})
+            "update_identity_handoff", {"blockers": "none"})
         self.assertFalse(is_err)
         self.assertEqual(second["handoff_version"], 2)
         is_err, stale, _ = alice_peer.call_tool(
-            "update_handoff", {"notes": "stale peer"})
+            "update_identity_handoff", {"notes": "stale peer"})
         self.assertTrue(is_err)
         self.assertIn("identity handoff conflict", stale)
         is_err, stale_again, _ = alice_peer.call_tool(
-            "update_handoff", {"notes": "still stale"})
+            "update_identity_handoff", {"notes": "still stale"})
         self.assertTrue(is_err)
         self.assertIn("identity handoff conflict", stale_again)
         # Re-briefing supplies the new expected version and permits the write.
         alice_peer.call_tool("get_handoff", {})
         is_err, _, third = alice_peer.call_tool(
-            "update_handoff", {"notes": "ok"})
+            "update_identity_handoff", {"notes": "ok"})
         self.assertFalse(is_err)
         self.assertEqual(third["updated_fields"], ["notes"])
 
@@ -347,15 +351,61 @@ class McpTestCase(unittest.TestCase):
         worker.initialize()
         _, _, brief = worker.call_tool("get_handoff", {})
         is_err, _, written = worker.call_tool(
-            "update_handoff",
+            "update_identity_handoff",
             {"notes": "worker exact continuity",
-             "expected_handoff_version": brief["handoff_version"]})
+             "expected_handoff_version": brief["identity_handoff_version"]})
         self.assertFalse(is_err)
-        self.assertEqual(written["handoff_actor"], brief["handoff_actor"])
+        self.assertEqual(written["handoff_actor"],
+                         brief["identity_handoff_actor"])
         self.assertEqual(written["handoff_version"], 1)
         _, _, current = worker.call_tool("get_handoff", {})
-        self.assertEqual(current["handoff"]["notes"],
+        self.assertEqual(current["identity_handoff"]["notes"],
                          "worker exact continuity")
+        # The shared project handoff stays Director-only over MCP.
+        is_err, refused, _ = worker.call_tool(
+            "update_handoff", {"notes": "worker shared overwrite"})
+        self.assertTrue(is_err)
+        self.assertIn("registered Director", refused)
+
+    def test_director_owns_the_shared_project_handoff_over_mcp(self):
+        director = self.client(actor="director")
+        director.initialize()
+        # The first call registers this session's exact canonical actor; the
+        # shared handoff then depends only on its registered workspace role.
+        _, _, who = director.call_tool("attacca_status", {})
+        conn = c.connect(self.db)
+        try:
+            conn.execute(
+                "UPDATE agents SET role='director' WHERE project_id='proj'"
+                " AND agent_id=?", (who["you"]["actor_id"],))
+            conn.commit()
+        finally:
+            conn.close()
+        _, _, brief = director.call_tool("get_handoff", {})
+        self.assertIsNone(brief["handoff_actor"])
+        self.assertEqual(brief["handoff_scope"], "project")
+        is_err, message, written = director.call_tool(
+            "update_handoff", {"objective": "one shared objective"})
+        self.assertFalse(is_err, message)
+        self.assertIsNone(written["handoff_actor"])
+        self.assertEqual(written["handoff_version"], 1)
+        # A stale shared version is rejected, and the identity version is
+        # tracked independently of it.
+        is_err, stale, _ = director.call_tool(
+            "update_handoff", {"objective": "stale shared",
+                               "expected_handoff_version": 0})
+        self.assertTrue(is_err)
+        self.assertIn("shared handoff conflict", stale)
+        is_err, _, identity = director.call_tool(
+            "update_identity_handoff", {"objective": "my own continuity"})
+        self.assertFalse(is_err)
+        self.assertEqual(identity["handoff_version"], 1)
+
+        worker = self.client(actor="worker")
+        worker.initialize()
+        _, _, seen = worker.call_tool("get_handoff", {})
+        self.assertEqual(seen["handoff"]["objective"], "one shared objective")
+        self.assertIsNone(seen["identity_handoff"]["objective"])
 
     def test_batch_request_gets_array_response(self):
         client = self.client(actor="batcher")

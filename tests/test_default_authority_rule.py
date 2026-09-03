@@ -377,6 +377,8 @@ class DefaultAuthorityRuleTest(unittest.TestCase):
                     conn, "alpha", "owner", "human", alpha_worker)
 
             remote = {}
+            remote_personas = {"peer": "cyan", "advisor": "indigo",
+                               "master": "violet"}
             for project_id, relation in (
                     ("peer", "peer"), ("advisor", "advisor"),
                     ("master", "master")):
@@ -387,7 +389,9 @@ class DefaultAuthorityRuleTest(unittest.TestCase):
                     project_id=project_id, name=project_id.title())
                 remote[project_id] = self._register(
                     conn, project_id,
-                    "%s.director.test.red" % project_id, "director")
+                    "%s.director.test.%s" % (
+                        project_id, remote_personas[project_id]),
+                    "director")
                 if relation == "peer":
                     c.bridge_add(
                         conn, "alpha", "owner", "human", project_id)

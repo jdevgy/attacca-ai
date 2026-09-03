@@ -43,6 +43,18 @@ def identity_handoff(scope, version=1, objective="Continue safely"):
     }
 
 
+def project_handoff(scope, version=1, objective="Coordinate the project",
+                    updated_by=None):
+    return {
+        "project_id": scope["project_id"],
+        "version": version,
+        "content": {"objective": objective},
+        "updated_by": updated_by if updated_by is not None else
+        scope["actor_id"],
+        "updated_at": "2026-08-31T00:00:00.000Z",
+    }
+
+
 def role_scope(scope, role=None, version=1):
     selected = role or scope["role"]
     return {
@@ -57,7 +69,8 @@ def role_scope(scope, role=None, version=1):
     }
 
 
-def projection(scope, *, handoffs=None, scopes=None, lead=None):
+def projection(scope, *, handoffs=None, project_handoffs=None, scopes=None,
+               lead=None):
     handoffs = list(handoffs if handoffs is not None else [
         identity_handoff(scope)])
     persona = scope["actor_id"].rsplit(".", 1)[-1]
@@ -71,6 +84,9 @@ def projection(scope, *, handoffs=None, scopes=None, lead=None):
         # Schema-v1 compatibility is an exact alias, not the old global rows.
         "handoffs": copy.deepcopy(handoffs),
         "identity_handoffs": copy.deepcopy(handoffs),
+        "project_handoffs": copy.deepcopy(
+            project_handoffs if project_handoffs is not None else [
+                project_handoff(scope)]),
         "role_scopes": list(scopes if scopes is not None else [
             role_scope(scope)]),
         "rules": [],
@@ -115,9 +131,38 @@ class IdentityProjectionProtocolTests(unittest.TestCase):
             checked["identity_handoffs"][0]["actor_id"],
             "agentg.director.codex.red")
         self.assertEqual(checked["handoffs"], checked["identity_handoffs"])
+        self.assertEqual(
+            checked["project_handoffs"][0]["content"]["objective"],
+            "Coordinate the project")
         self.assertEqual(checked["role_scopes"][0]["role"], "director")
         self.assertIn("identity_handoffs", self.capabilities["resources"])
+        self.assertIn("project_handoffs", self.capabilities["resources"])
         self.assertIn("role_scopes", self.capabilities["resources"])
+
+    def test_shared_history_is_project_bound_and_retains_human_writers(self):
+        history = [
+            project_handoff(
+                self.scope, 1, "Historical human state", "web.jack"),
+            project_handoff(self.scope, 2, "Current Director state"),
+        ]
+        checked = self.validate(projection(
+            self.scope, project_handoffs=history))
+        self.assertEqual(
+            [row["updated_by"] for row in checked["project_handoffs"]],
+            ["web.jack", self.scope["actor_id"]])
+
+        cross_project = copy.deepcopy(history)
+        cross_project[0]["project_id"] = "other"
+        with self.assertRaises(protocol.SyncProtocolError) as raised:
+            self.validate(projection(
+                self.scope, project_handoffs=cross_project))
+        self.assertEqual(raised.exception.code, "cross_project_projection")
+
+        reversed_history = list(reversed(history))
+        with self.assertRaises(protocol.SyncProtocolError) as raised:
+            self.validate(projection(
+                self.scope, project_handoffs=reversed_history))
+        self.assertEqual(raised.exception.code, "invalid_project_handoff")
 
     def test_other_persona_global_rows_and_false_attribution_fail_closed(self):
         blue = actor_scope("blue")
@@ -186,12 +231,14 @@ class IdentityProjectionProtocolTests(unittest.TestCase):
     def test_older_explicit_v2_offer_keeps_its_smaller_resource_shape(self):
         old_resources = [
             item for item in self.capabilities["resources"]
-            if item not in {"identity_handoffs", "role_scopes"}
+            if item not in {
+                "identity_handoffs", "role_scopes", "project_handoffs"}
         ]
         older = protocol.make_projection_capabilities(2, old_resources)
         negotiated = protocol.negotiate_projection_capabilities(older)
         self.assertNotIn("identity_handoffs", negotiated["resources"])
         self.assertNotIn("role_scopes", negotiated["resources"])
+        self.assertNotIn("project_handoffs", negotiated["resources"])
 
         # Current clients also tolerate an older server omitting optional new
         # fields, while still rejecting any non-empty project-global handoff
@@ -199,6 +246,7 @@ class IdentityProjectionProtocolTests(unittest.TestCase):
         older_projection = projection(self.scope, handoffs=[], scopes=[])
         older_projection.pop("identity_handoffs")
         older_projection.pop("role_scopes")
+        older_projection.pop("project_handoffs")
         protocol.validate_projection_for_capabilities(
             older_projection, self.scope, self.capabilities)
 
@@ -234,10 +282,22 @@ class IdentityProjectionOfflineTests(unittest.TestCase):
             mirror.read_section("identity_handoff")["actor_id"],
             self.scope["actor_id"])
         self.assertEqual(
-            mirror.read_section("handoff"),
-            mirror.read_section("identity_handoff"))
+            mirror.read_section("handoff")["content"]["objective"],
+            "Coordinate the project")
+        self.assertEqual(
+            mirror.read_section("shared_handoff"),
+            mirror.read_section("project_handoff"))
+        self.assertEqual(
+            mirror.read_section("handoffs"),
+            mirror.read_section("identity_handoffs"))
         self.assertEqual(
             mirror.read_section("role_scopes")[0]["role"], "director")
+        mirror.queue_mutation(
+            "handoff.update", {"notes": "Shared offline change"},
+            client_mutation_id="cm_project_handoff_0001")
+        self.assertEqual(
+            mirror.pending_overlays("handoff")[0]["resource"],
+            "project_handoffs")
 
         forged = projection(
             self.scope, handoffs=[identity_handoff(actor_scope("blue"))])
@@ -253,6 +313,7 @@ class IdentityProjectionOfflineTests(unittest.TestCase):
         legacy_projection = projection(self.scope)
         legacy_projection.pop("identity_handoffs")
         legacy_projection.pop("role_scopes")
+        legacy_projection.pop("project_handoffs")
         legacy_projection["handoffs"] = [{
             "project_id": "agentg", "version": 91,
             "content": {"objective": "retired global state"},
@@ -300,6 +361,8 @@ class IdentityProjectionServerTests(unittest.TestCase):
                 rows = [identity_handoff(selected)]
                 result["projection"]["handoffs"] = copy.deepcopy(rows)
                 result["projection"]["identity_handoffs"] = rows
+                result["projection"]["project_handoffs"] = [
+                    project_handoff(self.scope)]
                 result["projection"]["role_scopes"] = [
                     role_scope(self.scope)]
                 result["projection"]["persona_reservations"] = \
@@ -354,9 +417,12 @@ class ProductProjectionIntegrationTests(unittest.TestCase):
                 agent_id=actor, role="director", runtime="codex",
                 persona=persona, canonical_identity=True,
                 distinct_identity=True)
-            core.update_handoff(
+            core.update_identity_handoff(
                 self.connection, "agentg", actor, "agent",
                 {"objective": "%s private continuity" % persona})
+        core.update_handoff(
+            self.connection, "agentg", self.red, "agent",
+            {"objective": "Shared project continuity"})
         core.set_lead_director(
             self.connection, "agentg", "web.jack", "human", self.red)
         core.role_scope_set(
@@ -383,6 +449,8 @@ class ProductProjectionIntegrationTests(unittest.TestCase):
             {row["actor_id"] for row in red["identity_handoffs"]},
             {self.red})
         self.assertEqual(red["handoffs"], red["identity_handoffs"])
+        self.assertEqual(
+            red["project_handoffs"][-1]["project_id"], "agentg")
         self.assertEqual(
             [row["role"] for row in red["role_scopes"]],
             ["director", "lead_director"])

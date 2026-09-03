@@ -43,6 +43,70 @@ class NamedIdentityPanelControlsTests(unittest.TestCase):
             self.panel,
         )
 
+    def test_handoff_screen_separates_shared_identity_and_role_scope(self) -> None:
+        render = self.panel[
+            self.panel.index("function renderHandoff()"):
+            self.panel.index("function renderLog()")
+        ]
+        shared_heading = render.index("<h2>Shared project handoff</h2>")
+        identity_heading = render.index("<h2>Exact AI identity handoff</h2>")
+        role_heading = render.index("${renderRoleScopes()}")
+        self.assertLess(shared_heading, identity_heading)
+        self.assertLess(identity_heading, role_heading)
+        for contract in (
+            'sharedHandoff: pathFor("/handoff")',
+            '`/identity-handoff?actor=${encodeURIComponent(handoffActor)}`',
+            '`/identity-handoff/history${listQuery("handoff", {',
+            'pathFor("/handoff"), { method: "PUT", body }',
+            'pathFor(`/identity-handoff?actor=${encodeURIComponent(selectedHandoffActor())}`)',
+            'data-form="update-shared-handoff"',
+            'data-form="update-identity-handoff"',
+            "function canManageSharedHandoff()",
+            'state.prefs.actorType === "agent" &&',
+            'panelAgentRecord()?.role === "director"',
+            "Three continuity layers, kept separate.",
+        ):
+            self.assertIn(contract, self.panel)
+        self.assertIn(
+            "Only an exact registered AI Director may edit it.", self.panel)
+        self.assertNotIn('if (kind === "update-handoff")', self.panel)
+
+    def test_identity_selector_excludes_human_and_pseudo_actors(self) -> None:
+        helper = re.search(
+            r"function registeredAiAgents\(\) \{(?P<body>.*?)\n\s*\}",
+            self.panel,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(helper)
+        body = helper.group("body")
+        self.assertIn('actorType === "agent"', body)
+        self.assertIn('/^(?:web|console)\\./i.test(actor)', body)
+        self.assertIn(
+            "Only registered AI identities appear here; web and console "
+            "human operators never receive identity handoffs.",
+            self.panel,
+        )
+
+    def test_both_handoff_histories_use_server_paging_search_and_sort(self) -> None:
+        for contract in (
+            "sharedHandoff: newListPage()",
+            'sharedHandoff: "sharedHandoffHistory"',
+            'listQuery("sharedHandoff", {',
+            "q: state.sharedHandoffSearch",
+            'id="shared-handoff-search"',
+            'sortControl("sharedHandoff")',
+            'pageToolbar("sharedHandoff", sharedHistory, "versions", '
+            '"shared handoff versions")',
+            '"shared-handoff-search": '
+            '["sharedHandoffSearch", "sharedHandoff", false]',
+            "q: state.handoffSearch, actor: handoffActor",
+            'id="handoff-search"',
+            'sortControl("handoff")',
+            'pageToolbar("handoff", historyMismatch ? {} : history, '
+            '"versions", "identity handoff versions")',
+        ):
+            self.assertIn(contract, self.panel)
+
     def test_bridge_participation_selects_friendly_names_not_raw_input(self) -> None:
         for contract in (
             "function bridgeAgentOptions(workspaceId, allowedAgents = [])",

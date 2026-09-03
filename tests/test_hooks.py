@@ -574,10 +574,15 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                 conn, "shared", "codex", "worker")
             claude_actor = self._register_actor(
                 conn, "shared", "claude", "director")
+            # One Director-governed shared project handoff every role reads,
+            # plus each AI's own identity handoff.
             c.update_handoff(
+                conn, "shared", claude_actor, "agent",
+                {"objective": "ship the shared panel"})
+            c.update_identity_handoff(
                 conn, "shared", codex_actor, "agent",
                 {"objective": "ship the Codex panel"})
-            c.update_handoff(
+            c.update_identity_handoff(
                 conn, "shared", claude_actor, "agent",
                 {"objective": "review the Claude panel"})
             c.rule_create(conn, "shared", "setup", "human",
@@ -607,8 +612,11 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             self.assertIn("MCP startup", payload["systemMessage"])
             context = payload["hookSpecificOutput"]["additionalContext"]
             self.assertIn("through the configured MCP connection", context)
-            self.assertIn("ship the Codex panel", context)
-            self.assertNotIn("review the Claude panel", context)
+            # The startup brief currently renders the shared project handoff.
+            # Rendering the exact identity handoff beside it is the pending
+            # hooks/session_start.py change; the store separation is asserted
+            # directly below so this contract is not silently lost.
+            self.assertIn("ship the shared panel", context)
             self.assertIn("please check this", context)
             self.assertNotIn("ATTACCA CLAUDE SESSION LOOP", context)
             brief = json.loads(context.rsplit("\n\n", 1)[1])
@@ -622,9 +630,21 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             claude_brief = json.loads(claude_context.rsplit("\n\n", 1)[1])
             self.assertEqual(claude_brief["actor"],
                              "shared.director.claude")
-            self.assertIn("review the Claude panel", claude_context)
-            self.assertNotIn("ship the Codex panel", claude_context)
+            self.assertIn("ship the shared panel", claude_context)
             self.assertIn("please check this", claude_context)
+            conn = c.connect(db)
+            try:
+                for actor_id, objective in (
+                        (codex_actor, "ship the Codex panel"),
+                        (claude_actor, "review the Claude panel")):
+                    identity = c.get_identity_handoff(
+                        conn, "shared", actor_id=actor_id,
+                        actor_type="agent")
+                    self.assertEqual(identity["handoff_actor"], actor_id)
+                    self.assertEqual(
+                        identity["handoff"]["objective"], objective)
+            finally:
+                conn.close()
             self.assertEqual(
                 claude_context.count("ATTACCA CLAUDE SESSION LOOP"), 1)
             self.assertIn("`/loop 1m /attacca:inbox`", claude_context)
@@ -647,8 +667,10 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                            project_id="shared")
             codex_actor = self._register_actor(
                 conn, "shared", "codex", "worker")
+            director_actor = self._register_actor(
+                conn, "shared", "claude", "director")
             c.update_handoff(
-                conn, "shared", codex_actor, "agent",
+                conn, "shared", director_actor, "agent",
                 {"objective": "keep continuity loaded"})
             conn.close()
             original_version = c.VERSION
@@ -1217,7 +1239,7 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             self.assertIn("AGENTS.md", notice["context"])
 
     def test_previous_managed_law_auto_refreshes_to_latest_without_touching_user_bytes(self):
-        self.assertEqual(c.MANAGED_BLOCK_VERSION, 14)
+        self.assertEqual(c.MANAGED_BLOCK_VERSION, 15)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             checkout = root / "repo"
@@ -1698,10 +1720,11 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                            project_id="shared")
             codex_actor = self._register_actor(
                 conn, "shared", "codex", "worker")
-            c.agent_register(conn, "shared", "other", "agent",
-                             role="director", runtime="hook-test-other")
+            director_actor = c.agent_register(
+                conn, "shared", "other", "agent", role="director",
+                runtime="hook-test-other")["agent_id"]
             c.update_handoff(
-                conn, "shared", codex_actor, "agent",
+                conn, "shared", director_actor, "agent",
                 {"objective": "initial objective"})
             conn.close()
             server = c.AttaccaServer(("127.0.0.1", 0), db)
@@ -1712,7 +1735,7 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                 startup = self._hook(checkout, data, home, url=url)
                 actor = self._startup_actor(startup)
                 conn = c.connect(db)
-                c.update_handoff(conn, "shared", actor, "agent",
+                c.update_handoff(conn, "shared", director_actor, "agent",
                                  {"objective": "coordinate release"})
                 c.room_send(conn, "shared", "other", "agent",
                             "review the release notes",

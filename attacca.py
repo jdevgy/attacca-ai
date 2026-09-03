@@ -155,7 +155,7 @@ LOG_EXCLUDED_MSG_TYPES = {"chat", "status"}
 
 MANAGED_BEGIN = "<!-- MANAGED_ATTACCA:BEGIN"
 MANAGED_END = "<!-- MANAGED_ATTACCA:END -->"
-MANAGED_BLOCK_VERSION = 14
+MANAGED_BLOCK_VERSION = 15
 _CLOUD_CONTEXT_UNSET = object()
 _INSTRUCTION_FILE_ABSENT = object()
 _INSTRUCTION_WRITE_THREAD_LOCK = threading.RLock()
@@ -797,28 +797,43 @@ def parse_canonical_agent_id(actor_id, project_id=None):
             "persona": parts[3] if len(parts) == 4 else None}
 
 
+# Each identity-bearing field carries the timestamp that most closely records
+# when that value first became durable.  This matters during an upgrade from
+# the old workspace-local friendly-name namespace: the server must let the
+# actor that actually used @Gibbs first keep it, rather than choosing whichever
+# *workspace* happened to be created first.  ``None`` means that the table has
+# no trustworthy timestamp for that mutable pointer; the append-only
+# reservation time remains the deterministic fallback in that rare case.
 _PERSONA_HISTORY_COLUMNS = (
-    ("events", ("actor_id", "payload"), "seq"),
-    ("agents", ("agent_id",), "registered_at"),
-    ("actor_aliases", ("legacy_actor_id", "canonical_actor_id"),
-     "migrated_at"),
-    ("projects", ("created_by", "lead_director"), "created_at"),
-    ("bridges", ("created_by", "access_a", "access_b"), "created_at"),
-    ("inbox_cursors", ("actor_id",), "updated_at"),
-    ("message_dispositions", ("actor_id", "updated_by"), "updated_at"),
-    ("tasks", ("claimed_by", "created_by"), "created_at"),
-    ("task_plan_revisions", ("authored_by",), "authored_at"),
-    ("handoffs", ("updated_by",), "updated_at"),
-    ("identity_handoffs", ("actor_id", "updated_by"), "updated_at"),
-    ("role_scope_revisions", ("updated_by",), "updated_at"),
-    ("decisions", ("proposed_by", "resolved_by"), "created_at"),
-    ("project_rules", ("created_by", "updated_by"), "created_at"),
-    ("project_cloud_context", ("updated_by",), "updated_at"),
-    ("sync_operations", ("actor_id",), "created_at"),
-    ("auth_tokens", ("actor_id",), "created_at"),
-    ("auth_token_actor_bindings", ("actor_id",), "created_at"),
-    ("auth_migration_targets", ("actor_id",), "created_at"),
-    ("agent_clients", ("agent_id",), "first_seen_at"),
+    ("events", (("actor_id", "created_at"),
+                ("payload", "created_at"))),
+    ("agents", (("agent_id", "registered_at"),)),
+    ("actor_aliases", (("legacy_actor_id", "migrated_at"),
+                       ("canonical_actor_id", "migrated_at"))),
+    ("projects", (("created_by", "created_at"),
+                  ("lead_director", None))),
+    ("bridges", (("created_by", "created_at"),
+                 ("access_a", None), ("access_b", None))),
+    ("inbox_cursors", (("actor_id", "updated_at"),)),
+    ("message_dispositions", (("actor_id", "updated_at"),
+                              ("updated_by", "updated_at"))),
+    ("tasks", (("claimed_by", "updated_at"),
+               ("created_by", "created_at"))),
+    ("task_plan_revisions", (("authored_by", "authored_at"),)),
+    ("handoffs", (("updated_by", "updated_at"),)),
+    ("identity_handoffs", (("actor_id", "updated_at"),
+                           ("updated_by", "updated_at"))),
+    ("role_scope_revisions", (("updated_by", "updated_at"),)),
+    ("decisions", (("proposed_by", "created_at"),
+                   ("resolved_by", "resolved_at"))),
+    ("project_rules", (("created_by", "created_at"),
+                       ("updated_by", "updated_at"))),
+    ("project_cloud_context", (("updated_by", "updated_at"),)),
+    ("sync_operations", (("actor_id", "created_at"),)),
+    ("auth_tokens", (("actor_id", "created_at"),)),
+    ("auth_token_actor_bindings", (("actor_id", "created_at"),)),
+    ("auth_migration_targets", (("actor_id", "created_at"),)),
+    ("agent_clients", (("agent_id", "first_seen_at"),)),
 )
 
 
@@ -882,6 +897,81 @@ def _persona_seed_marker(project_id):
     return "agent_persona_reservations.seed.v2.%s" % slugify(project_id)
 
 
+def _project_named_actor_history(conn, project_id):
+    """Return the earliest durable occurrence of every exact named actor.
+
+    The scan is used only at creation/repair/setup migration boundaries, never
+    on ordinary request paths.  It deliberately reads immutable/audit history
+    as well as current rows so deleting or aliasing an actor cannot release a
+    friendly name.  A malformed named actor fails closed.
+    """
+    found = {}
+    for table, field_specs in _PERSONA_HISTORY_COLUMNS:
+        columns = {row["name"] for row in conn.execute(
+            "PRAGMA table_info(%s)" % table)}
+        usable = [(field, timestamp)
+                  for field, timestamp in field_specs
+                  if field in columns]
+        if "project_id" not in columns or not usable:
+            continue
+        selected = []
+        for field, timestamp in usable:
+            if field not in selected:
+                selected.append(field)
+            if timestamp and timestamp in columns and timestamp not in selected:
+                selected.append(timestamp)
+        rows = conn.execute(
+            "SELECT %s FROM %s WHERE project_id=?" %
+            (",".join(selected), table), (project_id,)).fetchall()
+        for row in rows:
+            for field, timestamp in usable:
+                occurred_at = row[timestamp] \
+                    if timestamp and timestamp in columns else None
+                for actor_id in _persona_actors_in_value(
+                        row[field], project_id):
+                    parsed = parse_canonical_agent_id(actor_id, project_id)
+                    persona = parsed.get("persona") if parsed else None
+                    if not persona:
+                        continue
+                    candidate = {
+                        "actor_id": actor_id,
+                        "occurred_at": occurred_at,
+                        "source": "historical:%s.%s" % (table, field),
+                    }
+                    previous = found.get(actor_id)
+                    # A real timestamp is stronger than an unknown one; among
+                    # timestamped facts, ISO-8601 UTC values sort chronologically.
+                    if previous is None or (
+                            candidate["occurred_at"] is not None and (
+                                previous["occurred_at"] is None or
+                                str(candidate["occurred_at"]) <
+                                str(previous["occurred_at"]))) or (
+                            candidate["occurred_at"] ==
+                            previous["occurred_at"] and
+                            candidate["actor_id"] < previous["actor_id"]):
+                        candidate["persona"] = persona
+                        found[actor_id] = candidate
+    return found
+
+
+def _project_persona_history(conn, project_id):
+    """Return the earliest exact actor occurrence for each persona."""
+    found = {}
+    for actor_id, occurrence in _project_named_actor_history(
+            conn, project_id).items():
+        persona = occurrence["persona"]
+        previous = found.get(persona)
+        if previous is None or (
+                occurrence["occurred_at"] is not None and (
+                    previous["occurred_at"] is None or
+                    str(occurrence["occurred_at"]) <
+                    str(previous["occurred_at"]))) or (
+                occurrence["occurred_at"] == previous["occurred_at"] and
+                actor_id < previous["actor_id"]):
+            found[persona] = occurrence
+    return found
+
+
 def _seed_project_persona_reservations(conn, project_id, force=False):
     """Reserve every persona carried by durable historical identity state.
 
@@ -898,36 +988,16 @@ def _seed_project_persona_reservations(conn, project_id, force=False):
             (marker,)).fetchone():
         return 0
     inserted = 0
-    seen = set()
-    for table, requested_columns, order_column in _PERSONA_HISTORY_COLUMNS:
-        columns = {row["name"] for row in conn.execute(
-            "PRAGMA table_info(%s)" % table)}
-        selected = [column for column in requested_columns
-                    if column in columns]
-        if "project_id" not in columns or not selected:
-            continue
-        ordering = (" ORDER BY %s" % order_column) \
-            if order_column in columns else ""
-        rows = conn.execute(
-            "SELECT %s FROM %s WHERE project_id=?%s" %
-            (",".join(selected), table, ordering), (project_id,)).fetchall()
-        for row in rows:
-            for column in selected:
-                for actor_id in _persona_actors_in_value(
-                        row[column], project_id):
-                    parsed = parse_canonical_agent_id(actor_id, project_id)
-                    persona = parsed.get("persona") if parsed else None
-                    if not persona or persona in seen:
-                        continue
-                    seen.add(persona)
-                    cursor = conn.execute(
-                        "INSERT OR IGNORE INTO agent_persona_reservations"
-                        " (project_id,persona,persona_name,reserved_actor_id,"
-                        " reserved_at,source) VALUES (?,?,?,?,?,?)",
-                        (project_id, persona, agent_persona_name(persona),
-                         actor_id, now_iso(), "historical:%s.%s" %
-                         (table, column)))
-                    inserted += cursor.rowcount
+    for persona, occurrence in sorted(
+            _project_persona_history(conn, project_id).items()):
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO agent_persona_reservations"
+            " (project_id,persona,persona_name,reserved_actor_id,"
+            " reserved_at,source) VALUES (?,?,?,?,?,?)",
+            (project_id, persona, agent_persona_name(persona),
+             occurrence["actor_id"], occurrence["occurred_at"] or now_iso(),
+             occurrence["source"]))
+        inserted += cursor.rowcount
     conn.execute(
         "INSERT OR IGNORE INTO server_settings"
         " (setting_key,value,updated_at) VALUES (?,?,?)",
@@ -951,26 +1021,116 @@ def _seed_all_persona_reservations(conn, force=False):
 
 
 def _persona_reservation_projects(conn, persona):
-    """Return deterministic legacy owners of one friendly name."""
+    """Return deterministic exact legacy owners of one friendly name.
+
+    Reservations are workspace-scoped append-only compatibility rows, while
+    older releases could create two Gibbs actors inside one workspace.  Merge
+    current exact actors with the reservation directory so setup can repair
+    both cross-workspace and same-workspace duplicates.
+    """
     persona = normalize_agent_persona(persona)
     if not persona:
         return []
-    return [dict(row) for row in conn.execute(
+    reservation_rows = [dict(row) for row in conn.execute(
         "SELECT r.project_id,r.reserved_actor_id,r.reserved_at,"
         " p.created_at AS project_created_at"
         " FROM agent_persona_reservations r JOIN projects p"
         " ON p.project_id=r.project_id WHERE r.persona=?"
-        " ORDER BY p.created_at,r.reserved_at,r.project_id",
-        (persona,))]
+        " ORDER BY r.reserved_at,r.project_id", (persona,))]
+    histories = {}
+    owners_by_key = {}
+    for row in conn.execute(
+            "SELECT a.*,p.created_at AS project_created_at"
+            " FROM agents a JOIN projects p ON p.project_id=a.project_id"):
+        parsed = parse_canonical_agent_id(row["agent_id"], row["project_id"])
+        if not parsed or parsed.get("persona") != persona:
+            continue
+        if row["project_id"] not in histories:
+            histories[row["project_id"]] = _project_named_actor_history(
+                conn, row["project_id"])
+        history = histories[row["project_id"]]
+        occurrence = history.get(row["agent_id"]) or {}
+        item = {
+            "project_id": row["project_id"],
+            "reserved_actor_id": row["agent_id"],
+            "reserved_at": row["registered_at"] or now_iso(),
+            "project_created_at": row["project_created_at"],
+            "first_used_at": occurrence.get("occurred_at") or
+                             row["registered_at"] or now_iso(),
+            "active": True,
+        }
+        owners_by_key[(item["project_id"], item["reserved_actor_id"])] = item
+    for owner in reservation_rows:
+        if owner["project_id"] not in histories:
+            histories[owner["project_id"]] = _project_named_actor_history(
+                conn, owner["project_id"])
+        history = histories[owner["project_id"]]
+        occurrence = history.get(owner["reserved_actor_id"])
+        owner["first_used_at"] = (
+            (occurrence or {}).get("occurred_at") or owner["reserved_at"])
+        resolved_actor = owner["reserved_actor_id"]
+        visited = set()
+        while resolved_actor not in visited:
+            visited.add(resolved_actor)
+            alias = conn.execute(
+                "SELECT canonical_actor_id FROM actor_aliases"
+                " WHERE project_id=? AND legacy_actor_id=?",
+                (owner["project_id"], resolved_actor)).fetchone()
+            if not alias:
+                break
+            resolved_actor = alias["canonical_actor_id"]
+        resolved_parts = parse_canonical_agent_id(
+            resolved_actor, owner["project_id"])
+        resolved_active = bool(
+            resolved_parts and resolved_parts.get("persona") == persona and
+            conn.execute(
+                "SELECT 1 FROM agents WHERE project_id=? AND agent_id=?",
+                (owner["project_id"], resolved_actor)).fetchone())
+        if resolved_active:
+            key = (owner["project_id"], resolved_actor)
+            owner["reserved_actor_id"] = resolved_actor
+            owner["active"] = True
+        else:
+            key = (owner["project_id"], owner["reserved_actor_id"])
+            owner["active"] = bool(conn.execute(
+                "SELECT 1 FROM agents WHERE project_id=? AND agent_id=?",
+                key).fetchone())
+        existing = owners_by_key.get(key)
+        if existing:
+            existing["first_used_at"] = min(
+                value for value in (
+                    existing.get("first_used_at"), owner["first_used_at"])
+                if value)
+        else:
+            owners_by_key[key] = owner
+    owners = list(owners_by_key.values())
+    owners.sort(key=lambda item: (
+        item.get("first_used_at") or item["reserved_at"],
+        item["project_id"], item["reserved_actor_id"]))
+    return owners
 
 
-def agent_persona_repair_status(conn, project_id, actor_id):
-    """Describe whether an existing actor has a grandfathered name clash."""
+def agent_persona_repair_status(conn, project_id, actor_id,
+                                owners_cache=None):
+    """Describe whether an existing actor has a grandfathered name clash.
+
+    ``owners_cache`` lets one request that inspects many actors reuse the
+    server-wide reservation scan per friendly name instead of repeating it
+    for every row; it must not outlive a single read.
+    """
     parsed = parse_canonical_agent_id(actor_id, project_id)
     persona = parsed.get("persona") if parsed else None
-    owners = _persona_reservation_projects(conn, persona)
-    required = bool(len(owners) > 1 and
-                    owners[0]["project_id"] != project_id)
+    if owners_cache is None:
+        owners = _persona_reservation_projects(conn, persona)
+    else:
+        if persona not in owners_cache:
+            owners_cache[persona] = _persona_reservation_projects(
+                conn, persona)
+        owners = owners_cache[persona]
+    actor_key = (project_id, str(actor_id or "").strip())
+    keeper_key = ((owners[0]["project_id"],
+                   owners[0]["reserved_actor_id"]) if owners else None)
+    required = bool(len(owners) > 1 and keeper_key != actor_key)
     return {
         "repair_required": required,
         "persona": persona,
@@ -4796,7 +4956,7 @@ def project_init(conn, actor_id, actor_type, path=None, project_id=None,
 # --- handoff ---------------------------------------------------------------
 
 def _latest_handoff(conn, project_id):
-    """Latest row in the retired project-global compatibility archive."""
+    """Latest shared project handoff."""
     return conn.execute(
         "SELECT * FROM handoffs WHERE project_id=? ORDER BY version DESC LIMIT 1",
         (project_id,)).fetchone()
@@ -4818,23 +4978,64 @@ def _identity_handoff_dict(row):
     return value
 
 
+def _handoff_dict(row):
+    if not row:
+        return None
+    value = dict(row)
+    value["content"] = json.loads(value["content"])
+    return value
+
+
+# Browser/console identities are people, never AI continuity owners.
+_HUMAN_ACTOR_PREFIXES = ("web.", "console.")
+
+
+def _registered_agent_actor(conn, project_id, actor_id):
+    """Return a row when ``actor_id`` is a registered AI of this workspace.
+
+    ``agents.actor_type`` records who performed the registration -- a human
+    Director registering an AI through the Control Panel stores 'human' --
+    so it is not a usable "is this row an AI" predicate.  Membership is the
+    registry row itself, exactly as every other authority check in this file
+    resolves it; human identities are excluded by their canonical name shape.
+    """
+    actor = str(actor_id or "").strip()
+    if not actor:
+        return None
+    lowered = actor.lower()
+    if lowered.startswith(_HUMAN_ACTOR_PREFIXES):
+        return None
+    parts = lowered.split(".")
+    if len(parts) > 1 and parts[1] == "human":
+        return None
+    return conn.execute(
+        "SELECT 1 FROM agents WHERE project_id=? AND agent_id=?",
+        (project_id, actor)).fetchone()
+
+
 def _handoff_read_actor(conn, project_id, actor_id, actor_type,
                         target_actor_id=None):
-    target = str(target_actor_id or actor_id or "").strip()
-    if not target:
-        raise AttaccaError("handoff read requires an exact identity")
-    if target != actor_id:
-        registered = conn.execute(
-            "SELECT 1 FROM agents WHERE project_id=? AND agent_id=?",
-            (project_id, target)).fetchone()
-        known_handoff = conn.execute(
-            "SELECT 1 FROM identity_handoffs WHERE project_id=?"
-            " AND actor_id=? LIMIT 1", (project_id, target)).fetchone()
-        if not registered and not known_handoff:
+    """Resolve whose identity handoff a reader is asking for.
+
+    An explicitly requested foreign identity must exist: silently returning
+    somebody else's empty handoff would hide a client mistake.  The caller's
+    own actor is different — a first-run or pre-registration client (an
+    ``*.unassigned.*`` brief, setup discovery) must still receive the shared
+    project brief, so an unregistered self simply owns no identity handoff.
+    """
+    target = str(target_actor_id or "").strip()
+    if target:
+        if not _registered_agent_actor(conn, project_id, target):
             raise AttaccaError(
-                "handoff identity '%s' is unknown in workspace '%s'"
-                % (target, project_id))
-    return target
+                "identity handoff actor '%s' is not a registered AI in "
+                "workspace '%s'" % (target, project_id))
+        return target
+    if actor_type != "agent":
+        return None
+    own = str(actor_id or "").strip()
+    if not own or not _registered_agent_actor(conn, project_id, own):
+        return None
+    return own
 
 
 def _role_scope_name(role):
@@ -5129,31 +5330,34 @@ def workflow_warnings(conn, project_id, actor_id=None, actor_type="agent"):
 def get_handoff(conn, project_id, actor_id=None, actor_type="agent",
                 target_actor_id=None):
     project = get_project(conn, project_id)
-    handoff_actor = _handoff_read_actor(
+    identity_actor = _handoff_read_actor(
         conn, project_id, actor_id, actor_type, target_actor_id)
-    row = _latest_identity_handoff(conn, project_id, handoff_actor)
-    legacy_fallback = row is None
-    if legacy_fallback:
-        # Read-only compatibility during the transition: an identity with no
-        # handoff may see the retired global snapshot so a rolling upgrade
-        # never produces an empty cold start. The row is not copied; the
-        # identity's first write starts its own version history at v1.
-        row = _latest_handoff(conn, project_id)
+    row = _latest_handoff(conn, project_id)
+    identity_row = _latest_identity_handoff(
+        conn, project_id, identity_actor) if identity_actor else None
     handoff_event = None
-    if row and not legacy_fallback and row["event_id"]:
-        handoff_event = conn.execute(
-            "SELECT * FROM events WHERE project_id=? AND event_id=?",
-            (project_id, row["event_id"])).fetchone()
-    elif row:
+    if row:
         handoff_event = conn.execute(
             "SELECT * FROM events WHERE project_id=?"
             " AND event_type='handoff.updated' AND context_version=?"
             " ORDER BY seq DESC LIMIT 1",
             (project_id, row["version"])).fetchone()
+        if not handoff_event:
+            handoff_event = conn.execute(
+                "SELECT * FROM events WHERE project_id=?"
+                " AND event_type='handoff.updated'"
+                " AND actor_id=? AND created_at<=?"
+                " ORDER BY seq DESC LIMIT 1",
+                (project_id, row["updated_by"], row["updated_at"])
+            ).fetchone()
     handoff_attribution = _ledger_action(
         handoff_event, conn, project_id) if handoff_event else None
     content = json.loads(row["content"]) if row else {}
     handoff = {field: content.get(field) for field in HANDOFF_FIELDS}
+    identity_content = json.loads(identity_row["content"]) \
+        if identity_row else {}
+    identity_handoff = {
+        field: identity_content.get(field) for field in HANDOFF_FIELDS}
     open_tasks = task_list(conn, project_id, status=None)["tasks"]
     open_tasks = [t for t in open_tasks if t["status"] not in ("done", "cancelled")]
     decisions = [d for d in decision_list(conn, project_id)["decisions"]
@@ -5209,16 +5413,24 @@ def get_handoff(conn, project_id, actor_id=None, actor_type="agent",
         "role_scope": role_scope_get(
             conn, project_id, actor_id=actor_id, actor_type=actor_type),
         "handoff": handoff,
-        "handoff_actor": handoff_actor,
-        "handoff_version": (row["version"] if row and not legacy_fallback
-                            else 0),
-        "legacy_handoff_fallback": bool(row and legacy_fallback),
+        "shared_handoff": handoff,
+        "handoff_scope": "project",
+        "handoff_actor": None,
+        "handoff_version": row["version"] if row else 0,
         "handoff_updated_by": row["updated_by"] if row else None,
-        "handoff_updated_owner": (
-            row["updated_owner"] if row and not legacy_fallback else
-            (handoff_attribution or {}).get("owner")),
+        "handoff_updated_owner": (handoff_attribution or {}).get("owner"),
         "handoff_attribution": handoff_attribution,
         "handoff_updated_at": row["updated_at"] if row else None,
+        "identity_handoff": identity_handoff,
+        "identity_handoff_actor": identity_actor,
+        "identity_handoff_version": (
+            identity_row["version"] if identity_row else 0),
+        "identity_handoff_updated_by": (
+            identity_row["updated_by"] if identity_row else None),
+        "identity_handoff_updated_owner": (
+            identity_row["updated_owner"] if identity_row else None),
+        "identity_handoff_updated_at": (
+            identity_row["updated_at"] if identity_row else None),
         "open_tasks": [_task_brief(t) for t in open_tasks],
         "decisions": [{k: d.get(k) for k in
                        ("decision_id", "title", "status", "proposed_owner",
@@ -5228,14 +5440,14 @@ def get_handoff(conn, project_id, actor_id=None, actor_type="agent",
         "git": {"head": git_head(project.get("root_path")),
                 "branch": git_branch(project.get("root_path"))},
         "hint": (None if row else
-                 "No handoff exists for identity %s. After meaningful work, "
-                 "that exact identity should call update_handoff." %
-                 handoff_actor),
+                 "No shared project handoff exists. A registered Director "
+                 "should initialize it with update_handoff."),
     }
 
 
 def update_handoff(conn, project_id, actor_id, actor_type, updates,
                    expected_context_version=None, expected_version=None):
+    """Append the Director-governed shared project handoff."""
     updates = {k: v for k, v in updates.items()
                if k in HANDOFF_FIELDS and v is not None}
     if not updates:
@@ -5243,24 +5455,12 @@ def update_handoff(conn, project_id, actor_id, actor_type, updates,
             "update_handoff needs at least one of: %s" % ", ".join(HANDOFF_FIELDS))
     with write_tx(conn):
         project = get_project(conn, project_id)
-        if actor_type == "agent":
-            actor_row = conn.execute(
-                "SELECT role FROM agents WHERE project_id=? AND agent_id=?",
-                (project_id, actor_id)).fetchone()
-            if not actor_row:
-                raise AttaccaError(
-                    "identity handoff owner '%s' is not registered in "
-                    "workspace '%s'" % (actor_id, project_id))
-        elif actor_type != "human":
+        role = _registered_actor_role(conn, project_id, actor_id) \
+            if actor_type == "agent" else "unassigned"
+        if actor_type != "agent" or role != "director":
             raise AttaccaError(
-                "identity handoff writes require an authenticated human or "
-                "registered AI identity")
-        elif conn.execute(
-                "SELECT 1 FROM agents WHERE project_id=? AND agent_id=?",
-                (project_id, actor_id)).fetchone():
-            raise AttaccaError(
-                "registered AI identity '%s' cannot be written through a "
-                "human actor type" % actor_id)
+                "shared project handoff may only be edited by a registered "
+                "Director; '%s' is %s" % (actor_id, role))
         if expected_context_version is not None:
             try:
                 expected = int(expected_context_version)
@@ -5271,6 +5471,108 @@ def update_handoff(conn, project_id, actor_id, actor_type, updates,
                     "handoff conflict: expected context v%d but project is now "
                     "v%d; reload get_handoff and reconcile before writing"
                     % (expected, project["context_version"]))
+        row = _latest_handoff(conn, project_id)
+        current_version = row["version"] if row else 0
+        if expected_version is not None:
+            try:
+                expected_version = int(expected_version)
+            except (TypeError, ValueError):
+                raise AttaccaError("expected_version must be an integer")
+            if current_version != expected_version:
+                raise AttaccaError(
+                    "shared handoff conflict: expected v%d but it is v%d; "
+                    "reload get_handoff and reconcile before writing" %
+                    (expected_version, current_version))
+        content = json.loads(row["content"]) if row else {}
+        content.update(updates)
+        handoff_version = current_version + 1
+        new_version = bump_context_version(conn, project_id)
+        event = append_event(conn, project_id, actor_id, actor_type,
+                             "handoff.updated",
+                             {"fields": sorted(updates.keys()),
+                              "handoff": content,
+                              "handoff_scope": "project",
+                              "handoff_version": handoff_version}, in_tx=True)
+        conn.execute(
+            "INSERT INTO handoffs"
+            " (project_id,version,content,updated_by,updated_at)"
+            " VALUES (?,?,?,?,?)",
+            (project_id, handoff_version, canonical_json(content), actor_id,
+             now_iso()))
+    return {"ok": True, "context_version": new_version,
+            "handoff_scope": "project", "handoff_actor": None,
+            "handoff_version": handoff_version,
+            "updated_fields": sorted(updates.keys()), "event": event}
+
+
+def get_identity_handoff(conn, project_id, actor_id=None, actor_type="agent",
+                         target_actor_id=None):
+    """Read one exact AI identity's own handoff.
+
+    ``target_actor_id`` is a read-only coordination read of a registered peer;
+    it never grants write authority.  A caller that owns no identity handoff
+    (a human, console, or not-yet-registered actor) receives an empty handoff
+    with ``handoff_actor`` set to null instead of an error.
+    """
+    project = get_project(conn, project_id)
+    identity_actor = _handoff_read_actor(
+        conn, project_id, actor_id, actor_type, target_actor_id)
+    row = _latest_identity_handoff(conn, project_id, identity_actor) \
+        if identity_actor else None
+    content = json.loads(row["content"]) if row else {}
+    handoff = {field: content.get(field) for field in HANDOFF_FIELDS}
+    version = row["version"] if row else 0
+    return {
+        "project": project_id,
+        "context_version": project["context_version"],
+        "handoff_scope": "identity",
+        "handoff_actor": identity_actor,
+        "identity_handoff_actor": identity_actor,
+        "handoff": handoff,
+        "identity_handoff": handoff,
+        "handoff_version": version,
+        "identity_handoff_version": version,
+        "handoff_updated_by": row["updated_by"] if row else None,
+        "identity_handoff_updated_by": row["updated_by"] if row else None,
+        "handoff_updated_owner": row["updated_owner"] if row else None,
+        "identity_handoff_updated_owner": (
+            row["updated_owner"] if row else None),
+        "handoff_updated_at": row["updated_at"] if row else None,
+        "identity_handoff_updated_at": row["updated_at"] if row else None,
+        "hint": (None if identity_actor else
+                 "Only a registered AI owns an identity handoff; humans and "
+                 "console identities read the shared project handoff."),
+    }
+
+
+def update_identity_handoff(conn, project_id, actor_id, actor_type, updates,
+                            expected_context_version=None,
+                            expected_version=None):
+    """Append one registered AI's exact identity handoff."""
+    updates = {k: v for k, v in updates.items()
+               if k in HANDOFF_FIELDS and v is not None}
+    if not updates:
+        raise AttaccaError(
+            "update_identity_handoff needs at least one of: %s" %
+            ", ".join(HANDOFF_FIELDS))
+    with write_tx(conn):
+        project = get_project(conn, project_id)
+        if actor_type != "agent" or not _registered_agent_actor(
+                conn, project_id, actor_id):
+            raise AttaccaError(
+                "identity handoff writes require one exact registered AI; "
+                "human/console identities do not own handoffs")
+        if expected_context_version is not None:
+            try:
+                expected = int(expected_context_version)
+            except (TypeError, ValueError):
+                raise AttaccaError(
+                    "expected_context_version must be an integer")
+            if project["context_version"] != expected:
+                raise AttaccaError(
+                    "identity handoff conflict: expected context v%d but "
+                    "project is now v%d; reload get_handoff and reconcile" %
+                    (expected, project["context_version"]))
         row = _latest_identity_handoff(conn, project_id, actor_id)
         current_version = row["version"] if row else 0
         if expected_version is not None:
@@ -5281,18 +5583,18 @@ def update_handoff(conn, project_id, actor_id, actor_type, updates,
             if current_version != expected_version:
                 raise AttaccaError(
                     "identity handoff conflict for %s: expected v%d but it "
-                    "is v%d; reload get_handoff and reconcile before writing"
-                    % (actor_id, expected_version, current_version))
+                    "is v%d; reload get_identity_handoff and reconcile" %
+                    (actor_id, expected_version, current_version))
         content = json.loads(row["content"]) if row else {}
         content.update(updates)
         handoff_version = current_version + 1
         new_version = bump_context_version(conn, project_id)
-        event = append_event(conn, project_id, actor_id, actor_type,
-                             "identity_handoff.updated",
-                             {"fields": sorted(updates.keys()),
-                              "handoff": content,
-                              "handoff_actor": actor_id,
-                              "handoff_version": handoff_version}, in_tx=True)
+        event = append_event(
+            conn, project_id, actor_id, actor_type,
+            "identity_handoff.updated",
+            {"fields": sorted(updates), "handoff": content,
+             "handoff_actor": actor_id,
+             "handoff_version": handoff_version}, in_tx=True)
         conn.execute(
             "INSERT INTO identity_handoffs"
             " (project_id,actor_id,version,content,updated_by,updated_owner,"
@@ -5304,7 +5606,7 @@ def update_handoff(conn, project_id, actor_id, actor_type, updates,
     return {"ok": True, "context_version": new_version,
             "handoff_actor": actor_id,
             "handoff_version": handoff_version,
-            "updated_fields": sorted(updates.keys()), "event": event}
+            "updated_fields": sorted(updates), "event": event}
 
 
 # --- room ------------------------------------------------------------------
@@ -8376,6 +8678,8 @@ def _migrate_actor_references_in_tx(conn, project_id, aliases, canonical_id,
                 "claims_migrated": 0, "cursor_migrated": False,
                 "agent_rows_migrated": 0,
                 "bridge_access_migrated": 0,
+                "identity_handoff_migrated": False,
+                "message_dispositions_migrated": 0,
                 "state_changed": False}
     placeholders = ",".join("?" for _ in aliases)
     nowi = now_iso()
@@ -8413,6 +8717,78 @@ def _migrate_actor_references_in_tx(conn, project_id, aliases, canonical_id,
             "DELETE FROM inbox_cursors WHERE project_id=?"
             " AND actor_id IN (%s)" % placeholders,
             [project_id] + aliases)
+
+    # Exact identity handoffs are immutable per-actor histories.  Preserve the
+    # legacy rows for audit, but seed the repaired canonical actor from the
+    # latest source snapshot when it does not already own a history.  Without
+    # this bridge, setup repair silently loses the AI's current objective.
+    identity_handoff_migrated = False
+    canonical_handoff = conn.execute(
+        "SELECT 1 FROM identity_handoffs WHERE project_id=? AND actor_id=?"
+        " LIMIT 1", (project_id, canonical_id)).fetchone()
+    if not canonical_handoff:
+        source_handoff = conn.execute(
+            "SELECT * FROM identity_handoffs WHERE project_id=?"
+            " AND actor_id IN (%s)"
+            " ORDER BY updated_at DESC,version DESC,actor_id LIMIT 1" %
+            placeholders, [project_id] + aliases).fetchone()
+        if source_handoff:
+            conn.execute(
+                "INSERT INTO identity_handoffs"
+                " (project_id,actor_id,version,content,updated_by,"
+                " updated_owner,updated_at,event_id,legacy_source_version)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (project_id, canonical_id, 1, source_handoff["content"],
+                 canonical_id, source_handoff["updated_owner"], nowi,
+                 source_handoff["event_id"], source_handoff["version"]))
+            identity_handoff_migrated = True
+
+    # Dispositions are mutable operational state keyed by exact actor.  Merge
+    # aliases into the canonical identity by latest write, then remove only the
+    # obsolete mutable rows.  The append-only room/disposition ledger events
+    # remain unchanged and retain their original attribution.
+    disposition_rows = conn.execute(
+        "SELECT * FROM message_dispositions WHERE project_id=?"
+        " AND actor_id IN (%s)"
+        " ORDER BY updated_at,actor_id,message_event_id" %
+        ",".join("?" for _ in ([canonical_id] + aliases)),
+        [project_id, canonical_id] + aliases).fetchall()
+    latest_dispositions = {}
+    for disposition_row in disposition_rows:
+        event_id = disposition_row["message_event_id"]
+        previous = latest_dispositions.get(event_id)
+        if previous is None or (
+                disposition_row["updated_at"], disposition_row["actor_id"]
+        ) >= (previous["updated_at"], previous["actor_id"]):
+            latest_dispositions[event_id] = disposition_row
+    migrated_dispositions = sum(
+        1 for row in disposition_rows if row["actor_id"] in aliases)
+    if migrated_dispositions:
+        conn.execute(
+            "DELETE FROM message_dispositions WHERE project_id=?"
+            " AND actor_id IN (%s)" % placeholders,
+            [project_id] + aliases)
+        for disposition_row in latest_dispositions.values():
+            updated_by = canonical_id \
+                if disposition_row["updated_by"] in aliases \
+                else disposition_row["updated_by"]
+            conn.execute(
+                "INSERT INTO message_dispositions"
+                " (project_id,actor_id,message_event_id,disposition,note,"
+                " task_id,updated_by,updated_owner,updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(project_id,actor_id,message_event_id)"
+                " DO UPDATE SET disposition=excluded.disposition,"
+                " note=excluded.note,task_id=excluded.task_id,"
+                " updated_by=excluded.updated_by,"
+                " updated_owner=excluded.updated_owner,"
+                " updated_at=excluded.updated_at",
+                (project_id, canonical_id,
+                 disposition_row["message_event_id"],
+                 disposition_row["disposition"], disposition_row["note"],
+                 disposition_row["task_id"], updated_by,
+                 disposition_row["updated_owner"],
+                 disposition_row["updated_at"]))
     claims = conn.execute(
         "UPDATE tasks SET claimed_by=?, updated_at=? WHERE project_id=?"
         " AND claimed_by IN (%s) AND status NOT IN ('done','cancelled')" %
@@ -8470,11 +8846,15 @@ def _migrate_actor_references_in_tx(conn, project_id, aliases, canonical_id,
         "DELETE FROM agents WHERE project_id=? AND agent_id IN (%s)" %
         placeholders, [project_id] + aliases)
     state_changed = bool(agent_rows_migrated or lead_migrated or claims
-                         or cursor is not None or bridge_access_migrated)
+                         or cursor is not None or bridge_access_migrated
+                         or identity_handoff_migrated
+                         or migrated_dispositions)
     return {"aliases": aliases, "lead_migrated": lead_migrated,
             "claims_migrated": claims, "cursor_migrated": cursor is not None,
             "agent_rows_migrated": agent_rows_migrated,
             "bridge_access_migrated": bridge_access_migrated,
+            "identity_handoff_migrated": identity_handoff_migrated,
+            "message_dispositions_migrated": migrated_dispositions,
             "state_changed": state_changed}
 
 
@@ -8565,6 +8945,8 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
                      "claims_migrated": 0, "cursor_migrated": False,
                      "agent_rows_migrated": 0,
                      "bridge_access_migrated": 0,
+                     "identity_handoff_migrated": False,
+                     "message_dispositions_migrated": 0,
                      "state_changed": False}
         if canonical_identity:
             # A pre-feature workspace is backfilled once. Normal registration
@@ -8812,7 +9194,11 @@ def agent_register(conn, project_id, actor_id, actor_type, agent_id=None,
                      "lead_migrated": migration["lead_migrated"],
                      "claims_migrated": migration["claims_migrated"],
                      "bridge_access_migrated": migration[
-                         "bridge_access_migrated"]},
+                         "bridge_access_migrated"],
+                     "identity_handoff_migrated": migration[
+                         "identity_handoff_migrated"],
+                     "message_dispositions_migrated": migration[
+                         "message_dispositions_migrated"]},
                     in_tx=True)
             return result
         conn.execute(
@@ -8879,12 +9265,14 @@ def agent_list(conn, project_id, query=None, limit=None, offset=0, sort=None,
     identity_metadata = {}
     if options:
         persona_conflicts = {}
+        owners_cache = {}
         for agent in agents:
             parsed = parse_canonical_agent_id(
                 agent.get("agent_id"), project_id)
             if parsed and parsed.get("persona"):
                 status = agent_persona_repair_status(
-                    conn, project_id, agent["agent_id"])
+                    conn, project_id, agent["agent_id"],
+                    owners_cache=owners_cache)
                 if status["legacy_duplicate_count"] > 1:
                     persona_conflicts[agent["agent_id"]] = status
         agents = [{key: agent.get(key) for key in (
@@ -8902,6 +9290,20 @@ def agent_list(conn, project_id, query=None, limit=None, offset=0, sort=None,
             "next_persona": next_agent_persona(
                 conn, project_id, "director", "codex"),
             "persona_conflicts": persona_conflicts,
+            # Setup uses this to heal a machine binding when hosted identity
+            # repair committed but the client crashed before saving the new
+            # canonical actor locally.  These are mutable resolution pointers,
+            # never rewritten ledger identities.
+            "identity_aliases": {
+                row["legacy_actor_id"]: row["canonical_actor_id"]
+                for row in conn.execute(
+                    "SELECT legacy_actor_id,canonical_actor_id"
+                    " FROM actor_aliases WHERE project_id=?"
+                    " ORDER BY legacy_actor_id", (project_id,))
+                if conn.execute(
+                    "SELECT 1 FROM agents WHERE project_id=? AND agent_id=?",
+                    (project_id, row["canonical_actor_id"])).fetchone()
+            },
         }
     result = _collection_page(
         agents, "agents", query=query, limit=limit, offset=offset, sort=sort,
@@ -9468,6 +9870,17 @@ def search_project(conn, project_id, query, limit=20, actor_id=None,
         value = _identity_handoff_dict(row)
         if all(term in canonical_json(value).casefold() for term in terms):
             handoffs.append(value)
+    # The Director-governed shared project handoff is project state every role
+    # reads, so it must be findable by the same history search.
+    shared_handoffs = []
+    for row in conn.execute(
+            "SELECT * FROM handoffs WHERE project_id=?"
+            " ORDER BY updated_at DESC, version DESC",
+            (project_id,)).fetchall():
+        value = _handoff_dict(row)
+        if all(term in canonical_json(value).casefold() for term in terms):
+            value["handoff_scope"] = "project"
+            shared_handoffs.append(value)
 
     # Search only role scopes the caller may read. Directors and humans may
     # inspect every role; ordinary AIs get their effective role (+ lead
@@ -9527,6 +9940,11 @@ def search_project(conn, project_id, query, limit=20, actor_id=None,
         "updated_at": item.get("updated_at"), "data": item,
     } for item in handoffs)
     unified.extend({
+        "kind": "handoff", "id": "shared:v%s" % item["version"],
+        "text": "Shared project handoff updated by %s" % item["updated_by"],
+        "updated_at": item.get("updated_at"), "data": item,
+    } for item in shared_handoffs)
+    unified.extend({
         "kind": "role_scope", "id": "%s:v%s" % (
             item["role"], item["version"]),
         "text": "%s role scope" % item["role"],
@@ -9571,8 +9989,40 @@ def handoff_history(conn, project_id, limit=20, actor_id=None,
                     actor_type="agent", target_actor_id=None, query=None,
                     offset=None, sort=None):
     get_project(conn, project_id)
+    if target_actor_id:
+        raise AttaccaError(
+            "shared handoff history has no target identity; use "
+            "identity_handoff_history")
+    paged = offset is not None or query is not None or sort is not None
+    rows = conn.execute(
+        "SELECT * FROM handoffs WHERE project_id=? ORDER BY version DESC",
+        (project_id,)).fetchall()
+    versions = [_handoff_dict(row) for row in rows]
+    if not paged:
+        versions = versions[:max(1, min(int(limit or 20), 200))]
+        return {"project": project_id, "handoff_scope": "project",
+                "versions": versions}
+    result = _collection_page(
+        versions, "versions", query=query, limit=limit,
+        offset=offset or 0, sort=sort, date_fields=("updated_at",),
+        id_fields=("version",))
+    result.update({"project": project_id, "handoff_scope": "project"})
+    return result
+
+
+def identity_handoff_history(conn, project_id, limit=20, actor_id=None,
+                             actor_type="agent", target_actor_id=None,
+                             query=None, offset=None, sort=None):
+    get_project(conn, project_id)
     handoff_actor = _handoff_read_actor(
         conn, project_id, actor_id, actor_type, target_actor_id)
+    if not handoff_actor:
+        return {"project": project_id, "handoff_actor": None,
+                "identity_handoff_actor": None,
+                "handoff_scope": "identity",
+                "versions": [], "total": 0, "unfiltered_total": 0,
+                "limit": int(limit or 20), "offset": int(offset or 0),
+                "has_more": False}
     paged = offset is not None or query is not None or sort is not None
     rows = conn.execute(
         "SELECT * FROM identity_handoffs WHERE project_id=? AND actor_id=?"
@@ -9581,13 +10031,16 @@ def handoff_history(conn, project_id, limit=20, actor_id=None,
     if not paged:
         versions = versions[:max(1, min(int(limit or 20), 200))]
         return {"project": project_id, "handoff_actor": handoff_actor,
-                "versions": versions}
+                "identity_handoff_actor": handoff_actor,
+                "handoff_scope": "identity", "versions": versions}
     result = _collection_page(
         versions, "versions", query=query, limit=limit,
         offset=offset or 0, sort=sort, date_fields=("updated_at",),
         id_fields=("version",))
     result.update({"project": project_id,
-                   "handoff_actor": handoff_actor})
+                   "handoff_actor": handoff_actor,
+                   "identity_handoff_actor": handoff_actor,
+                   "handoff_scope": "identity"})
     return result
 
 
@@ -9675,24 +10128,26 @@ MCP_TOOLS = [
     },
     {
         "name": "get_handoff",
-        "description": "Read the current exact identity's versioned handoff "
-                       "(objective, what changed, active work, blockers, risks, "
-                       "next actions), mandatory rules applicable to your registered role, "
-                       "open tasks, standing decisions, recent activity and "
-                       "the current context_version. A target_actor_id performs a "
-                       "coordination read without changing the reader's authority.",
+        "description": "Read the shared project handoff (the Director-governed "
+                       "project-wide brief) together with this exact identity's own "
+                       "identity handoff, the mandatory rules applicable to your "
+                       "registered role, open tasks, standing decisions, recent "
+                       "activity and the current context_version. A target_actor_id "
+                       "performs a coordination read of another identity's handoff "
+                       "without changing the reader's authority.",
         "inputSchema": {"type": "object", "properties": {
             "project": PROJECT_PROP,
-            "target_actor_id": _s("Optional exact identity whose handoff to read."),
+            "target_actor_id": _s(
+                "Optional exact identity whose identity handoff to read."),
         }},
     },
     {
         "name": "update_handoff",
-        "description": "Update only this exact identity's handoff. Pass only changed "
-                       "fields; others are preserved. Every registered AI role and each "
-                       "human identity owns independent history. A persona-qualified actor "
-                       "can never overwrite another persona. Use the handoff version for "
-                       "optimistic conflict checking at a meaningful transition.",
+        "description": "Update the one shared project handoff. Only a registered "
+                       "Director may write it; every role reads it. Pass only changed "
+                       "fields; others are preserved. Use expected_handoff_version for "
+                       "optimistic conflict checking. Your own per-AI continuity note "
+                       "belongs in update_identity_handoff instead.",
         "inputSchema": {"type": "object", "properties": {
             "project": PROJECT_PROP,
             "objective": _s("Current objective of the project/phase."),
@@ -9705,7 +10160,59 @@ MCP_TOOLS = [
             "expected_context_version": _i(
                 "Deprecated project-wide freshness guard."),
             "expected_handoff_version": _i(
-                "Exact identity handoff version returned by get_handoff."),
+                "Shared project handoff version returned by get_handoff."),
+        }},
+    },
+    {
+        "name": "get_identity_handoff",
+        "description": "Read one exact AI identity's own handoff (objective, what "
+                       "changed, active work, blockers, risks, next actions, notes) "
+                       "plus its current version. Defaults to the calling identity; a "
+                       "target_actor_id is a read-only coordination read of another "
+                       "registered AI and never grants write authority.",
+        "inputSchema": {"type": "object", "properties": {
+            "project": PROJECT_PROP,
+            "target_actor_id": _s(
+                "Optional registered AI whose identity handoff to read."),
+        }},
+    },
+    {
+        "name": "update_identity_handoff",
+        "description": "Update only this exact AI identity's own handoff. Pass only "
+                       "changed fields; others are preserved. Every registered AI owns "
+                       "independent history and can never overwrite another identity; "
+                       "humans and console identities own no identity handoff. Use "
+                       "expected_handoff_version for optimistic conflict checking at a "
+                       "meaningful transition.",
+        "inputSchema": {"type": "object", "properties": {
+            "project": PROJECT_PROP,
+            "objective": _s("Current objective of the project/phase."),
+            "what_changed": _s("What changed recently (merged, refactored, fixed)."),
+            "active_work": _s("Work in progress and by whom."),
+            "blockers": _s("Known blockers."),
+            "risks": _s("Current risks."),
+            "next_actions": _s("Concrete next actions for the next worker."),
+            "notes": _s("Anything else the next worker must know."),
+            "expected_context_version": _i(
+                "Deprecated project-wide freshness guard."),
+            "expected_handoff_version": _i(
+                "Exact identity handoff version returned by get_handoff or "
+                "get_identity_handoff."),
+        }},
+    },
+    {
+        "name": "identity_handoff_history",
+        "description": "Read immutable revisions of one exact AI identity's handoff. "
+                       "Defaults to the calling identity; a target_actor_id reads a "
+                       "registered peer's history for coordination.",
+        "inputSchema": {"type": "object", "properties": {
+            "project": PROJECT_PROP,
+            "target_actor_id": _s(
+                "Optional registered AI whose history to read."),
+            "q": _s("Search the complete revision history before paging."),
+            "limit": _i("Page size (default 20, max 200)."),
+            "offset": _i("Zero-based revision offset."),
+            "sort": _s("newest | oldest (default newest)."),
         }},
     },
     {
@@ -10374,6 +10881,9 @@ class McpSession:
         self.preserve_actor_identity = bool(preserve_actor_identity)
         self.briefed_versions = {}   # project_id -> context_version at last get_handoff
         self.briefed_handoff_versions = {}  # (project_id, actor_id) -> version
+        # The Director-governed shared handoff has no owning identity, so its
+        # optimistic version is tracked per project, not per (project, actor).
+        self.briefed_shared_handoff_versions = {}  # project_id -> version
         self._registered = set()     # (project, actor) auto-registered pairs
         self.stdin = stdin or sys.stdin
         self.stdout = stdout or sys.stdout
@@ -10632,6 +11142,24 @@ class McpSession:
         project = self._project(args)
         return project, self._actor(project)
 
+    def _record_briefed_handoff(self, project_id, actor, result):
+        """Record the versions this session was actually briefed on.
+
+        The shared project handoff has no owning identity, so its optimistic
+        version is remembered per project.  The identity handoff version is
+        remembered only when the brief really carried this actor's own row --
+        a coordination read of somebody else's identity must never arm this
+        session's own conflict guard.
+        """
+        if isinstance(result.get("context_version"), int):
+            self.briefed_versions[project_id] = result["context_version"]
+        if isinstance(result.get("handoff_version"), int):
+            self.briefed_shared_handoff_versions[project_id] = \
+                result["handoff_version"]
+        if result.get("identity_handoff_actor") == actor:
+            self.briefed_handoff_versions[(project_id, actor)] = \
+                result.get("identity_handoff_version", 0)
+
     def _guarded_write(self, project_id, op):
         """Drift Guard around a mutating op: staleness is judged BEFORE the
         write (so the actor's own bump never looks like drift). A fresh actor
@@ -10706,11 +11234,27 @@ class McpSession:
             result = get_handoff(conn, project, actor_id=actor,
                                  actor_type=atype,
                                  target_actor_id=args.get("target_actor_id"))
-            self.briefed_versions[project] = result["context_version"]
+            self._record_briefed_handoff(project, actor, result)
+            return result
+
+        if name == "get_identity_handoff":
+            project, actor = self._project_actor(args)
+            result = get_identity_handoff(
+                conn, project, actor_id=actor, actor_type=atype,
+                target_actor_id=args.get("target_actor_id"))
             if result.get("handoff_actor") == actor:
                 self.briefed_handoff_versions[(project, actor)] = \
                     result.get("handoff_version", 0)
             return result
+
+        if name == "identity_handoff_history":
+            project, actor = self._project_actor(args)
+            return identity_handoff_history(
+                conn, project, limit=args.get("limit") or 20,
+                actor_id=actor, actor_type=atype,
+                target_actor_id=args.get("target_actor_id"),
+                query=args.get("q"), offset=args.get("offset"),
+                sort=args.get("sort"))
 
         if name == "check_inbox":
             project, actor = self._project_actor(args)
@@ -10782,14 +11326,34 @@ class McpSession:
             project, actor = self._project_actor(args)
             if args.get("target_actor_id"):
                 raise AttaccaError(
-                    "update_handoff cannot target another identity; only the "
-                    "authenticated exact identity may mutate its handoff")
+                    "update_handoff cannot target another identity; "
+                    "target_actor_id is a read-only coordination filter")
+            updates = {k: args.get(k) for k in HANDOFF_FIELDS}
+            expected_handoff = args.get("expected_handoff_version")
+            if expected_handoff is None:
+                expected_handoff = self.briefed_shared_handoff_versions.get(
+                    project)
+            result = update_handoff(
+                conn, project, actor, atype, updates,
+                expected_context_version=args.get("expected_context_version"),
+                expected_version=expected_handoff)
+            self.briefed_versions[project] = result["context_version"]
+            self.briefed_shared_handoff_versions[project] = \
+                result["handoff_version"]
+            return result
+
+        if name == "update_identity_handoff":
+            project, actor = self._project_actor(args)
+            if args.get("target_actor_id"):
+                raise AttaccaError(
+                    "update_identity_handoff cannot target another identity; "
+                    "target_actor_id is a read-only coordination filter")
             updates = {k: args.get(k) for k in HANDOFF_FIELDS}
             expected_handoff = args.get("expected_handoff_version")
             if expected_handoff is None:
                 expected_handoff = self.briefed_handoff_versions.get(
                     (project, actor))
-            result = update_handoff(
+            result = update_identity_handoff(
                 conn, project, actor, atype, updates,
                 expected_context_version=args.get("expected_context_version"),
                 expected_version=expected_handoff)
@@ -11579,6 +12143,8 @@ SYNC_OPERATION_TO_TOOL = {
     "rule.update": "rule_update", "rule_update": "rule_update",
     "handoff.update": "update_handoff",
     "update_handoff": "update_handoff",
+    "identity_handoff.update": "update_identity_handoff",
+    "update_identity_handoff": "update_identity_handoff",
     "event.append": "append_event", "append_event": "append_event",
 }
 SYNC_DIRECTOR_TOOLS = {"rule_create", "rule_update", "update_handoff"}
@@ -11955,6 +12521,13 @@ def _sync_projection(conn, scope):
             " AND actor_id=? ORDER BY version",
             (scope["project_id"], scope["actor_id"])).fetchall()
     ]
+    # Negotiated schema-v3 resource: the Director-governed shared project
+    # handoff is readable by every role, so it is not actor-filtered.
+    project_handoffs = [
+        _handoff_dict(row) for row in conn.execute(
+            "SELECT * FROM handoffs WHERE project_id=? ORDER BY version",
+            (scope["project_id"],)).fetchall()
+    ]
     role_scopes = role_scope_get(
         conn, scope["project_id"], actor_id=scope["actor_id"],
         actor_type=scope["actor_type"],
@@ -11970,6 +12543,9 @@ def _sync_projection(conn, scope):
         # project-global archive exists only in administrative exports.
         "handoffs": identity_handoffs,
         "identity_handoffs": identity_handoffs,
+        # Negotiated schema-v3 resource. The shared project handoff has no
+        # owning identity; every role mirrors the same project-bound history.
+        "project_handoffs": project_handoffs,
         "role_scopes": role_scopes,
         # Negotiated schema-v2 resource. The originating actor/source are
         # administrative audit details and are deliberately not mirrored.
@@ -15456,12 +16032,51 @@ def _r_handoff_get(h, m, q):
 def _r_handoff_history(h, m, q):
     actor, atype = h._actor()
     limit = q.get("limit") or PANEL_COLLECTION_LIMIT
+    # The shared project handoff has no owning identity; a target filter
+    # belongs to /identity-handoff/history instead.
     h._reply_json(200, handoff_history(
         h._conn(), m.group(1), limit=limit, actor_id=actor,
         actor_type=atype,
-        target_actor_id=(q.get("target_actor_id") or q.get("actor_id")),
         query=q.get("q"), offset=q.get("offset") or 0,
         sort=q.get("sort") or "newest"))
+
+
+def _identity_handoff_target(q):
+    return (q.get("target_actor_id") or q.get("actor") or
+            q.get("actor_id") or None)
+
+
+def _r_identity_handoff_get(h, m, q):
+    actor, atype = h._actor()
+    h._reply_json(200, get_identity_handoff(
+        h._conn(), m.group(1), actor_id=actor, actor_type=atype,
+        target_actor_id=_identity_handoff_target(q)))
+
+
+def _r_identity_handoff_history(h, m, q):
+    actor, atype = h._actor()
+    limit = q.get("limit") or PANEL_COLLECTION_LIMIT
+    h._reply_json(200, identity_handoff_history(
+        h._conn(), m.group(1), limit=limit, actor_id=actor,
+        actor_type=atype, target_actor_id=_identity_handoff_target(q),
+        query=q.get("q"), offset=q.get("offset") or 0,
+        sort=q.get("sort") or "newest"))
+
+
+def _r_identity_handoff_set(h, m, q):
+    actor, atype = h._actor()
+    body = h._body_json()
+    target = str(body.get("target_actor_id") or
+                 _identity_handoff_target(q) or "").strip()
+    if target and target != str(actor or "").strip():
+        raise AttaccaError(
+            "identity handoff updates cannot target another identity; "
+            "target_actor_id is a read-only coordination filter")
+    updates = {k: body.get(k) for k in HANDOFF_FIELDS}
+    h._reply_json(200, update_identity_handoff(
+        h._conn(), m.group(1), actor, atype, updates,
+        expected_context_version=body.get("expected_context_version"),
+        expected_version=body.get("expected_handoff_version")))
 
 
 def _r_inbox_get(h, m, q):
@@ -15502,7 +16117,8 @@ def _r_handoff_set(h, m, q):
     body = h._body_json()
     if body.get("target_actor_id"):
         raise AttaccaError(
-            "identity handoff updates cannot target another identity")
+            "the shared project handoff cannot target another identity; "
+            "target_actor_id is a read-only coordination filter")
     updates = {k: body.get(k) for k in HANDOFF_FIELDS}
     h._reply_json(200, update_handoff(
         h._conn(), m.group(1), actor, atype, updates,
@@ -15901,6 +16517,20 @@ def _r_agents_list(h, m, q):
             if row.get("agent_id") == exact_current_actor or (
                 owners.get(row.get("agent_id")) and
                 _auth_owner_alias_key(owners[row["agent_id"]]) in owner_keys)]
+        visible_actor_ids = {
+            row.get("agent_id") for row in result["agents"]}
+        # Reuse/repair metadata is just as identity-sensitive as the rows it
+        # annotates. Never leak a hidden owner's actor through a side map.
+        result["persona_conflicts"] = {
+            actor_id: value for actor_id, value in
+            (result.get("persona_conflicts") or {}).items()
+            if actor_id in visible_actor_ids
+        }
+        result["identity_aliases"] = {
+            legacy: canonical for legacy, canonical in
+            (result.get("identity_aliases") or {}).items()
+            if canonical in visible_actor_ids
+        }
         result.update({"total": len(result["agents"]),
                        "unfiltered_total": len(result["agents"]),
                        "limit": max(1, len(result["agents"])),
@@ -16068,6 +16698,14 @@ ROUTES = [
     (*_route_def("GET", "/v1/projects/%s/handoff/history" % _PID), _r_handoff_history),
     (*_route_def("POST", "/v1/projects/%s/handoff" % _PID), _r_handoff_set),
     (*_route_def("PUT", "/v1/projects/%s/handoff" % _PID), _r_handoff_set),
+    (*_route_def("GET", "/v1/projects/%s/identity-handoff" % _PID),
+     _r_identity_handoff_get),
+    (*_route_def("GET", "/v1/projects/%s/identity-handoff/history" % _PID),
+     _r_identity_handoff_history),
+    (*_route_def("POST", "/v1/projects/%s/identity-handoff" % _PID),
+     _r_identity_handoff_set),
+    (*_route_def("PUT", "/v1/projects/%s/identity-handoff" % _PID),
+     _r_identity_handoff_set),
     (*_route_def("GET", "/v1/projects/%s/role-scopes" % _PID),
      _r_role_scope_get),
     (*_route_def("GET", "/v1/projects/%s/role-scopes/%s/history" %
@@ -16161,7 +16799,8 @@ def run_server(db_path, host="127.0.0.1", port=DEFAULT_PORT,
 
 
 OFFLINE_PROXY_READ_TOOLS = {
-    "attacca_status", "get_handoff", "get_project_log", "room_read",
+    "attacca_status", "get_handoff", "get_identity_handoff",
+    "identity_handoff_history", "get_project_log", "room_read",
     "check_inbox", "bridge_list", "search", "task_list", "task_show",
     "task_plan_get", "decision_list", "rule_list", "agent_list",
     "list_projects", "check_freshness",
@@ -16182,6 +16821,7 @@ OFFLINE_PROXY_WRITE_OPERATIONS = {
     "rule_create": "rule.create",
     "rule_update": "rule.update",
     "update_handoff": "handoff.update",
+    "update_identity_handoff": "identity_handoff.update",
     "append_event": "event.append",
 }
 OFFLINE_PROXY_EXPLICITLY_UNAVAILABLE = {
@@ -16823,8 +17463,9 @@ class OfflineProxySession:
                 "context_version": project.get("context_version") or
                 snapshot["cursor"]["context_version"],
                 "lead_director": project.get("lead_director"),
-                "handoff_updated_at": ((projection.get("handoffs") or [{}])[-1]
-                                       .get("updated_at")),
+                "handoff_updated_at": (
+                    (projection.get("project_handoffs") or [{}])[-1]
+                    .get("updated_at")),
                 "counts": {
                     "events": len(events),
                     "messages": len(projection.get("room_messages") or []),
@@ -16843,10 +17484,21 @@ class OfflineProxySession:
                 result["you"]["registered_agent"] = actor_row
             return _offline_proxy_mark(result, adapter, proof)
         if name == "get_handoff":
-            handoffs = projection.get("handoffs") or []
-            latest = handoffs[-1] if handoffs else None
+            # ``project_handoffs`` is the shared Director-governed history;
+            # ``handoffs``/``identity_handoffs`` remain this exact identity's
+            # own rows.  A v2 mirror predates the shared resource and simply
+            # carries no cached shared handoff.
+            shared_rows = projection.get("project_handoffs") or []
+            latest = shared_rows[-1] if shared_rows else None
             content = dict((latest or {}).get("content") or {})
             handoff = {field: content.get(field) for field in HANDOFF_FIELDS}
+            identity_rows = projection.get(
+                "identity_handoffs", projection.get("handoffs")) or []
+            identity_latest = identity_rows[-1] if identity_rows else None
+            identity_content = dict(
+                (identity_latest or {}).get("content") or {})
+            identity_handoff = {field: identity_content.get(field)
+                                for field in HANDOFF_FIELDS}
             handoff_event = next((event for event in reversed(events)
                                   if event.get("event_type") ==
                                   "handoff.updated"), None)
@@ -16896,18 +17548,90 @@ class OfflineProxySession:
                     "content": "", "version": 0, "updated_by": None,
                     "updated_owner": None, "updated_at": None},
                 "handoff": handoff,
+                "shared_handoff": handoff,
+                "handoff_scope": "project",
+                "handoff_actor": None,
+                "handoff_version": (latest or {}).get("version") or 0,
                 "handoff_updated_by": (latest or {}).get("updated_by"),
                 "handoff_updated_owner": (handoff_event or {}).get("owner"),
                 "handoff_attribution": (_offline_proxy_action(handoff_event)
                                         if handoff_event else None),
                 "handoff_updated_at": (latest or {}).get("updated_at"),
+                "identity_handoff": identity_handoff,
+                "identity_handoff_actor": (
+                    (identity_latest or {}).get("actor_id") or
+                    (scope["actor_id"] if identity_latest else None)),
+                "identity_handoff_version": (
+                    (identity_latest or {}).get("version") or 0),
+                "identity_handoff_updated_by": (
+                    (identity_latest or {}).get("updated_by")),
+                "identity_handoff_updated_owner": (
+                    (identity_latest or {}).get("updated_owner")),
+                "identity_handoff_updated_at": (
+                    (identity_latest or {}).get("updated_at")),
                 "open_tasks": tasks, "decisions": decisions,
                 "recent_activity": (projection.get("full_log") or [])[-8:],
                 "git": {"head": git_head(self.root),
                         "branch": git_branch(self.root)},
-                "hint": (None if latest else "No cached handoff exists."),
+                "hint": (
+                    None if latest else
+                    ("This mirror predates the shared project handoff "
+                     "resource; reconnect to re-seed it before relying on "
+                     "the project-wide brief."
+                     if "project_handoffs" not in projection else
+                     "No cached shared project handoff exists.")),
             }
             return _offline_proxy_mark(result, adapter, proof)
+        if name in ("get_identity_handoff", "identity_handoff_history"):
+            # A verified mirror is bound to exactly one identity, so it can
+            # answer for this actor only.  A coordination read of somebody
+            # else must reach the hosted server rather than quietly return
+            # the reader's own row under another actor's name.
+            requested = str(args.get("target_actor_id") or "").strip()
+            if requested and requested != scope["actor_id"]:
+                raise AttaccaError(
+                    "coordination reads of another identity's handoff "
+                    "require the hosted server; this offline mirror is bound "
+                    "to '%s'" % scope["actor_id"])
+            identity_rows = projection.get(
+                "identity_handoffs", projection.get("handoffs")) or []
+            if name == "identity_handoff_history":
+                versions = list(reversed([dict(row) for row in identity_rows]))
+                limit = max(1, min(int(args.get("limit") or 20), 200))
+                return _offline_proxy_mark({
+                    "project": project_id,
+                    "handoff_scope": "identity",
+                    "handoff_actor": scope["actor_id"],
+                    "identity_handoff_actor": scope["actor_id"],
+                    "versions": versions[:limit],
+                }, adapter, proof)
+            latest = identity_rows[-1] if identity_rows else None
+            content = dict((latest or {}).get("content") or {})
+            handoff = {field: content.get(field) for field in HANDOFF_FIELDS}
+            version = (latest or {}).get("version") or 0
+            return _offline_proxy_mark({
+                "project": project_id,
+                "context_version": project.get("context_version") or
+                snapshot["cursor"]["context_version"],
+                "handoff_scope": "identity",
+                "handoff_actor": scope["actor_id"],
+                "identity_handoff_actor": scope["actor_id"],
+                "handoff": handoff,
+                "identity_handoff": handoff,
+                "handoff_version": version,
+                "identity_handoff_version": version,
+                "handoff_updated_by": (latest or {}).get("updated_by"),
+                "identity_handoff_updated_by": (
+                    (latest or {}).get("updated_by")),
+                "handoff_updated_owner": (latest or {}).get("updated_owner"),
+                "identity_handoff_updated_owner": (
+                    (latest or {}).get("updated_owner")),
+                "handoff_updated_at": (latest or {}).get("updated_at"),
+                "identity_handoff_updated_at": (
+                    (latest or {}).get("updated_at")),
+                "hint": (None if latest else
+                         "No cached identity handoff exists."),
+            }, adapter, proof)
         if name == "get_project_log":
             entries = [{"line": str(line), "seq": index + 1,
                         "created_at": str(line)[:24]}
@@ -17362,8 +18086,8 @@ class OfflineProxySession:
             raise AttaccaError(
                 "offline mutation cannot override trusted field(s): %s" %
                 ", ".join(forbidden))
-        if name == "update_handoff" and payload.get(
-                "expected_context_version") is None:
+        if name in ("update_handoff", "update_identity_handoff") \
+                and payload.get("expected_context_version") is None:
             if self.briefed_context is None:
                 raise AttaccaError(
                     "offline handoff update requires expected_context_version "
@@ -20482,6 +21206,7 @@ def _remote_setup_network(url, project_id, workspaces, actor_id, actor_type):
     persona_names_reserved = []
     next_persona_preview = None
     persona_conflicts = {}
+    identity_aliases = {}
     if candidate:
         encoded = urllib.parse.quote(project_id, safe="")
         bridges = (remote_json(
@@ -20501,6 +21226,7 @@ def _remote_setup_network(url, project_id, workspaces, actor_id, actor_type):
             "persona_names_reserved") or []
         next_persona_preview = agent_payload.get("next_persona")
         persona_conflicts = agent_payload.get("persona_conflicts") or {}
+        identity_aliases = agent_payload.get("identity_aliases") or {}
     other = [p for p in workspaces if p["project_id"] != project_id]
     suggested_master = next(
         (m.get("origin_project") for m in relationship_inbox
@@ -20543,6 +21269,7 @@ def _remote_setup_network(url, project_id, workspaces, actor_id, actor_type):
         "persona_names_reserved": persona_names_reserved,
         "next_persona": next_persona_preview,
         "persona_conflicts": persona_conflicts,
+        "identity_aliases": identity_aliases,
         "existing_relationships": named_bridges,
         "relationship_inbox": named_inbox,
         "available_workspaces": [
@@ -20589,6 +21316,9 @@ def setup_identity_options(agents, project_id, role, runtime,
             "compatibility_identity": parsed.get("persona") is None,
             "currently_bound": record["agent_id"] == bound_actor_id,
             "repair": persona_conflicts.get(record["agent_id"]),
+            "repair_required": bool((
+                persona_conflicts.get(record["agent_id"]) or {}).get(
+                    "repair_required")),
         })
     reusable.sort(key=lambda item: (
         not item["currently_bound"], item.get("persona") is None,
@@ -20601,6 +21331,17 @@ def setup_identity_options(agents, project_id, role, runtime,
         if next_persona_preview else next_agent_persona(
             preview_records, project_id, role, runtime)
     preview_fields = agent_persona_fields(next_persona)
+    for item in reusable:
+        if item["repair_required"]:
+            item["repair_identity"] = {
+                "mode": "repair", "actor_id": item["actor_id"],
+                "persona_preview": next_persona,
+                "persona_name": preview_fields["persona_name"],
+                "short_name": preview_fields["short_name"],
+                "actor_id_preview": canonical_agent_id(
+                    project_id, role, runtime, next_persona),
+                "persistent": True,
+            }
     return {
         "project_id": project_id, "role": role, "runtime": runtime,
         "bound_actor_id": bound_actor_id,
@@ -20639,6 +21380,20 @@ def setup_identity_options(agents, project_id, role, runtime,
             "persistent": False,
         } if bound_actor_id else None),
     }
+
+
+def _resolve_actor_alias_mapping(actor_id, aliases):
+    """Resolve a bounded client-visible alias map and fail closed on cycles."""
+    current = str(actor_id or "").strip()
+    seen = set()
+    while current and current in (aliases or {}):
+        if current in seen:
+            raise AttaccaError(
+                "identity_alias_cycle: setup cannot resolve saved actor '%s'" %
+                actor_id)
+        seen.add(current)
+        current = str(aliases[current] or "").strip()
+    return current
 
 
 def select_registered_agent_identity(conn, project_id, current_actor_id,
@@ -20872,9 +21627,25 @@ def discover_remote_setup(url=None, path=None, here=False,
     effective_actor = (actor_binding or {}).get("actor_id") or actor_id
     network = _remote_setup_network(
         url, network_project, raw_projects, effective_actor, actor_type)
+    stored_binding_actor = (actor_binding or {}).get("actor_id")
+    resolved_binding_actor = _resolve_actor_alias_mapping(
+        stored_binding_actor, network.get("identity_aliases") or {}) \
+        if stored_binding_actor else None
+    if resolved_binding_actor and resolved_binding_actor != stored_binding_actor:
+        network["machine_actor_binding_repair"] = {
+            "required": True,
+            "stored_actor_id": stored_binding_actor,
+            "resolved_actor_id": resolved_binding_actor,
+            "action": "rerun setup to persist the repaired identity",
+        }
+        network["current_actor"] = resolved_binding_actor
+        network["current_actor_record"] = next(
+            (item for item in network.get("agents") or []
+             if item.get("agent_id") == resolved_binding_actor), None)
     network["client_instance"] = client_instance
     network["machine_actor_binding"] = ({
-        "actor_id": actor_binding["actor_id"],
+        "actor_id": resolved_binding_actor or actor_binding["actor_id"],
+        "stored_actor_id": actor_binding["actor_id"],
         "runtime": actor_binding["runtime"],
         "client_instance": actor_binding["client_instance"],
         "config_path": actor_binding["config_path"],
@@ -20883,7 +21654,7 @@ def discover_remote_setup(url=None, path=None, here=False,
         network["identity_options_by_role"] = {
             selected_role: setup_identity_options(
                 network.get("agents") or [], network_project, selected_role,
-                runtime, bound_actor_id=(actor_binding or {}).get("actor_id"),
+                runtime, bound_actor_id=resolved_binding_actor,
                 reserved_personas=network.get("persona_names_reserved") or [],
                 next_persona_preview=network.get("next_persona"),
                 persona_conflicts=network.get("persona_conflicts") or {})
@@ -20901,6 +21672,26 @@ def discover_remote_setup(url=None, path=None, here=False,
             "action": action, "workspaces": workspaces,
             "migration_sources": detect_migration_sources(str(local_root)),
             "network": network}
+
+
+def _reuse_identity_choices(url, encoded, project_id, actor_id, actor_type,
+                            role, runtime):
+    """Registered identities this checkout may reuse for role/runtime.
+
+    It asks the hosted server the same question guided discovery asks, so a
+    scripted ``setup --identity-mode reuse`` and the interactive picker never
+    disagree about which identities exist.
+    """
+    payload = remote_json(
+        url, "GET",
+        "/v1/projects/%s/agents?options=1&reuse_options=1" % encoded,
+        actor=actor_id, actor_type=actor_type)
+    options = setup_identity_options(
+        payload.get("agents") or [], project_id, role, runtime,
+        reserved_personas=payload.get("persona_names_reserved"),
+        next_persona_preview=payload.get("next_persona"),
+        persona_conflicts=payload.get("persona_conflicts"))
+    return [item["actor_id"] for item in options["reusable_identities"]]
 
 
 def apply_remote_network_setup(url, project_id, actor_id, actor_type,
@@ -20950,10 +21741,31 @@ def apply_remote_network_setup(url, project_id, actor_id, actor_type,
         url, project_id, runtime, client_instance=client_instance, home=home)
     selected_mode = identity_mode
     bound_repair = None
+    binding_alias_repair = None
     if binding:
         option_payload = remote_json(
             url, "GET", "/v1/projects/%s/agents?options=1&reuse_options=1" %
             encoded, actor=binding["actor_id"], actor_type=actor_type)
+        resolved_binding_actor = _resolve_actor_alias_mapping(
+            binding["actor_id"], option_payload.get("identity_aliases") or {})
+        if resolved_binding_actor != binding["actor_id"]:
+            binding_alias_repair = {
+                "stored_actor_id": binding["actor_id"],
+                "resolved_actor_id": resolved_binding_actor,
+            }
+            repaired_binding = machine_actor_binding_set(
+                url, project_id, runtime, resolved_binding_actor,
+                client_instance=client_instance, home=home)
+            binding = dict(repaired_binding["binding"],
+                           binding_key=repaired_binding["binding_key"],
+                           config_path=repaired_binding["config_path"])
+            actions.append({
+                "kind": "identity_binding_repaired",
+                "actor_id": resolved_binding_actor,
+                "previous_actor_id": binding_alias_repair[
+                    "stored_actor_id"],
+                "changed": repaired_binding["changed"],
+            })
         bound_repair = (option_payload.get("persona_conflicts") or {}).get(
             binding["actor_id"])
     if selected_mode == "auto":
@@ -20977,24 +21789,87 @@ def apply_remote_network_setup(url, project_id, actor_id, actor_type,
         if selected_mode == "reuse":
             effective_actor = str(
                 identity_actor or (binding or {}).get("actor_id") or "")
+            discovered = None
+            if not effective_actor:
+                # Nothing was supplied and this machine has no binding yet.
+                # Reuse still has a well-defined answer when the discovered
+                # setup options contain exactly one matching identity; more
+                # than one is a real choice the human must make, so name them
+                # instead of failing with an opaque requirement.
+                discovered = _reuse_identity_choices(
+                    url, encoded, project_id, actor_id, actor_type,
+                    role, runtime)
+                if len(discovered) == 1:
+                    effective_actor = discovered[0]
+                elif not discovered:
+                    # Reuse candidates are filtered to this operator's own
+                    # identities, so "none" can mean "none visible to you".
+                    # Never steer straight to a fresh permanent name: that
+                    # burns a server-unique @Name and can recreate the very
+                    # duplicate the named-identity rules exist to prevent.
+                    raise AttaccaError(
+                        "reuse found no %s %s identity visible to this "
+                        "operator in workspace '%s'; name one explicitly with "
+                        "--identity-actor <ACTOR_ID>, or use "
+                        "--identity-mode new only if this really is a first "
+                        "identity for this client" %
+                        (runtime, role, project_id))
+                else:
+                    raise AttaccaError(
+                        "reuse is ambiguous: workspace '%s' has %d registered "
+                        "%s %s identities (%s); re-run with "
+                        "--identity-actor <ACTOR_ID>" %
+                        (project_id, len(discovered), runtime, role,
+                         ", ".join(discovered)))
             parsed = parse_canonical_agent_id(effective_actor, project_id)
             if not parsed or parsed["role"] != role \
                     or parsed["runtime"] != runtime:
+                if discovered is None:
+                    discovered = _reuse_identity_choices(
+                        url, encoded, project_id, actor_id, actor_type,
+                        role, runtime)
                 raise AttaccaError(
                     "reuse requires an exact registered actor matching this "
-                    "workspace, role, and runtime")
-            registration_body = {
-                "agent_id": effective_actor,
-                "display_name": workspace_name + " · " + role + " · " +
-                                runtime + (" · " + agent_persona_name(
-                                           parsed["persona"])
-                                           if parsed.get("persona") else ""),
-                "role": role, "runtime": runtime,
-                "persona": parsed.get("persona"),
-                "canonical_identity": True,
-                "identity_mode": "reuse",
-            }
-            registration_actor = effective_actor
+                    "workspace, role, and runtime; --identity-actor %s does "
+                    "not. Available: %s" %
+                    (effective_actor or "<missing>",
+                     ", ".join(discovered) if discovered else
+                     "none (use --identity-mode new)"))
+            selected_repair = (
+                option_payload.get("persona_conflicts") or {}
+            ).get(effective_actor) if binding else None
+            if not binding:
+                selected_payload = remote_json(
+                    url, "GET",
+                    "/v1/projects/%s/agents?options=1&reuse_options=1" %
+                    encoded, actor=effective_actor, actor_type=actor_type)
+                selected_repair = (
+                    selected_payload.get("persona_conflicts") or {}
+                ).get(effective_actor)
+            if (selected_repair or {}).get("repair_required"):
+                selected_mode = "repair"
+                make_default = True
+                registration_body = {
+                    "agent_id": effective_actor,
+                    "role": role, "runtime": runtime,
+                    "canonical_identity": True,
+                    "identity_mode": "repair",
+                    "make_default": True,
+                }
+                registration_actor = effective_actor
+            else:
+                registration_body = {
+                    "agent_id": effective_actor,
+                    "display_name": workspace_name + " · " + role + " · " +
+                                    runtime + (" · " + agent_persona_name(
+                                               parsed["persona"])
+                                               if parsed.get("persona") else ""),
+                    "role": role, "runtime": runtime,
+                    "persona": parsed.get("persona"),
+                    "canonical_identity": True,
+                    "identity_mode": "reuse",
+                }
+                registration_actor = effective_actor
         elif selected_mode == "repair":
             effective_actor = str(
                 identity_actor or (binding or {}).get("actor_id") or "")
@@ -21029,6 +21904,11 @@ def apply_remote_network_setup(url, project_id, actor_id, actor_type,
             registration_actor = actor_id
         persist_default = identity_make_default(
             selected_mode, make_default)
+        if selected_mode == "new" and not persist_default:
+            raise AttaccaError(
+                "session_only_new_identity_requires_current_mcp: shell setup"
+                " cannot create a permanent identity and select it in its"
+                " parent coding process; use native setup or choose temporary")
         if selected_mode == "reuse" and not persist_default and (
                 not binding or effective_actor != binding["actor_id"]):
             raise AttaccaError(
@@ -21411,7 +22291,8 @@ def managed_instruction_block(project_id, db_path):
     lines.append("shared by ALL workers — Claude Code, Kimi Code, Codex, GLM, Cline,")
     lines.append("other agents and humans. It is the source of truth for project")
     lines.append("state: append-only event ledger, shared task board with work claims,")
-    lines.append("decision records, a human+AI project room, identity handoffs, and role scopes.")
+    lines.append("decision records, a human+AI project room, one Director-governed shared")
+    lines.append("project handoff, per-AI identity handoffs, and role scopes.")
     lines.append("The project owns the knowledge; your session is replaceable.")
     lines.append("")
     lines.append("MCP server `attacca` exposes the tools (get_handoff, room_send,")
@@ -21421,7 +22302,8 @@ def managed_instruction_block(project_id, db_path):
     lines.append("The installed plugin's **lifecycle hooks are the primary continuity path**.")
     lines.append("On startup/resume/clear/compact they resolve `.attacca/project.json` and")
     lines.append("load mandatory Project Rules, Cloud Context, the applicable Role Scope, the")
-    lines.append("exact identity handoff, inbox, room, tasks, agents, and status through MCP.")
+    lines.append("shared project handoff and this AI's exact identity handoff, inbox, room,")
+    lines.append("tasks, agents, and status through MCP.")
     lines.append("A background watcher polls the hosted workspace every")
     lines.append("minute by default (configurable) even while the coding client is idle,")
     lines.append("queues concise changes, and surfaces them independently where the OS allows.")
@@ -21456,7 +22338,8 @@ def managed_instruction_block(project_id, db_path):
     lines.append("")
     lines.append("1. **Session start and group-room reading**: use the injected")
     lines.append("   `ATTACCA ACTIVE SESSION BRIEF`. If that brief is absent, immediately")
-    lines.append("   call `rule_list`, `cloud_context_get`, `role_scope_get`, and `get_handoff`,")
+    lines.append("   call `rule_list`, `cloud_context_get`, `role_scope_get`, `get_handoff`")
+    lines.append("   (which also returns your identity handoff) and `get_identity_handoff`,")
     lines.append("   then `check_inbox` and `room_read` before any other")
     lines.append("   work. A Project Room or permitted bridged conversation is a GROUP CHAT:")
     lines.append("   read every participation-visible unread message, including messages that")
@@ -21528,15 +22411,20 @@ def managed_instruction_block(project_id, db_path):
     lines.append("   directives, and meaningful coordination through Attacca as the work happens;")
     lines.append("   do not leave project state only in chat or private files. Every write must")
     lines.append("   retain the authenticated human, canonical AI actor, and available Git context.")
-    lines.append("8. **Identity handoff and Role Scope**: every exact registered identity —")
+    lines.append("8. **Shared handoff, identity handoff, and Role Scope**: the project has ONE")
+    lines.append("   shared project handoff — the workspace-wide objective and status that")
+    lines.append("   every role reads and only a registered AI Director writes with")
+    lines.append("   `update_handoff`. Separately, every exact registered identity —")
     lines.append("   Director, Advisor, or Worker — owns and updates only its own identity")
-    lines.append("   handoff after reporting task evidence and at meaningful transitions or")
-    lines.append("   session end. Pass the exact handoff version returned by `get_handoff`;")
-    lines.append("   stale concurrent writes are rejected and must be reconciled. The applicable")
-    lines.append("   Role Scope supplies durable role-level context shared by identities with")
-    lines.append("   that authority. Only humans and registered Directors govern Role Scopes,")
-    lines.append("   Project Rules, and Cloud Context; no identity may overwrite another")
-    lines.append("   identity’s handoff.")
+    lines.append("   handoff with `update_identity_handoff`, after reporting task evidence and")
+    lines.append("   at meaningful transitions or session end. Humans and console identities")
+    lines.append("   own no identity handoff. Pass the exact handoff version returned by")
+    lines.append("   `get_handoff` / `get_identity_handoff`; the shared and identity versions")
+    lines.append("   are independent, and stale concurrent writes are rejected and must be")
+    lines.append("   reconciled. The applicable Role Scope supplies durable role-level context")
+    lines.append("   shared by identities with that authority. Only humans and registered")
+    lines.append("   Directors govern Role Scopes, Project Rules, and Cloud Context; no")
+    lines.append("   identity may overwrite another identity’s handoff.")
     lines.append("9. **Drift Guard**: if any response carries a `stale_context_warning`,")
     lines.append("   re-run `get_handoff` before further writes.")
     lines.append("")
@@ -23147,7 +24035,10 @@ def build_parser():
                         "identities can only be activated through an already-"
                         "authorized current MCP proxy")
     p.add_argument("--identity-actor", default=None, metavar="ACTOR_ID",
-                   help=argparse.SUPPRESS)
+                   help="exact registered actor for --identity-mode reuse or "
+                        "repair (for example workspace.director.codex.gibbs); "
+                        "optional when this machine is already bound or the "
+                        "workspace has exactly one matching identity")
     identity_scope = p.add_mutually_exclusive_group()
     identity_scope.add_argument(
         "--make-default", dest="make_default", action="store_true",
@@ -23956,7 +24847,7 @@ def cli_main(argv=None):
                             "Repair duplicate identity as %s — recommended" %
                             (repair.get("short_name") or
                              repair.get("persona_name") or "next name")))
-                    if bound:
+                    if bound and not repair:
                         choices.append((
                             "reuse", bound["actor_id"],
                             "Continue as %s (%s)%s" % (
@@ -23973,12 +24864,22 @@ def cli_main(argv=None):
                     for item in reusable:
                         if item["actor_id"] == bound_id:
                             continue
-                        choices.append((
-                            "reuse", item["actor_id"],
-                            "Take over/reuse %s (%s)" % (
-                                item["display_name"],
-                                item.get("persona_name") or
-                                "legacy compatibility identity")))
+                        if item.get("repair_required"):
+                            repair_choice = item.get("repair_identity") or {}
+                            choices.append((
+                                "repair", item["actor_id"],
+                                "Repair duplicate %s as %s" % (
+                                    item["display_name"],
+                                    repair_choice.get("short_name") or
+                                    repair_choice.get("persona_name") or
+                                    "the next unused name")))
+                        else:
+                            choices.append((
+                                "reuse", item["actor_id"],
+                                "Take over/reuse %s (%s)" % (
+                                    item["display_name"],
+                                    item.get("persona_name") or
+                                    "legacy compatibility identity")))
                     if bound:
                         choices.append((
                             "new", None,

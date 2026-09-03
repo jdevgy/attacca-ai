@@ -168,7 +168,7 @@ class ConcurrencyTestCase(unittest.TestCase):
             "SELECT COALESCE(MAX(seq), 0) AS seq FROM events "
             "WHERE project_id='stress'").fetchone()["seq"]
         baseline_handoffs = conn.execute(
-            "SELECT COUNT(*) AS n FROM identity_handoffs "
+            "SELECT COUNT(*) AS n FROM handoffs "
             "WHERE project_id='stress'").fetchone()["n"]
         conn.close()
 
@@ -213,29 +213,24 @@ class ConcurrencyTestCase(unittest.TestCase):
             conn, "stress", actor_id=winner["actor"],
             actor_type="agent")
         self.assertEqual(final["context_version"], expected + 1)
-        self.assertEqual(final["handoff_actor"], winner["actor"])
+        # The shared project handoff has no owning identity; the losing
+        # Director's write is rejected instead of merged.
+        self.assertIsNone(final["handoff_actor"])
+        self.assertEqual(final["handoff_scope"], "project")
         self.assertEqual(final["handoff_updated_by"], winner["actor"])
         self.assertEqual(final["handoff"]["what_changed"], winner["value"])
-        if winner["actor"] == "director-a":
-            self.assertEqual(final["handoff"]["objective"],
-                             "shared objective")
-            self.assertEqual(final["handoff"]["notes"],
-                             "seed is preserved")
-        else:
-            # Exact identities never inherit or overwrite another actor's
-            # handoff fields merely because they won a project-context race.
-            self.assertIsNone(final["handoff"]["objective"])
-            self.assertIsNone(final["handoff"]["notes"])
+        self.assertEqual(final["handoff"]["objective"], "shared objective")
+        self.assertEqual(final["handoff"]["notes"], "seed is preserved")
         self.assertNotEqual(final["handoff"]["what_changed"],
                             conflicts[0]["value"])
         handoff_count = conn.execute(
-            "SELECT COUNT(*) AS n FROM identity_handoffs "
+            "SELECT COUNT(*) AS n FROM handoffs "
             "WHERE project_id='stress'").fetchone()["n"]
         self.assertEqual(handoff_count, baseline_handoffs + 1)
         events = conn.execute(
             "SELECT actor_id, payload FROM events "
             "WHERE project_id='stress' AND seq>? "
-            "AND event_type='identity_handoff.updated' ORDER BY seq",
+            "AND event_type='handoff.updated' ORDER BY seq",
             (baseline_seq,)).fetchall()
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["actor_id"], winner["actor"])

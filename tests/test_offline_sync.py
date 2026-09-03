@@ -126,6 +126,13 @@ class FakeRemote:
             "event_id": "ev_handoff_0001",
             "legacy_source_version": None,
         }]
+        project_handoffs = [{
+            "project_id": "agentg",
+            "version": 1,
+            "content": {"objective": "Continue offline safely"},
+            "updated_by": "agentg.director.codex",
+            "updated_at": "2026-08-24T00:00:00.000Z",
+        }]
         role_scopes = []
         if role in {"director", "advisor", "worker"}:
             role_scopes.append({
@@ -143,6 +150,7 @@ class FakeRemote:
             },
             "handoffs": list(identity_handoffs),
             "identity_handoffs": list(identity_handoffs),
+            "project_handoffs": list(project_handoffs),
             "role_scopes": role_scopes,
             "rules": [{
                 "project_id": "agentg", "rule_id": "R-everyone",

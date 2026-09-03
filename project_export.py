@@ -4,8 +4,9 @@ This module deliberately has no dependency on :mod:`attacca.py`, which lets
 the HTTP, CLI, and test surfaces integrate it without creating an import
 cycle.  Export construction operates on an already-open SQLite connection
 without mutating it.  The narrowly-scoped reservation restore helper is the
-only write path: it atomically imports an already-validated, append-only agent
-short-name registry and refuses conflicting history.
+only write path: it atomically imports an already-validated slice of the
+append-only, server-unique agent short-name registry and refuses same- or
+cross-project conflicts.
 
 The JSON export keeps both a decoded event ``payload`` and the exact stored
 ``payload_json`` used by Attacca's immutable hash chain.  Server-global
@@ -535,15 +536,16 @@ def build_project_export(conn, project_id, log_renderer=None):
         for task in tasks:
             task["plan_revisions"] = plans_by_task.get(task.get("task_id"), [])
 
-        # ``handoffs`` is the retired project-global archive.  Preserve it
-        # row-for-row for administrative recovery, but never use it as an
-        # identity mirror or clone it into the new per-actor history.
+        # ``handoffs`` is the canonical shared project handoff history.
+        # Preserve every historical writer (including older human writers)
+        # row-for-row; current write authorization is a domain concern and
+        # must never erase portable audit history.
         raw_handoffs = _optional_rows(
             conn, tables, "handoffs",
             "SELECT * FROM handoffs WHERE project_id=? ORDER BY version",
             (project_id,),
         )
-        legacy_handoffs = _decode_columns(raw_handoffs, ("content",))
+        handoffs = _decode_columns(raw_handoffs, ("content",))
         raw_identity_handoffs = _optional_rows(
             conn, tables, "identity_handoffs",
             "SELECT * FROM identity_handoffs WHERE project_id=? "
@@ -636,11 +638,10 @@ def build_project_export(conn, project_id, log_renderer=None):
         "room_messages": len(room_messages),
         "tasks": len(tasks),
         "task_plan_revisions": len(plans),
-        # ``handoffs`` remains the schema-v1 compatibility name for the same
-        # explicitly labelled legacy archive.  It is intentionally not a
-        # count of current identity handoffs.
-        "handoffs": len(legacy_handoffs),
-        "legacy_handoffs": len(legacy_handoffs),
+        "handoffs": len(handoffs),
+        # Retain the old section name as an exact compatibility alias.  New
+        # readers use ``handoffs`` as canonical shared project history.
+        "legacy_handoffs": len(handoffs),
         "identity_handoffs": len(identity_handoffs),
         "role_scope_revisions": len(role_scope_revisions),
         "decisions": len(decisions),
@@ -667,10 +668,8 @@ def build_project_export(conn, project_id, log_renderer=None):
         "full_log": full_log,
         "room_messages": room_messages,
         "tasks": tasks,
-        # Keep the historical key for export-v1 readers while making its
-        # archive status unmistakable to current readers.
-        "handoffs": legacy_handoffs,
-        "legacy_handoffs": legacy_handoffs,
+        "handoffs": handoffs,
+        "legacy_handoffs": handoffs,
         "identity_handoffs": identity_handoffs,
         "role_scope_revisions": role_scope_revisions,
         "decisions": decisions,
@@ -698,14 +697,15 @@ def build_project_export(conn, project_id, log_renderer=None):
         "integrity": {"ledger": verification},
         "compatibility": {
             "handoffs": {
-                "canonical_section": "legacy_handoffs",
-                "kind": "retired_project_global_archive",
-                "read_only": True,
+                "canonical_section": "handoffs",
+                "kind": "shared_project_handoff_history",
+                "legacy_alias": "legacy_handoffs",
+                "append_only": True,
             },
             "agent_persona_reservations": {
-                "kind": "append_only_workspace_name_registry",
+                "kind": "append_only_server_unique_name_registry_slice",
                 "complete": True,
-                "import_policy": "insert_or_reject_conflict",
+                "import_policy": "insert_or_reject_global_conflict",
                 "coverage": persona_coverage,
             },
         },
@@ -746,12 +746,15 @@ def project_export_full_log_bytes(project_export):
 
 
 def restore_exported_persona_reservations(conn, project_export):
-    """Atomically restore the complete never-reuse short-name registry.
+    """Atomically restore one project's server-unique name registry slice.
 
     This intentionally does not import any other project data.  A broader
     restore/migration workflow calls it after creating the destination schema
     and before allowing another agent registration.  Existing identical rows
-    are idempotent; any conflicting reservation aborts the whole operation.
+    are idempotent; any same- or cross-project conflicting reservation aborts
+    the whole operation.  The conditional insert is one SQLite write
+    statement, so two concurrent restores cannot both reserve the same name
+    after separately observing it as available.
     Original schema-v1 exports remain readable, but cannot prove names that
     existed only in the then-unexported registry and are therefore refused as
     an authoritative reservation import.
@@ -786,24 +789,45 @@ def restore_exported_persona_reservations(conn, project_export):
                 conn,
                 "SELECT project_id,persona,persona_name,reserved_actor_id,"
                 "reserved_at,source FROM agent_persona_reservations "
-                "WHERE project_id=? AND persona=?",
-                (project_id, row["persona"]),
+                "WHERE persona=? ORDER BY project_id",
+                (row["persona"],),
             )
-            if existing_rows:
-                if existing_rows[0] != row:
+            same_project = next((
+                existing for existing in existing_rows
+                if existing["project_id"] == project_id), None)
+            if same_project is not None:
+                if same_project != row:
                     raise ProjectExportError(
                         "destination has a conflicting reservation for @%s" %
                         row["persona_name"])
                 preserved += 1
                 continue
-            conn.execute(
+            if existing_rows:
+                raise ProjectExportError(
+                    "destination server already reserves @%s in project %s" %
+                    (row["persona_name"], existing_rows[0]["project_id"]))
+            cursor = conn.execute(
                 "INSERT INTO agent_persona_reservations "
                 "(project_id,persona,persona_name,reserved_actor_id,"
-                "reserved_at,source) VALUES (?,?,?,?,?,?)",
+                "reserved_at,source) "
+                "SELECT ?,?,?,?,?,? WHERE NOT EXISTS ("
+                "SELECT 1 FROM agent_persona_reservations WHERE persona=?)",
                 tuple(row[key] for key in (
                     "project_id", "persona", "persona_name",
-                    "reserved_actor_id", "reserved_at", "source")),
+                    "reserved_actor_id", "reserved_at", "source")) +
+                (row["persona"],),
             )
+            if cursor.rowcount != 1:
+                collision = _query_rows(
+                    conn,
+                    "SELECT project_id FROM agent_persona_reservations "
+                    "WHERE persona=? ORDER BY project_id LIMIT 1",
+                    (row["persona"],),
+                )
+                owner = collision[0]["project_id"] if collision else "another"
+                raise ProjectExportError(
+                    "destination server already reserves @%s in project %s" %
+                    (row["persona_name"], owner))
             inserted += 1
         conn.execute("RELEASE %s" % savepoint)
     except BaseException as error:
@@ -879,16 +903,34 @@ def validate_project_export(project_export, require_valid_ledger=True):
                 project_export.get("legacy_handoffs"):
             raise ProjectExportError(
                 "handoffs compatibility section must exactly alias the "
-                "legacy_handoffs archive")
+                "legacy_handoffs section")
         compatibility = manifest.get("compatibility") or {}
         marker = compatibility.get("handoffs") \
             if isinstance(compatibility, dict) else None
-        if not isinstance(marker, dict) \
-                or marker.get("canonical_section") != "legacy_handoffs" \
-                or marker.get("kind") != "retired_project_global_archive" \
-                or marker.get("read_only") is not True:
+        current_marker = isinstance(marker, dict) \
+            and marker.get("canonical_section") == "handoffs" \
+            and marker.get("kind") == "shared_project_handoff_history" \
+            and marker.get("legacy_alias") == "legacy_handoffs" \
+            and marker.get("append_only") is True
+        # Exports emitted while D-19 treated the same table as a retired
+        # archive remain verifiable.  Compatibility never changes their
+        # bytes or promotes an identity row into shared state.
+        retired_marker = isinstance(marker, dict) \
+            and marker.get("canonical_section") == "legacy_handoffs" \
+            and marker.get("kind") == "retired_project_global_archive" \
+            and marker.get("read_only") is True
+        if not (current_marker or retired_marker):
             raise ProjectExportError(
-                "legacy handoff archive is missing its compatibility label")
+                "handoff history is missing a recognized compatibility label")
+    for row in project_export.get("handoffs") or []:
+        if not isinstance(row, dict) \
+                or row.get("project_id") != project_id:
+            raise ProjectExportError(
+                "handoffs contains a row outside project %s" % project_id)
+        version = row.get("version")
+        if not isinstance(version, int) or isinstance(version, bool) \
+                or version <= 0:
+            raise ProjectExportError("handoffs row has an invalid version")
     for section in ("identity_handoffs", "role_scope_revisions"):
         for row in project_export.get(section) or []:
             if not isinstance(row, dict) \
@@ -925,15 +967,21 @@ def validate_project_export(project_export, require_valid_ledger=True):
         compatibility = manifest.get("compatibility") or {}
         marker = compatibility.get("agent_persona_reservations") \
             if isinstance(compatibility, dict) else None
-        if not isinstance(marker, dict) \
-                or marker.get("kind") != \
-                "append_only_workspace_name_registry" \
-                or marker.get("complete") is not True \
-                or marker.get("import_policy") != \
-                "insert_or_reject_conflict":
+        current_registry_marker = isinstance(marker, dict) \
+            and marker.get("kind") == \
+            "append_only_server_unique_name_registry_slice" \
+            and marker.get("complete") is True \
+            and marker.get("import_policy") == \
+            "insert_or_reject_global_conflict"
+        legacy_registry_marker = isinstance(marker, dict) \
+            and marker.get("kind") == \
+            "append_only_workspace_name_registry" \
+            and marker.get("complete") is True \
+            and marker.get("import_policy") == "insert_or_reject_conflict"
+        if not (current_registry_marker or legacy_registry_marker):
             raise ProjectExportError(
                 "agent persona reservation registry is missing its complete "
-                "append-only import contract")
+                "append-only server-unique import contract")
         coverage = marker.get("coverage") or {}
         if not isinstance(coverage, dict) \
                 or coverage.get("method") != \

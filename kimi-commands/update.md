@@ -2,7 +2,7 @@
 description: Load a fresh full-project update from Attacca in Kimi Code (/attacca:update)
 ---
 
-Before the seven reads, treat a hosted 401/403 as an AI-owned authorization
+Before the eight reads, treat a hosted 401/403 as an AI-owned authorization
 transition. Kimi itself starts the packaged client-key helper in its active
 terminal; never give the human a shell command. The helper opens a short-lived,
 non-secret Settings link for this exact installation. The human signs in,
@@ -16,19 +16,21 @@ validation. If the browser cannot open, show the safe link and keep lifecycle
 polling deferred and nonblocking; never force a restart.
 
 Refresh the current project's shared state through the `attacca` MCP tools.
-Call all seven, even if the SessionStart brief already ran:
+Call all eight, even if the SessionStart brief already ran:
 
 1. `get_handoff`
-2. `check_inbox` with `mark_read: true`; process every returned page and keep
+2. `get_identity_handoff`
+3. `check_inbox` with `mark_read: true`; process every returned page and keep
    calling while `may_have_more` is true
-3. `room_read`
-4. `task_list`
-5. `attacca_status`
-6. `agent_list`
-7. `rule_list`
+4. `room_read`
+5. `task_list`
+6. `attacca_status`
+7. `agent_list`
+8. `rule_list`
 
-Give the user one concise update, not a raw tool dump. Cover the current
-objective and context version; material changes; blockers, risks, and next
+Give the user one concise update, not a raw tool dump. Distinguish the shared
+project handoff from this exact AI identity handoff and Role Scope. Cover the
+current objective and context version; material changes; blockers, risks, and next
 actions; claimed work and its owners; queued, blocked, review, or expired
 tasks; every visible non-self room message; which messages expect this actor's
 response; important shared group context; and anything requiring the user's

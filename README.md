@@ -17,9 +17,10 @@ workspace:
 
 - **History that survives sessions** — a per-project, hash-chained event ledger
   and a readable activity log preserve what changed, why, and who ran it.
-- **Cold-resume context** — shared Cloud Context, binding role-scoped Rules,
-  shared Role Scope, exact-identity handoffs, and startup briefs restore the
-  state a returning worker needs without merging parallel AI identities.
+- **Cold-resume context** — one Director-governed shared project handoff,
+  shared Cloud Context, binding role-scoped Rules, shared Role Scope,
+  exact-AI-identity handoffs, and startup briefs restore the state a returning
+  worker needs without merging parallel AI identities.
 - **Coordinated work** — rooms, persistent inbox cursors, tasks, expiring claims,
   declared path scopes, immutable plan revisions, decisions, and evidence-based
   completion keep parallel workers aligned.
@@ -181,9 +182,10 @@ name, or use a freshly generated name only in the current MCP process. The
 temporary path is deliberately performed by `agent_register` through that
 already-running, already-bound proxy; it is not offered to a first/unbound
 client because D-17 authentication requires an exact actor first. A setup shell
-subprocess cannot claim to change its parent MCP process. Reuse is selection-only: it shares that
-exact actor's handoff, inbox cursor, and task
-leases without merging, deleting, or renaming the currently active identity.
+subprocess cannot claim to change its parent MCP process. Reuse is
+selection-only: it shares that exact actor's identity handoff, inbox cursor,
+and task leases without merging, deleting, or renaming the currently active
+identity.
 User-facing choices show **Gibbs** / **@Gibbs** with role and runtime; raw
 project and actor IDs remain internal arguments.
 
@@ -329,8 +331,9 @@ any remotely reachable instance.
 The native plugins bundle lifecycle continuity. Claude/Codex use `SessionStart`,
 `UserPromptSubmit`, and `Stop`; Kimi uses its manifest startup skill plus native
 `UserPromptSubmit` and `Stop` hooks. Once setup writes `.attacca/project.json`,
-each new session loads Project Rules, Cloud Context, its applicable Role Scope,
-its exact-identity handoff, inbox, room, tasks, agents, and status. Setup also
+each new session loads Project Rules, Cloud Context, the shared project handoff,
+its applicable Role Scope, its exact AI identity handoff, inbox, room, tasks,
+agents, and status. Setup also
 starts one machine-global background watcher. At the
 server-configured interval (one minute by default, configurable or disableable
 in `/app` Settings), it makes lightweight inbox and append-only event-feed
@@ -450,8 +453,11 @@ GET  /v1/projects                          POST /v1/projects
 GET  /v1/projects/{id}/status              GET  /v1/projects/{id}/inbox
 PUT  /v1/projects/{id}/lead
 GET/POST /v1/projects/{id}/bridges         DELETE /v1/projects/{id}/bridges/{other}
-GET  /v1/projects/{id}/handoff             POST /v1/projects/{id}/handoff
+GET  /v1/projects/{id}/handoff             PUT  /v1/projects/{id}/handoff
 GET  /v1/projects/{id}/handoff/history
+GET  /v1/projects/{id}/identity-handoff?actor=AI
+PUT  /v1/projects/{id}/identity-handoff?actor=AI
+GET  /v1/projects/{id}/identity-handoff/history?actor=AI
 GET  /v1/projects/{id}/role-scopes
 PUT  /v1/projects/{id}/role-scopes/{role}
 GET  /v1/projects/{id}/role-scopes/{role}/history
@@ -519,13 +525,15 @@ Injected via the managed block and the MCP server's `instructions`:
 4. **Decisions for durable choices** — architecture, API, data, security,
    workflow, or product choices use `decision_propose` / `decision_resolve`,
    not chat; routine implementation details do not need a decision record.
-5. **Role Scope + identity handoff** — Role Scope is durable background shared
-   by all identities in one role, with an additional Lead Director overlay for
-   the lead. Humans and registered Directors manage it with optimistic
-   versions. At a meaningful transition, every registered AI role reports task
-   evidence, then updates only its own exact-identity handoff with the handoff
-   version returned by `get_handoff`; Gibbs can never overwrite Turing's
-   history. A human identity also owns only its own handoff.
+5. **Shared handoff + identity handoff + Role Scope** — the shared project
+   handoff is the workspace-wide objective and current status; only registered
+   AI Directors update it, using an optimistic project-handoff version. Every
+   registered AI may separately update only its own exact identity handoff
+   after reporting task evidence; Gibbs can never overwrite Turing's history.
+   Web and console humans remain separately attributed operators and never own
+   an identity handoff. Role Scope is durable background shared by every AI in
+   one role, with an additional Lead Director overlay for the lead; humans and
+   registered Directors govern Role Scope through its own optimistic version.
 6. **Drift Guard** — responses carry `stale_context_warning` when the project moved
    after your briefing; re-run `get_handoff` before writing.
 
@@ -542,9 +550,10 @@ receive R-0 once when opened by the upgraded product; because it is a normal
 Project Rule, authorized governance may edit or disable it and Attacca will not
 overwrite that choice.
 
-## MCP tools (42)
+## MCP tools
 
-`attacca_status`, `get_handoff`, `update_handoff`, `get_project_log`,
+`attacca_status`, `get_handoff`, `update_handoff`, `get_identity_handoff`,
+`update_identity_handoff`, `identity_handoff_history`, `get_project_log`,
 `role_scope_get`, `role_scope_set`, `role_scope_history`,
 `room_send`, `room_read`, `check_inbox`, `message_dispose`,
 `set_lead_director`, `bridge_add`, `bridge_update_access`, `bridge_list`,
@@ -618,8 +627,9 @@ python3 attacca.py event verify  # hash-chain + sequence integrity of a real led
 
 - **Prototype authentication, not production identity infrastructure.** Account
   sessions, CSRF, hash-only per-install client keys, exact project/actor request
-  selection, human attribution, exact-identity handoff ownership,
-  Director-managed Role Scope/directive rules, and stale versions are enforced.
+  selection, human attribution, Director-governed shared project handoff,
+  exact-AI-identity handoff ownership, Director-managed Role Scope/directive
+  rules, and stale versions are enforced.
   SSO/MFA, login rate
   limits, centralized key rotation, TLS termination, and hostile-host isolation
   remain later layers (blueprint §12.3, §28 "policy bypass").
@@ -636,9 +646,10 @@ python3 attacca.py event verify  # hash-chain + sequence integrity of a real led
 - **Hash chain is tamper-*evident*, not tamper-*proof*** (no signatures yet — §23.3).
 - **One exact actor = one workspace/role/runtime/persona continuity owner.**
   Two simultaneous sessions that reuse the same named actor intentionally
-  share its handoff, inbox cursor, and task leases. Separate permanent names
-  have independent handoffs/cursors/leases while receiving the same applicable
-  Role Scope. Existing three-part actors remain explicit compatibility choices;
+  share its identity handoff, inbox cursor, and task leases. Separate permanent
+  names have independent identity handoffs/cursors/leases while receiving the
+  same shared project handoff and applicable Role Scope. Existing three-part
+  actors remain explicit compatibility choices;
   existing Red/Blue persona records are preserved unless an explicit setup
   repair resolves a grandfathered duplicate. New setup-created identities
   always receive a server-unique friendly name and `@ShortName`. Owner remains

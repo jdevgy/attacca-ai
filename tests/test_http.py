@@ -1357,16 +1357,22 @@ class HttpTestCase(unittest.TestCase):
             "GET", "/v1/projects/hub/handoff", actor=actor,
             actor_type="agent")
         status, updated, _ = self.rest(
-            "POST", "/v1/projects/hub/handoff",
+            "POST", "/v1/projects/hub/identity-handoff",
             {"objective": "serve the world", "expected_handoff_version": 0},
             actor=actor, actor_type="agent")
         self.assertEqual(status, 200)
         self.assertEqual(updated["handoff_actor"], actor)
         _, handoff, _ = self.rest(
-            "GET", "/v1/projects/hub/handoff", actor=actor,
+            "GET", "/v1/projects/hub/identity-handoff", actor=actor,
             actor_type="agent")
         self.assertEqual(handoff["handoff"]["objective"], "serve the world")
         self.assertEqual(handoff["handoff_actor"], actor)
+        _, brief, _ = self.rest(
+            "GET", "/v1/projects/hub/handoff", actor=actor,
+            actor_type="agent")
+        self.assertEqual(brief["identity_handoff"]["objective"],
+                         "serve the world")
+        self.assertEqual(brief["identity_handoff_actor"], actor)
         _, fresh, _ = self.rest(
             "GET", "/v1/projects/hub/freshness?context_version=%d"
             % before["context_version"])
@@ -1399,33 +1405,33 @@ class HttpTestCase(unittest.TestCase):
             actor="director-a", actor_type="agent")
         expected = brief["context_version"]
         status, first, _ = self.rest(
-            "PUT", "/v1/projects/%s/handoff" % project,
+            "PUT", "/v1/projects/%s/identity-handoff" % project,
             {"what_changed": "first director",
              "expected_context_version": expected},
             actor="director-a", actor_type="agent")
         self.assertEqual(status, 200)
         status, conflict, _ = self.rest(
-            "PUT", "/v1/projects/%s/handoff" % project,
+            "PUT", "/v1/projects/%s/identity-handoff" % project,
             {"what_changed": "stale second director",
              "expected_context_version": expected},
             actor="director-b", actor_type="agent")
         self.assertEqual(status, 400)
         self.assertIn("handoff conflict", conflict["error"])
         status, worker_update, _ = self.rest(
-            "PUT", "/v1/projects/%s/handoff" % project,
+            "PUT", "/v1/projects/%s/identity-handoff" % project,
             {"notes": "worker write",
              "expected_context_version": first["context_version"],
              "expected_handoff_version": 0},
             actor="worker", actor_type="agent")
-        # D-19 handoffs belong to every exact registered identity. Role scope
-        # supplies shared background; it does not turn a worker's handoff into
-        # the Director's document or forbid the worker from maintaining one.
+        # Identity handoffs belong to every exact registered identity. Role
+        # scope supplies shared background; it does not turn a worker's
+        # identity handoff into the Director's document.
         self.assertEqual(status, 200)
         self.assertEqual(worker_update["handoff_actor"], "worker")
         self.assertEqual(worker_update["handoff_version"], 1)
 
         status, own_conflict, _ = self.rest(
-            "PUT", "/v1/projects/%s/handoff" % project,
+            "PUT", "/v1/projects/%s/identity-handoff" % project,
             {"notes": "stale own revision",
              "expected_context_version": worker_update["context_version"],
              "expected_handoff_version": 0},
@@ -1434,16 +1440,41 @@ class HttpTestCase(unittest.TestCase):
         self.assertIn("identity handoff conflict", own_conflict["error"])
 
         _, director_handoff, _ = self.rest(
-            "GET", "/v1/projects/%s/handoff" % project,
+            "GET", "/v1/projects/%s/identity-handoff" % project,
             actor="director-a", actor_type="agent")
         _, worker_handoff, _ = self.rest(
-            "GET", "/v1/projects/%s/handoff" % project,
+            "GET", "/v1/projects/%s/identity-handoff" % project,
             actor="worker", actor_type="agent")
         self.assertEqual(
             director_handoff["handoff"]["what_changed"], "first director")
         self.assertIsNone(director_handoff["handoff"]["notes"])
         self.assertEqual(worker_handoff["handoff"]["notes"], "worker write")
         self.assertIsNone(worker_handoff["handoff"]["what_changed"])
+
+        # The shared project handoff is one Director-only record, unchanged by
+        # any of the identity writes above.
+        status, shared, _ = self.rest(
+            "PUT", "/v1/projects/%s/handoff" % project,
+            {"objective": "one shared objective",
+             "expected_handoff_version": 0},
+            actor="director-a", actor_type="agent")
+        self.assertEqual(status, 200)
+        self.assertIsNone(shared["handoff_actor"])
+        self.assertEqual(shared["handoff_scope"], "project")
+        status, refused, _ = self.rest(
+            "PUT", "/v1/projects/%s/handoff" % project,
+            {"objective": "worker overwrite",
+             "expected_handoff_version": 1},
+            actor="worker", actor_type="agent")
+        self.assertEqual(status, 400)
+        self.assertIn("registered Director", refused["error"])
+        _, worker_view, _ = self.rest(
+            "GET", "/v1/projects/%s/handoff" % project,
+            actor="worker", actor_type="agent")
+        self.assertEqual(worker_view["handoff"]["objective"],
+                         "one shared objective")
+        self.assertEqual(worker_view["identity_handoff"]["notes"],
+                         "worker write")
 
     # -- MCP over streamable HTTP -------------------------------------------
 
@@ -1591,7 +1622,7 @@ class HttpTestCase(unittest.TestCase):
         self.assertFalse(resp["result"]["isError"])
         # someone else advances the context via REST
         status, moved, _ = self.rest(
-            "POST", "/v1/projects/hub/handoff",
+            "POST", "/v1/projects/hub/identity-handoff",
             {"objective": "moved underneath",
              "expected_handoff_version": 0},
             actor="hub.director.drift.red", actor_type="agent")

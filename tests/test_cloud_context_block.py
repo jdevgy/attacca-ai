@@ -528,11 +528,15 @@ class CloudContextBlockTestCase(unittest.TestCase):
 
     def test_managed_law_describes_identity_handoffs_and_auto_sync(self):
         block = c.managed_instruction_block("p1", None)
-        self.assertEqual(c.MANAGED_BLOCK_VERSION, 14)
+        self.assertEqual(c.MANAGED_BLOCK_VERSION, 15)
         self.assertIn("workspace.role.runtime.persona", block)
         self.assertIn("legacy three-part", block)
         self.assertIn("exact identity handoff", block)
         self.assertIn("every exact registered identity", block)
+        self.assertIn("ONE", block)
+        self.assertIn("shared project handoff", block)
+        self.assertIn("update_identity_handoff", block)
+        self.assertIn("only a registered AI Director writes", block)
         self.assertIn("ATTACCA_CLOUD_CONTEXT", block)
         self.assertIn("loaded in full", block)
         self.assertIn("at session start", block)

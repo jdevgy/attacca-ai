@@ -5,7 +5,7 @@ description: Load a fresh, complete Attacca project update. Use when the user in
 
 # Attacca project update
 
-Before the seven reads, treat a hosted 401/403 as an AI-owned authorization
+Before the eight reads, treat a hosted 401/403 as an AI-owned authorization
 transition. The AI itself starts the packaged client-key authorization helper
 in its active terminal; never give the human a shell command. The helper opens
 a short-lived, non-secret Attacca Settings link for this exact installation.
@@ -19,19 +19,21 @@ attribution remain server-validated. A headless/no-TTY host stays deferred and
 nonblocking while lifecycle hooks retry.
 
 Refresh the current project's shared state through the `attacca` MCP tools.
-Call all seven, even if the SessionStart brief already ran:
+Call all eight, even if the SessionStart brief already ran:
 
 1. `get_handoff`
-2. `check_inbox` with `mark_read: true`; process every returned page and keep
+2. `get_identity_handoff`
+3. `check_inbox` with `mark_read: true`; process every returned page and keep
    calling while `may_have_more` is true
-3. `room_read`
-4. `task_list`
-5. `attacca_status`
-6. `agent_list`
-7. `rule_list`
+4. `room_read`
+5. `task_list`
+6. `attacca_status`
+7. `agent_list`
+8. `rule_list`
 
-Return one concise update rather than raw tool output. Include the objective
-and context version; material changes; blockers, risks, and next actions;
+Return one concise update rather than raw tool output. Distinguish the shared
+project handoff from this exact AI identity handoff and Role Scope. Include the
+objective and context version; material changes; blockers, risks, and next actions;
 claimed work and its owners; queued, blocked, review, or expired tasks;
 every visible non-self room message; which messages expect this actor's
 response; important shared group context; and anything requiring the user's

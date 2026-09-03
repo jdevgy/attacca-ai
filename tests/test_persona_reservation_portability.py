@@ -132,6 +132,10 @@ class PersonaReservationExportTests(unittest.TestCase):
             "portable.worker.claude.turing")
         coverage = exported["manifest"]["compatibility"][
             "agent_persona_reservations"]["coverage"]
+        self.assertEqual(
+            exported["manifest"]["compatibility"]
+            ["agent_persona_reservations"]["kind"],
+            "append_only_server_unique_name_registry_slice")
         self.assertTrue(coverage["complete"])
         self.assertEqual(
             coverage["method"], "durable_identity_history_scan_v1")
@@ -179,6 +183,32 @@ class PersonaReservationExportTests(unittest.TestCase):
         self.assertIsNone(conflict.execute(
             "SELECT 1 FROM agent_persona_reservations "
             "WHERE project_id='portable' AND persona='turing'").fetchone())
+
+    def test_restore_atomically_rejects_name_reserved_by_another_project(self):
+        exported = self.build()
+        destination = self.destination("global-conflict")
+        self.addCleanup(destination.close)
+        other_workspace = self.root / "other-workspace"
+        other_workspace.mkdir()
+        core.project_init(
+            destination, "human.fixture", "human", path=other_workspace,
+            project_id="other", name="Other")
+        destination.execute(
+            "INSERT INTO agent_persona_reservations "
+            "(project_id,persona,persona_name,reserved_actor_id,"
+            "reserved_at,source) VALUES (?,?,?,?,?,?)",
+            ("other", "gibbs", "Gibbs", "other.director.codex.gibbs",
+             "2026-08-30T00:00:00.000Z", "existing.global.name"))
+
+        with self.assertRaisesRegex(
+                project_export.ProjectExportError,
+                "already reserves @Gibbs in project other"):
+            project_export.restore_exported_persona_reservations(
+                destination, exported)
+        self.assertIsNone(destination.execute(
+            "SELECT 1 FROM agent_persona_reservations "
+            "WHERE project_id='portable' AND persona IN ('gibbs','turing')"
+        ).fetchone())
 
     def test_v1_remains_readable_but_cannot_claim_complete_name_restore(self):
         legacy = copy.deepcopy(self.build())
@@ -328,7 +358,7 @@ class PersonaReservationSyncTests(unittest.TestCase):
             "persona_reservations", self.capabilities["resources"])
         prior_resources = [
             resource for resource in self.capabilities["resources"]
-            if resource != "persona_reservations"]
+            if resource not in {"persona_reservations", "project_handoffs"}]
         prior = protocol.make_projection_capabilities(2, prior_resources)
         self.assertNotIn(
             "persona_reservations",
@@ -473,7 +503,7 @@ class PersonaReservationSyncTests(unittest.TestCase):
                 "persona_name"], "Gibbs")
         prior = protocol.make_projection_capabilities(2, [
             resource for resource in self.capabilities["resources"]
-            if resource != "persona_reservations"])
+            if resource not in {"persona_reservations", "project_handoffs"}])
         older = engine.snapshot(
             self.scope, projection_capabilities=prior)
         self.assertNotIn("persona_reservations", older["projection"])

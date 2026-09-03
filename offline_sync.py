@@ -82,7 +82,16 @@ _RESERVED_ATTRIBUTION_KEYS = {
     "run_by_user", "server_id", "workspace",
 }
 _RESOURCE_ALIASES = {
-    "handoffs": "handoffs", "handoff": "handoffs",
+    # ``handoffs`` is the schema-v1/v2 exact-identity compatibility wire
+    # resource.  The singular product-level handoff now resolves to the
+    # schema-v3 shared project history so an offline client never mistakes
+    # one AI's private continuity for the workspace handoff.
+    "handoffs": "handoffs",
+    "handoff": "project_handoffs",
+    "project_handoffs": "project_handoffs",
+    "project_handoff": "project_handoffs",
+    "shared_handoffs": "project_handoffs",
+    "shared_handoff": "project_handoffs",
     "identity_handoffs": "identity_handoffs",
     "identity_handoff": "identity_handoffs",
     "role_scopes": "role_scopes", "role_scope": "role_scopes",
@@ -109,6 +118,8 @@ _RESOURCE_ALIASES = {
     "persona_reservations": "persona_reservations",
 }
 _OPERATION_RESOURCE_ALIASES = {
+    "handoff.update": "project_handoffs",
+    "identity_handoff.update": "identity_handoffs",
     "message.dispose": "message_dispositions",
 }
 
@@ -1985,8 +1996,12 @@ class OfflineProjectSync:
                 raise OfflineMirrorError(
                     "unknown identity mirror section %r" % section)
             value = projection.get(resource)
-            if resource in {"handoffs", "identity_handoffs"} \
-                    and name in {"handoff", "identity_handoff"}:
+            if resource in {
+                    "handoffs", "identity_handoffs", "project_handoffs"} \
+                    and name in {
+                        "handoff", "identity_handoff", "project_handoff",
+                        "shared_handoff",
+                    }:
                 value = value[-1] if value else None
         copied = _json_copy(value)
         if not include_pending:

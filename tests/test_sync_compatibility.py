@@ -21,7 +21,7 @@ from tests.test_sync_server import Harness
 
 
 def projection(scope, *, cloud=False, dispositions=False,
-               identity_resources=False):
+               identity_resources=False, project_resources=False):
     value = {
         "project": {
             "project_id": scope["project_id"], "name": "Agentg",
@@ -47,6 +47,8 @@ def projection(scope, *, cloud=False, dispositions=False,
     if identity_resources:
         value["identity_handoffs"] = []
         value["role_scopes"] = []
+    if project_resources:
+        value["project_handoffs"] = []
     return value
 
 
@@ -59,7 +61,9 @@ def empty_snapshot(scope, capabilities, *, cloud=False, dispositions=False):
         projection(
             scope, cloud=cloud, dispositions=dispositions,
             identity_resources=(
-                "identity_handoffs" in capabilities["resources"])), [])
+                "identity_handoffs" in capabilities["resources"]),
+            project_resources=(
+                "project_handoffs" in capabilities["resources"])), [])
 
 
 class RecordingTransport:
@@ -84,9 +88,10 @@ class ProjectionCapabilityTests(unittest.TestCase):
         self.assertEqual(legacy["schema_version"], 1)
         self.assertNotIn("cloud_context", legacy["resources"])
         self.assertNotIn("message_dispositions", legacy["resources"])
-        self.assertEqual(current["schema_version"], 2)
+        self.assertEqual(current["schema_version"], 3)
         self.assertIn("cloud_context", current["resources"])
         self.assertIn("message_dispositions", current["resources"])
+        self.assertIn("project_handoffs", current["resources"])
 
         future = dict(current)
         future["schema_version"] = 99
@@ -133,6 +138,7 @@ class ServerNegotiationTests(unittest.TestCase):
                 }]
                 result["projection"]["identity_handoffs"] = []
                 result["projection"]["role_scopes"] = []
+                result["projection"]["project_handoffs"] = []
             return result
 
         self.harness.visibility_projector = projector
@@ -190,7 +196,7 @@ class ClientNegotiationTests(unittest.TestCase):
             snapshot["visibility_fingerprint"]).fetch_snapshot()
         self.assertIn("cloud_context", checked["projection"])
         query = parse_qs(urlsplit(transport.calls[0]["url"]).query)
-        self.assertEqual(query["projection_schema_version"], ["2"])
+        self.assertEqual(query["projection_schema_version"], ["3"])
         self.assertIn("cloud_context", query["projection_resources"][0])
 
         legacy = protocol.legacy_projection_capabilities()
@@ -274,7 +280,7 @@ class ClientNegotiationTests(unittest.TestCase):
                 mutations=[mutation], known_receipts=[])
         self.assertEqual(checked["results"][0]["status"], "applied")
         query = parse_qs(urlsplit(transport.calls[0]["url"]).query)
-        self.assertEqual(query["projection_schema_version"], ["2"])
+        self.assertEqual(query["projection_schema_version"], ["3"])
         self.assertIn(
             "message_dispositions", query["projection_resources"][0])
 

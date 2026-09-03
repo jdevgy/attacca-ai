@@ -28,7 +28,7 @@ SCHEMA_VERSION = 1
 # snapshot or delta.  This separation is deliberate: adding an optional
 # projection key must never make an otherwise compatible, still-running
 # schema-v1 client reject the entire offline mirror.
-PROJECTION_SCHEMA_VERSION = 2
+PROJECTION_SCHEMA_VERSION = 3
 LEGACY_PROJECTION_SCHEMA_VERSION = 1
 PROJECTION_CAPABILITIES_FORMAT = "attacca.sync.projection-capabilities"
 
@@ -83,10 +83,10 @@ _IDENTITY_PROJECTION_REQUIRED = {
 _IDENTITY_PROJECTION_OPTIONAL = {
     "task_plans", "full_log", "actor_aliases", "cloud_context",
     "message_dispositions", "identity_handoffs", "role_scopes",
-    "persona_reservations",
+    "persona_reservations", "project_handoffs",
 }
-# Projection schema v2 is explicitly resource-negotiated.  Adding resources
-# does not relabel an already verified v2 mirror: the negotiated
+# Projection schemas v2+ are explicitly resource-negotiated. Adding resources
+# does not relabel an already verified older mirror: the negotiated
 # resource list is part of both its visibility fingerprint and storage key.
 # An older v2 client continues to offer its smaller list and never receives
 # fields it does not understand.
@@ -94,6 +94,7 @@ _PROJECTION_V2_RESOURCES = {
     "cloud_context", "message_dispositions", "identity_handoffs",
     "role_scopes", "persona_reservations",
 }
+_PROJECTION_V3_RESOURCES = {"project_handoffs"}
 _PROJECTION_RESOURCE_INTRODUCED = {
     key: LEGACY_PROJECTION_SCHEMA_VERSION
     for key in (_IDENTITY_PROJECTION_REQUIRED |
@@ -101,6 +102,8 @@ _PROJECTION_RESOURCE_INTRODUCED = {
 }
 for _resource in _PROJECTION_V2_RESOURCES:
     _PROJECTION_RESOURCE_INTRODUCED[_resource] = 2
+for _resource in _PROJECTION_V3_RESOURCES:
+    _PROJECTION_RESOURCE_INTRODUCED[_resource] = 3
 _PROJECTION_RESOURCES = set(_PROJECTION_RESOURCE_INTRODUCED)
 _LEGACY_PROJECTION_RESOURCES = {
     key for key, version in _PROJECTION_RESOURCE_INTRODUCED.items()
@@ -690,7 +693,8 @@ def validate_identity_projection(projection, scope, partial=False):
         if not isinstance(project, dict) \
                 or project.get("project_id") != scope["project_id"]:
             _error("cross_project_projection", "projection project does not match scope")
-    for key in ("handoffs", "identity_handoffs", "role_scopes", "rules",
+    for key in ("handoffs", "identity_handoffs", "project_handoffs",
+                "role_scopes", "rules",
                 "tasks", "decisions", "room_messages", "agents",
                 "bridges", "task_plans", "full_log", "actor_aliases",
                 "message_dispositions", "persona_reservations"):
@@ -799,6 +803,58 @@ def _validate_identity_handoff_rows(rows, scope, label):
             _error(
                 "invalid_identity_handoff",
                 "%s.legacy_source_version must be positive or null" % path)
+
+
+def _validate_project_handoff_rows(rows, scope):
+    """Validate the Director-governed shared project handoff history.
+
+    Unlike exact identity handoffs, these rows intentionally have no
+    ``actor_id`` ownership boundary.  Historical human writers and legacy
+    rows with no recorded writer remain readable audit history; current write
+    authorization is enforced by the hosted mutation path, not rewritten at
+    the mirror boundary.
+    """
+    previous_version = None
+    for index, row in enumerate(rows):
+        path = "projection.project_handoffs[%d]" % index
+        required = {
+            "project_id", "version", "content", "updated_by", "updated_at",
+        }
+        if not isinstance(row, dict) or not required <= set(row):
+            _error(
+                "invalid_project_handoff",
+                "%s must contain project, version, content, and attribution"
+                % path)
+        if row.get("project_id") != scope["project_id"]:
+            _error(
+                "cross_project_projection",
+                "%s belongs to another project" % path)
+        version = row.get("version")
+        if not _is_int(version) or version <= 0:
+            _error(
+                "invalid_project_handoff",
+                "%s.version must be a positive integer" % path)
+        if previous_version is not None and version <= previous_version:
+            _error(
+                "invalid_project_handoff",
+                "projection.project_handoffs must be ordered by increasing "
+                "unique version")
+        previous_version = version
+        if not isinstance(row.get("content"), dict):
+            _error(
+                "invalid_project_handoff",
+                "%s.content must be an object" % path)
+        writer = row.get("updated_by")
+        if writer is not None and (
+                not isinstance(writer, str) or not writer.strip()):
+            _error(
+                "invalid_project_handoff",
+                "%s.updated_by must be a non-empty string or null" % path)
+        if not isinstance(row.get("updated_at"), str) \
+                or not row["updated_at"].strip():
+            _error(
+                "invalid_project_handoff",
+                "%s.updated_at must be a non-empty string" % path)
 
 
 def _applicable_role_scope_names(scope, project):
@@ -1003,6 +1059,9 @@ def _validate_negotiated_identity_resources(value, scope, selected,
             _error(
                 "invalid_projection",
                 "handoffs must alias the exact identity_handoffs history")
+    if "project_handoffs" in resources \
+            and "project_handoffs" in value:
+        _validate_project_handoff_rows(value["project_handoffs"], scope)
     if "role_scopes" in resources:
         if "role_scopes" in value:
             _validate_role_scope_rows(

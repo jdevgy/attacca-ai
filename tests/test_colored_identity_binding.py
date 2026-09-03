@@ -32,6 +32,8 @@ from types import SimpleNamespace
 # Test attribution and state must not inherit the operator's real machine.
 os.environ["ATTACCA_OWNER"] = ""
 
+from tests.test_http import ServerFixture  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 SPEC = importlib.util.spec_from_file_location(
     "attacca_colored_identity_binding_under_test", ROOT / "attacca.py")
@@ -479,6 +481,258 @@ class ColoredIdentityBindingContractTest(unittest.TestCase):
             c.rule_create(
                 self.conn, PROJECT, codex_worker["actor_id"], "agent",
                 "Worker escalation", "must not gain authority from color")
+
+
+class GuidedSetupIdentityRepairTest(unittest.TestCase):
+    """Guided shell setup against an isolated loopback server.
+
+    The server is a subprocess on port 0 with its own temporary database and
+    home directories; nothing here reads or contacts a configured Attacca
+    host, and no test writes outside the temporary tree.
+    """
+
+    OWNER = "jack"
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.db = self.root / "setup.db"
+        self.checkout = self.root / "checkout"
+        self.checkout.mkdir()
+        self.home = self.root / "home"
+        self.home.mkdir()
+        # Use the same installation id guided discovery derives, so a stored
+        # binding is found by both discovery and apply.
+        self.client_instance = c._binding_client_instance(
+            "codex", home=self.home)
+        self.previous_owner = os.environ.get("ATTACCA_OWNER")
+        os.environ["ATTACCA_OWNER"] = self.OWNER
+        self.addCleanup(self._restore_owner)
+        conn = c.connect(self.db)
+        try:
+            c.set_current_owner(self.OWNER)
+            c.project_init(
+                conn, "setup", "human", path=str(self.checkout),
+                project_id=PROJECT, name="Guided setup")
+            self.seed(conn)
+        finally:
+            c.set_current_owner(None)
+            conn.close()
+        self.server = ServerFixture(self.db)
+        self.addCleanup(self.server.stop)
+        self.addCleanup(self.temporary.cleanup)
+
+    def _restore_owner(self):
+        if self.previous_owner is None:
+            os.environ.pop("ATTACCA_OWNER", None)
+        else:
+            os.environ["ATTACCA_OWNER"] = self.previous_owner
+
+    def seed(self, conn):
+        """Overridden by tests that need pre-existing identities."""
+
+    def register(self, conn, actor_id, role="director", runtime="codex",
+                 registered_at=None):
+        c.agent_register(
+            conn, PROJECT, actor_id, "agent", agent_id=actor_id,
+            display_name=actor_id, role=role, runtime=runtime,
+            canonical_identity=False)
+        if registered_at:
+            conn.execute(
+                "UPDATE agents SET registered_at=?, last_seen_at=?"
+                " WHERE project_id=? AND agent_id=?",
+                (registered_at, registered_at, PROJECT, actor_id))
+        return actor_id
+
+    def apply(self, **kw):
+        options = {
+            "role": "director", "client_instance": self.client_instance,
+            "home": self.home,
+        }
+        options.update(kw)
+        return c.apply_remote_network_setup(
+            self.server.base, PROJECT, "jack.codex_director", "agent",
+            **options)
+
+
+class GuidedSetupReuseResolutionTest(GuidedSetupIdentityRepairTest):
+    def seed(self, conn):
+        self.only = self.register(conn, "p1.director.codex.gibbs")
+        # A different role and a different runtime must never be offered as a
+        # reuse candidate for a director/codex client.
+        self.register(conn, "p1.worker.codex.turing", role="worker")
+        self.register(conn, "p1.director.claude.hopper", runtime="claude")
+
+    def test_reuse_resolves_the_single_matching_identity_without_a_flag(self):
+        """`setup --identity-mode reuse` must not require --identity-actor.
+
+        Reported by a consumer workspace: reuse failed with "reuse requires an
+        exact registered actor" on a machine that had no binding yet, even
+        though the workspace had exactly one matching identity.
+        """
+        result = self.apply(identity_mode="reuse", make_default=True)
+        self.assertEqual(result["actor"], self.only)
+        self.assertEqual(result["identity_mode"], "reuse")
+        binding = c.machine_actor_binding_get(
+            self.server.base, PROJECT, "codex",
+            client_instance=self.client_instance, home=self.home)
+        self.assertEqual(
+            binding["actor_id"] if isinstance(binding, dict) else binding,
+            self.only)
+
+    def test_explicit_identity_actor_still_selects_that_exact_actor(self):
+        result = self.apply(
+            identity_mode="reuse", identity_actor=self.only,
+            make_default=True)
+        self.assertEqual(result["actor"], self.only)
+
+    def test_unmatched_identity_actor_is_refused_with_guidance(self):
+        # A wrong-role/runtime actor never matches this client, so setup can
+        # name the identities that would.
+        with self.assertRaises(c.AttaccaError) as raised:
+            self.apply(
+                identity_mode="reuse",
+                identity_actor="p1.worker.codex.turing",
+                make_default=True)
+        message = str(raised.exception)
+        self.assertIn("p1.worker.codex.turing", message)
+        self.assertIn(self.only, message)
+
+        # A well-shaped but unregistered actor is refused by the server that
+        # owns the registry, not silently created.
+        with self.assertRaisesRegex(
+                c.AttaccaError, "identity_reuse_target_required"):
+            self.apply(
+                identity_mode="reuse",
+                identity_actor="p1.director.codex.nobody",
+                make_default=True)
+
+
+class GuidedSetupAmbiguousReuseTest(GuidedSetupIdentityRepairTest):
+    def seed(self, conn):
+        self.first = self.register(conn, "p1.director.codex.gibbs")
+        self.second = self.register(conn, "p1.director.codex.turing")
+
+    def test_ambiguous_reuse_lists_every_candidate(self):
+        with self.assertRaises(c.AttaccaError) as raised:
+            self.apply(identity_mode="reuse", make_default=True)
+        message = str(raised.exception)
+        self.assertIn("ambiguous", message)
+        self.assertIn("--identity-actor", message)
+        self.assertIn(self.first, message)
+        self.assertIn(self.second, message)
+
+
+class GuidedSetupNoReusableIdentityTest(GuidedSetupIdentityRepairTest):
+    def test_reuse_without_a_visible_candidate_offers_identity_actor_first(self):
+        # Reuse candidates are filtered to this operator's own identities, so
+        # "none found" must not steer straight to a fresh permanent @Name:
+        # that would burn a server-unique name and can recreate the very
+        # duplicate the named-identity rules exist to prevent.
+        with self.assertRaises(c.AttaccaError) as raised:
+            self.apply(identity_mode="reuse", make_default=True)
+        message = str(raised.exception)
+        self.assertIn("visible to this operator", message)
+        self.assertIn("--identity-actor", message)
+        self.assertLess(message.index("--identity-actor"),
+                        message.index("--identity-mode new"))
+
+    def test_shell_setup_refuses_a_session_only_new_identity(self):
+        with self.assertRaisesRegex(
+                c.AttaccaError,
+                "session_only_new_identity_requires_current_mcp"):
+            self.apply(identity_mode="new", make_default=False)
+        # The refusal is scoped to the session-only choice, not to `new`.
+        created = self.apply(identity_mode="new", make_default=True)
+        self.assertEqual(created["actor"], "p1.director.codex.gibbs")
+
+    def test_shell_setup_refuses_a_temporary_identity(self):
+        with self.assertRaisesRegex(
+                c.AttaccaError,
+                "temporary_identity_requires_current_mcp"):
+            self.apply(identity_mode="temporary")
+
+
+class GuidedSetupStaleBindingRepairTest(GuidedSetupIdentityRepairTest):
+    def seed(self, conn):
+        self.legacy = "p1.director.codex.gibbs"
+        self.canonical = "p1.director.codex.turing"
+        self.register(conn, self.canonical)
+        # The hosted repair committed and recorded the immutable alias, but
+        # the client crashed before persisting the new canonical actor.
+        conn.execute(
+            "INSERT INTO actor_aliases"
+            " (project_id,legacy_actor_id,canonical_actor_id,migrated_at)"
+            " VALUES (?,?,?,?)",
+            (PROJECT, self.legacy, self.canonical, c.now_iso()))
+
+    def test_discovery_and_setup_heal_an_alias_resolved_binding(self):
+        c.machine_actor_binding_set(
+            self.server.base, PROJECT, "codex", self.legacy,
+            client_instance=self.client_instance, home=self.home)
+        discovery = c.discover_remote_setup(
+            self.server.base, path=str(self.checkout),
+            actor_id="jack.codex_director", actor_type="agent",
+            selected_project_id=PROJECT, home=self.home)
+        repair = discovery["network"]["machine_actor_binding_repair"]
+        self.assertTrue(repair["required"])
+        self.assertEqual(repair["stored_actor_id"], self.legacy)
+        self.assertEqual(repair["resolved_actor_id"], self.canonical)
+        self.assertEqual(discovery["network"]["current_actor"], self.canonical)
+
+        applied = self.apply(role="keep")
+        repaired = next(
+            action for action in applied["actions"]
+            if action["kind"] == "identity_binding_repaired")
+        self.assertEqual(repaired["actor_id"], self.canonical)
+        self.assertEqual(repaired["previous_actor_id"], self.legacy)
+        binding = c.machine_actor_binding_get(
+            self.server.base, PROJECT, "codex",
+            client_instance=self.client_instance, home=self.home)
+        self.assertEqual(
+            binding["actor_id"] if isinstance(binding, dict) else binding,
+            self.canonical)
+
+
+class GuidedSetupReuseUpgradesToRepairTest(GuidedSetupIdentityRepairTest):
+    def seed(self, conn):
+        self.duplicate = "p1.director.codex.gibbs"
+        self.register(conn, self.duplicate,
+                      registered_at="2026-06-01T00:00:00.000Z")
+        other = self.root / "other"
+        other.mkdir()
+        c.project_init(
+            conn, "setup", "human", path=str(other),
+            project_id="p2", name="Earlier workspace")
+        conn.execute(
+            "INSERT INTO agents"
+            " (project_id,agent_id,display_name,role,runtime,owner,"
+            " actor_type,registered_at,last_seen_at)"
+            " VALUES ('p2','p2.director.codex.gibbs','Earlier Gibbs',"
+            " 'director','codex',?, 'agent',"
+            " '2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')",
+            (self.OWNER,))
+        for project_id in ("p2", PROJECT):
+            c._seed_project_persona_reservations(
+                conn, project_id, force=True)
+
+    def test_reusing_a_flagged_duplicate_upgrades_to_repair(self):
+        c.machine_actor_binding_set(
+            self.server.base, PROJECT, "codex", self.duplicate,
+            client_instance=self.client_instance, home=self.home)
+        applied = self.apply(identity_mode="reuse")
+        self.assertEqual(applied["identity_mode"], "repair")
+        self.assertNotEqual(applied["actor"], self.duplicate)
+        parsed = c.parse_canonical_agent_id(applied["actor"], PROJECT)
+        self.assertEqual(parsed["role"], "director")
+        self.assertEqual(parsed["runtime"], "codex")
+        self.assertNotEqual(parsed["persona"], "gibbs")
+        binding = c.machine_actor_binding_get(
+            self.server.base, PROJECT, "codex",
+            client_instance=self.client_instance, home=self.home)
+        self.assertEqual(
+            binding["actor_id"] if isinstance(binding, dict) else binding,
+            applied["actor"])
 
 
 if __name__ == "__main__":

@@ -170,13 +170,17 @@ before the role question. Never render its raw actor ID.
 - If this AI is already the lead, recommend keeping it Director and Lead
   Director. Never silently change an existing role or lead.
 
-Label the authority difference clearly. Every registered role owns and may
-update only its own exact-identity handoff after reporting work; it can never
-overwrite another named identity's handoff. Advisor and Worker still cannot manage
-Project Rules, Cloud Context, or Role Scope. Humans and registered Directors
-manage the versioned Role Scope shared by each role; the selected Lead Director
-also receives the `lead_director` overlay. Handoff and Role Scope writes use
-their own optimistic versions and stale writes must reload and reconcile.
+Label the authority difference clearly. One project-wide handoff gives every AI
+the shared objective and current status; only a registered AI Director may
+update it. Every registered AI also owns and may update only its own exact-
+identity handoff after reporting work; it can never overwrite another named
+identity's handoff. Web and console humans remain attributed operators and do
+not own identity handoffs. Advisor and Worker still cannot manage Project
+Rules, Cloud Context, Role Scope, or the shared project handoff. Humans and
+registered Directors manage the versioned Role Scope shared by each role; the
+selected Lead Director also receives the `lead_director` overlay. Shared
+handoff, identity handoff, and Role Scope writes use independent optimistic
+versions and stale writes must reload and reconcile.
 
 ## 3. Choose this installation's AI identity
 
@@ -200,7 +204,7 @@ Offer these friendly choices:
    identity.
 2. For each other same-owner reusable identity, **Take over/reuse <Role> ·
    <Runtime> · <Name> (@<Name>)**. Explain in one short clause that simultaneous clients
-   reusing it intentionally share its handoff, inbox cursor, and task leases.
+   reusing it intentionally share its identity handoff, inbox cursor, and task leases.
    Label a three-part choice **Existing compatibility identity**, never with its
    raw actor ID.
 3. **Create permanent <next generated name> identity**. The server allocates and
@@ -301,11 +305,12 @@ the lifecycle startup hook. Inspect its result for server URL,
 `.attacca/project.json` is the portable, safe-to-commit workspace selection;
 any checkout `.mcp.json` is a machine/site-local endpoint that must be
 regenerated per machine. Then re-brief and verify through MCP with
-`get_handoff`, `role_scope_get`, `attacca_status`, `agent_list`, and
-`bridge_list`. `get_handoff` must identify the exact selected identity and its
-own handoff version; `role_scope_get` must return that identity's selected role
-background plus the Lead Director overlay when applicable. Role, identity,
-lead, and relationship choices may also have advanced project context.
+`get_handoff`, `get_identity_handoff`, `role_scope_get`, `attacca_status`,
+`agent_list`, and `bridge_list`. `get_handoff` must return the project-wide
+shared handoff, while `get_identity_handoff` must identify the exact selected
+registered AI and its own version; `role_scope_get` must return that identity's
+selected role background plus the Lead Director overlay when applicable. Role,
+identity, lead, and relationship choices may also have advanced project context.
 If the current MCP host cannot hot-reload the new connection, report the exact
 unverified checks and let its native reconnect mechanism run; never infer
 success from configuration files and never make restart the default recovery.

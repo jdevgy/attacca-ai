@@ -85,17 +85,32 @@ class ProjectExportTestCase(unittest.TestCase):
             requested_state="review")
 
         c.update_handoff(
-            self.conn, "p1", "owner", "human",
+            self.conn, "p1", "director", "agent",
             {"objective": "Create a portable export"})
         c.update_handoff(
-            self.conn, "p1", "owner", "human",
+            self.conn, "p1", "director", "agent",
             {"what_changed": "Added deterministic ZIP output"})
-        c.update_handoff(
+        c.update_identity_handoff(
             self.conn, "p1", "director", "agent",
             {"objective": "Direct the portable export"})
-        c.update_handoff(
+        c.update_identity_handoff(
             self.conn, "p1", "worker", "agent",
             {"objective": "Verify the portable export"})
+        # Preserve pre-upgrade human-owned exact rows as audit/export history.
+        # The operational API no longer creates or selects these rows.
+        self.conn.executemany(
+            "INSERT INTO identity_handoffs "
+            "(project_id,actor_id,version,content,updated_by,updated_owner,"
+            "updated_at,event_id,legacy_source_version) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            [
+                ("p1", "owner", 1,
+                 c.canonical_json({"objective": "Historical human state"}),
+                 "owner", "owner", "2026-08-23T00:00:00.000Z", None, None),
+                ("p1", "owner", 2,
+                 c.canonical_json({"what_changed": "Historical update"}),
+                 "owner", "owner", "2026-08-23T01:00:00.000Z", None, None),
+            ])
         c.role_scope_set(
             self.conn, "p1", "owner", "human", "director",
             "Directors preserve release and governance context.")
@@ -205,11 +220,17 @@ class ProjectExportTestCase(unittest.TestCase):
         self.assertEqual(
             [plan["version"] for plan in task["plan_revisions"]], [1, 2])
         self.assertIsInstance(task["plan_revisions"][1]["sections"], list)
-        self.assertEqual(first["handoffs"], [])
+        self.assertEqual(
+            [(row["version"], row["updated_by"])
+             for row in first["handoffs"]],
+            [(1, "director"), (2, "director")])
         self.assertEqual(first["legacy_handoffs"], first["handoffs"])
         self.assertEqual(
             first["manifest"]["compatibility"]["handoffs"]["kind"],
-            "retired_project_global_archive")
+            "shared_project_handoff_history")
+        self.assertEqual(
+            first["manifest"]["compatibility"]["handoffs"]
+            ["canonical_section"], "handoffs")
         self.assertEqual(len(first["identity_handoffs"]), 4)
         self.assertEqual(
             [(row["actor_id"], row["version"])
@@ -225,6 +246,7 @@ class ProjectExportTestCase(unittest.TestCase):
             [("director", 1), ("director", 2), ("worker", 1)])
         self.assertEqual(
             first["manifest"]["counts"]["identity_handoffs"], 4)
+        self.assertEqual(first["manifest"]["counts"]["handoffs"], 2)
         self.assertEqual(
             first["manifest"]["counts"]["role_scope_revisions"], 3)
         self.assertEqual(len(first["decisions"]), 1)
@@ -248,6 +270,21 @@ class ProjectExportTestCase(unittest.TestCase):
         self.assertIn("auth_tokens",
                       first["manifest"]["excluded_server_tables"])
         self.assertNotIn("auth_tokens", first)
+
+        # The current verifier continues to accept exports emitted while the
+        # same shared table carried the retired-archive compatibility marker.
+        older = copy.deepcopy(first)
+        older["manifest"]["compatibility"]["handoffs"] = {
+            "canonical_section": "legacy_handoffs",
+            "kind": "retired_project_global_archive",
+            "read_only": True,
+        }
+        older["manifest"]["compatibility"][
+            "agent_persona_reservations"].update({
+                "kind": "append_only_workspace_name_registry",
+                "import_policy": "insert_or_reject_conflict",
+            })
+        self.assertTrue(exporter.validate_project_export(older)["ok"])
 
     def test_json_and_zip_artifacts_are_exact_and_reproducible(self):
         project_export = self.build()

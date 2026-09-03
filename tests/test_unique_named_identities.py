@@ -161,6 +161,125 @@ class NamedIdentityTestCase(unittest.TestCase):
         }, {("engine", "gibbs"), ("target", "gibbs"),
             ("target", "turing")})
 
+    def test_earliest_use_keeps_the_name_not_the_oldest_workspace(self):
+        """The actor that used @Gibbs first keeps it on upgrade.
+
+        Workspace creation order is not evidence of who used a friendly name
+        first: a long-lived workspace may have adopted the name only after a
+        newer workspace was already using it.
+        """
+        # ``early`` is created after ``late`` but uses the name first.
+        for project_id, created_at in (("late", "2026-01-01T00:00:00.000Z"),
+                                       ("early", "2026-06-01T00:00:00.000Z")):
+            root = self.root / project_id
+            root.mkdir()
+            c.project_init(
+                self.conn, "setup", "human", path=str(root),
+                project_id=project_id, name=project_id.title())
+            self.conn.execute(
+                "UPDATE projects SET created_at=? WHERE project_id=?",
+                (created_at, project_id))
+        first_user = "early.director.codex.gibbs"
+        later_user = "late.director.codex.gibbs"
+        for project_id, actor, registered_at in (
+                ("early", first_user, "2026-02-01T00:00:00.000Z"),
+                ("late", later_user, "2026-03-01T00:00:00.000Z")):
+            self.conn.execute(
+                "INSERT INTO agents"
+                " (project_id,agent_id,display_name,role,runtime,owner,"
+                " actor_type,registered_at,last_seen_at)"
+                " VALUES (?,?,?, 'director','codex','jack','agent',?,?)",
+                (project_id, actor, actor, registered_at, registered_at))
+        for project_id in ("early", "late"):
+            c._seed_project_persona_reservations(
+                self.conn, project_id, force=True)
+
+        owners = c._persona_reservation_projects(self.conn, "gibbs")
+        self.assertEqual(owners[0]["reserved_actor_id"], first_user)
+        self.assertFalse(c.agent_persona_repair_status(
+            self.conn, "early", first_user)["repair_required"])
+        later_status = c.agent_persona_repair_status(
+            self.conn, "late", later_user)
+        self.assertTrue(later_status["repair_required"])
+        self.assertEqual(later_status["persona_name"], "Gibbs")
+        self.assertGreater(later_status["legacy_duplicate_count"], 1)
+
+    def test_same_workspace_duplicate_named_identity_also_requires_repair(self):
+        """Older releases could create two @Gibbs actors in one workspace."""
+        keeper = "engine.director.codex.gibbs"
+        duplicate = "engine.worker.codex.gibbs"
+        for actor, role, registered_at in (
+                (keeper, "director", "2026-01-01T00:00:00.000Z"),
+                (duplicate, "worker", "2026-02-01T00:00:00.000Z")):
+            self.conn.execute(
+                "INSERT INTO agents"
+                " (project_id,agent_id,display_name,role,runtime,owner,"
+                " actor_type,registered_at,last_seen_at)"
+                " VALUES ('engine',?,?,?, 'codex','jack','agent',?,?)",
+                (actor, actor, role, registered_at, registered_at))
+        c._seed_project_persona_reservations(self.conn, "engine", force=True)
+
+        owners = c._persona_reservation_projects(self.conn, "gibbs")
+        self.assertEqual(
+            {(item["project_id"], item["reserved_actor_id"])
+             for item in owners},
+            {("engine", keeper), ("engine", duplicate)})
+        # The repair keeper key is the exact (workspace, actor) pair, so a
+        # same-workspace duplicate is not silently treated as "already mine".
+        self.assertFalse(c.agent_persona_repair_status(
+            self.conn, "engine", keeper)["repair_required"])
+        self.assertTrue(c.agent_persona_repair_status(
+            self.conn, "engine", duplicate)["repair_required"])
+
+        repaired = c.select_setup_identity(
+            self.conn, "engine", "worker", "codex", mode="repair",
+            actor_id=duplicate, server_url="https://attacca.example",
+            client_instance="same-workspace-repair",
+            home=self.root / "same-workspace-home")
+        self.assertNotEqual(repaired["actor_id"], duplicate)
+        self.assertEqual(
+            c.parse_canonical_agent_id(
+                repaired["actor_id"], "engine")["persona"], "turing")
+        alias = self.conn.execute(
+            "SELECT canonical_actor_id FROM actor_aliases"
+            " WHERE project_id='engine' AND legacy_actor_id=?",
+            (duplicate,)).fetchone()
+        self.assertEqual(alias["canonical_actor_id"], repaired["actor_id"])
+        self.assertFalse(c.agent_persona_repair_status(
+            self.conn, "engine", keeper)["repair_required"])
+
+    def test_repair_status_reuses_one_reservation_scan_per_name(self):
+        """A directory read must not rescan whole-project history per row.
+
+        The historical scan is a creation/repair boundary tool; ordinary
+        panel/MCP agent pages inspect many actors at once and must reuse it.
+        """
+        calls = []
+        original = c._project_named_actor_history
+
+        def counted(conn, project_id):
+            calls.append(project_id)
+            return original(conn, project_id)
+
+        for index in range(6):
+            actor = "engine.worker.codex.%s" % c.AGENT_PERSONA_NAMES[index]
+            self.conn.execute(
+                "INSERT INTO agents"
+                " (project_id,agent_id,display_name,role,runtime,owner,"
+                " actor_type,registered_at,last_seen_at)"
+                " VALUES ('engine',?,?, 'worker','codex','jack','agent',"
+                " '2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')",
+                (actor, actor))
+        c._seed_project_persona_reservations(self.conn, "engine", force=True)
+        c._project_named_actor_history = counted
+        try:
+            listing = c.agent_list(self.conn, "engine", limit=60, options=True)
+        finally:
+            c._project_named_actor_history = original
+        self.assertEqual(listing["unfiltered_total"], 6)
+        # One scan per distinct friendly name, not one per listed actor.
+        self.assertLessEqual(len(calls), 6)
+
     def test_unicode_persona_input_and_post_marker_history_fail_closed(self):
         before = self.conn.execute(
             "SELECT COUNT(*) AS n FROM agents WHERE project_id='engine'"
