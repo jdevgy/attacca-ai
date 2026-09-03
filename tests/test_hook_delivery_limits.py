@@ -553,13 +553,30 @@ class WatcherNoLossDeliveryTestCase(unittest.TestCase):
         state = self.state()["subscriptions"][key]
         self.assertEqual(state["attention"], [])
         self.assertEqual(state["pending_disposition_total"], 1)
+        # Render-once (T-82/T-84): the first boundary carries the full row.
+        # Every later boundary keeps it pinned as ONE reminder line until
+        # the host clears it; the old behaviour re-dumped the body each turn.
+        first = hook._watcher_attention_notice(self.status, self.config)
+        self.assertIn("PENDING DISPOSITIONS (1 total · 1 new · 0 collapsed)",
+                      first["context"])
+        self.assertIn("- [DISPOSITION REQUIRED] Event assign-72",
+                      first["context"])
+        self.assertIn("ASSIGNMENT-MUST-STAY-PINNED", first["context"])
+        self.assertIn("message_dispose", first["context"])
         for _ in range(2):
             notice = hook._watcher_attention_notice(
                 self.status, self.config)
-            self.assertIn("PENDING DISPOSITIONS (1)", notice["context"])
-            self.assertIn("ASSIGNMENT-MUST-STAY-PINNED", notice["context"])
-            self.assertIn("Event assign-72", notice["context"])
+            self.assertIn(
+                "PENDING DISPOSITIONS (1 total · 0 new · 1 collapsed)",
+                notice["context"])
+            self.assertIn(
+                "- [PENDING · none] assign-72 · Room #72 · directive · "
+                "shared.director.claude: ASSIGNMENT-MUST-STAY-PINNED",
+                notice["context"])
+            self.assertNotIn("DISPOSITION REQUIRED", notice["context"])
             self.assertIn("message_dispose", notice["context"])
+        self.assertIn("assign-72",
+                      self.state()["subscriptions"][key]["rendered"])
 
         cleared = dict(
             current, pending_dispositions=[], pending_disposition_total=0)
@@ -769,6 +786,158 @@ class WatcherNoLossDeliveryTestCase(unittest.TestCase):
         self.assertEqual(delivered,
                          ["%03d" % index for index in range(1, 152)])
         self.assertEqual(all_context.count("🌍"), len(rows))
+
+    def _periodic_with_mocks(self, event_name, runtime="codex",
+                             hook_payload=None):
+        with mock.patch.dict(os.environ, {
+                "ATTACCA_RUNTIME": runtime}, clear=False), \
+             mock.patch.object(
+                hook, "_plugin_and_config",
+                return_value=(ROOT, self.config)), \
+             mock.patch.object(
+                hook, "_ensure_background_watcher",
+                return_value={"ok": True, "already_running": True}), \
+             mock.patch.object(
+                hook, "_watcher_refresh_inbox_attention",
+                side_effect=RuntimeError("HTTP 401 inbox rejected")), \
+             mock.patch.object(
+                hook, "_terminal_migration_notice", return_value=None), \
+             mock.patch.object(hook, "_update_offer", return_value={
+                 "system_message": "new release",
+                 "context": "UPDATE-NOTICE-HIDDEN-WHILE-401"}), \
+             mock.patch.object(hook, "_settings_interval", return_value=60), \
+             mock.patch.object(hook, "_mcp_snapshot") as snapshot, \
+             mock.patch.object(
+                hook, "_poll_entry",
+                return_value=({"key": "actor"},
+                              {"snapshot": {},
+                               "last_poll_at": hook.time.time()})):
+            output = hook._periodic_output(
+                self.status, event_name, offline_adapter=object(),
+                hook_payload=hook_payload)
+        snapshot.assert_not_called()
+        return output
+
+    def test_auth_latch_gates_prompt_and_stop_without_dropping_fifo(self):
+        key = hook._register_watcher_subscription(
+            self.status, ROOT, self.config, runtime="codex", now=0)
+        hook._watcher_stage_attention(key, [{
+            "event_id": "gate-mail-9", "seq": 9,
+            "actor": "peer.director.claude", "msg_type": "directive",
+            "body": "MAIL-BODY-HIDDEN-WHILE-401",
+            "directed_to_you": True, "addressed_to_you": True,
+            "broadcast_to_everyone": False, "group_context": False,
+            "origin_project": "peer",
+        }])
+        pinned = {
+            "messages": [], "read_cursor": 9, "may_have_more": False,
+            "pending_dispositions": [{
+                "event_id": "gate-assign-8", "seq": 8,
+                "actor": "shared.director.claude", "msg_type": "directive",
+                "body": "ASSIGNMENT-BODY-HIDDEN-WHILE-401",
+                "directed_to_you": True, "addressed_to_you": True,
+                "broadcast_to_everyone": False, "group_context": False,
+                "requires_disposition": True, "disposition": None,
+            }],
+            "pending_disposition_total": 1,
+            "pending_disposition_may_have_more": False,
+        }
+        with mock.patch.object(
+                hook, "_watcher_inbox_page", side_effect=[pinned, pinned]):
+            hook._watcher_refresh_inbox_attention(self.status, self.config)
+
+        def queue_delta(state):
+            state["subscriptions"][key]["pending"].append({
+                "fingerprint": "delta-1", "kind": "project_entity_delta",
+                "entity_key": "task:T-9",
+                "summary": "QUEUED-DELTA-MUST-SURVIVE-THE-GATE",
+                "created_at": "2026-09-02T00:00:00+00:00",
+            })
+        hook._mutate_state(hook._watcher_state_path(), queue_delta)
+        hook._watcher_queue_auth_required(
+            key, self.state()["subscriptions"][key],
+            hook.HostedAuthenticationRequired(
+                "revoked client-install key", http_status=401), 0)
+
+        hidden = (
+            "DISPOSITION REQUIRED", "PENDING DISPOSITIONS",
+            "ASSIGNMENT-BODY-HIDDEN-WHILE-401", "MAIL-BODY-HIDDEN-WHILE-401",
+            "QUEUED-DELTA-MUST-SURVIVE-THE-GATE", "INBOX CHECK FAILED",
+            "UPDATE-NOTICE-HIDDEN-WHILE-401", "SESSION LOOP",
+            "BACKGROUND WATCHER")
+        prompt = self._periodic_with_mocks("UserPromptSubmit")
+        context = prompt["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("ATTACCA AUTHENTICATION REQUIRED", context)
+        self.assertIn("/app", context)
+        for marker in hidden:
+            self.assertNotIn(marker, json.dumps(prompt))
+        # Stop blocks with the login text once per session, then stays quiet.
+        first_stop = self._periodic_with_mocks("Stop")
+        self.assertIsNone(first_stop)  # the prompt already surfaced it
+        def forget_surfaced(state):
+            state["subscriptions"][key].pop("auth_login_surfaced_at", None)
+        hook._mutate_state(hook._watcher_state_path(), forget_surfaced)
+        blocked = self._periodic_with_mocks("Stop")
+        self.assertEqual(blocked["decision"], "block")
+        self.assertIn("ATTACCA AUTHENTICATION REQUIRED", blocked["reason"])
+        for marker in hidden:
+            self.assertNotIn(marker, json.dumps(blocked))
+        self.assertIsNone(self._periodic_with_mocks("Stop"))
+        # No-loss: the gate withheld rendering only. The FIFO delta, the
+        # staged mail row, and the pinned disposition all survive unrendered.
+        entry = self.state()["subscriptions"][key]
+        self.assertIn("QUEUED-DELTA-MUST-SURVIVE-THE-GATE",
+                      json.dumps(entry["pending"]))
+        self.assertEqual([row["event_id"] for row in entry["attention"]],
+                         ["gate-mail-9"])
+        self.assertNotIn("delivered_at", entry["attention"][0])
+        self.assertEqual(entry["pending_disposition_total"], 1)
+        self.assertNotIn("rendered", entry)
+
+    def test_stop_is_quiet_once_pinned_rows_were_delivered(self):
+        key = hook._register_watcher_subscription(
+            self.status, ROOT, self.config, runtime="codex", now=0)
+        hook._watcher_stage_attention(key, [{
+            "event_id": "quiet-mail-3", "seq": 3,
+            "actor": "peer.director.claude", "msg_type": "chat",
+            "body": "QUIET-MAIL-BODY " + ("filler " * 60),
+            "directed_to_you": True, "addressed_to_you": True,
+            "broadcast_to_everyone": False, "group_context": False,
+        }])
+        with mock.patch.object(
+                hook, "_plugin_and_config",
+                return_value=(ROOT, self.config)), \
+             mock.patch.object(
+                hook, "_ensure_background_watcher",
+                return_value={"ok": True, "already_running": True}), \
+             mock.patch.object(
+                hook, "_watcher_refresh_inbox_attention",
+                return_value={"ok": True}), \
+             mock.patch.object(
+                hook, "_terminal_migration_notice", return_value=None), \
+             mock.patch.object(hook, "_update_offer", return_value=None), \
+             mock.patch.object(hook, "_settings_interval", return_value=60), \
+             mock.patch.object(
+                hook, "_poll_entry",
+                return_value=({"key": "actor"},
+                              {"snapshot": {},
+                               "last_poll_at": hook.time.time()})):
+            first_stop = hook._periodic_output(
+                self.status, "Stop", offline_adapter=object())
+            second_stop = hook._periodic_output(
+                self.status, "Stop", offline_adapter=object())
+            prompt = hook._periodic_output(
+                self.status, "UserPromptSubmit", offline_adapter=object())
+        self.assertEqual(first_stop["decision"], "block")
+        self.assertIn("QUIET-MAIL-BODY filler filler", first_stop["reason"])
+        self.assertIsNone(second_stop)
+        context = prompt["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(
+            "- [PENDING · none] quiet-mail-3 · Room #3 · chat · "
+            "peer.director.claude: QUIET-MAIL-BODY", context)
+        self.assertIn("room_read since_seq=2 for the full body", context)
+        # The 80-character excerpt survives; the multi-KB body does not.
+        self.assertNotIn("filler " * 20, context)
 
 
 if __name__ == "__main__":

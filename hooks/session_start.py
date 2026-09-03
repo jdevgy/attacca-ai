@@ -79,6 +79,13 @@ STARTUP_RULE_PAGE_SIZE = 60
 # snapshot closed instead of presenting a partial rules banner as complete.
 STARTUP_RULE_MAX_PAGES = 64
 WATCHER_ROOM_BODY_LIMIT = 600
+# Render-once budget: a pinned/staged row is injected in full exactly once
+# per session, then only as one reminder line. Rows the actor already
+# deferred/blocked/claimed are always compact. Collapsed reminders share
+# one small byte budget so 25 pinned rows cannot re-cost a full page.
+WATCHER_OPEN_DISPOSITIONS = frozenset({"deferred", "blocked", "claimed"})
+WATCHER_COLLAPSED_BODY_CHARACTERS = 80
+WATCHER_COLLAPSED_REMINDER_BYTES = 1_600
 
 # A watcher process keeps executing the Python code which was imported when it
 # started even if install.sh later atomically replaces the stable plugin tree.
@@ -2598,6 +2605,7 @@ def _watcher_install_sync_snapshot(key, entry, snapshot):
         current.pop("auth_required", None)
         current.pop("auth_required_at", None)
         current.pop("last_auth_error_fingerprint", None)
+        current.pop("auth_login_surfaced_at", None)
         current["pending"] = [
             row for row in current.get("pending") or []
             if row.get("kind") not in {
@@ -3056,11 +3064,140 @@ def _watcher_refresh_inbox_entry(key, entry, opener=None):
             "may_have_more": more}
 
 
-def _watcher_attention_notice(status, config, runtime=None, consume=True):
-    """Pin unresolved assignments and staged unread mail at every boundary."""
+def _watcher_rendered_key(row):
+    """Stable per-message key for the session render ledger."""
+    return str(row.get("event_id") or row.get("message_key") or "")
+
+
+def _watcher_body_sha256(body):
+    return hashlib.sha256(str(body or "").encode("utf-8")).hexdigest()
+
+
+def _watcher_disposition_state(row):
+    current = row.get("disposition")
+    state = current.get("disposition") if isinstance(current, dict) else None
+    state = str(state or "").strip().lower()
+    return state or None
+
+
+def _watcher_render_ledger(entry):
+    ledger = entry.get("rendered")
+    return ledger if isinstance(ledger, dict) else {}
+
+
+def _watcher_render_plan(ledger, rows, consume, rendered_at):
+    """Classify every selected row against the session render ledger.
+
+    ``full``      never delivered this session, or its disposition/body changed
+    ``compact``   never delivered (or changed) but already deferred/blocked/
+                  claimed by this actor, so only the one-line reminder is due
+    ``collapsed`` already delivered this session and unchanged since
+    """
+    plan = []
+    for row in rows:
+        key = _watcher_rendered_key(row)
+        state = _watcher_disposition_state(row)
+        digest = _watcher_body_sha256(row.get("body"))
+        previous = ledger.get(key) if key else None
+        unseen = not isinstance(previous, dict)
+        changed = not unseen and (
+            previous.get("disposition_state") != state or
+            previous.get("body_sha256") != digest)
+        if not (unseen or changed):
+            mode = "collapsed"
+        elif state in WATCHER_OPEN_DISPOSITIONS:
+            mode = "compact"
+        else:
+            mode = "full"
+        plan.append((row, mode, state))
+        if consume and key:
+            ledger[key] = {
+                "disposition_state": state,
+                "body_sha256": digest,
+                "rendered_at": rendered_at,
+            }
+    return plan
+
+
+def _watcher_prune_render_ledger(ledger, *row_lists):
+    """Forget rows the host no longer pins or stages; nothing else is dropped."""
+    live = set()
+    for rows in row_lists:
+        for row in rows or []:
+            key = _watcher_rendered_key(row)
+            if key:
+                live.add(key)
+    return {key: value for key, value in ledger.items() if key in live}
+
+
+def _watcher_collapsed_line(row, state, default_type, pointer):
+    """One reminder line for a row already delivered in full this session."""
+    body = " ".join(str(row.get("body") or "").split())
+    limit = WATCHER_COLLAPSED_BODY_CHARACTERS
+    cut = len(body) > limit
+    excerpt = body[:limit].rstrip() + "…" if cut else body
+    try:
+        seq = int(row.get("seq") or 0)
+    except (TypeError, ValueError):
+        seq = 0
+    line = "- [PENDING · %s] %s · Room #%s · %s · %s: %s" % (
+        state or "none",
+        row.get("event_id") or row.get("message_key") or "?",
+        row.get("seq") or "?", row.get("msg_type") or default_type,
+        row.get("actor") or "unknown", excerpt)
+    if pointer or cut:
+        line += " · room_read since_seq=%d for the full body" % max(
+            0, seq - 1)
+    return line
+
+
+def _watcher_reset_session_rendering(status, config, runtime=None):
+    """A fresh/resumed/compacted session must see every pinned row in full once.
+
+    SessionStart is the only boundary at which the model context is known to
+    be new. Clearing the render ledger (and the once-per-session login marker)
+    makes the next render complete without touching the durable FIFO or the
+    pinned disposition set.
+    """
+    try:
+        key = _watcher_subscription_key(status, config, runtime=runtime)
+        current = ((_read_state(_watcher_state_path()).get("subscriptions")
+                    or {}).get(key)) or {}
+    except Exception:
+        return False
+    if not any(field in current for field in (
+            "rendered", "auth_login_surfaced_at")):
+        return False
+
+    def mutate(state):
+        entry = (state.get("subscriptions") or {}).get(key)
+        if entry:
+            entry.pop("rendered", None)
+            entry.pop("auth_login_surfaced_at", None)
+
+    try:
+        _mutate_state(_watcher_state_path(), mutate)
+    except Exception:
+        return False
+    return True
+
+
+def _watcher_attention_notice(status, config, runtime=None, consume=True,
+                              new_only=False):
+    """Pin unresolved assignments and staged unread mail at every boundary.
+
+    Delivery is render-once per session: a row is injected in full the first
+    time this session sees it and afterwards collapses to one reminder line
+    until its disposition or body changes. The durable FIFO and the pinned
+    disposition set are never reduced here; only the rendering collapses.
+    Rows this actor already deferred, blocked, or claimed are always compact.
+    With ``new_only`` (the Stop boundary) only never-delivered rows are listed
+    and ``None`` is returned when there are none, so Stop stays quiet.
+    """
     key = _watcher_subscription_key(status, config, runtime=runtime)
     captured = {"rows": [], "remaining": 0, "dispositions": [],
-                "disposition_total": 0, "disposition_more": False}
+                "disposition_total": 0, "disposition_more": False,
+                "disposition_plan": [], "row_plan": []}
 
     def mutate(state):
         entry = (state.get("subscriptions") or {}).get(key)
@@ -3068,14 +3205,14 @@ def _watcher_attention_notice(status, config, runtime=None, consume=True):
             return
         # A row acknowledged by the hosted inbox and delivered on a previous
         # lifecycle boundary is complete. Failed acknowledgements deliberately
-        # repeat, even if a prior hook rendered them.
+        # repeat (compactly, after their first full render).
         pending = [row for row in (entry.get("attention") or [])
                    if not (row.get("acknowledged") and
                            row.get("delivered_at"))]
         entry["attention"] = pending
-        captured["dispositions"] = list(
-            entry.get("pending_dispositions") or [])[
-                :WATCHER_ATTENTION_PAGE_SIZE]
+        all_dispositions = list(entry.get("pending_dispositions") or [])
+        captured["dispositions"] = all_dispositions[
+            :WATCHER_ATTENTION_PAGE_SIZE]
         captured["disposition_total"] = max(
             len(captured["dispositions"]),
             int(entry.get("pending_disposition_total") or 0))
@@ -3091,53 +3228,72 @@ def _watcher_attention_notice(status, config, runtime=None, consume=True):
             if row.get("message_key") not in disposition_keys]
         captured["remaining"] = max(
             0, len(pending) - len(selected))
+        rendered_at = datetime.now(timezone.utc).isoformat()
+        ledger = _watcher_render_ledger(entry)
+        captured["disposition_plan"] = _watcher_render_plan(
+            ledger, captured["dispositions"], consume, rendered_at)
+        captured["row_plan"] = _watcher_render_plan(
+            ledger, captured["rows"], consume, rendered_at)
         if consume:
-            delivered_at = datetime.now(timezone.utc).isoformat()
+            entry["rendered"] = _watcher_prune_render_ledger(
+                ledger, all_dispositions, pending)
             for row in selected:
-                row["delivered_at"] = delivered_at
+                row["delivered_at"] = rendered_at
 
     if consume:
         _mutate_state(_watcher_state_path(), mutate)
     else:
         mutate(_read_state(_watcher_state_path()))
-    rows = captured["rows"]
-    dispositions = captured["dispositions"]
-    if not rows and not dispositions:
+    disposition_plan = captured["disposition_plan"]
+    row_plan = captured["row_plan"]
+    if not disposition_plan and not row_plan:
         return None
-    lines = [
-        "ATTACCA PENDING ASSIGNMENTS + UNREAD GROUP MAIL · %s" %
-        status["project_id"],
-        "ATTACCA AUTOMATIC UPDATE · group-mail check completed",
-        "Automatically checked by Attacca. Read and disposition messages "
-        "marked YOUR ATTENTION, EVERYONE, or BRIDGE before yielding; no user "
-        "needs to type ‘check messages’.",
-    ]
-    if dispositions:
-        lines.append(
-            "PENDING DISPOSITIONS (%d): these stay pinned even after the read "
-            "cursor advances. Handle each assignment, then record its outcome "
-            "with message_dispose; rendering alone does not clear it." %
-            captured["disposition_total"])
-    for row in dispositions:
-        current = row.get("disposition") or {}
-        state = current.get("disposition") if isinstance(current, dict) \
-            else None
-        body, _ = _head_tail_text(
-            row.get("body") or "", WATCHER_ROOM_BODY_LIMIT,
-            "call room_read with since_seq=%s for the complete message" %
+    fresh = [item for item in disposition_plan + row_plan
+             if item[1] == "full"]
+    if new_only and not fresh:
+        # Everything pinned/staged was already injected in full this session;
+        # repeating it as a Stop reason was the measured token flood.
+        return None
+    listed_modes = ("full", "compact") if new_only else (
+        "full", "compact", "collapsed")
+    reminder_budget = [WATCHER_COLLAPSED_REMINDER_BYTES]
+
+    def render(plan, full_line, default_type, pointer):
+        lines, omitted = [], 0
+        for row, mode, state in plan:
+            if mode not in listed_modes:
+                continue
+            if mode == "full":
+                lines.append(full_line(row, state))
+                continue
+            line = _watcher_collapsed_line(row, state, default_type, pointer)
+            if mode == "collapsed":
+                cost = len(line.encode("utf-8")) + 1
+                if cost > reminder_budget[0]:
+                    omitted += 1
+                    continue
+                reminder_budget[0] -= cost
+            lines.append(line)
+        return lines, omitted
+
+    def counts(plan):
+        new = sum(1 for item in plan if item[1] != "collapsed")
+        return new, len(plan) - new
+
+    def recovery(row):
+        return "call room_read with since_seq=%s for the complete message" % (
             max(0, int(row.get("seq") or 0) - 1))
-        lines.append(
-            "- [DISPOSITION REQUIRED%s] Event %s · Room #%s · %s · %s: %s" % (
-                " · current=%s" % state if state else "",
-                row.get("event_id") or row.get("message_key") or "?",
-                row.get("seq") or "?", row.get("msg_type") or "directive",
-                row.get("actor") or "unknown", body))
-    if captured["disposition_more"]:
-        lines.append(
-            "- %d additional pending disposition(s) exist on the host; call "
-            "check_inbox for the complete current assignment set." % max(
-                0, captured["disposition_total"] - len(dispositions)))
-    for row in rows:
+
+    def disposition_full(row, state):
+        body, _ = _head_tail_text(
+            row.get("body") or "", WATCHER_ROOM_BODY_LIMIT, recovery(row))
+        return "- [DISPOSITION REQUIRED%s] Event %s · Room #%s · %s · %s: %s" % (
+            " · current=%s" % state if state else "",
+            row.get("event_id") or row.get("message_key") or "?",
+            row.get("seq") or "?", row.get("msg_type") or "directive",
+            row.get("actor") or "unknown", body)
+
+    def mail_full(row, _state):
         labels = []
         if row.get("origin_project") or row.get("authority"):
             labels.append("BRIDGE")
@@ -3152,13 +3308,67 @@ def _watcher_attention_notice(status, config, runtime=None, consume=True):
         authority = " [%s]" % row["authority"] \
             if row.get("authority") else ""
         body, _ = _head_tail_text(
-            row.get("body") or "", WATCHER_ROOM_BODY_LIMIT,
-            "call room_read with since_seq=%s for the complete message" %
-            max(0, int(row.get("seq") or 0) - 1))
-        lines.append("- [%s] Room #%s%s%s · %s · %s: %s" % (
+            row.get("body") or "", WATCHER_ROOM_BODY_LIMIT, recovery(row))
+        return "- [%s] Room #%s%s%s · %s · %s: %s" % (
             "][".join(labels), row.get("seq") or "?", source, authority,
             row.get("msg_type") or "chat", row.get("actor") or "unknown",
-            body))
+            body)
+
+    lines = [
+        "ATTACCA PENDING ASSIGNMENTS + UNREAD GROUP MAIL · %s" %
+        status["project_id"],
+        "ATTACCA AUTOMATIC UPDATE · group-mail check completed",
+        "Automatically checked by Attacca. Read and disposition messages "
+        "marked YOUR ATTENTION, EVERYONE, or BRIDGE before yielding; no user "
+        "needs to type ‘check messages’.",
+    ]
+    if new_only:
+        lines.append(
+            "STOP DELTA: only rows never delivered in this session are "
+            "listed; earlier rows stay pinned in your context and in "
+            "check_inbox.")
+    disposition_new, disposition_collapsed = counts(disposition_plan)
+    if disposition_plan:
+        lines.append(
+            "PENDING DISPOSITIONS (%d total · %d new · %d collapsed): "
+            "these stay pinned even after the read cursor advances. Handle "
+            "each assignment, then record its outcome with message_dispose; "
+            "rendering alone does not clear it." % (
+                captured["disposition_total"], disposition_new,
+                disposition_collapsed))
+        if any(item[1] != "full" for item in disposition_plan):
+            lines.append(
+                "[PENDING · …] rows were already delivered in full this "
+                "session or carry your own deferred/blocked/claimed "
+                "disposition; they re-render in full only when their "
+                "disposition or body changes.")
+    rendered_dispositions, omitted_dispositions = render(
+        disposition_plan, disposition_full, "directive", pointer=False)
+    lines.extend(rendered_dispositions)
+    if omitted_dispositions:
+        lines.append(
+            "- %d more already-delivered pending disposition(s) fit only as "
+            "a count here; every id is unchanged — call check_inbox for "
+            "the complete current set." % omitted_dispositions)
+    if captured["disposition_more"]:
+        lines.append(
+            "- %d additional pending disposition(s) exist on the host; call "
+            "check_inbox for the complete current assignment set." % max(
+                0, captured["disposition_total"] -
+                len(captured["dispositions"])))
+    row_new, row_collapsed = counts(row_plan)
+    if row_plan:
+        lines.append(
+            "UNREAD GROUP MAIL (%d staged · %d new · %d collapsed)" % (
+                len(row_plan), row_new, row_collapsed))
+    rendered_rows, omitted_rows = render(
+        row_plan, mail_full, "chat", pointer=True)
+    lines.extend(rendered_rows)
+    if omitted_rows:
+        lines.append(
+            "- %d more already-delivered staged message(s) fit only as a "
+            "count here; they remain in the lossless FIFO — call "
+            "check_inbox or room_read for the complete set." % omitted_rows)
     if captured["remaining"]:
         lines.append(
             "- %d additional staged message(s) remain in lossless FIFO and "
@@ -3168,14 +3378,19 @@ def _watcher_attention_notice(status, config, runtime=None, consume=True):
         "These rows were durably staged before the hosted read cursor was "
         "acknowledged. A failed acknowledgement keeps them pinned and retries "
         "automatically.")
-    return {
-        "system_message": (
+    if new_only:
+        system_message = (
+            "Attacca assignments/mail · %d new pinned row(s) delivered at "
+            "Stop, %d already delivered" % (
+                len(fresh),
+                len(disposition_plan) + len(row_plan) - len(fresh)))
+    else:
+        system_message = (
             "Attacca assignments/mail · %d pending dispositions, %d unread "
             "shown, %d queued" % (
-                captured["disposition_total"], len(rows),
-                captured["remaining"])),
-        "context": "\n".join(lines),
-    }
+                captured["disposition_total"], len(row_plan),
+                captured["remaining"]))
+    return {"system_message": system_message, "context": "\n".join(lines)}
 
 
 def _watcher_entity_key(event):
@@ -3947,6 +4162,7 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
                 live.pop("auth_required", None)
                 live.pop("auth_required_at", None)
                 live.pop("last_auth_error_fingerprint", None)
+                live.pop("auth_login_surfaced_at", None)
                 live["pending"] = [
                     row for row in live.get("pending") or []
                     if row.get("kind") not in {
@@ -4205,6 +4421,13 @@ def _watcher_pending_notice(status, config, runtime=None, consume=True):
     return {"system_message": "Attacca background watcher · %d delivered, %d queued"
                               % (len(rows), captured["remaining"]),
             "context": context}
+
+
+def _watcher_consume_pending(status, config, preview):
+    """Consume the previewed FIFO rows only when they are delivered."""
+    if not preview:
+        return None
+    return _watcher_pending_notice(status, config)
 
 
 def _watcher_launch_fields_match(record, identity):
@@ -5926,6 +6149,46 @@ def _authentication_required_output(status, config, event_name, error):
         status["project_id"], context)
 
 
+def _watcher_mark_auth_login_surfaced(key):
+    """Remember that this session already received the login path once."""
+    if not key:
+        return
+
+    def mutate(state):
+        entry = (state.get("subscriptions") or {}).get(key)
+        if entry:
+            entry["auth_login_surfaced_at"] = datetime.now(
+                timezone.utc).isoformat()
+
+    try:
+        _mutate_state(_watcher_state_path(), mutate)
+    except Exception:
+        # The marker is an optimization; a read-only watcher directory must
+        # never hide the login path itself.
+        pass
+
+
+def _authentication_gate_output(status, config, event_name, error, key=None,
+                                entry=None):
+    """While the host rejects this credential, inject only the login path.
+
+    Pending FIFO deltas, pinned dispositions, staged mail, inbox-check,
+    session-loop, update, and watcher notices are withheld: none of them can be
+    acted on before the account/AI binding is repaired, and re-sending them on
+    every boundary was the measured token flood. SessionStart and
+    UserPromptSubmit carry the short login text; Stop blocks with it once per
+    session and is otherwise quiet.
+    """
+    surfaced = bool(isinstance(entry, dict) and
+                    entry.get("auth_login_surfaced_at"))
+    if event_name == "Stop" and surfaced:
+        return None
+    output = _authentication_required_output(
+        status, config, event_name, error)
+    _watcher_mark_auth_login_surfaced(key)
+    return output
+
+
 def _failure_output(status, config, event_name, err):
     label = "STARTUP" if event_name == "SessionStart" else "AUTOMATIC UPDATE"
     context = ("ATTACCA MCP %s CHECK FAILED for workspace '%s' at %s: %s. "
@@ -6176,6 +6439,9 @@ def _claude_stop_loop_notice(status, payload, interval):
 def _active_output(status, offline_adapter=None, offline_factory=None,
                    hook_payload=None):
     plugin_root, config = _plugin_and_config()
+    # startup/resume/clear/compact: the model context is new, so every
+    # pinned row is due in full exactly once more.
+    _watcher_reset_session_rendering(status, config)
     interval = DEFAULT_UPDATE_INTERVAL_SECONDS
     watcher_notice = None
     try:
@@ -6210,7 +6476,9 @@ def _active_output(status, offline_adapter=None, offline_factory=None,
         }
     claude_loop_notice = _claude_session_loop_notice(
         status, interval, payload=hook_payload)
-    pending_notice = _watcher_pending_notice(status, config)
+    # Peek only: the durable FIFO is consumed at delivery, so a boundary
+    # that ends in the authentication gate never drops queued deltas.
+    pending_preview = _watcher_pending_notice(status, config, consume=False)
     offline_key, offline_entry = _watcher_subscription_entry(status, config)
     inbox_check_notice = None
     try:
@@ -6223,8 +6491,6 @@ def _active_output(status, offline_adapter=None, offline_factory=None,
                 "mail remains pinned and the per-minute watcher will retry; "
                 "do not assume an empty inbox." % _trim(err, 240)),
         }
-    attention_notice = _watcher_attention_notice(
-        status, config, consume=False)
     terminal_notice = _terminal_migration_notice(
         status, config, "SessionStart", offline_entry)
     if offline_adapter is None:
@@ -6277,7 +6543,8 @@ handoff before further writes.
         # maintenance may prevent delivery of the authoritative shared state.
         # Deliver the durable watcher FIFO first so lower-priority update and
         # migration notices cannot consume its reserved context budget.
-        output = _append_notice(output, pending_notice)
+        output = _append_notice(
+            output, _watcher_consume_pending(status, config, pending_preview))
         output = _append_notice(
             output, _refresh_managed_laws(status, plugin_root, config=config))
         output = _append_notice(output, cloud_context_notice)
@@ -6299,7 +6566,9 @@ handoff before further writes.
         return _append_notices(
             output, "SessionStart",
             (update_notice, watcher_notice, claude_loop_notice,
-             terminal_notice, pending_notice, inbox_check_notice))
+             terminal_notice,
+             _watcher_consume_pending(status, config, pending_preview),
+             inbox_check_notice))
     except Exception as err:
         auth_blocked = _authentication_required_error(err) or bool(
             isinstance(offline_entry, dict) and
@@ -6311,29 +6580,26 @@ handoff before further writes.
                     "credential/AI scope repair is required")
             _watcher_queue_auth_required(
                 offline_key, offline_entry, auth_error, time.time())
-            output = _authentication_required_output(
-                status, config, "SessionStart", auth_error)
-            # A previously queued outage notice may say that verified cached
-            # work can continue. Once the reachable host rejects this identity,
-            # that stale notice is no longer safe to inject. The live snapshot
-            # after re-authentication will recover any durable project deltas.
-            trailing_notices = (update_notice, watcher_notice)
-        else:
-            attention_notice = _watcher_attention_notice(status, config)
-            output = _offline_failure_output(
-                status, config, "SessionStart", err, offline_adapter,
-                entry=offline_entry)
-            if output is None:
-                output = _failure_output(status, config, "SessionStart", err)
-            trailing_notices = (
-                pending_notice, update_notice, watcher_notice,
-                claude_loop_notice, terminal_notice, inbox_check_notice,
-                attention_notice)
-        if auth_blocked:
-            trailing_notices = trailing_notices + (claude_loop_notice,)
+            # Only the login path is injected. A previously queued outage
+            # notice may say that verified cached work can continue; once
+            # the reachable host rejects this identity that guidance, the
+            # pinned mail, update/watcher notices and the session-loop
+            # instruction are all withheld until the binding is repaired.
+            # The unconsumed FIFO delivers after re-authentication.
+            return _authentication_gate_output(
+                status, config, "SessionStart", auth_error,
+                key=offline_key, entry=offline_entry)
+        attention_notice = _watcher_attention_notice(status, config)
+        output = _offline_failure_output(
+            status, config, "SessionStart", err, offline_adapter,
+            entry=offline_entry)
+        if output is None:
+            output = _failure_output(status, config, "SessionStart", err)
         return _append_notices(
             output, "SessionStart",
-            trailing_notices)
+            (_watcher_consume_pending(status, config, pending_preview),
+             update_notice, watcher_notice, claude_loop_notice,
+             terminal_notice, inbox_check_notice, attention_notice))
 
 
 def _task_change_lines(previous_tasks, current_tasks):
@@ -6474,6 +6740,34 @@ def _change_summary(status, previous, current, snapshot, interval):
     return "\n".join(lines)
 
 
+def _deliver_periodic_notices(status, config, event_name, output,
+                              pending_preview, delta_notices, status_notices,
+                              include_attention=True):
+    """Assemble one periodic boundary without repeating delivered content.
+
+    The watcher FIFO is consumed only here, at delivery. Stop is a strict
+    new-delta boundary: it blocks only for consumed FIFO deltas, a genuine
+    change summary/failure output, one-shot notices, or pinned/staged rows
+    never delivered this session. Repeating status notices (watcher restart,
+    inbox-check retry, update, terminal) are prompt-turn context only, so a
+    Stop with nothing new returns None and the client stops quietly.
+    """
+    pending_notice = _watcher_consume_pending(status, config, pending_preview)
+    attention_notice = _watcher_attention_notice(
+        status, config, new_only=(event_name == "Stop")) \
+        if include_attention else None
+    if event_name == "Stop":
+        notices = (pending_notice,) + tuple(delta_notices) + (
+            attention_notice,)
+    else:
+        notices = (pending_notice,) + tuple(status_notices) + tuple(
+            delta_notices) + (attention_notice,)
+    # Append last: _insert_after_rules_banner places the newest notice
+    # directly after the mandatory rules, so pinned mail stays the first
+    # operational content at every supported turn boundary.
+    return _append_notices(output, event_name, notices)
+
+
 def _periodic_output(status, event_name, offline_adapter=None,
                      offline_factory=None, hook_payload=None):
     plugin_root, config = _plugin_and_config()
@@ -6501,13 +6795,47 @@ def _periodic_output(status, event_name, offline_adapter=None,
                         "This lifecycle boundary is using the direct-poll "
                         "fallback." % _trim(err, 240)),
         }
-    pending_notice = _watcher_pending_notice(status, config)
     offline_key, offline_entry = _watcher_subscription_entry(status, config)
-    _early_identity, early_poll_entry = _poll_entry(status, config)
+    identity, entry = _poll_entry(status, config)
     polling_disabled = bool(
         (offline_entry or {}).get("interval_seconds") == 0 or
-        (early_poll_entry or {}).get("interval_seconds") == 0)
+        (entry or {}).get("interval_seconds") == 0)
     interval = _settings_interval(config, entry=offline_entry)
+    # Kimi's native startup contract is a skill rather than a SessionStart
+    # command hook. Its first prompt boundary is therefore the reliable place
+    # to perform an unthrottled release check. Claude and Codex already check
+    # on SessionStart, so their background shared-state cadence stays quiet.
+    is_kimi_prompt = (_runtime_name() == "kimi" and
+                      event_name == "UserPromptSubmit")
+    # A healthy daemon is the primary periodic path and owns network polling.
+    # This boundary polls the host itself only as the direct-poll fallback
+    # (or on Kimi's first prompt), with polling on and the cadence due.
+    checked_at = time.time()
+    last_poll_at = entry.get("last_poll_at")
+    elapsed = checked_at - last_poll_at \
+        if isinstance(last_poll_at, (int, float)) else None
+    hook_polls = not (watcher_healthy and not is_kimi_prompt)
+    # Polling Off still allows Kimi's first native prompt to validate the link
+    # and refresh managed laws once; subsequent prompts remain off.
+    cadence_off = interval == 0 and not (is_kimi_prompt and not entry)
+    poll_due = hook_polls and not cadence_off and not (
+        elapsed is not None and 0 <= elapsed < interval)
+    auth_latched = bool(isinstance(offline_entry, dict) and
+                        offline_entry.get("auth_required"))
+    if auth_latched and not poll_due:
+        # The watcher proved a hosted 401/403 and owns the retry. No pinned
+        # mail, FIFO delta, inbox check, update, or loop instruction is
+        # injected until verified identity sync clears the latch. A due
+        # direct poll below may still find that the credential was repaired.
+        return _authentication_gate_output(
+            status, config, event_name,
+            HostedAuthenticationRequired(
+                offline_entry.get("last_error") or
+                "credential/AI scope repair is required"),
+            key=offline_key, entry=offline_entry)
+    # Peek only: the durable FIFO is consumed at delivery, never before an
+    # authentication rejection can withhold it.
+    pending_preview = _watcher_pending_notice(status, config, consume=False)
     claude_loop_notice = _claude_stop_loop_notice(
         status, hook_payload, interval) if event_name == "Stop" else None
     inbox_check_notice = None
@@ -6523,8 +6851,6 @@ def _periodic_output(status, event_name, offline_adapter=None,
                     "will retry; do not assume an empty inbox." %
                     _trim(err, 240)),
             }
-    attention_notice = _watcher_attention_notice(
-        status, config, consume=False)
     terminal_notice = _terminal_migration_notice(
         status, config, event_name, offline_entry)
     if offline_adapter is None:
@@ -6533,76 +6859,40 @@ def _periodic_output(status, event_name, offline_adapter=None,
                 offline_entry, factory=offline_factory)
         except Exception:
             offline_adapter = None
-    # Kimi's native startup contract is a skill rather than a SessionStart
-    # command hook. Its first prompt boundary is therefore the reliable place
-    # to perform an unthrottled release check. Claude and Codex already check
-    # on SessionStart, so their background shared-state cadence stays quiet.
-    is_kimi_prompt = (_runtime_name() == "kimi" and
-                      event_name == "UserPromptSubmit")
+    # Claude/Codex already checked this release on SessionStart. Their
+    # prompt/stop hooks stay focused on shared-state changes.
     update_notice = _update_offer(
         status, plugin_root, config,
         check_interval_seconds=UPDATE_CHECK_INTERVAL_SECONDS) \
         if is_kimi_prompt else None
-    # Claude/Codex already checked this release on SessionStart. Their
-    # prompt/stop hooks stay focused on shared-state changes.
-    if not is_kimi_prompt:
-        update_notice = None
-    notices = (pending_notice, watcher_notice, update_notice, terminal_notice,
-               inbox_check_notice, claude_loop_notice, attention_notice)
-    # A healthy daemon is the primary periodic path. Queued changes bypass the
-    # old hook throttle and are delivered immediately; otherwise this boundary
-    # stays quiet and leaves network polling to the autonomous watcher.
-    if watcher_healthy and not is_kimi_prompt:
-        # The healthy watcher owns network polling, but the mandatory
-        # Project Rules must still be re-pinned at the start of every
-        # response so they never fall out of a long conversation.
-        banner_output = None
-        # Rules are pinned SILENTLY at every UserPromptSubmit (additionalContext,
-        # never displayed). Re-pinning them on Stop would surface as a visible
-        # blocking-reason wall in the client chat, so Stop never emits the banner.
-        if event_name == "UserPromptSubmit":
-            _identity, _entry = _poll_entry(status, config)
-            _snap = (_entry or {}).get("snapshot") or {}
-            _rules_banner = _mandatory_rules_banner(
-                _snap.get("project_rules"),
-                pre_omitted=_snap.get("project_rules_omitted_count"),
-                pre_omitted_ids=_snap.get("project_rules_omitted_ids"))
-            if _rules_banner:
-                banner_output = _event_context_output(
-                    event_name,
-                    "Attacca \u00b7 mandatory project rules pinned",
-                    _rules_banner)
-        notices = notices[:-1] + (
-            _watcher_attention_notice(status, config),)
-        return _append_notices(banner_output, event_name, notices)
-    identity, entry = _poll_entry(status, config)
-    cached_rules_output = None
-    # Same rule as above: the banner is a UserPromptSubmit-only silent injection,
-    # never a Stop blocking-reason (which the client renders as a visible wall).
-    if event_name == "UserPromptSubmit":
+    status_notices = (watcher_notice, update_notice, terminal_notice,
+                      inbox_check_notice)
+
+    def deliver(output, delta_notices=(), include_attention=True):
+        return _deliver_periodic_notices(
+            status, config, event_name, output, pending_preview,
+            (claude_loop_notice,) + tuple(delta_notices), status_notices,
+            include_attention=include_attention)
+
+    # Rules are pinned SILENTLY at every UserPromptSubmit (additionalContext,
+    # never displayed). Re-pinning them on Stop would surface as a visible
+    # blocking-reason wall in the client chat, so Stop never emits the banner.
+    rules_output = None
+    if event_name == "UserPromptSubmit" and not poll_due:
         cached_poll = (entry or {}).get("snapshot") or {}
         cached_banner = _mandatory_rules_banner(
             cached_poll.get("project_rules"),
             pre_omitted=cached_poll.get("project_rules_omitted_count"),
             pre_omitted_ids=cached_poll.get("project_rules_omitted_ids"))
         if cached_banner:
-            cached_rules_output = _event_context_output(
-                event_name, "Attacca · mandatory project rules pinned",
+            rules_output = _event_context_output(
+                event_name, "Attacca \u00b7 mandatory project rules pinned",
                 cached_banner)
-    # Polling Off still allows Kimi's first native prompt to validate the link
-    # and refresh managed laws once; subsequent prompts remain off.
-    if interval == 0 and not (is_kimi_prompt and not entry):
-        notices = notices[:-1] + (
-            _watcher_attention_notice(status, config),)
-        return _append_notices(cached_rules_output, event_name, notices)
-    checked_at = time.time()
-    last_poll_at = entry.get("last_poll_at")
-    elapsed = checked_at - last_poll_at \
-        if isinstance(last_poll_at, (int, float)) else None
-    if elapsed is not None and 0 <= elapsed < interval:
-        notices = notices[:-1] + (
-            _watcher_attention_notice(status, config),)
-        return _append_notices(cached_rules_output, event_name, notices)
+    if not poll_due:
+        # Queued changes bypass the old hook throttle and are delivered
+        # immediately; otherwise this boundary stays quiet and leaves network
+        # polling to the autonomous watcher.
+        return deliver(rules_output)
     try:
         snapshot = _mcp_snapshot(status, plugin_root, config)
         _watcher_activate_after_mcp(status, config, snapshot)
@@ -6613,46 +6903,38 @@ def _periodic_output(status, event_name, offline_adapter=None,
         law_notice = _refresh_managed_laws(
             status, plugin_root, config=config) \
             if is_kimi_prompt else None
-        notices = (law_notice, cloud_context_notice, update_notice,
-                   terminal_notice,
-                   inbox_check_notice,
-                   _watcher_attention_notice(status, config))
         current = _poll_view(snapshot)
         previous = entry.get("snapshot") if entry else None
         _record_poll(status, identity, interval, checked_at, current)
-        rules_output = None
         if event_name == "UserPromptSubmit":
             rules_banner = _mandatory_rules_banner(
                 (snapshot.get("rules") or {}).get("rules"))
             if rules_banner:
                 rules_output = _event_context_output(
                     event_name,
-                    "Attacca · mandatory project rules pinned",
+                    "Attacca \u00b7 mandatory project rules pinned",
                     rules_banner)
         summary = _change_summary(status, previous, current, snapshot, interval)
         # On Stop we deliver only a genuine change summary (short), never the
         # rules banner — that stays a UserPromptSubmit-only silent injection so
         # the client chat is not flooded with a re-pinned wall every turn.
         if not summary:
-            return _append_notices(rules_output, event_name, notices)
+            return deliver(rules_output, (law_notice, cloud_context_notice))
         if rules_output:
             output = _append_notice(rules_output, {
-                "system_message": "Attacca update · shared project state changed",
+                "system_message": "Attacca update \u00b7 shared project state changed",
                 "context": summary,
             })
         else:
             output = _event_context_output(
                 event_name,
-                "Attacca update · shared project state changed", summary)
-        return _append_notices(output, event_name, notices)
+                "Attacca update \u00b7 shared project state changed", summary)
+        return deliver(output, (law_notice, cloud_context_notice))
     except StaleProjectLink as err:
         set_offered(status["root"], stale_project_id=status["project_id"])
         output = _hook_output(status, recovery_reason=str(err),
                               event_name=event_name)
-        return _append_notices(
-            output, event_name,
-            tuple(notice for notice in notices
-                  if notice is not attention_notice))
+        return deliver(output, include_attention=False)
     except Exception as err:
         _record_poll(status, identity, interval, checked_at,
                      entry.get("snapshot") if entry else {})
@@ -6666,20 +6948,19 @@ def _periodic_output(status, event_name, offline_adapter=None,
                     "credential/AI scope repair is required")
             _watcher_queue_auth_required(
                 offline_key, offline_entry, auth_error, time.time())
-            output = _authentication_required_output(
-                status, config, event_name, auth_error)
-            # Never mix a stale queued outage-continuity notice into an auth or
-            # authority rejection. The reachable host has revoked cached use.
-            notices = (watcher_notice, update_notice)
-        else:
-            notices = notices[:-1] + (
-                _watcher_attention_notice(status, config),)
-            output = _offline_failure_output(
-                status, config, event_name, err, offline_adapter,
-                entry=offline_entry)
-            if output is None:
-                output = _failure_output(status, config, event_name, err)
-        return _append_notices(output, event_name, notices)
+            # Never mix a stale queued outage-continuity notice, pinned mail,
+            # or watcher/update chatter into an auth or authority rejection.
+            # The reachable host has revoked cached use; the unconsumed FIFO
+            # delivers after re-authentication.
+            return _authentication_gate_output(
+                status, config, event_name, auth_error,
+                key=offline_key, entry=offline_entry)
+        output = _offline_failure_output(
+            status, config, event_name, err, offline_adapter,
+            entry=offline_entry)
+        if output is None:
+            output = _failure_output(status, config, event_name, err)
+        return deliver(output)
 
 
 def main(argv=None):
