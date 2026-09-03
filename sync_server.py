@@ -37,6 +37,7 @@ except (ImportError, ValueError):  # Direct module loading in isolated tests.
 
 
 JOURNAL_SCHEMA_VERSION = 1
+MAX_RECEIPT_LOOKUP_IDS = 100
 
 _RESERVED_ATTRIBUTION_KEYS = {
     "actor_id", "actor_type", "authenticated_scope", "attribution",
@@ -257,6 +258,46 @@ class SyncServerEngine:
               client_sequence
             )
         """)
+        # Live hosted writes carry the very same client_mutation_id but no
+        # queued schema-v1 envelope, so they keep their own partition of the
+        # receipt store.  Mixing them into ``sync_operations`` would collide
+        # on that table's primary key and break its client-mutation
+        # validation; a separate table keeps replay and live idempotency
+        # independently verifiable.
+        self.connection.execute("""
+            CREATE TABLE IF NOT EXISTS sync_live_operations (
+              schema_version INTEGER NOT NULL,
+              project_id TEXT NOT NULL,
+              principal_id TEXT NOT NULL,
+              actor_id TEXT NOT NULL,
+              device_id TEXT NOT NULL,
+              client_mutation_id TEXT NOT NULL,
+              tool TEXT NOT NULL,
+              request_sha256 TEXT NOT NULL,
+              state TEXT NOT NULL CHECK (
+                state IN ('reserved', 'applied', 'failed')
+              ),
+              receipt_json TEXT,
+              created_at TEXT NOT NULL,
+              committed_at TEXT,
+              PRIMARY KEY (
+                project_id, principal_id, actor_id, device_id,
+                client_mutation_id
+              )
+            )
+        """)
+        live_required = {
+            "schema_version", "project_id", "principal_id", "actor_id",
+            "device_id", "client_mutation_id", "tool", "request_sha256",
+            "state", "receipt_json", "created_at", "committed_at",
+        }
+        live_columns = {
+            row[1] for row in self.connection.execute(
+                "PRAGMA table_info(sync_live_operations)").fetchall()
+        }
+        if not live_required <= live_columns:
+            raise SyncServerStateError(
+                "sync_live_operations table has an incompatible schema")
 
     @contextmanager
     def _sqlite_savepoint(self):
@@ -795,6 +836,215 @@ class SyncServerEngine:
             return protocol.make_push_result(
                 scope, final_fingerprint, results, final_head)
 
+    # -- live hosted write idempotency ------------------------------------
+
+    @staticmethod
+    def _live_key(scope, device_id, mutation_id):
+        return (
+            scope["project_id"], scope["principal_id"], scope["actor_id"],
+            device_id, mutation_id,
+        )
+
+    def _live_row(self, scope, device_id, mutation_id):
+        cursor = self.connection.execute("""
+            SELECT * FROM sync_live_operations
+            WHERE project_id=? AND principal_id=? AND actor_id=?
+              AND device_id=? AND client_mutation_id=?
+        """, self._live_key(scope, device_id, mutation_id))
+        return _row_dict(cursor, cursor.fetchone())
+
+    def _live_receipt_from_row(self, row, scope):
+        """Return one validated receipt for a live row in any state."""
+        if row is None:
+            return None
+        if row.get("state") == "applied":
+            if not row.get("receipt_json"):
+                raise SyncServerStateError(
+                    "applied live operation has no stored receipt")
+            try:
+                receipt = protocol.validate_live_receipt(
+                    json.loads(row["receipt_json"]), expected_scope=scope)
+            except (TypeError, ValueError, json.JSONDecodeError,
+                    protocol.SyncProtocolError) as error:
+                raise SyncServerStateError(
+                    "sync journal contains an invalid live receipt") from error
+            if receipt["client_mutation_id"] != row["client_mutation_id"] \
+                    or receipt["request_sha256"] != row["request_sha256"]:
+                raise SyncServerStateError(
+                    "live journal row and receipt disagree")
+            return receipt
+        # ``reserved`` is deliberately reported, never hidden: a client must
+        # be able to distinguish "no record at all" (safe to replay) from
+        # "this server started the write and never finished recording it".
+        return protocol.make_live_receipt(
+            scope, row["client_mutation_id"], row["tool"],
+            row["request_sha256"],
+            status="failed" if row.get("state") == "failed" else "reserved",
+            recorded_at=row.get("committed_at") or row["created_at"])
+
+    def live_reserve(self, authenticated_scope, device_id, mutation_id, tool,
+                     request_sha256):
+        """Claim one live write id, or report the recorded prior outcome.
+
+        Returns ``{'status': 'reserved'}`` when the caller owns the attempt,
+        ``duplicate`` with the stored receipt when the identical body already
+        applied, ``in_progress`` when a concurrent attempt holds the id, and
+        ``conflict`` when the same id already named a different body.
+        """
+        scope = self._trusted_scope(authenticated_scope)
+        self._require_authorized(scope, "sync.push")
+        device_id = _wire_identifier("device_id", device_id)
+        mutation_id = _wire_identifier("client_mutation_id", mutation_id)
+        if not protocol.is_client_mutation_id(mutation_id):
+            raise SyncServerStateError("client_mutation_id is unsafe")
+        with self._lock:
+            with self._transaction(write=True):
+                row = self._live_row(scope, device_id, mutation_id)
+                if row is not None:
+                    if row["request_sha256"] != request_sha256:
+                        return {"status": "conflict", "receipt": None,
+                                "reason": "client_mutation_id was already "
+                                          "used for a different request"}
+                    if row["state"] == "applied":
+                        return {
+                            "status": "duplicate",
+                            "receipt": self._live_receipt_from_row(row, scope),
+                        }
+                    if row["state"] == "reserved":
+                        return {
+                            "status": "in_progress",
+                            "receipt": self._live_receipt_from_row(row, scope),
+                        }
+                    # A previously failed attempt may be retried under the
+                    # same id: nothing was applied.
+                    self.connection.execute("""
+                        UPDATE sync_live_operations
+                        SET state='reserved', receipt_json=NULL,
+                            created_at=?, committed_at=NULL
+                        WHERE project_id=? AND principal_id=? AND actor_id=?
+                          AND device_id=? AND client_mutation_id=?
+                    """, (protocol.utc_now(),
+                          *self._live_key(scope, device_id, mutation_id)))
+                    return {"status": "reserved", "receipt": None}
+                self.connection.execute("""
+                    INSERT INTO sync_live_operations (
+                      schema_version, project_id, principal_id, actor_id,
+                      device_id, client_mutation_id, tool, request_sha256,
+                      state, receipt_json, created_at, committed_at
+                    ) VALUES (?,?,?,?,?,?,?,?, 'reserved', NULL, ?, NULL)
+                """, (
+                    JOURNAL_SCHEMA_VERSION, scope["project_id"],
+                    scope["principal_id"], scope["actor_id"], device_id,
+                    mutation_id, str(tool), str(request_sha256),
+                    protocol.utc_now(),
+                ))
+                return {"status": "reserved", "receipt": None}
+
+    def live_commit(self, authenticated_scope, device_id, mutation_id, tool,
+                    request_sha256, *, canonical_event_id,
+                    canonical_event_seq, server_cursor, result=None):
+        """Record the durable receipt for one applied live hosted write."""
+        scope = self._trusted_scope(authenticated_scope)
+        self._require_authorized(scope, "sync.push")
+        device_id = _wire_identifier("device_id", device_id)
+        mutation_id = _wire_identifier("client_mutation_id", mutation_id)
+        receipt = protocol.make_live_receipt(
+            scope, mutation_id, tool, request_sha256, status="applied",
+            canonical_event_id=canonical_event_id,
+            canonical_event_seq=canonical_event_seq,
+            server_cursor=server_cursor, result=result)
+        with self._lock:
+            with self._transaction(write=True):
+                updated = self.connection.execute("""
+                    UPDATE sync_live_operations
+                    SET state='applied', receipt_json=?, committed_at=?
+                    WHERE project_id=? AND principal_id=? AND actor_id=?
+                      AND device_id=? AND client_mutation_id=?
+                      AND state='reserved' AND request_sha256=?
+                """, (
+                    protocol.canonical_json_bytes(receipt).decode("utf-8"),
+                    protocol.utc_now(),
+                    *self._live_key(scope, device_id, mutation_id),
+                    str(request_sha256),
+                )).rowcount
+                if updated != 1:
+                    raise SyncServerStateError(
+                        "live reservation disappeared before its receipt")
+        return receipt
+
+    def live_fail(self, authenticated_scope, device_id, mutation_id):
+        """Release one reservation whose operation provably did not apply."""
+        scope = self._trusted_scope(authenticated_scope)
+        self._require_authorized(scope, "sync.push")
+        device_id = _wire_identifier("device_id", device_id)
+        mutation_id = _wire_identifier("client_mutation_id", mutation_id)
+        with self._lock:
+            with self._transaction(write=True):
+                self.connection.execute("""
+                    UPDATE sync_live_operations
+                    SET state='failed', receipt_json=NULL, committed_at=?
+                    WHERE project_id=? AND principal_id=? AND actor_id=?
+                      AND device_id=? AND client_mutation_id=?
+                      AND state='reserved'
+                """, (protocol.utc_now(),
+                      *self._live_key(scope, device_id, mutation_id)))
+        return True
+
+    def _outbox_receipt_as_live(self, scope, device_id, mutation_id):
+        """Present one queued-mutation receipt in the shared receipt shape."""
+        row = self._journal_row(scope, device_id, mutation_id)
+        if row is None:
+            return None
+        try:
+            mutation = protocol.validate_client_mutation(
+                json.loads(row["mutation_json"]), expected_scope=scope)
+        except (TypeError, ValueError, json.JSONDecodeError,
+                protocol.SyncProtocolError) as error:
+            raise SyncServerStateError(
+                "sync journal contains an invalid stored mutation") from error
+        if row.get("state") != "applied" or not row.get("receipt_json"):
+            return protocol.make_live_receipt(
+                scope, mutation_id, mutation["operation"],
+                mutation["request_sha256"], status="reserved",
+                recorded_at=row["created_at"])
+        receipt = self._receipt_from_row(row, scope)
+        applied = receipt["applied"]
+        mapping = applied.get("result") or {}
+        return protocol.make_live_receipt(
+            scope, mutation_id, mutation["operation"],
+            receipt["request_sha256"], status="applied",
+            canonical_event_id=mapping.get("canonical_event_id"),
+            canonical_event_seq=mapping.get("canonical_event_seq"),
+            server_cursor=applied.get("server_cursor"),
+            result=None, recorded_at=receipt["stored_at"])
+
+    def receipts(self, authenticated_scope, device_id, mutation_ids):
+        """Return ``{id: receipt or None}`` for this exact device/principal."""
+        scope = self._trusted_scope(authenticated_scope)
+        self._require_authorized(scope, "sync.receipt.read")
+        device_id = _wire_identifier("device_id", device_id)
+        wanted = []
+        for item in mutation_ids or []:
+            item = _wire_identifier("client_mutation_id", item)
+            if not protocol.is_client_mutation_id(item):
+                raise SyncServerStateError("client_mutation_id is unsafe")
+            if item not in wanted:
+                wanted.append(item)
+        if len(wanted) > MAX_RECEIPT_LOOKUP_IDS:
+            raise SyncServerStateError(
+                "receipt lookup accepts at most %d ids"
+                % MAX_RECEIPT_LOOKUP_IDS)
+        answer = {}
+        with self._lock:
+            for item in wanted:
+                receipt = self._live_receipt_from_row(
+                    self._live_row(scope, device_id, item), scope)
+                if receipt is None:
+                    receipt = self._outbox_receipt_as_live(
+                        scope, device_id, item)
+                answer[item] = receipt
+        return answer
+
     def journal_receipt(self, authenticated_scope, device_id, mutation_id):
         """Read one scoped receipt for diagnostics without cross-scope lookup."""
         scope = self._trusted_scope(authenticated_scope)
@@ -807,7 +1057,7 @@ class SyncServerEngine:
 
 
 __all__ = [
-    "JOURNAL_SCHEMA_VERSION", "SyncServerError",
+    "JOURNAL_SCHEMA_VERSION", "MAX_RECEIPT_LOOKUP_IDS", "SyncServerError",
     "SyncServerAuthorizationError", "SyncServerStateError",
     "MutationConflict", "MutationRejected", "ApplyRequest",
     "SyncServerAdapters", "SyncServerEngine",

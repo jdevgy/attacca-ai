@@ -484,5 +484,170 @@ class OfflineCapabilityTests(unittest.TestCase):
                 remote.applied_ids.count(item["client_mutation_id"]), 1)
 
 
+class CompatibilityLiveReceiptScopeTests(unittest.TestCase):
+    """Live write receipts stay inside one transitional principal/device.
+
+    Compatibility mode has no authenticated human, so the sync resolver
+    derives a narrow transitional principal from the exact registered actor
+    owner or the legacy device.  A receipt stored under one such principal
+    must never answer another one's "did my write land?" question.
+    """
+
+    def setUp(self):
+        import threading
+        import urllib.error
+        import urllib.request
+
+        import attacca as core
+        self.core = core
+        self.urlreq = urllib.request
+        self.urlerr = urllib.error
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        root = Path(self.temporary.name)
+        self.db = root / "compatibility.db"
+        checkout = root / "checkout"
+        checkout.mkdir()
+        conn = core.connect(self.db)
+        try:
+            core.set_current_owner("ownera")
+            core.project_init(conn, "ownera", "human", path=checkout,
+                              project_id="p", name="Compatibility")
+            core.agent_register(
+                conn, "p", "ownera", "human", agent_id="p.director.codex",
+                role="director", runtime="codex")
+            core.set_current_owner("ownerb")
+            core.agent_register(
+                conn, "p", "ownerb", "human", agent_id="p.worker.claude",
+                role="worker", runtime="claude")
+            self.assertTrue(core.auth_compatibility_active(
+                conn, type("Server", (), {"auth_mode": "auto"})()))
+        finally:
+            conn.close()
+        self.server = core.AttaccaServer(("127.0.0.1", 0), self.db)
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = "http://127.0.0.1:%d" % self.server.server_address[1]
+        self.addCleanup(self._stop)
+
+    def _stop(self):
+        self.server.shutdown()
+        self.thread.join(timeout=10)
+        self.server.server_close()
+
+    def _headers(self, actor="p.director.codex", device="device_legacy"):
+        return {
+            "X-Attacca-Project": "p",
+            "X-Attacca-Actor": actor,
+            "X-Attacca-Actor-Type": "agent",
+            "X-Attacca-Device-ID": device,
+        }
+
+    def _request(self, method, path, body=None, headers=None):
+        merged = {"Accept": "application/json"}
+        merged.update(headers or {})
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            merged["Content-Type"] = "application/json"
+        request = self.urlreq.Request(
+            self.base + path, data=data, headers=merged, method=method)
+        try:
+            with self.urlreq.urlopen(request, timeout=10) as response:
+                raw = response.read()
+                return (response.status, json.loads(raw) if raw else None,
+                        dict(response.headers))
+        except self.urlerr.HTTPError as error:
+            raw = error.read()
+            return (error.code, json.loads(raw) if raw else None,
+                    dict(error.headers))
+
+    def _live_write(self, mutation_id, actor="p.director.codex",
+                    device="device_legacy", body="compatibility probe"):
+        status, _, headers = self._request(
+            "POST", "/mcp", {
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18",
+                           "capabilities": {},
+                           "clientInfo": {"name": "compat", "version": "1"}},
+            }, self._headers(actor, device))
+        self.assertEqual(status, 200)
+        session = dict(self._headers(actor, device))
+        session["Mcp-Session-Id"] = headers.get("Mcp-Session-Id")
+        status, value, _ = self._request(
+            "POST", "/mcp", {
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "room_send", "arguments": {
+                    "body": body,
+                    "_attacca_client_mutation_id": mutation_id,
+                }},
+            }, session)
+        self.assertEqual(status, 200)
+        result = value["result"]
+        self.assertFalse(result.get("isError"), result)
+        return json.loads(result["content"][0]["text"])
+
+    def test_live_receipts_are_scoped_to_the_transitional_principal(self):
+        mutation_id = protocol.new_client_mutation_id(
+            "compat_client", "device_legacy")
+        answer = self._live_write(mutation_id)
+        receipt = answer["_attacca_receipt"]
+        self.assertEqual(receipt["status"], "applied")
+        self.assertEqual(receipt["client_mutation_id"], mutation_id)
+
+        status, value, _ = self._request(
+            "GET", "/v1/projects/p/sync/receipts?ids=" + mutation_id,
+            headers=self._headers())
+        self.assertEqual(status, 200)
+        # The transitional principal is the exact registered actor owner,
+        # never an authenticated account and never a shared anonymous one.
+        self.assertEqual(value["scope"]["principal_id"], "ownera")
+        self.assertEqual(value["scope"]["actor_id"], "p.director.codex")
+        stored = value["receipts"][mutation_id]
+        self.assertEqual(stored["status"], "applied")
+        self.assertEqual(stored["request_sha256"], receipt["request_sha256"])
+        protocol.validate_live_receipt(stored, expected_scope=value["scope"])
+
+        # Another device on the same transitional principal is a different
+        # outbox partition and must not read this receipt.
+        status, other, _ = self._request(
+            "GET", "/v1/projects/p/sync/receipts?ids=" + mutation_id,
+            headers=self._headers(device="other_device"))
+        self.assertEqual(status, 200)
+        self.assertIsNone(other["receipts"][mutation_id])
+
+        # A different registered actor resolves a different transitional
+        # principal and also sees nothing.
+        status, foreign, _ = self._request(
+            "GET", "/v1/projects/p/sync/receipts?ids=" + mutation_id,
+            headers=self._headers(actor="p.worker.claude"))
+        self.assertEqual(status, 200)
+        self.assertEqual(foreign["scope"]["principal_id"], "ownerb")
+        self.assertIsNone(foreign["receipts"][mutation_id])
+
+        # The idempotency itself still holds inside the owning scope.
+        repeat = self._live_write(mutation_id)
+        self.assertTrue(repeat.get("duplicate"))
+        conn = self.core.connect(self.db)
+        try:
+            bodies = [json.loads(row["payload"]).get("body") for row in
+                      conn.execute(
+                          "SELECT payload FROM events WHERE project_id='p'"
+                          " AND event_type='room.message'").fetchall()]
+        finally:
+            conn.close()
+        self.assertEqual(bodies.count("compatibility probe"), 1)
+
+    def test_unregistered_actor_cannot_read_or_store_receipts(self):
+        mutation_id = protocol.new_client_mutation_id(
+            "compat_client", "device_legacy")
+        self._live_write(mutation_id)
+        status, value, _ = self._request(
+            "GET", "/v1/projects/p/sync/receipts?ids=" + mutation_id,
+            headers=self._headers(actor="p.director.stranger"))
+        self.assertIn(status, (401, 403), value)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1047,11 +1047,28 @@ class OfflineConnectProxyBlackBoxTests(unittest.TestCase):
             elapsed = time.monotonic() - started
             self.assertTrue(accepted.is_set(), "server never accepted mutation")
             self.assertLess(elapsed, 1.5, error)
-            self.assertIn("ambiguous", error.lower())
-            self.assertIn("not queued", error.lower())
+            lowered = error.lower()
+            self.assertIn("ambiguous", lowered)
+            self.assertIn("recorded", lowered)
+            self.assertIn("ambiguous_pending_reconcile", lowered)
+            self.assertNotIn("not queued", lowered)
             self._stop_process(process)
             process = None
+            # An ambiguous outcome is never a queued mutation: it must not be
+            # replayed until hosted receipts say what actually happened.
             self.assertEqual(self.primary["engine"].pending_mutations(), [])
+            ambiguous = self.primary["engine"].ambiguous_records()
+            self.assertEqual(len(ambiguous), 1, ambiguous)
+            self.assertEqual(ambiguous[0]["ambiguous"]["tool"], "room_send")
+            self.assertEqual(ambiguous[0]["ambiguous"]["phase"], "response")
+            self.assertTrue(ambiguous[0]["ambiguous"]["replayable"])
+            self.assertIn(
+                ambiguous[0]["client_mutation_id"], error)
+            status = self.primary["engine"].status()
+            self.assertEqual(
+                status["ambiguous_pending_reconcile"],
+                [ambiguous[0]["client_mutation_id"]])
+            self.assertTrue(status["pending_sync"])
         finally:
             release.set()
             if process is not None and process in self.processes:

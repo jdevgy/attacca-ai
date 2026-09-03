@@ -80,6 +80,10 @@ class FakeRemote:
         self.misdirect_receipts = set()
         self.pull_failures = 0
         self.force_handoff_conflict = False
+        # Live hosted writes keep their receipts in the same store the
+        # reconnect path queries: {client_mutation_id: receipt fields}.
+        self.live_receipts = {}
+        self.receipt_lookups = []
         previous = protocol.GENESIS_HASH
         for audience, body in (
                 ("everyone", "public architecture history"),
@@ -200,6 +204,56 @@ class FakeRemote:
 
     def bind_verified_identity(self, scope, visibility_fingerprint):
         self.bound.append((scope, visibility_fingerprint))
+
+    def land_live_write(self, mutation_id, tool, payload, operation=None):
+        """Apply one live hosted write and store its durable receipt."""
+        previous = self.events[-1]["hash"] if self.events \
+            else protocol.GENESIS_HASH
+        event = canonical_event(
+            len(self.events) + 1, previous,
+            body="%s %s" % (tool, json.dumps(payload, sort_keys=True)),
+            actor=self.scope["actor_id"], owner=self.scope["principal_id"])
+        self.events.append(event)
+        if operation == "room.send" or tool == "room_send":
+            self.room.append({
+                "project_id": "agentg", "seq": event["seq"],
+                "body": payload.get("body"),
+            })
+        self.live_receipts[mutation_id] = {
+            "tool": tool,
+            "request_sha256": protocol.live_request_sha256(tool, payload),
+            "status": "applied",
+            "event_id": event["event_id"],
+            "event_seq": event["seq"],
+        }
+        return event
+
+    def reserve_live_write(self, mutation_id, tool, payload):
+        """Record a started-but-never-receipted write: unknown, not absent."""
+        self.live_receipts[mutation_id] = {
+            "tool": tool,
+            "request_sha256": protocol.live_request_sha256(tool, payload),
+            "status": "reserved",
+        }
+
+    def fetch_receipts(self, ids):
+        if not self.online:
+            raise offline.RemoteUnavailableError("hosted Attacca is offline")
+        self.receipt_lookups.append(list(ids))
+        answer = {}
+        for item in ids:
+            entry = self.live_receipts.get(item)
+            if entry is None:
+                answer[item] = None
+                continue
+            applied = entry.get("status", "applied") == "applied"
+            answer[item] = protocol.make_live_receipt(
+                self.scope, item, entry["tool"], entry["request_sha256"],
+                status=entry.get("status", "applied"),
+                canonical_event_id=entry.get("event_id") if applied else None,
+                canonical_event_seq=entry.get("event_seq") if applied else None,
+                server_cursor=self.head() if applied else None)
+        return answer
 
     def pull(self, *, cursor, visibility_fingerprint, limit):
         if not self.online:
@@ -673,6 +727,167 @@ class OfflineIdentitySyncTest(unittest.TestCase):
             offline.OfflineProjectSync(
                 symlink_root, "https://example.test", self.remote.scope,
                 "client_bad", "device_bad", self.remote.visibility())
+
+    def ambiguous(self, engine, mutation_id, tool="room_send",
+                  payload=None, operation="room.send", replayable=True):
+        payload = payload or {"body": "ambiguous %s" % mutation_id}
+        return engine.record_ambiguous_live_write(
+            mutation_id, tool, payload, operation=operation,
+            request_sha256=protocol.live_request_sha256(tool, payload),
+            phase="response", replayable=replayable)
+
+    def test_ambiguous_records_are_schema_checked_and_never_pending_work(self):
+        engine = self.engine("ambiguity")
+        self.initialize(engine)
+        record = self.ambiguous(engine, "cm_ambiguous_0001")
+        self.assertEqual(record["kind"], "ambiguous")
+        self.assertEqual(record["ambiguous"]["phase"], "response")
+
+        # An ambiguous write is not queued work: it is never replayed until
+        # the hosted receipt says what happened.
+        self.assertEqual(engine.pending_mutations(), [])
+        status = engine.status()
+        self.assertEqual(
+            status["ambiguous_pending_reconcile"], ["cm_ambiguous_0001"])
+        self.assertEqual(status["ambiguous_count"], 1)
+        self.assertTrue(status["pending_sync"])
+        self.assertFalse(status["convergence_proof"]["online"])
+
+        # A malformed or reserved-attribution body never becomes replayable.
+        forced = engine.record_ambiguous_live_write(
+            "cm_ambiguous_0002", "agent_register",
+            {"agent_id": "agentg.director.claude", "role": "director"},
+            request_sha256=protocol.live_request_sha256("agent_register", {}),
+            phase="response")
+        self.assertFalse(forced["ambiguous"]["replayable"])
+        self.assertEqual(forced["ambiguous"]["payload"], {})
+        with self.assertRaises(offline.OfflineSyncError):
+            engine.record_ambiguous_live_write(
+                "short", "room_send", {"body": "bad id"})
+
+        # The journal validates the stored record exactly like a mutation.
+        paths = sorted(engine.journal_directory.iterdir())
+        target = next(path for path in paths
+                      if json.loads(path.read_text()).get("kind")
+                      == "ambiguous")
+        record = json.loads(target.read_text())
+        record["ambiguous"]["phase"] = "teleported"
+        target.write_text(json.dumps(record))
+        with self.assertRaises(offline.OfflineJournalError):
+            engine.status()
+
+    def test_reconnect_reconciles_landed_and_absent_ambiguous_writes(self):
+        engine = self.engine("reconcile")
+        self.initialize(engine)
+        landed_payload = {"body": "landed before the reply was lost"}
+        absent_payload = {"body": "never reached the hosted ledger"}
+        self.ambiguous(engine, "cm_landed_0001", payload=landed_payload)
+        self.ambiguous(engine, "cm_absent_0001", payload=absent_payload)
+        self.remote.land_live_write(
+            "cm_landed_0001", "room_send", landed_payload,
+            operation="room.send")
+
+        report = engine.synchronize(self.remote)
+        self.assertEqual(report["ambiguous_landed"], ["cm_landed_0001"])
+        self.assertEqual(report["ambiguous_replayed"], ["cm_absent_0001"])
+        self.assertTrue(report["receipt_lookup_supported"])
+        self.assertEqual(report["applied"], ["cm_absent_0001"])
+        # The landed write is never pushed again.
+        self.assertEqual(self.remote.applied_ids, ["cm_absent_0001"])
+        self.assertEqual(
+            [item["body"] for item in self.remote.room].count(
+                "landed before the reply was lost"), 1)
+        summary = report["outage_summary"]
+        self.assertEqual(summary["ambiguous_landed"], ["cm_landed_0001"])
+        self.assertEqual(summary["ambiguous_replayed"], ["cm_absent_0001"])
+        self.assertEqual(summary["queued_replayed"], [])
+        self.assertEqual(summary["unresolved_ambiguous"], [])
+        status = engine.status()
+        self.assertEqual(status["ambiguous_pending_reconcile"], [])
+        self.assertEqual(status["last_outage_summary"], summary)
+
+        # A second cycle repeats nothing.
+        again = engine.synchronize(self.remote)
+        self.assertEqual(again["ambiguous_landed"], [])
+        self.assertEqual(again["ambiguous_replayed"], [])
+        self.assertEqual(self.remote.applied_ids, ["cm_absent_0001"])
+
+    def test_unknown_receipt_or_missing_route_keeps_the_write_ambiguous(self):
+        engine = self.engine("unknown")
+        self.initialize(engine)
+        payload = {"body": "outcome is genuinely unknown"}
+        self.ambiguous(engine, "cm_unknown_0001", payload=payload)
+        self.remote.reserve_live_write(
+            "cm_unknown_0001", "room_send", payload)
+
+        report = engine.synchronize(self.remote)
+        self.assertEqual(report["ambiguous_unknown"], ["cm_unknown_0001"])
+        self.assertEqual(report["ambiguous_replayed"], [])
+        self.assertEqual(report["ambiguous_landed"], [])
+        self.assertEqual(self.remote.applied_ids, [])
+        self.assertEqual(
+            engine.status()["ambiguous_pending_reconcile"],
+            ["cm_unknown_0001"])
+        self.assertEqual(
+            report["outage_summary"]["unresolved_ambiguous"],
+            ["cm_unknown_0001"])
+
+        # An older hosted server has no receipt route at all: still unknown.
+        class Older:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def fetch_snapshot(self, allow_scope_change=False):
+                return self._inner.fetch_snapshot(
+                    allow_scope_change=allow_scope_change)
+
+            def pull(self, **kwargs):
+                return self._inner.pull(**kwargs)
+
+            def push(self, **kwargs):
+                return self._inner.push(**kwargs)
+
+        older = engine.reconcile_ambiguous(Older(self.remote))
+        self.assertFalse(older["supported"])
+        self.assertEqual(older["unknown"], ["cm_unknown_0001"])
+        self.assertEqual(engine.pending_mutations(), [])
+
+    def test_live_cursor_marks_the_mirror_stale_and_survives_v2_state(self):
+        engine = self.engine("live-cursor")
+        self.initialize(engine)
+        self.assertIsNone(engine.live_cursor())
+        head = engine.local_snapshot()["cursor"]
+        ahead = protocol.make_cursor(
+            head["event_seq"] + 5, "f" * 64, head["context_version"] + 1)
+        engine.record_live_cursor(ahead)
+        self.assertEqual(engine.live_cursor(), ahead)
+        self.assertTrue(engine.status()["mirror_stale_below_live_cursor"])
+        self.assertTrue(offline.OfflineProjectSync.cursor_behind(head, ahead))
+        self.assertFalse(offline.OfflineProjectSync.cursor_behind(ahead, head))
+        # The live cursor only ever moves forward.
+        behind = protocol.make_cursor(1, "a" * 64, 0)
+        self.assertEqual(engine.record_live_cursor(behind), ahead)
+
+        # A schema-v2 state file from an older client still loads: it is
+        # digest-checked exactly as before and upgraded in place.
+        state = json.loads(engine.state_path.read_text())
+        for key in ("live_cursor", "last_outage_summary",
+                    "surfaced_ambiguous_ids", "state_sha256"):
+            state.pop(key, None)
+        state["schema_version"] = offline.SYNC_STATE_SCHEMA_VERSION - 1
+        state["state_sha256"] = hashlib.sha256(json.dumps(
+            state, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False).encode("utf-8")).hexdigest()
+        engine.state_path.write_text(json.dumps(state))
+        reloaded = self.engine("live-cursor")
+        self.assertIsNone(reloaded.live_cursor())
+        self.assertEqual(reloaded.status()["ambiguous_pending_reconcile"], [])
+        # The upgraded shape persists on the next ordinary state write.
+        reloaded.record_live_cursor(ahead)
+        persisted = json.loads(reloaded.state_path.read_text())
+        self.assertEqual(
+            persisted["schema_version"], offline.SYNC_STATE_SCHEMA_VERSION)
+        self.assertEqual(persisted["live_cursor"], ahead)
 
 
 class OfflineDispositionParityTest(unittest.TestCase):

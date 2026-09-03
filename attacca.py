@@ -29,6 +29,7 @@ Run `attacca.py --help` for everything.
 
 import argparse
 import contextlib
+import errno
 import fnmatch
 import getpass
 import hashlib
@@ -5340,8 +5341,125 @@ def workflow_warnings(conn, project_id, actor_id=None, actor_type="agent"):
     return warnings
 
 
+HANDOFF_COMPACT_TASK_CAP = 30
+HANDOFF_COMPACT_DECISION_CAP = 30
+HANDOFF_COMPACT_INBOX_PAGE = 10
+HANDOFF_COMPACT_BODY_CHARS = 300
+
+
+def _compact_handoff_task(task):
+    """One open-task row for the brief: ids, state, owner, lease."""
+    row = {key: task.get(key) for key in (
+        "task_id", "title", "status", "risk_level", "claimed_by",
+        "updated_at")}
+    if task.get("status") == "claimed":
+        row["lease_until"] = task.get("lease_until")
+        if task.get("lease_expired"):
+            row["lease_expired"] = True  # dead claim: reclaimable
+    return row
+
+
+def _compact_bridge_row(bridge):
+    """Bridge identity, authority and this side's participation only."""
+    row = {key: bridge.get(key) for key in (
+        "with", "relation", "principal", "participation")}
+    if "can_participate" in bridge:
+        row["can_participate"] = bridge["can_participate"]
+    return row
+
+
+def _compact_role_scope_record(role_scope):
+    """Keep the binding effective role instructions, drop the duplicate copy.
+
+    ``effective_content`` already concatenates every applicable scope body,
+    so repeating each body inside ``scopes`` doubles the law for no reader.
+    """
+    if not isinstance(role_scope, dict):
+        return role_scope
+    result = dict(role_scope)
+    scopes = []
+    for item in role_scope.get("scopes") or []:
+        if not isinstance(item, dict):
+            scopes.append(item)
+            continue
+        row = {key: item.get(key) for key in (
+            "role", "version", "updated_by", "updated_owner", "updated_at")}
+        row["content_chars"] = len(str(item.get("content") or ""))
+        scopes.append(row)
+    result["scopes"] = scopes
+    result["scopes_detail_hint"] = (
+        "scope bodies are concatenated in effective_content; call "
+        "role_scope_get for each separate revision")
+    return result
+
+
+def _compact_cloud_context_record(record, requested=None, known_sha=None):
+    """Send the Cloud Context body only when the caller cannot already have it.
+
+    Every linked checkout already carries the document in its read-only
+    ATTACCA_CLOUD_CONTEXT block, so the compact brief ships version metadata
+    plus the sha256 and nothing else.  The body is returned when the caller
+    reports a DIFFERENT ``cloud_context_sha`` (it changed under them), or
+    when it explicitly asks for ``cloud_context='full'``.
+    """
+    if not isinstance(record, dict):
+        return record
+    wanted = str(requested or "").strip().lower()
+    if wanted not in ("full", "summary", "metadata", ""):
+        raise AttaccaError("cloud_context must be 'full' or 'summary'")
+    sha = record.get("sha256")
+    include = wanted == "full"
+    if not include and wanted not in ("summary", "metadata") and known_sha:
+        include = str(known_sha).strip() != str(sha or "")
+    result = {key: record.get(key) for key in (
+        "version", "sha256", "updated_by", "updated_owner", "updated_at")}
+    content = record.get("content")
+    result["content_chars"] = len(str(content or ""))
+    if include:
+        result["content"] = content
+        result["content_included"] = True
+    else:
+        result["content_included"] = False
+        result["content_hint"] = (
+            "body omitted: your checkout's ATTACCA_CLOUD_CONTEXT block holds "
+            "sha256 %s. Call cloud_context_get, pass cloud_context='full', "
+            "or send cloud_context_sha to be told only when it changes."
+            % (sha or "unknown"))
+    return result
+
+
+def _compact_inbox_row(message):
+    """One inbox/pending row narrowed to routing, attention and a body head."""
+    body = str(message.get("body") or "")
+    row = {
+        "event_id": message.get("event_id"),
+        "seq": message.get("seq"),
+        "at": message.get("at"),
+        "actor": message.get("actor"),
+        "msg_type": message.get("msg_type"),
+        "task_id": message.get("task_id"),
+        "mentions": message.get("mentions"),
+        "reply_to": message.get("reply_to"),
+        "origin_project": message.get("origin_project"),
+        "authority": message.get("authority"),
+        "body": body[:HANDOFF_COMPACT_BODY_CHARS],
+        "body_truncated": len(body) > HANDOFF_COMPACT_BODY_CHARS,
+    }
+    for key in ("mentioned_to_you", "reply_to_you", "directed_to_you",
+                "broadcast_to_everyone", "addressed_to_you",
+                "group_context", "requires_disposition"):
+        if key in message:
+            row[key] = message[key]
+    if message.get("disposition") is not None:
+        row["disposition"] = _compact_disposition(message.get("disposition"))
+    return row
+
+
 def get_handoff(conn, project_id, actor_id=None, actor_type="agent",
-                target_actor_id=None):
+                target_actor_id=None, detail="full", cloud_context=None,
+                cloud_context_sha=None):
+    detail = _read_detail(detail)
+    compact = detail == "compact"
     project = get_project(conn, project_id)
     identity_actor = _handoff_read_actor(
         conn, project_id, actor_id, actor_type, target_actor_id)
@@ -5373,8 +5491,10 @@ def get_handoff(conn, project_id, actor_id=None, actor_type="agent",
         field: identity_content.get(field) for field in HANDOFF_FIELDS}
     open_tasks = task_list(conn, project_id, status=None)["tasks"]
     open_tasks = [t for t in open_tasks if t["status"] not in ("done", "cancelled")]
+    open_tasks_total = len(open_tasks)
     decisions = [d for d in decision_list(conn, project_id)["decisions"]
                  if d["status"] in ("proposed", "accepted")]
+    decisions_total = len(decisions)
     applicable_rules = rule_list(
         conn, project_id, actor_id=actor_id, actor_type=actor_type)["rules"]
     recent = _significant_events(
@@ -5383,20 +5503,35 @@ def get_handoff(conn, project_id, actor_id=None, actor_type="agent",
     your_inbox = None
     if actor_id:
         peek = inbox_read(conn, project_id, actor_id, mark_read=False,
-                          limit=200, actor_type=actor_type)
+                          limit=200, actor_type=actor_type, detail=detail)
+        pending = peek.get("pending_dispositions", [])
         your_inbox = {
             "unread_total": peek["unread_total"],
             "unread_addressed_to_you": peek["unread_addressed"],
+            "unread_direct": peek.get("unread_direct"),
             "unread_everyone": peek["unread_everyone"],
             "unread_group_context": peek["unread_group_context"],
             "pending_disposition_total": peek.get(
                 "pending_disposition_total", 0),
-            "pending_dispositions": peek.get("pending_dispositions", []),
+            "reconciled_count": peek.get("reconciled_count", 0),
             "may_have_more": peek["may_have_more"],
             "messages_include_all_visible": True,
             "hint": ("read every message with check_inbox; mentions/replies "
                      "assign attention, not visibility"),
         }
+        if compact:
+            # The complete pending list is one check_inbox call away; the
+            # brief carries only the first page so a large backlog cannot
+            # dominate the handoff response.
+            your_inbox["first_page"] = [
+                _compact_inbox_row(item)
+                for item in pending[:HANDOFF_COMPACT_INBOX_PAGE]]
+            your_inbox["first_page_of"] = "pending_dispositions"
+            your_inbox["pending_disposition_may_have_more"] = bool(
+                peek.get("pending_disposition_may_have_more") or
+                len(pending) > HANDOFF_COMPACT_INBOX_PAGE)
+        else:
+            your_inbox["pending_dispositions"] = pending
     bridges = _bridge_rows(
         conn, project_id, actor_id=actor_id, actor_type=actor_type)
     governance = None
@@ -5412,19 +5547,28 @@ def get_handoff(conn, project_id, actor_id=None, actor_type="agent",
                       "hint": ("messages tagged [MASTER] from a project you "
                                "follow are binding directives; your outbound "
                                "messages to it arrive as suggestions")}
-    return {
+    role_scope = role_scope_get(
+        conn, project_id, actor_id=actor_id, actor_type=actor_type)
+    context_record = cloud_context_get(conn, project_id)["cloud_context"]
+    if compact:
+        context_record = _compact_cloud_context_record(
+            context_record, requested=cloud_context,
+            known_sha=cloud_context_sha)
+    result = {
         "project": project_id,
         "context_version": project["context_version"],
         "lead_director": project.get("lead_director"),
         "your_inbox": your_inbox,
-        "bridges": bridges,
+        "bridges": ([_compact_bridge_row(item) for item in bridges]
+                    if compact else bridges),
         "governance": governance,
         "workflow_warnings": workflow_warnings(
             conn, project_id, actor_id, actor_type),
         "project_rules": applicable_rules,
-        "cloud_context": cloud_context_get(conn, project_id)["cloud_context"],
-        "role_scope": role_scope_get(
-            conn, project_id, actor_id=actor_id, actor_type=actor_type),
+        "cloud_context": context_record,
+        "role_scope": (
+            _compact_role_scope_record(role_scope) if compact
+            else role_scope),
         "handoff": handoff,
         "shared_handoff": handoff,
         "handoff_scope": "project",
@@ -5444,11 +5588,19 @@ def get_handoff(conn, project_id, actor_id=None, actor_type="agent",
             identity_row["updated_owner"] if identity_row else None),
         "identity_handoff_updated_at": (
             identity_row["updated_at"] if identity_row else None),
-        "open_tasks": [_task_brief(t) for t in open_tasks],
-        "decisions": [{k: d.get(k) for k in
-                       ("decision_id", "title", "status", "proposed_owner",
-                        "resolved_owner", "attribution")}
-                      for d in decisions],
+        "open_tasks": (
+            [_compact_handoff_task(t)
+             for t in open_tasks[:HANDOFF_COMPACT_TASK_CAP]] if compact
+            else [_task_brief(t) for t in open_tasks]),
+        "open_tasks_total": open_tasks_total,
+        "decisions": (
+            [{k: d.get(k) for k in ("decision_id", "title", "status")}
+             for d in decisions[:HANDOFF_COMPACT_DECISION_CAP]] if compact
+            else [{k: d.get(k) for k in
+                   ("decision_id", "title", "status", "proposed_owner",
+                    "resolved_owner", "attribution")}
+                  for d in decisions]),
+        "decisions_total": decisions_total,
         "recent_activity": recent,
         "git": {"head": git_head(project.get("root_path")),
                 "branch": git_branch(project.get("root_path"))},
@@ -5456,6 +5608,17 @@ def get_handoff(conn, project_id, actor_id=None, actor_type="agent",
                  "No shared project handoff exists. A registered Director "
                  "should initialize it with update_handoff."),
     }
+    result["detail"] = detail
+    if compact:
+        result["handoff_attribution"] = _compact_attribution(
+            handoff_attribution)
+        result["detail_hint"] = (
+            "compact brief: open_tasks/decisions are capped id rows, "
+            "cloud_context carries version+sha256 only unless it changed, "
+            "and your_inbox.first_page is the pending head. Call task_list, "
+            "task_show, decision_list, cloud_context_get or check_inbox for "
+            "the rest, or pass detail='full'.")
+    return result
 
 
 def update_handoff(conn, project_id, actor_id, actor_type, updates,
@@ -5918,7 +6081,8 @@ def _actor_alias_ids(conn, project_id, actor_id):
 
 
 def room_read(conn, project_id, since_seq=None, limit=30, actor_id=None,
-              actor_type="agent"):
+              actor_type="agent", detail="full"):
+    detail = _read_detail(detail)
     get_project(conn, project_id)
     limit = max(1, min(int(limit or 30), 500))
     if since_seq is not None:
@@ -5987,7 +6151,11 @@ def room_read(conn, project_id, since_seq=None, limit=30, actor_id=None,
     else:
         older_messages_available = False
         may_have_more = len(rows) == limit
+    if detail == "compact":
+        visible_messages = [_compact_message_row(item)
+                            for item in visible_messages]
     return {"project": project_id, "messages": visible_messages,
+            "detail": detail,
             "next_since_seq": next_since,
             "may_have_more": may_have_more,
             "older_messages_available": older_messages_available,
@@ -6002,8 +6170,9 @@ def room_read(conn, project_id, since_seq=None, limit=30, actor_id=None,
 
 def room_history(conn, project_id, actor_id=None, actor_type="agent",
                  conversation="local", query=None, limit=60, offset=0,
-                 sort="newest", known_latest_seq=None):
+                 sort="newest", known_latest_seq=None, detail="full"):
     """Server-filtered, visibility-safe room history for the Control Panel."""
+    detail = _read_detail(detail)
     get_project(conn, project_id)
     try:
         limit = max(1, min(int(limit or 60), 60))
@@ -6078,7 +6247,10 @@ def room_history(conn, project_id, actor_id=None, actor_type="agent",
     _attach_message_dispositions(
         conn, project_id, actor_id, actor_type, messages,
         actor_ids=actor_ids)
+    if detail == "compact":
+        messages = [_compact_message_row(item) for item in messages]
     return {"project": project_id, "conversation": conversation,
+            "detail": detail,
             "messages": messages, "total": total,
             "unfiltered_total": unfiltered_total, "limit": limit,
             "offset": offset, "has_more": offset + len(messages) < total,
@@ -6438,13 +6610,14 @@ def _message_disposition_inputs(conn, project_id, actor_id, actor_ids=None,
 def pending_message_dispositions(conn, project_id, actor_id,
                                  actor_type="agent", limit=100,
                                  allow_baseline_write=False,
-                                 baseline_source_seq=None):
+                                 baseline_source_seq=None, detail="full"):
     """Return addressed work that is neither explicitly nor implicitly closed.
 
     ``allow_baseline_write`` gates the one-per-actor upgrade reconciliation
     write.  GET-only read surfaces pass False so no ledger event is smuggled
     through a read; they still see the provisional baseline's effect.
     """
+    detail = _read_detail(detail)
     get_project(conn, project_id)
     limit = max(1, min(int(limit or 100), 500))
     actor_ids = _actor_alias_ids(conn, project_id, actor_id)
@@ -6503,8 +6676,11 @@ def pending_message_dispositions(conn, project_id, actor_id,
             # rows it computed; it never rewrites that identity's baseline.
             baseline_event = None
     has_more = len(pending) > limit
+    page = pending[:limit]
+    if detail == "compact":
+        page = [_compact_message_row(item) for item in page]
     return {
-        "pending": pending[:limit],
+        "pending": page,
         "pending_total": len(pending),
         "may_have_more": has_more,
         # Disposition state for EVERY message that requires one, so read
@@ -7097,7 +7273,7 @@ def _room_policy_payloads(conn, project_id, rows, payloads=None):
 
 
 def inbox_read(conn, project_id, actor_id, mark_read=True, limit=50,
-               actor_type="agent"):
+               actor_type="agent", detail="full"):
     """Return every unread group-room message visible to this participant.
 
     Bridge participation is the visibility boundary. Mentions/replies are
@@ -7105,6 +7281,7 @@ def inbox_read(conn, project_id, actor_id, mark_read=True, limit=50,
     broadcasts to every participant. The raw ledger cursor still advances
     across self or bridge-hidden rows so polling cannot loop on invisible data.
     """
+    detail = _read_detail(detail)
     get_project(conn, project_id)
     limit = max(1, min(int(limit or 50), 500))
     actor_ids = _actor_alias_ids(conn, project_id, actor_id)
@@ -7188,16 +7365,20 @@ def inbox_read(conn, project_id, actor_id, mark_read=True, limit=50,
     # is delivering.  Only a read that may write persists that baseline.
     disposition_state = pending_message_dispositions(
         conn, project_id, actor_id, actor_type=actor_type, limit=limit,
-        allow_baseline_write=bool(mark_read), baseline_source_seq=cursor)
+        allow_baseline_write=bool(mark_read), baseline_source_seq=cursor,
+        detail=detail)
     for message in messages:
         record = (disposition_state["dispositions"] or {}).get(
             message.get("event_id"), False)
         if record is not False:
             message["requires_disposition"] = True
             message["disposition"] = record
+    if detail == "compact":
+        messages = [_compact_message_row(item) for item in messages]
     return {
         "project": project_id,
         "actor": actor_id,
+        "detail": detail,
         "messages": messages,
         "messages_include_all_visible": True,
         "unread_total": unread_total,
@@ -7220,6 +7401,10 @@ def inbox_read(conn, project_id, actor_id, mark_read=True, limit=50,
         "pending_disposition_total": disposition_state["pending_total"],
         "pending_disposition_may_have_more": disposition_state["may_have_more"],
         "disposition_baseline_seq": disposition_state["baseline_seq"],
+        # T-80 §E: how many addressed rows this identity's upgrade baseline
+        # closed, so a client can say it once instead of silently dropping
+        # a backlog it never showed the human.
+        "reconciled_count": disposition_state.get("reconciled_count", 0),
         "hint": ("more unread group messages remain — call check_inbox again"
                  if may_have_more else
                  "all participation-visible unread room messages are included; "
@@ -7770,6 +7955,140 @@ def _ledger_action(row, conn=None, project_id=None):
     }
 
 
+READ_DETAIL_LEVELS = ("compact", "full")
+
+
+def _read_detail(value, default="full"):
+    """Normalize a read tool's ``detail`` selector.
+
+    Python callers default to ``full`` so internal projections (sync, export,
+    panel history) keep the complete nested shape; only the MCP/REST entry
+    points ask for ``compact``.
+    """
+    detail = str(value or default).strip().lower()
+    if detail not in READ_DETAIL_LEVELS:
+        raise AttaccaError(
+            "detail must be one of %s" % ", ".join(READ_DETAIL_LEVELS))
+    return detail
+
+
+def _read_fields(value):
+    """Parse an optional comma-separated response field allow-list."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, set)):
+        raw = [str(item) for item in value]
+    else:
+        raw = str(value).split(",")
+    wanted = [item.strip() for item in raw if item.strip()]
+    return wanted or None
+
+
+def _select_fields(row, fields, always=("task_id",)):
+    if not fields or not isinstance(row, dict):
+        return row
+    keep = set(fields) | set(always)
+    return {key: value for key, value in row.items() if key in keep}
+
+
+def _compact_attribution(value, at=None):
+    """Narrow one attribution record to what an agent needs to act.
+
+    The nested ``identity`` object and the ``ledger_actor_id`` duplicate are
+    audit/export detail; they remain available behind ``detail='full'``.  The
+    accountable human is NEVER dropped: ``run_by_user`` (and ``human_user``
+    for a human actor) survives every compaction (invariant 3).
+    """
+    if not isinstance(value, dict):
+        return None
+    attribution = value.get("attribution") \
+        if isinstance(value.get("attribution"), dict) else value
+    identity = attribution.get("identity") \
+        if isinstance(attribution.get("identity"), dict) else {}
+    when = at if at is not None else (
+        value.get("at") or value.get("created_at") or attribution.get("at"))
+    result = {
+        "actor_id": attribution.get("actor_id") or identity.get("actor_id"),
+        "actor_type": attribution.get("actor_type"),
+        "run_by_user": attribution.get("run_by_user"),
+        "role": identity.get("role"),
+        "runtime": identity.get("runtime"),
+        "persona": identity.get("persona"),
+        "at": when,
+    }
+    if attribution.get("human_user"):
+        # A human actor records no separate ``Run by user``; losing this
+        # would erase the accountable person from the compact row.
+        result["human_user"] = attribution["human_user"]
+    return result
+
+
+MESSAGE_COMPACT_NOTE_CHARS = 200
+
+
+def _compact_disposition(record):
+    """Narrow an explicit or implied disposition to its decisive fields."""
+    if not isinstance(record, dict):
+        return record
+    note = record.get("note") or record.get("detail")
+    row = {
+        "disposition": record.get("disposition"),
+        "implicit": bool(record.get("implicit")),
+        "reason": record.get("reason"),
+        "task_id": record.get("task_id"),
+    }
+    if note:
+        note = str(note)
+        row["note"] = note[:MESSAGE_COMPACT_NOTE_CHARS]
+        if len(note) > MESSAGE_COMPACT_NOTE_CHARS:
+            row["note_truncated"] = True
+    if record.get("updated_at"):
+        row["updated_at"] = record["updated_at"]
+    if record.get("pending_sync"):
+        row["pending_sync"] = True
+    return row
+
+
+MESSAGE_COMPACT_FIELDS = (
+    "event_id", "seq", "at", "actor", "actor_type", "owner", "msg_type",
+    "body", "mentions", "task_id", "reply_to", "origin_project", "authority",
+    "mirrored_to", "mirrored_to_inferred", "mentioned_to_you",
+    "reply_to_you", "directed_to_you", "broadcast_to_everyone",
+    "addressed_to_you", "group_context", "requires_disposition",
+    "disposition",
+)
+
+
+def _compact_message_row(message):
+    """One room/inbox row: routing, attention, the FULL body, no identity dup.
+
+    The canonical ``actor`` already answers who spoke; the nested identity
+    object, its ledger alias and the repeated attribution record are audit
+    detail available behind ``detail='full'``.  The message body is never
+    truncated - a group conversation the reader cannot read is not a
+    projection, it is data loss.
+    """
+    if not isinstance(message, dict):
+        return message
+    row = {key: message[key] for key in MESSAGE_COMPACT_FIELDS
+           if key in message}
+    if "disposition" in row:
+        row["disposition"] = _compact_disposition(row["disposition"])
+    return row
+
+
+def _compact_action(action):
+    """One ledger action with its attribution narrowed to the compact shape."""
+    if not isinstance(action, dict):
+        return action
+    result = dict(action)
+    result["attribution"] = _compact_attribution(action)
+    for key in ("operational_actor_id", "git_branch", "git_revision",
+                "device_id", "context_version"):
+        result.pop(key, None)
+    return result
+
+
 def _task_attribution(actions):
     result = {"created": None, "claimed": None, "reported": None,
               "resolved": None, "status_changed": None,
@@ -7914,9 +8233,67 @@ def _task_attribution_event_rows(conn, project_id, task_ids):
     return by_task, counts
 
 
+TASK_COMPACT_SCOPE_CAP = 8
+TASK_COMPACT_SUMMARY_CHARS = 200
+TASK_COMPACT_FIELDS = (
+    "task_id", "title", "status", "risk_level", "claimed_by", "lease_until",
+    "lease_expired", "plan_required", "plan_version", "updated_at",
+    "dependencies", "expected_scope", "expected_scope_total", "last_report",
+    "created_by", "verification_status", "attribution", "actions_total",
+    "actions_compacted",
+)
+
+
+def _compact_task_row(task):
+    """Project one board row to ids, state, owners and one-line summaries.
+
+    Everything removed here is reachable with a follow-up ``task_show`` or
+    ``task_plan_get`` call: the six nested lifecycle attribution blocks
+    collapse to the latest action's compact attribution, the plan summary
+    collapses to its version, and a long declared scope reports its own
+    total instead of every path.
+    """
+    plan = task.get("plan") or {}
+    scope = list(task.get("expected_scope") or [])
+    attribution = task.get("attribution") or {}
+    row = {
+        "task_id": task.get("task_id"),
+        "title": task.get("title"),
+        "status": task.get("status"),
+        "risk_level": task.get("risk_level"),
+        "claimed_by": task.get("claimed_by"),
+        "lease_until": task.get("lease_until"),
+        "plan_required": task.get("plan_required"),
+        "plan_version": plan.get("version"),
+        "updated_at": task.get("updated_at"),
+        "dependencies": list(task.get("dependencies") or []),
+        "expected_scope": scope[:TASK_COMPACT_SCOPE_CAP],
+        "expected_scope_total": len(scope),
+        "created_by": task.get("created_by"),
+        "verification_status": task.get("verification_status"),
+        "attribution": _compact_attribution(attribution.get("latest")),
+        "last_report": None,
+    }
+    if task.get("lease_expired"):
+        row["lease_expired"] = True
+    report = task.get("last_report")
+    if isinstance(report, dict):
+        summary = str(report.get("summary") or "")
+        row["last_report"] = {
+            "at": report.get("at") or report.get("reported_at"),
+            "requested_state": report.get("requested_state"),
+            "summary": summary[:TASK_COMPACT_SUMMARY_CHARS],
+            "summary_truncated": len(summary) > TASK_COMPACT_SUMMARY_CHARS,
+        }
+    for key in ("actions_total", "actions_compacted"):
+        if key in task:
+            row[key] = task[key]
+    return row
+
+
 def _task_dict(row, event_rows=None, conn=None, project_id=None,
                plan_row=None, attribution_event_rows=None,
-               actions_total=None):
+               actions_total=None, detail="full", fields=None):
     task = dict(row)
     task["expected_scope"] = json.loads(task.get("expected_scope") or "[]")
     task["dependencies"] = json.loads(task.get("dependencies") or "[]")
@@ -7955,7 +8332,12 @@ def _task_dict(row, event_rows=None, conn=None, project_id=None,
     if task["status"] == "claimed" and task.get("lease_until") \
             and task["lease_until"] < now_iso():
         task["lease_expired"] = True
-    return task
+    if _read_detail(detail) == "compact":
+        # Compact rows are derived AFTER the full projection so every value
+        # that depends on the nested attribution map (verification_status,
+        # last_report owner, current claimant) is still computed exactly.
+        task = _compact_task_row(task)
+    return _select_fields(task, _read_fields(fields))
 
 
 def task_create(conn, project_id, actor_id, actor_type, title, description=None,
@@ -7993,7 +8375,9 @@ def task_create(conn, project_id, actor_id, actor_type, title, description=None,
 
 
 def task_list(conn, project_id, status=None, query=None, limit=None, offset=0,
-              sort=None):
+              sort=None, detail="full", fields=None):
+    detail = _read_detail(detail)
+    fields = _read_fields(fields)
     get_project(conn, project_id)
     status = str(status or "").strip().lower() or None
     if status == "all":
@@ -8069,8 +8453,14 @@ def task_list(conn, project_id, status=None, query=None, limit=None, offset=0,
               "tasks": [_task_dict(row, by_task.get(row["task_id"], []),
                                    conn, project_id, plans.get(row["task_id"]),
                                    actions_total=action_counts.get(
-                                       row["task_id"], 0))
+                                       row["task_id"], 0),
+                                   detail=detail, fields=fields)
                         for row in rows]}
+    result["detail"] = detail
+    if detail == "compact":
+        result["detail_hint"] = (
+            "compact board rows; call task_show, or pass detail='full', for "
+            "nested per-action attribution and plan detail")
     result.update({"total": total, "unfiltered_total": unfiltered_total,
                    "limit": limit, "offset": offset,
                    "has_more": offset + len(rows) < total})
@@ -8086,11 +8476,24 @@ def _task_history_filter(rows, value):
     return [row for row in rows if row.get("event_type") in wanted]
 
 
+TASK_SHOW_COMPACT_PAGE = 10
+
+
 def task_show(conn, project_id, task_id, action_query=None,
-              action_filter=None, action_limit=60, action_offset=0,
-              action_sort="oldest", history_query=None,
-              history_filter=None, history_limit=60, history_offset=0,
-              history_sort="oldest"):
+              action_filter=None, action_limit=None, action_offset=0,
+              action_sort=None, history_query=None,
+              history_filter=None, history_limit=None, history_offset=0,
+              history_sort=None, detail="full", fields=None):
+    detail = _read_detail(detail)
+    compact = detail == "compact"
+    # ``compact`` answers "what happened to this task lately" in one screen;
+    # the explicit paging arguments still reach the complete history.
+    default_page = TASK_SHOW_COMPACT_PAGE if compact else 60
+    default_sort = "newest" if compact else "oldest"
+    action_limit = default_page if action_limit is None else action_limit
+    history_limit = default_page if history_limit is None else history_limit
+    action_sort = default_sort if action_sort is None else action_sort
+    history_sort = default_sort if history_sort is None else history_sort
     rows = conn.execute(
         "SELECT * FROM events WHERE project_id=? AND task_id=? ORDER BY seq",
         (project_id, task_id)).fetchall()
@@ -8116,10 +8519,17 @@ def task_show(conn, project_id, task_id, action_query=None,
         _task_row(conn, project_id, task_id), selected_action_rows,
         conn, project_id, plan_row,
         attribution_event_rows=attribution_rows.get(task_id, []),
-        actions_total=action_page["unfiltered_total"])
+        actions_total=action_page["unfiltered_total"],
+        detail=detail, fields=fields)
+    if compact and not fields:
+        # A board row omits the description; the task's own detail view is
+        # the only surface that returns it, so compaction keeps it.
+        task["description"] = _task_row(conn, project_id, task_id)["description"]
     # _task_dict preserves ledger order, so restore the requested display
     # order after conversion when newest was selected.
-    task["actions"] = action_page["actions"]
+    task["actions"] = [_compact_action(item) for item in
+                       action_page["actions"]] if compact \
+        else action_page["actions"]
     task["actions_pagination"] = {
         key: action_page[key] for key in (
             "total", "unfiltered_total", "limit", "offset", "has_more")}
@@ -8142,6 +8552,11 @@ def task_show(conn, project_id, task_id, action_query=None,
     task["history_pagination"] = {
         key: history_page[key] for key in (
             "total", "unfiltered_total", "limit", "offset", "has_more")}
+    task["detail"] = detail
+    if compact:
+        task["detail_hint"] = (
+            "compact task view; raise action_limit/history_limit or pass "
+            "detail='full' for nested attribution, plan and description")
     return task
 
 
@@ -10847,6 +11262,31 @@ def _i(desc):
     return {"type": "integer", "description": desc}
 
 
+def _tool_detail(args):
+    """Tool and REST reads default to the compact projection.
+
+    Python callers keep ``detail='full'`` so internal projections (sync,
+    export, panel history) are unchanged; only the wire surfaces compact.
+    """
+    return _read_detail(
+        (args or {}).get("detail") or "compact", default="compact")
+
+
+def _detail_prop(extra=""):
+    """Shared ``detail`` selector for the compact-by-default read tools."""
+    return _s(
+        "Response shape: compact (default) returns ids, state, owners, "
+        "versions and one-line summaries with a single compact attribution "
+        "block per row; full restores the complete nested identity and "
+        "attribution records.%s" % (" " + extra if extra else ""),
+        enum=list(READ_DETAIL_LEVELS))
+
+
+FIELDS_PROP = _s(
+    "Optional comma-separated allow-list of row fields to return "
+    "(task_id is always included).")
+
+
 def _b(desc):
     return {"type": "boolean", "description": desc}
 
@@ -10879,6 +11319,16 @@ MCP_TOOLS = [
             "project": PROJECT_PROP,
             "target_actor_id": _s(
                 "Optional exact identity whose identity handoff to read."),
+            "detail": _detail_prop(
+                "Compact caps open_tasks/decisions at 30 id rows and returns "
+                "your_inbox.first_page instead of every pending row."),
+            "cloud_context": _s(
+                "'full' to include the complete Cloud Context document; the "
+                "compact default returns version + sha256 only.",
+                enum=["full", "summary"]),
+            "cloud_context_sha": _s(
+                "sha256 of the Cloud Context your checkout already holds. "
+                "The body is returned only when it differs."),
         }},
     },
     {
@@ -11036,6 +11486,8 @@ MCP_TOOLS = [
         "inputSchema": {"type": "object", "properties": {
             "since_seq": _i("Only messages with ledger seq greater than this."),
             "limit": _i("Max messages (default 30)."),
+            "detail": _detail_prop(
+                "Message bodies are complete in both shapes."),
             "project": PROJECT_PROP,
         }},
     },
@@ -11052,6 +11504,8 @@ MCP_TOOLS = [
             "mark_read": {"type": "boolean",
                           "description": "Advance your read cursor (default true)."},
             "limit": _i("Max messages to scan (default 50)."),
+            "detail": _detail_prop(
+                "Message bodies are complete in both shapes."),
             "project": PROJECT_PROP,
         }},
     },
@@ -11240,6 +11694,10 @@ MCP_TOOLS = [
             "offset": {"type": "integer", "minimum": 0,
                        "description": "Zero-based task offset."},
             "sort": _s("newest | oldest."),
+            "detail": _detail_prop(
+                "Compact board rows carry one attribution block for the "
+                "latest action instead of six nested lifecycle records."),
+            "fields": FIELDS_PROP,
             "project": PROJECT_PROP,
         }},
     },
@@ -11260,6 +11718,10 @@ MCP_TOOLS = [
             "history_limit": {"type": "integer", "minimum": 1, "maximum": 60},
             "history_offset": {"type": "integer", "minimum": 0},
             "history_sort": _s("newest | oldest."),
+            "detail": _detail_prop(
+                "Compact defaults to the newest 10 actions and 10 history "
+                "lines; raise action_limit/history_limit to page further."),
+            "fields": FIELDS_PROP,
             "project": PROJECT_PROP,
         }, "required": ["task_id"]},
     },
@@ -11660,6 +12122,9 @@ class McpSession:
         # optimistic version is tracked per project, not per (project, actor).
         self.briefed_shared_handoff_versions = {}  # project_id -> version
         self._registered = set()     # (project, actor) auto-registered pairs
+        # Set per hosted request when that request carries a live write
+        # idempotency key; never inherited between requests.
+        self.live_write_context = None
         self.stdin = stdin or sys.stdin
         self.stdout = stdout or sys.stdout
 
@@ -11790,7 +12255,7 @@ class McpSession:
             name = params.get("name")
             args = params.get("arguments") or {}
             try:
-                result = self.dispatch_tool(name, args)
+                result = self.dispatch_live_tool(name, args)
                 text = json.dumps(result, indent=2, ensure_ascii=False)
                 return self._res(msg_id, {
                     "content": [{"type": "text", "text": text}],
@@ -11809,6 +12274,40 @@ class McpSession:
         return self._err(msg_id, -32601, "method not found: %s" % method)
 
     # -- tool dispatch --------------------------------------------------------
+
+    def dispatch_live_tool(self, name, args):
+        """Dispatch one tool, honouring an explicit live idempotency key.
+
+        The key is a transport concern, never a tool argument: it is removed
+        before dispatch so no tool can read, store, or be confused by it.
+        When this request has no resolvable receipt scope the write still
+        proceeds, but its answer says plainly that no receipt was stored.
+        """
+        mutation_id = None
+        if isinstance(args, dict) and args.get(LIVE_IDEMPOTENCY_ARGUMENT):
+            mutation_id = str(args.get(LIVE_IDEMPOTENCY_ARGUMENT) or "").strip()
+            args = {key: value for key, value in args.items()
+                    if key != LIVE_IDEMPOTENCY_ARGUMENT}
+        if not mutation_id:
+            return self.dispatch_tool(name, args)
+        if name not in OFFLINE_PROXY_WRITE_OPERATIONS \
+                and name not in OFFLINE_PROXY_EXPLICITLY_UNAVAILABLE:
+            # Reads have nothing to be idempotent about; never let one grow
+            # the receipt store.
+            return self.dispatch_tool(name, args)
+        context = getattr(self, "live_write_context", None)
+        if not context:
+            result = self.dispatch_tool(name, args)
+            answer = dict(result) if isinstance(result, dict) \
+                else {"result": result}
+            answer[LIVE_RECEIPT_RESULT_KEY] = {
+                "status": "unavailable",
+                "client_mutation_id": mutation_id,
+                "reason": "this request has no resolvable receipt scope",
+            }
+            return answer
+        return _live_idempotent_dispatch(
+            self, context, name, args, mutation_id)
 
     def _conn(self):
         if self.conn is None:
@@ -12008,7 +12507,11 @@ class McpSession:
             project, actor = self._project_actor(args)
             result = get_handoff(conn, project, actor_id=actor,
                                  actor_type=atype,
-                                 target_actor_id=args.get("target_actor_id"))
+                                 target_actor_id=args.get("target_actor_id"),
+                                 detail=_tool_detail(args),
+                                 cloud_context=args.get("cloud_context"),
+                                 cloud_context_sha=args.get(
+                                     "cloud_context_sha"))
             self._record_briefed_handoff(project, actor, result)
             return result
 
@@ -12037,7 +12540,7 @@ class McpSession:
             return inbox_read(conn, project, actor,
                               mark_read=True if mark is None else bool(mark),
                               limit=args.get("limit") or 50,
-                              actor_type=atype)
+                              actor_type=atype, detail=_tool_detail(args))
 
         if name == "message_dispose":
             project, actor = self._project_actor(args)
@@ -12201,7 +12704,7 @@ class McpSession:
             project, actor = self._project_actor(args)
             return room_read(conn, project, since_seq=args.get("since_seq"),
                              limit=args.get("limit") or 30, actor_id=actor,
-                             actor_type=atype)
+                             actor_type=atype, detail=_tool_detail(args))
 
         if name == "task_create":
             project, actor = self._project_actor(args)
@@ -12218,7 +12721,8 @@ class McpSession:
             return task_list(
                 conn, project, status=args.get("status"), query=args.get("q"),
                 limit=args.get("limit") or 60, offset=args.get("offset") or 0,
-                sort=args.get("sort") or "newest")
+                sort=args.get("sort") or "newest",
+                detail=_tool_detail(args), fields=args.get("fields"))
 
         if name == "task_show":
             project, actor = self._project_actor(args)
@@ -12226,14 +12730,15 @@ class McpSession:
                 conn, project, task_id=args.get("task_id"),
                 action_query=args.get("action_q"),
                 action_filter=args.get("action_filter"),
-                action_limit=args.get("action_limit") or 60,
+                action_limit=args.get("action_limit"),
                 action_offset=args.get("action_offset") or 0,
-                action_sort=args.get("action_sort") or "oldest",
+                action_sort=args.get("action_sort"),
                 history_query=args.get("history_q"),
                 history_filter=args.get("history_filter"),
-                history_limit=args.get("history_limit") or 60,
+                history_limit=args.get("history_limit"),
                 history_offset=args.get("history_offset") or 0,
-                history_sort=args.get("history_sort") or "oldest")
+                history_sort=args.get("history_sort"),
+                detail=_tool_detail(args), fields=args.get("fields"))
 
         if name == "task_plan_get":
             project, actor = self._project_actor(args)
@@ -12742,6 +13247,8 @@ _SYNC_RUNTIME = None
 _SYNC_RUNTIME_LOCK = threading.Lock()
 _OFFLINE_SYNC_RUNTIME = None
 _OFFLINE_SYNC_RUNTIME_LOCK = threading.Lock()
+_SYNC_CLIENT_RUNTIME = None
+_SYNC_CLIENT_RUNTIME_LOCK = threading.Lock()
 _TERMINAL_FLOW_RUNTIME = None
 _TERMINAL_FLOW_RUNTIME_LOCK = threading.Lock()
 
@@ -12851,6 +13358,47 @@ def _offline_sync_runtime():
                 sys.modules["sync_protocol"] = prior_protocol
         _OFFLINE_SYNC_RUNTIME = (protocol, module)
     return _OFFLINE_SYNC_RUNTIME
+
+
+def _sync_client_runtime():
+    """Load the bundled sync HTTP client beside this executable.
+
+    The connect proxy needs only its transport-failure classification, but it
+    must be the very same implementation the watcher uses so a dead host is
+    judged identically on both paths.
+    """
+    global _SYNC_CLIENT_RUNTIME
+    if _SYNC_CLIENT_RUNTIME is not None:
+        return _SYNC_CLIENT_RUNTIME
+    with _SYNC_CLIENT_RUNTIME_LOCK:
+        if _SYNC_CLIENT_RUNTIME is not None:
+            return _SYNC_CLIENT_RUNTIME
+        protocol, offline = _offline_sync_runtime()
+        path = Path(script_path()).resolve().parent / "sync_client.py"
+        if not path.is_file():
+            raise AttaccaError(
+                "Attacca sync client support is missing from this install")
+        spec = importlib.util.spec_from_file_location(
+            "attacca_sync_client_runtime", path)
+        if spec is None or spec.loader is None:
+            raise AttaccaError("cannot load the Attacca sync client")
+        module = importlib.util.module_from_spec(spec)
+        prior_protocol = sys.modules.get("sync_protocol")
+        prior_offline = sys.modules.get("offline_sync")
+        sys.modules[spec.name] = module
+        sys.modules["sync_protocol"] = protocol
+        sys.modules["offline_sync"] = offline
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            for name, prior in (("sync_protocol", prior_protocol),
+                                ("offline_sync", prior_offline)):
+                if prior is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = prior
+        _SYNC_CLIENT_RUNTIME = module
+    return _SYNC_CLIENT_RUNTIME
 
 
 def _terminal_flow_runtime():
@@ -13535,6 +14083,162 @@ def _sync_engine(handler, scope):
         fault_injector=fault,
     )
     return server.SyncServerEngine(handler._conn(), adapters)
+
+
+# ---------------------------------------------------------------------------
+# Live hosted write idempotency
+#
+# A queued offline mutation and a live hosted MCP write are the same intent
+# expressed over two transports.  Both therefore carry one immutable
+# ``client_mutation_id``.  The live path reserves that id, applies the tool,
+# and stores a durable receipt, so a client whose reply was lost can ask
+# afterwards whether its write landed instead of guessing or replaying it.
+# ---------------------------------------------------------------------------
+
+LIVE_IDEMPOTENCY_ARGUMENT = "_attacca_client_mutation_id"
+LIVE_RECEIPT_RESULT_KEY = "_attacca_receipt"
+MAX_LIVE_RECEIPT_RESULT_BYTES = 16 * 1024
+
+
+def _live_receipt_engine(conn):
+    """A receipt-only engine: it can reserve, commit, and read, never push."""
+    _, server = _sync_runtime()
+
+    def _refuse(_conn, _request):
+        raise server.SyncServerStateError(
+            "the live receipt engine cannot apply queued mutations")
+
+    adapters = server.SyncServerAdapters(
+        authorize=_sync_authorize,
+        head_cursor=_sync_head_cursor,
+        read_events=_sync_read_events,
+        visibility_projector=_sync_visibility_projector,
+        apply_mutation=_refuse,
+    )
+    return server.SyncServerEngine(conn, adapters)
+
+
+def _message_carries_live_mutation_id(msg):
+    items = msg if isinstance(msg, list) else [msg]
+    for item in items:
+        if not isinstance(item, dict) or item.get("method") != "tools/call":
+            continue
+        arguments = (item.get("params") or {}).get("arguments")
+        if isinstance(arguments, dict) \
+                and arguments.get(LIVE_IDEMPOTENCY_ARGUMENT):
+            return True
+    return False
+
+
+def _live_write_context(handler, project_id, msg):
+    """Bind one hosted request to the scope its receipts are stored under.
+
+    The scope is the same authenticated schema-v1 identity the sync routes
+    use, so a later receipt lookup from the watcher finds exactly these rows.
+    A caller whose scope cannot be resolved simply gets no receipt; it is
+    never silently attributed to another principal, actor, or device.
+    """
+    if not project_id or not _message_carries_live_mutation_id(msg):
+        return None
+    try:
+        scope = _sync_authenticated_scope(handler, project_id)
+    except (AttaccaError, AuthenticationError, AuthorizationError):
+        return None
+    device_id = str(handler._request_device_id() or "").strip()
+    if not device_id:
+        return None
+    return {"scope": scope, "device_id": device_id}
+
+
+def _bounded_live_receipt_result(result):
+    """Keep a replayable copy of the original answer, or none at all."""
+    if not isinstance(result, dict):
+        return None
+    protocol, _ = _sync_runtime()
+    value = {key: item for key, item in result.items()
+             if key != LIVE_RECEIPT_RESULT_KEY}
+    try:
+        encoded = protocol.canonical_json_bytes(
+            value, max_bytes=MAX_LIVE_RECEIPT_RESULT_BYTES)
+    except protocol.SyncProtocolError:
+        return None
+    return json.loads(encoded.decode("utf-8"))
+
+
+def _live_idempotent_dispatch(session, context, name, args, mutation_id):
+    """Reserve, apply, and receipt one live hosted write exactly once."""
+    protocol, server = _sync_runtime()
+    scope = context["scope"]
+    device_id = context["device_id"]
+    if not protocol.is_client_mutation_id(str(mutation_id)):
+        raise AttaccaError(
+            "%s must be a bounded safe client mutation id"
+            % LIVE_IDEMPOTENCY_ARGUMENT)
+    conn = session._conn()
+    engine = _live_receipt_engine(conn)
+    try:
+        request_hash = protocol.live_request_sha256(name, args)
+        reserved = engine.live_reserve(
+            scope, device_id, mutation_id, name, request_hash)
+    except (protocol.SyncProtocolError, server.SyncServerError) as error:
+        raise AttaccaError(
+            "live write idempotency is unavailable: %s" % error) from error
+    status = reserved["status"]
+    if status == "duplicate":
+        receipt = reserved["receipt"]
+        answer = dict(receipt.get("result") or {})
+        answer["duplicate"] = True
+        answer[LIVE_RECEIPT_RESULT_KEY] = receipt
+        answer.setdefault(
+            "hint", "This exact write already applied; the stored hosted "
+                    "result is returned instead of applying it twice.")
+        return answer
+    if status == "in_progress":
+        raise AttaccaError(
+            "this client_mutation_id is still being applied by another "
+            "request; retry the lookup instead of resending %s" % name)
+    if status == "conflict":
+        raise AttaccaError(
+            "client_mutation_id was already used for a different request; "
+            "mint a new id for %s" % name)
+    try:
+        result = session.dispatch_tool(name, args)
+    except BaseException:
+        # Nothing was applied, so the id must become reusable rather than
+        # blocking an honest retry of the same intent.
+        try:
+            engine.live_fail(scope, device_id, mutation_id)
+        except Exception:
+            pass
+        raise
+    event = result.get("event") if isinstance(result, dict) else None
+    canonical_event_id = event.get("event_id") if isinstance(event, dict) \
+        else None
+    canonical_event_seq = event.get("seq") if isinstance(event, dict) else None
+    if not isinstance(canonical_event_id, str) \
+            or not isinstance(canonical_event_seq, int) \
+            or isinstance(canonical_event_seq, bool):
+        canonical_event_id = None
+        canonical_event_seq = None
+    try:
+        receipt = engine.live_commit(
+            scope, device_id, mutation_id, name, request_hash,
+            canonical_event_id=canonical_event_id,
+            canonical_event_seq=canonical_event_seq,
+            server_cursor=_sync_head_cursor(conn, scope["project_id"]),
+            result=_bounded_live_receipt_result(result))
+    except (protocol.SyncProtocolError, server.SyncServerError) as error:
+        # The write itself succeeded.  Report it honestly instead of
+        # pretending the operation failed and inviting a duplicate retry.
+        answer = dict(result) if isinstance(result, dict) else {"result": result}
+        answer[LIVE_RECEIPT_RESULT_KEY] = {
+            "status": "unrecorded", "client_mutation_id": str(mutation_id),
+            "reason": str(error)[:500],
+        }
+        return answer
+    answer = dict(result) if isinstance(result, dict) else {"result": result}
+    answer[LIVE_RECEIPT_RESULT_KEY] = receipt
+    return answer
 
 
 def save_project_export_artifact(path, data, force=False):
@@ -15436,6 +16140,10 @@ class AttaccaHandler(BaseHTTPRequestHandler):
                 session.default_project = default_project
                 session.require_project = False
                 session.setup_required_reason = None
+            # Live write idempotency is bound per request from the verified
+            # principal, and is never carried into an unrelated later call.
+            session.live_write_context = _live_write_context(
+                self, session.default_project, msg)
             if isinstance(msg, list):
                 if not msg:
                     self._reply_json(400, {"jsonrpc": "2.0", "id": None,
@@ -16754,6 +17462,51 @@ def _r_sync_push(h, m, q):
     })
 
 
+def _r_sync_receipts(h, m, q):
+    """Answer 'did my write land?' for this exact device and principal.
+
+    ``null`` means the hosted workspace holds no record of that id at all and
+    the caller may safely replay it.  A ``reserved`` receipt deliberately
+    means unknown, never absent.
+    """
+    scope = _sync_route_scope(h, m.group(1))
+    if scope is None:
+        return
+    protocol, server = _sync_runtime()
+    try:
+        device_id = h._request_device_id()
+        if not device_id:
+            raise protocol.SyncProtocolError(
+                "missing_device",
+                "X-Attacca-Device-ID is required for receipt lookup")
+        identifiers = [item.strip() for item in
+                       str(q.get("ids") or "").split(",") if item.strip()]
+        if not identifiers:
+            raise protocol.SyncProtocolError(
+                "missing_field", "receipt lookup needs one or more ids")
+        receipts = _sync_engine(h, scope).receipts(
+            scope, device_id, identifiers)
+    except protocol.SyncProtocolError as error:
+        _sync_protocol_error(h, error)
+        return
+    except server.SyncServerAuthorizationError as error:
+        raise AuthorizationError(str(error))
+    except server.SyncServerStateError as error:
+        _sync_protocol_error(h, protocol.SyncProtocolError(
+            "invalid_receipt_request", str(error)))
+        return
+    h._reply_json(200, {
+        "format": "attacca.sync.receipts-result",
+        "schema_version": protocol.SCHEMA_VERSION,
+        "scope": scope,
+        "receipts": receipts,
+        "generated_at": protocol.utc_now(),
+    }, {
+        "Cache-Control": "private, no-store, max-age=0",
+        "X-Content-Type-Options": "nosniff",
+    })
+
+
 def _r_lead_set(h, m, q):
     actor, atype = h._actor()
     body = h._body_json()
@@ -16836,7 +17589,9 @@ def _r_handoff_get(h, m, q):
     actor, atype = h._actor()
     h._reply_json(200, get_handoff(
         h._conn(), m.group(1), actor_id=actor, actor_type=atype,
-        target_actor_id=(q.get("target_actor_id") or q.get("actor_id"))))
+        target_actor_id=(q.get("target_actor_id") or q.get("actor_id")),
+        detail=_tool_detail(q), cloud_context=q.get("cloud_context"),
+        cloud_context_sha=q.get("cloud_context_sha")))
 
 
 def _r_handoff_history(h, m, q):
@@ -16910,7 +17665,8 @@ def _r_inbox_get(h, m, q):
     h._reply_json(200, inbox_read(
         h._conn(), m.group(1), actor, mark_read=mark_read,
         limit=min(int(q.get("limit") or PANEL_COLLECTION_LIMIT),
-                  PANEL_COLLECTION_LIMIT), actor_type=atype))
+                  PANEL_COLLECTION_LIMIT), actor_type=atype,
+        detail=_tool_detail(q)))
 
 
 def _r_message_dispose(h, m, q):
@@ -17021,7 +17777,8 @@ def _r_room_read(h, m, q):
     h._reply_json(200, room_read(h._conn(), m.group(1),
                                  since_seq=int(since) if since is not None else None,
                                  limit=int(q.get("limit") or 30),
-                                 actor_id=actor, actor_type=atype))
+                                 actor_id=actor, actor_type=atype,
+                                 detail=_tool_detail(q)))
 
 
 def _r_room_history(h, m, q):
@@ -17032,7 +17789,8 @@ def _r_room_history(h, m, q):
         conversation=q.get("conversation") or "local", query=q.get("q"),
         limit=int(q.get("limit") or 60), offset=int(q.get("offset") or 0),
         sort=q.get("sort") or "newest",
-        known_latest_seq=int(known) if known is not None else None))
+        known_latest_seq=int(known) if known is not None else None,
+        detail=_tool_detail(q)))
 
 
 def _r_room_send(h, m, q):
@@ -17075,7 +17833,8 @@ def _r_task_list(h, m, q):
     h._reply_json(200, task_list(
         h._conn(), m.group(1), status=q.get("status"), query=q.get("q"),
         limit=int(q.get("limit") or 60), offset=int(q.get("offset") or 0),
-        sort=q.get("sort") or "newest"))
+        sort=q.get("sort") or "newest", detail=_tool_detail(q),
+        fields=q.get("fields")))
 
 
 def _r_task_create(h, m, q):
@@ -17095,14 +17854,15 @@ def _r_task_show(h, m, q):
         h._conn(), m.group(1), m.group(2),
         action_query=q.get("action_q"),
         action_filter=q.get("action_filter"),
-        action_limit=q.get("action_limit") or 60,
+        action_limit=q.get("action_limit"),
         action_offset=q.get("action_offset") or 0,
-        action_sort=q.get("action_sort") or "oldest",
+        action_sort=q.get("action_sort"),
         history_query=q.get("history_q"),
         history_filter=q.get("history_filter"),
-        history_limit=q.get("history_limit") or 60,
+        history_limit=q.get("history_limit"),
         history_offset=q.get("history_offset") or 0,
-        history_sort=q.get("history_sort") or "oldest"))
+        history_sort=q.get("history_sort"),
+        detail=_tool_detail(q), fields=q.get("fields")))
 
 
 def _r_task_plan_get(h, m, q):
@@ -17503,6 +18263,8 @@ ROUTES = [
      _r_sync_snapshot),
     (*_route_def("GET", "/v1/projects/%s/sync/pull" % _PID), _r_sync_pull),
     (*_route_def("POST", "/v1/projects/%s/sync/push" % _PID), _r_sync_push),
+    (*_route_def("GET", "/v1/projects/%s/sync/receipts" % _PID),
+     _r_sync_receipts),
     (*_route_def("GET", "/v1/projects/%s/inbox" % _PID), _r_inbox_get),
     (*_route_def("POST", "/v1/projects/%s/inbox/dispositions" % _PID),
      _r_message_dispose),
@@ -17796,8 +18558,23 @@ def _offline_proxy_latch_auth_required(url, project_id, root, actor_hint,
         return True
 
 
+def _offline_proxy_state_adapter(url, project_id, root, actor_hint, runtime,
+                                 device_id):
+    """Construct the exact verified outbox adapter without loading a mirror.
+
+    Identity, subscription, and role checks are identical to
+    :func:`_offline_proxy_adapter`; only the expensive snapshot/convergence
+    validation is skipped.  Use it for state-only writes such as recording
+    the live hosted cursor after a successful hosted mutation.
+    """
+    adapter, _snapshot_unused, _proof_unused, entry = _offline_proxy_adapter(
+        url, project_id, root, actor_hint, runtime, device_id,
+        verify_mirror=False)
+    return adapter, entry
+
+
 def _offline_proxy_adapter(url, project_id, root, actor_hint, runtime,
-                           device_id):
+                           device_id, verify_mirror=True):
     """Open one exact watcher-owned verified mirror/outbox partition.
 
     No owner, role, principal, or token is inferred here.  All authority comes
@@ -17845,6 +18622,15 @@ def _offline_proxy_adapter(url, project_id, root, actor_hint, runtime,
     client_id = "watcher_" + hashlib.sha256(
         material.encode("utf-8")).hexdigest()[:32]
     wake = lambda: _offline_proxy_wake(state_path, stored_key)
+    if not verify_mirror:
+        try:
+            return offline.OfflineProjectSync(
+                state_path.parent / "offline", normalized_url, scope,
+                client_id, device_id, visibility_fingerprint=visibility,
+                wake_callback=wake), None, None, dict(entry)
+        except offline.OfflineSyncError as error:
+            raise AttaccaError(
+                "verified offline outbox is unavailable: %s" % error) from error
     try:
         adapter = offline.OfflineProjectSync(
             state_path.parent / "offline", normalized_url, scope, client_id,
@@ -17914,21 +18700,36 @@ def _offline_proxy_action(event):
 
 def _offline_proxy_marker(adapter, proof):
     status = adapter.status()
-    return {
+    ambiguous = list(status.get("ambiguous_pending_reconcile") or [])
+    marker = {
         "offline": True,
         "read_source": "verified_local_mirror",
         "pending_sync": bool(status.get("pending_sync")),
         "sync": {
             "mode": status.get("mode"),
-            "mirror_stale": bool(proof.get("mirror_stale")),
-            "mirror_verified_at": proof.get("mirror_verified_at"),
-            "mirror_cursor": proof.get("cursor"),
+            "mirror_stale": bool(proof.get("mirror_stale"))
+            if proof else bool(status.get("mirror_stale")),
+            "mirror_verified_at": (proof or {}).get("mirror_verified_at"),
+            "mirror_cursor": (proof or {}).get("cursor")
+            or status.get("mirror_cursor"),
             "pending_count": status.get("pending_count", 0),
             "conflict_count": status.get("conflict_count", 0),
             "convergence_awaiting_count": status.get(
                 "convergence_awaiting_count", 0),
+            # Live hosted writes whose outcome is still unknown are neither
+            # queued work nor finished work; they are reported as their own
+            # state until reconnect proves what happened.
+            "ambiguous_pending_reconcile": ambiguous,
+            "ambiguous_count": len(ambiguous),
+            "live_cursor": status.get("live_cursor"),
+            "mirror_stale_below_live_cursor": bool(
+                status.get("mirror_stale_below_live_cursor")),
+            "last_outage_summary": status.get("last_outage_summary"),
         },
     }
+    if ambiguous:
+        marker["ambiguous_pending_reconcile"] = ambiguous
+    return marker
 
 
 def _offline_proxy_mark(result, adapter, proof):
@@ -18092,6 +18893,33 @@ class OfflineProxySession:
             self.url, self.project_getter(), self.root, self.actor_hint,
             self.runtime, self.device_id, http_status)
 
+    def _state_adapter(self):
+        adapter, _entry = _offline_proxy_state_adapter(
+            self.url, self.project_getter(), self.root, self.actor_hint,
+            self.runtime, self.device_id)
+        return adapter
+
+    def record_live_cursor(self, cursor):
+        """Remember the hosted cursor a successful live write just proved.
+
+        Any cached read below it would be knowingly stale, so the mirror is
+        refused until a pull catches up.
+        """
+        return self._state_adapter().record_live_cursor(cursor)
+
+    def outage_status(self):
+        """Reconnect/ambiguity state for status surfaces and lifecycle hooks."""
+        status = self._state_adapter().status()
+        return {
+            "ambiguous_pending_reconcile": status[
+                "ambiguous_pending_reconcile"],
+            "ambiguous_count": status["ambiguous_count"],
+            "live_cursor": status.get("live_cursor"),
+            "mirror_stale_below_live_cursor": status[
+                "mirror_stale_below_live_cursor"],
+            "last_outage_summary": status.get("last_outage_summary"),
+        }
+
     @staticmethod
     def _project_args(args, scope):
         if not isinstance(args, dict):
@@ -18102,10 +18930,34 @@ class OfflineProxySession:
                 "offline mode cannot cross workspace boundaries; this "
                 "verified mirror belongs to '%s'" % scope["project_id"])
 
+    # Status surfaces must stay readable precisely so a stale mirror can be
+    # explained rather than silently answered from.
+    STALE_READABLE_TOOLS = {
+        "attacca_status", "check_freshness", "list_projects"}
+
+    def _refuse_stale_mirror(self, name, adapter, snapshot):
+        """Never answer from a mirror older than this device's own write."""
+        if name in self.STALE_READABLE_TOOLS:
+            return None
+        _, offline = _offline_sync_runtime()
+        reader = getattr(adapter, "live_cursor", None)
+        live_cursor = reader() if callable(reader) else None
+        if not offline.OfflineProjectSync.cursor_behind(
+                snapshot.get("cursor"), live_cursor):
+            return None
+        raise AttaccaError(
+            "hosted Attacca is unreachable and this verified mirror is stale: "
+            "a hosted write from this device reached ledger #%s, but the "
+            "cached projection stops at #%s. %s would report a state this "
+            "device already changed; retry once the watcher has pulled."
+            % (live_cursor.get("event_seq"),
+               (snapshot.get("cursor") or {}).get("event_seq"), name))
+
     def _read(self, name, args, adapter, snapshot, proof):
         scope = snapshot["scope"]
         project_id = scope["project_id"]
         projection = snapshot["projection"]
+        self._refuse_stale_mirror(name, adapter, snapshot)
         project = projection.get("project") or {}
         events = _offline_proxy_visible_events(snapshot)
         self._project_args(args, scope)
@@ -18207,6 +19059,9 @@ class OfflineProxySession:
                 "scanned_through_seq": scanned_through,
                 "hosted_read_cursor": hosted_cursor,
                 "offline_mark_read_deferred": bool(mark_read),
+                # The exact mirror generation this page was projected from,
+                # so a reader can tell which hosted writes it can contain.
+                "offline_mirror_cursor": snapshot["cursor"],
                 "pending_dispositions": disposition_state["pending"],
                 "pending_disposition_total":
                     disposition_state["pending_total"],
@@ -18816,13 +19671,74 @@ class OfflineProxySession:
             return _offline_proxy_mark(result, adapter, proof)
         raise AttaccaError("tool %s is not available from an offline mirror" % name)
 
-    def _write(self, name, args, adapter, snapshot, proof, allow_queue):
+    def _record_ambiguous(self, name, args, adapter, snapshot, failure):
+        """Durably record one live write whose hosted outcome is unknown.
+
+        The complete request body has already reached the hosted workspace,
+        so the write may have been applied.  Nothing is queued and nothing is
+        replayed here: the record is fsynced before this call returns and is
+        resolved against hosted receipts on the next successful connection.
+        """
+        failure = failure or {}
+        scope = snapshot["scope"]
+        # The hosted server hashes the arguments it received minus only the
+        # transport key, so the reconciliation hash must match that exactly.
+        sent = {key: value for key, value in dict(args or {}).items()
+                if key != LIVE_IDEMPOTENCY_ARGUMENT}
+        payload = dict(sent)
+        payload.pop("project", None)
+        operation = OFFLINE_PROXY_WRITE_OPERATIONS.get(name)
+        replayable = bool(
+            operation
+            and operation in SYNC_OPERATION_TO_TOOL
+            and name not in OFFLINE_PROXY_EXPLICITLY_UNAVAILABLE
+            and not (name == "room_send" and (args or {}).get(
+                "target_project"))
+            and not SYNC_RESERVED_ARGUMENTS.intersection(payload))
+        if name in SYNC_DIRECTOR_TOOLS and scope["role"] != "director":
+            replayable = False
+        # The proxy stamps the id into the outgoing arguments, so the exact
+        # id the hosted server saw is recovered from this very request.
+        mutation_id = (args or {}).get(LIVE_IDEMPOTENCY_ARGUMENT) \
+            or failure.get("client_mutation_id")
+        protocol, _ = _offline_sync_runtime()
+        recorded = None
+        error_detail = None
+        if mutation_id:
+            try:
+                recorded = adapter.record_ambiguous_live_write(
+                    mutation_id, name, payload, operation=operation,
+                    metadata={"git_branch": git_branch(self.root),
+                              "git_revision": git_head(self.root)},
+                    request_sha256=protocol.live_request_sha256(name, sent),
+                    phase=failure.get("phase"), replayable=replayable)
+            except Exception as error:  # durability failure must be visible
+                error_detail = str(error)
+        if recorded is None:
+            raise AttaccaError(
+                "%s reached the hosted workspace before the connection "
+                "failed, so its outcome is ambiguous, and this client could "
+                "not record it for reconciliation (%s). Do not resend it "
+                "blindly; verify the hosted workspace once it is reachable"
+                % (name, error_detail or "no live mutation id was assigned"))
+        raise AttaccaError(
+            "%s may already have been applied by the hosted workspace: the "
+            "complete request was sent and the reply was lost, so the "
+            "outcome is ambiguous. It is recorded durably as %s and shows as "
+            "ambiguous_pending_reconcile until the next successful "
+            "connection checks the hosted receipt%s. Do not resend it."
+            % (name, mutation_id,
+               "" if replayable else
+               "; this operation changes identity, authority, or crosses a "
+               "workspace boundary and is never replayed automatically"))
+
+    def _write(self, name, args, adapter, snapshot, proof, allow_queue,
+               failure=None):
         scope = snapshot["scope"]
         self._project_args(args, scope)
         if not allow_queue:
-            raise AttaccaError(
-                "hosted mutation outcome is ambiguous after the transport "
-                "failed; it was not queued. Retry after the outage is confirmed")
+            return self._record_ambiguous(
+                name, args, adapter, snapshot, failure)
         if name in OFFLINE_PROXY_EXPLICITLY_UNAVAILABLE:
             raise AttaccaError(
                 "%s is unavailable offline because it changes identity, "
@@ -18906,19 +19822,20 @@ class OfflineProxySession:
         result["sync"]["pending_count"] = adapter.status()["pending_count"]
         return result
 
-    def _tool(self, name, args, allow_queue):
+    def _tool(self, name, args, allow_queue, failure=None):
         adapter, snapshot, proof, _ = self._open()
         if name in OFFLINE_PROXY_READ_TOOLS:
             return self._read(name, args, adapter, snapshot, proof)
         if name in OFFLINE_PROXY_WRITE_OPERATIONS \
                 or name in OFFLINE_PROXY_EXPLICITLY_UNAVAILABLE:
             return self._write(
-                name, args, adapter, snapshot, proof, allow_queue)
+                name, args, adapter, snapshot, proof, allow_queue,
+                failure=failure)
         raise AttaccaError(
             "%s is explicitly unavailable offline; reconnect to hosted MCP"
             % name)
 
-    def process(self, msg, transport_error, allow_queue=True):
+    def process(self, msg, transport_error, allow_queue=True, failure=None):
         method = msg.get("method")
         msg_id = msg.get("id")
         params = msg.get("params") or {}
@@ -18951,7 +19868,7 @@ class OfflineProxySession:
             name = params.get("name")
             args = params.get("arguments") or {}
             try:
-                result = self._tool(name, args, allow_queue)
+                result = self._tool(name, args, allow_queue, failure=failure)
                 return self._res(msg_id, {
                     "content": [{"type": "text", "text": json.dumps(
                         result, indent=2, ensure_ascii=False)}],
@@ -18969,7 +19886,8 @@ class OfflineProxySession:
                     "isError": True})
         return self._err(msg_id, -32601, "method not found: %s" % method)
 
-    def process_message(self, msg, transport_error, allow_queue=True):
+    def process_message(self, msg, transport_error, allow_queue=True,
+                        failure=None):
         if isinstance(msg, list):
             if not msg:
                 return self._err(None, -32600, "invalid request: empty batch")
@@ -18978,13 +19896,15 @@ class OfflineProxySession:
                 if not isinstance(item, dict):
                     responses.append(self._err(None, -32600, "invalid request"))
                     continue
-                response = self.process(item, transport_error, allow_queue)
+                response = self.process(
+                    item, transport_error, allow_queue, failure=failure)
                 if response is not None:
                     responses.append(response)
             return responses or None
         if not isinstance(msg, dict):
             return self._err(None, -32600, "invalid request")
-        return self.process(msg, transport_error, allow_queue)
+        return self.process(
+            msg, transport_error, allow_queue, failure=failure)
 
 
 def _offline_proxy_write_request(msg):
@@ -18995,15 +19915,132 @@ def _offline_proxy_write_request(msg):
                for item in items)
 
 
-def _offline_proxy_safe_unavailable(error):
-    """True only when no hosted mutation request could have been received."""
+# Errors that prove a connection never established, mirroring
+# ``sync_client.proves_request_undelivered`` for installs whose bundled sync
+# client cannot be loaded at all.
+_OFFLINE_PROXY_UNDELIVERED_ERRNOS = frozenset(
+    value for value in (
+        getattr(errno, name, None) for name in (
+            "ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH", "ENETDOWN",
+            "EHOSTDOWN", "EADDRNOTAVAIL", "EAFNOSUPPORT", "ENOTCONN",
+        )
+    ) if value is not None)
+
+
+def _offline_proxy_legacy_safe_unavailable(error):
+    """Proof-by-exception fallback when the sync client cannot be loaded."""
     import urllib.error
-    if isinstance(error, (ConnectionRefusedError, socket.gaierror)):
-        return True
-    if isinstance(error, urllib.error.URLError):
-        reason = error.reason
-        return isinstance(reason, (ConnectionRefusedError, socket.gaierror))
+    seen = set()
+    current = error
+    while isinstance(current, BaseException) and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (ConnectionRefusedError, socket.gaierror)):
+            return True
+        code = getattr(current, "errno", None)
+        if isinstance(code, int) \
+                and code in _OFFLINE_PROXY_UNDELIVERED_ERRNOS:
+            return True
+        reason = getattr(current, "reason", None) \
+            if isinstance(current, urllib.error.URLError) else None
+        current = reason if isinstance(reason, BaseException) \
+            else current.__cause__
     return False
+
+
+def _offline_proxy_transport_classification(error, phase=None):
+    """Classify one transport failure exactly as the watcher does.
+
+    A dead host -- refused, unreachable network, unknown name, or a timeout
+    while still connecting -- provably delivered nothing, so the write may be
+    queued.  Only a failure after the complete request was sent is ambiguous.
+    """
+    try:
+        client = _sync_client_runtime()
+    except Exception:
+        return "undelivered" \
+            if _offline_proxy_legacy_safe_unavailable(error) else "ambiguous"
+    return client.classify_transport_failure(error, phase)
+
+
+def _offline_proxy_safe_unavailable(error, phase=None):
+    """True only when no complete hosted request could have been received."""
+    return _offline_proxy_transport_classification(error, phase) == \
+        "undelivered"
+
+
+def _offline_proxy_live_mutation_id(client_instance, device_id):
+    protocol, _ = _offline_sync_runtime()
+    return protocol.new_client_mutation_id(
+        client_instance or "attacca-connect", device_id or "unknown-device")
+
+
+def _offline_proxy_stamp_live_mutation_ids(msg, client_instance, device_id):
+    """Give every outgoing live mutation one immutable idempotency key.
+
+    Without it a lost reply is unanswerable: the hosted workspace has no name
+    for the write and this client cannot ask afterwards whether it landed.
+    """
+    stamped = {}
+    for item in (msg if isinstance(msg, list) else [msg]):
+        if not isinstance(item, dict) or item.get("method") != "tools/call":
+            continue
+        params = item.get("params")
+        if not isinstance(params, dict):
+            continue
+        name = params.get("name")
+        if name not in OFFLINE_PROXY_WRITE_OPERATIONS \
+                and name not in OFFLINE_PROXY_EXPLICITLY_UNAVAILABLE:
+            continue
+        arguments = params.get("arguments")
+        if arguments is None:
+            arguments = {}
+            params["arguments"] = arguments
+        if not isinstance(arguments, dict):
+            continue
+        existing = arguments.get(LIVE_IDEMPOTENCY_ARGUMENT)
+        if not existing:
+            existing = _offline_proxy_live_mutation_id(
+                client_instance, device_id)
+            arguments[LIVE_IDEMPOTENCY_ARGUMENT] = existing
+        stamped[str(item.get("id"))] = existing
+    return stamped
+
+
+def _offline_proxy_take_live_receipts(decoded):
+    """Strip transport receipts from a hosted answer, returning them.
+
+    The receipt is proxy plumbing, not project content: the AI sees exactly
+    the hosted tool result it would have seen without idempotency.
+    """
+    receipts = []
+    for response in (decoded if isinstance(decoded, list) else [decoded]):
+        if not isinstance(response, dict):
+            continue
+        result = response.get("result")
+        if not isinstance(result, dict):
+            continue
+        content = result.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "text":
+                continue
+            text = part.get("text")
+            if not isinstance(text, str) \
+                    or LIVE_RECEIPT_RESULT_KEY not in text:
+                continue
+            try:
+                body = json.loads(text)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(body, dict) \
+                    or LIVE_RECEIPT_RESULT_KEY not in body:
+                continue
+            receipt = body.pop(LIVE_RECEIPT_RESULT_KEY)
+            if isinstance(receipt, dict):
+                receipts.append(receipt)
+            part["text"] = json.dumps(body, indent=2, ensure_ascii=False)
+    return receipts
 
 
 def run_connect_proxy(url=None, actor=None, actor_type=None, project=None,
@@ -19151,7 +20188,7 @@ def run_connect_proxy(url=None, actor=None, actor_type=None, project=None,
                 sys.stderr.write(
                     "attacca connect: autostart failed: %s\n" % error)
 
-    def post(message, context, include_session=True):
+    def post(message, context, include_session=True, sent_flag=None):
         headers = {"Content-Type": "application/json",
                    "Accept": "application/json"}
         if context["project"]:
@@ -19186,8 +20223,24 @@ def run_connect_proxy(url=None, actor=None, actor_type=None, project=None,
         req = urlreq.Request(
             context["url"] + "/mcp", data=body, headers=headers,
             method="POST")
+        opener = transport_opener()
+        # The phase is trusted only when a tracker actually observed this
+        # attempt; without one, classification falls back to proof-by-
+        # exception, whose default is the fail-safe "ambiguous".
+        state["transport_phase"] = None
+        if opener is not None:
+            opener.reset()
+            state["transport_phase"] = "connect"
+        # Everything above is local preparation.  Only from here can any byte
+        # of this request reach the hosted workspace.
+        if sent_flag is not None:
+            sent_flag["tool_request"] = True
         try:
             with urlreq.urlopen(req, timeout=request_timeout) as resp:
+                # A complete reply arrived; nothing about this request is
+                # ambiguous any more.
+                if opener is not None:
+                    state["transport_phase"] = "response"
                 sid = resp.headers.get("Mcp-Session-Id")
                 if sid:
                     state["session"] = sid
@@ -19197,6 +20250,30 @@ def run_connect_proxy(url=None, actor=None, actor_type=None, project=None,
                 return resp.status, resp.read()
         except urllib.error.HTTPError as err:
             return err.code, err.read()
+        except BaseException as err:
+            state["transport_phase"] = (
+                getattr(err, "attacca_transport_phase", None)
+                or (opener.phase if opener is not None else None))
+            raise
+
+    def transport_opener():
+        """One shared phase-tracking opener, or None when unavailable.
+
+        It is installed as this process's default urllib opener so ordinary
+        ``urlopen`` calls record how far each attempt got.  That is what
+        separates a dead host, whose write may be queued, from a lost reply,
+        whose outcome is ambiguous.  Installing it also stops an Attacca
+        Bearer credential from ever being replayed through a redirect.
+        """
+        if "transport_opener" not in state:
+            opener = None
+            try:
+                opener = _sync_client_runtime().PhaseTrackingOpener()
+                urlreq.install_opener(opener.opener)
+            except Exception:
+                opener = None
+            state["transport_opener"] = opener
+        return state["transport_opener"]
 
     def response_error_text(status, data):
         try:
@@ -19420,6 +20497,25 @@ def run_connect_proxy(url=None, actor=None, actor_type=None, project=None,
         # Recreate it lazily under the selected exact identity next call.
         reset_remote()
 
+    def apply_live_receipts(decoded):
+        """Advance the local live cursor from hosted write receipts.
+
+        The mirror cannot contain a write that was just applied live, so the
+        next cached read must not answer from a snapshot below this cursor.
+        """
+        receipts = _offline_proxy_take_live_receipts(decoded)
+        for receipt in receipts:
+            cursor = receipt.get("server_cursor") \
+                if receipt.get("status") == "applied" else None
+            if not cursor:
+                continue
+            try:
+                offline_session.record_live_cursor(cursor)
+            except Exception:
+                # Continuity bookkeeping never breaks a successful hosted
+                # write; the watcher still refreshes the mirror on its tick.
+                pass
+
     def process_one(message):
         if not isinstance(message, dict):
             return {"jsonrpc": "2.0", "id": None,
@@ -19444,6 +20540,7 @@ def run_connect_proxy(url=None, actor=None, actor_type=None, project=None,
             return ({"jsonrpc": "2.0", "id": msg_id, "result": {}}
                     if msg_id is not None else None)
 
+        sent = {"tool_request": False}
         try:
             context = refresh_binding()
             ensure_autostart(context)
@@ -19451,8 +20548,13 @@ def run_connect_proxy(url=None, actor=None, actor_type=None, project=None,
             if failure:
                 return hosted_failure(
                     message, context, failure[0], failure[1])
+            # Every live mutation leaves with an immutable idempotency key so
+            # a lost reply remains answerable after the outage.
+            _offline_proxy_stamp_live_mutation_ids(
+                message, context.get("client_instance"),
+                context.get("device_id"))
             had_session = bool(state["session"])
-            status, data = post(message, context)
+            status, data = post(message, context, sent_flag=sent)
             if status == 404 and had_session:
                 # A hosted restart invalidates only its transient MCP session.
                 # Recreate it invisibly, then retry the request once. Session
@@ -19462,9 +20564,10 @@ def run_connect_proxy(url=None, actor=None, actor_type=None, project=None,
                 if failure:
                     return hosted_failure(
                         message, context, failure[0], failure[1])
-                status, data = post(message, context)
+                status, data = post(message, context, sent_flag=sent)
             decoded = decode_hosted(message, context, status, data)
             apply_identity_selection(message, decoded, context)
+            apply_live_receipts(decoded)
             return decoded if msg_id is not None else None
         except AuthenticationError as error:
             latch_auth(401)
@@ -19477,50 +20580,67 @@ def run_connect_proxy(url=None, actor=None, actor_type=None, project=None,
             return authentication_response(
                 message, context, 401, str(error))
         except Exception as error:
-            # The original tool request has not been sent when hidden
-            # initialization fails. Conservatively retain the existing
-            # ambiguity rules; only proven refusal/DNS failures can queue a
-            # write, while reads may use a verified exact mirror.
+            # Classification decides whether a write may be queued. A dead
+            # host delivered nothing and queues safely; a failure after the
+            # complete request was sent is ambiguous and is recorded for
+            # reconciliation instead. When hidden initialization fails the
+            # tool request itself never left this process, so it is
+            # undelivered by construction regardless of the phase reached.
+            phase = state.get("transport_phase") \
+                if sent["tool_request"] else "connect"
+            classification = "undelivered" if not sent["tool_request"] \
+                else _offline_proxy_transport_classification(error, phase)
             allow_queue = (not _offline_proxy_write_request(message)
-                           or _offline_proxy_safe_unavailable(error))
+                           or classification == "undelivered")
             offline_response = offline_session.process_message(
-                message, error, allow_queue=allow_queue)
+                message, error, allow_queue=allow_queue,
+                failure={"classification": classification, "phase": phase})
             return offline_response if msg_id is not None else None
 
-    while True:
-        try:
-            line = stdin.readline()
-        except (KeyboardInterrupt, BrokenPipeError):
-            return
-        if line == "":
-            return
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
-            send_line({"jsonrpc": "2.0", "id": None,
-                       "error": {"code": -32700, "message": "parse error"}})
-            continue
-        if isinstance(msg, list):
-            if not msg:
-                payload = {"jsonrpc": "2.0", "id": None,
-                           "error": {"code": -32600,
-                                     "message": "invalid request: empty batch"}}
-            else:
-                responses = [process_one(item) for item in msg]
-                payload = [item for item in responses if item is not None]
-                if not payload:
-                    continue
-        else:
-            payload = process_one(msg)
-            if payload is None:
+    # The tracking opener is installed lazily on the first hosted request and
+    # removed again when this proxy exits, so an embedding process is left
+    # exactly as it was found.
+    previous_opener = getattr(urlreq, "_opener", None)
+    try:
+        while True:
+            try:
+                line = stdin.readline()
+            except (KeyboardInterrupt, BrokenPipeError):
+                return
+            if line == "":
+                return
+            line = line.strip()
+            if not line:
                 continue
-        try:
-            send_line(payload)
-        except BrokenPipeError:
-            return
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                send_line({"jsonrpc": "2.0", "id": None,
+                           "error": {"code": -32700,
+                                     "message": "parse error"}})
+                continue
+            if isinstance(msg, list):
+                if not msg:
+                    payload = {"jsonrpc": "2.0", "id": None,
+                               "error": {
+                                   "code": -32600,
+                                   "message": "invalid request: empty batch"}}
+                else:
+                    responses = [process_one(item) for item in msg]
+                    payload = [item for item in responses if item is not None]
+                    if not payload:
+                        continue
+            else:
+                payload = process_one(msg)
+                if payload is None:
+                    continue
+            try:
+                send_line(payload)
+            except BrokenPipeError:
+                return
+    finally:
+        if state.get("transport_opener") is not None:
+            urlreq.install_opener(previous_opener)
 
 
 # ---------------------------------------------------------------------------

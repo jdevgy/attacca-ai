@@ -1163,6 +1163,42 @@ def _snapshot_cloud_context(snapshot):
     return value if isinstance(value, dict) else None
 
 
+_CLOUD_CONTEXT_BLOCK_HEAD = re.compile(
+    r"(?m)^<!-- ATTACCA_CLOUD_CONTEXT:BEGIN\b([^\r\n]*)-->[ \t]*\r?$")
+CLOUD_CONTEXT_BLOCK_FILES = ("CLAUDE.md", "AGENTS.md")
+
+
+def _checkout_cloud_context_sha(status):
+    """sha256 of the Cloud Context this checkout already carries locally.
+
+    Passing it to ``get_handoff`` lets the server answer with version
+    metadata only while the document is unchanged, so the brief never
+    re-downloads a Cloud Context the model is about to read anyway from the
+    synchronized ATTACCA_CLOUD_CONTEXT block.  A missing, unreadable, or
+    foreign-project block simply yields None and the server sends the body.
+    """
+    project_id = str((status or {}).get("project_id") or "").strip()
+    if not project_id:
+        return None
+    root = (status or {}).get("link_path")
+    root = Path(root).parent.parent if root else Path(
+        (status or {}).get("root") or ".")
+    for name in CLOUD_CONTEXT_BLOCK_FILES:
+        try:
+            text = (Path(root) / name).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        match = _CLOUD_CONTEXT_BLOCK_HEAD.search(text)
+        if not match:
+            continue
+        header = match.group(1)
+        owner = re.search(r"(?:^|\s)project=([^\s>]+)", header)
+        sha = re.search(r"(?:^|\s)sha=([0-9a-f]{16,64})(?=\s|$)", header)
+        if sha and owner and owner.group(1) == project_id:
+            return sha.group(1)
+    return None
+
+
 def _cloud_context_block_adapter(plugin_root, project_id, root_path,
                                  cloud_context, create=True):
     runtime = _load_attacca_runtime(plugin_root)
@@ -4492,6 +4528,69 @@ def _watcher_outage_recovered_notice(key):
     }
 
 
+def _snapshot_reconciled_count(snapshot):
+    """Rows this identity's upgrade baseline closed, per T-80 section E."""
+    if not isinstance(snapshot, dict):
+        return 0
+    candidates = [snapshot.get("inbox")]
+    handoff = snapshot.get("handoff")
+    if isinstance(handoff, dict):
+        candidates.append(handoff.get("your_inbox"))
+    for source in candidates:
+        if not isinstance(source, dict):
+            continue
+        try:
+            count = int(source.get("reconciled_count") or 0)
+        except (TypeError, ValueError):
+            continue
+        if count > 0:
+            return count
+    return 0
+
+
+def _disposition_reconciled_notice(key, snapshot):
+    """One-time line naming the addressed backlog an upgrade auto-closed.
+
+    Implicit reconciliation silently resolves messages this identity had
+    already read before dispositions shipped.  Silence would look like the
+    backlog never existed, so it is reported exactly once per subscription -
+    the same latch discipline as the hosted-outage notice.
+    """
+    count = _snapshot_reconciled_count(snapshot)
+    if count <= 0:
+        return None
+    seen = False
+
+    def mutate(state):
+        nonlocal seen
+        entry = (state.get("subscriptions") or {}).get(key)
+        if not entry:
+            return
+        seen = bool(entry.get("disposition_reconciled_notice_at"))
+        if not seen:
+            entry["disposition_reconciled_notice_at"] = \
+                datetime.now(timezone.utc).isoformat()
+            entry["disposition_reconciled_count"] = count
+
+    try:
+        _mutate_state(_watcher_state_path(), mutate)
+    except Exception:
+        return None
+    if seen:
+        return None
+    return {
+        "system_message": "Attacca reconciled earlier addressed messages",
+        "context": (
+            "ATTACCA DISPOSITION RECONCILIATION: %d pending row%s "
+            "were reconciled on upgrade — addressed messages this identity "
+            "had already read before explicit dispositions shipped are "
+            "recorded as acknowledged. Nothing was deleted: check_inbox "
+            "still shows each row with its implied outcome, and anything "
+            "still open remains in pending_dispositions. Reported once."
+            % (count, "" if count == 1 else "s")),
+    }
+
+
 # The managed pulse keeps its `* * * * *` cron. Only the network probe backs
 # off, so a dead endpoint cannot burn one model turn per minute for hours.
 PULSE_PROBE_FAILURE_THRESHOLD = 3
@@ -5162,6 +5261,17 @@ def _compact_cloud_context(value):
     result = {key: value.get(key) for key in (
         "version", "sha256", "updated_by", "updated_owner", "updated_at")
               if key in value}
+    if value.get("content_included") is False or (
+            "content" not in value and value.get("content_chars")):
+        # A compact get_handoff answers with version + sha256 only when the
+        # caller already holds the document.  Rendering that as an empty
+        # string would claim this project has no Cloud Context at all.
+        result["content"] = None
+        result["content_omitted"] = True
+        result["content_next_action"] = (
+            value.get("content_hint") or
+            "call cloud_context_get for the complete Cloud Context")
+        return result
     content, truncated = _head_tail_text(
         value.get("content"), 100_000,
         "call cloud_context_get before relying on the omitted section")
@@ -5688,6 +5798,19 @@ def _turn_rules_banner(status, config, rules, event_name, pre_omitted=0,
     return banner
 
 
+def _poll_decision_rows(rows):
+    """Projection-independent decision markers for the poll baseline.
+
+    ``get_handoff`` returns richer decision rows under ``detail='full'`` than
+    under the compact default.  Storing the raw rows would make the first
+    poll after any projection change report every decision as changed, so the
+    baseline keeps only the fields that actually describe a decision's state.
+    """
+    return [{key: item.get(key) for key in
+             ("decision_id", "title", "status")}
+            for item in (rows or []) if isinstance(item, dict)]
+
+
 def _poll_view(snapshot):
     """Stable shared-state markers used to suppress no-change hook output."""
     handoff = snapshot.get("handoff") or {}
@@ -5712,7 +5835,7 @@ def _poll_view(snapshot):
         "identity_handoff": handoff.get("identity_handoff"),
         "identity_handoff_actor": handoff.get("identity_handoff_actor"),
         "identity_handoff_version": handoff.get("identity_handoff_version"),
-        "decisions": handoff.get("decisions") or [],
+        "decisions": _poll_decision_rows(handoff.get("decisions")),
         "project_rules": compact_rules,
         "project_rules_omitted_count": len(omitted_rule_ids),
         "project_rules_omitted_ids": omitted_rule_ids,
@@ -5960,8 +6083,13 @@ def _mcp_snapshot(status, plugin_root, config, mark_inbox_read=True):
          "params": {"name": "cloud_context_get", "arguments": {}}},
         {"jsonrpc": "2.0", "id": 6, "method": "tools/call",
          "params": {"name": "role_scope_get", "arguments": {}}},
+        # The compact handoff returns the Cloud Context body only when the
+        # sha this checkout already holds no longer matches.
         {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
-         "params": {"name": "get_handoff", "arguments": {}}},
+         "params": {"name": "get_handoff", "arguments": {
+             key: value for key, value in
+             (("cloud_context_sha", _checkout_cloud_context_sha(status)),)
+             if value}}},
         {"jsonrpc": "2.0", "id": 8, "method": "tools/call",
          "params": {"name": "get_project_log", "arguments": {}}},
         {"jsonrpc": "2.0", "id": 9, "method": "tools/call",
@@ -7234,6 +7362,8 @@ handoff before further writes.
         output = _append_notice(output, claude_loop_notice)
         output = _append_notice(output, terminal_notice)
         output = _append_notice(output, inbox_check_notice)
+        output = _append_notice(
+            output, _disposition_reconciled_notice(offline_key, snapshot))
         # Append last: _insert_after_rules_banner places the newest notice
         # directly after the mandatory rules, making unread mail the first
         # operational content at every supported turn boundary.
@@ -7342,7 +7472,8 @@ def _change_summary(status, previous, current, snapshot, interval):
     if previous.get("lead_director") != current.get("lead_director"):
         details.append("Lead director: %s" % (
             current.get("lead_director") or "not set"))
-    if previous.get("decisions") != current.get("decisions"):
+    if _poll_decision_rows(previous.get("decisions")) != \
+            _poll_decision_rows(current.get("decisions")):
         decisions = current.get("decisions") or []
         details.append("Decisions: %s" % (
             ", ".join("%s %s" % (item.get("decision_id"), item.get("status"))
@@ -7363,6 +7494,11 @@ def _change_summary(status, previous, current, snapshot, interval):
             updated += (
                 "; this refreshed text is authoritative for the current "
                 "session:\n\n%s\n\n[END ATTACCA CLOUD CONTEXT]" % content)
+        elif cloud_context.get("content_omitted"):
+            # The body was withheld because this checkout already holds the
+            # matching sha; never report that as an emptied context.
+            updated += ("; call cloud_context_get for the refreshed "
+                        "authoritative text")
         else:
             updated += "; the authoritative context is now empty"
         details.append(updated)

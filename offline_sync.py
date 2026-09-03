@@ -54,21 +54,48 @@ JOURNAL_RECORD_FORMAT = "attacca.offline.identity-outbox-record"
 CONVERGENCE_PROOF_FORMAT = "attacca.offline.convergence-proof"
 OFFLINE_SYNC_SCHEMA_VERSION = 1
 MIRROR_SCHEMA_VERSION = 2
-SYNC_STATE_SCHEMA_VERSION = 2
+SYNC_STATE_SCHEMA_VERSION = 3
 JOURNAL_GENESIS_HASH = "0" * 64
 
-_SYNC_STATE_MUTABLE_KEYS = {
+# Schema-v2 state files remain readable: they are digest-checked exactly as
+# before and then upgraded in place with the new keys defaulted, so an
+# existing device never fails closed merely because it was written by an
+# older generation of this client.
+_SYNC_STATE_V2_MUTABLE_KEYS = {
     "mode", "pending_sync", "mirror_stale", "last_attempt_at",
     "last_success_at", "last_error", "last_local_write_at",
     "mirror_verified_at", "last_verified_remote_cursor", "last_reset_reason",
     "last_converged_ids",
 }
+_SYNC_STATE_ADDED_V3_KEYS = {
+    "live_cursor", "last_outage_summary", "surfaced_ambiguous_ids",
+}
+_SYNC_STATE_MUTABLE_KEYS = (
+    _SYNC_STATE_V2_MUTABLE_KEYS | _SYNC_STATE_ADDED_V3_KEYS)
 _SYNC_STATE_IDENTITY_KEYS = {
     "format", "schema_version", "storage_key", "scope_fingerprint",
     "client_id", "device_id", "mirror_key", "projection_capabilities",
 }
 _SYNC_STATE_KEYS = (
     _SYNC_STATE_MUTABLE_KEYS | _SYNC_STATE_IDENTITY_KEYS | {"state_sha256"})
+_SYNC_STATE_V2_KEYS = (
+    _SYNC_STATE_V2_MUTABLE_KEYS | _SYNC_STATE_IDENTITY_KEYS
+    | {"state_sha256"})
+
+# Append-only outbox record kinds.  ``mutation`` and ``ambiguous`` are the two
+# root kinds: every other record must reference one of them.
+JOURNAL_ROOT_KINDS = frozenset({"mutation", "ambiguous"})
+JOURNAL_RECORD_KINDS = frozenset({
+    "mutation", "receipt", "conflict", "resolution", "converged",
+    "ambiguous", "ambiguous_resolved",
+})
+AMBIGUOUS_PHASES = frozenset({"connect", "send", "response", "unknown"})
+AMBIGUOUS_RESOLUTIONS = frozenset({"landed", "requeued", "abandoned"})
+MAX_OUTAGE_SUMMARY_IDS = 100
+_OUTAGE_SUMMARY_LISTS = (
+    "queued_replayed", "ambiguous_landed", "ambiguous_replayed",
+    "conflicts", "unresolved_ambiguous",
+)
 _SYNC_MODES = {
     "uninitialized", "offline_uninitialized", "offline", "pending",
     "syncing", "online", "conflict",
@@ -186,6 +213,43 @@ def _validate_optional_timestamp(value, label):
     except (TypeError, ValueError) as error:
         raise OfflineSyncError("%s is not a timezone-aware timestamp" % label) \
             from error
+
+
+def _validate_mutation_id_list(value, label, limit=MAX_OUTAGE_SUMMARY_IDS):
+    if not isinstance(value, list) or len(value) > limit \
+            or len(value) != len(set(value)) \
+            or any(not isinstance(item, str)
+                   or not _MUTATION_ID_RE.fullmatch(item) for item in value):
+        raise OfflineSyncError("%s is invalid" % label)
+    return list(value)
+
+
+def _validate_outage_summary(value):
+    """One bounded reconnect summary a lifecycle hook can render once."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) \
+            or set(value) != set(_OUTAGE_SUMMARY_LISTS) | {"at"}:
+        raise OfflineSyncError("sync state outage summary is invalid")
+    _validate_optional_timestamp(value.get("at"), "outage summary at")
+    if value.get("at") is None:
+        raise OfflineSyncError("sync state outage summary is invalid")
+    for name in _OUTAGE_SUMMARY_LISTS:
+        _validate_mutation_id_list(
+            value.get(name), "outage summary %s" % name)
+    return value
+
+
+def _make_outage_summary(**lists):
+    summary = {"at": _utc_now()}
+    for name in _OUTAGE_SUMMARY_LISTS:
+        values = []
+        for item in lists.get(name) or []:
+            item = str(item)
+            if item not in values:
+                values.append(item)
+        summary[name] = values[:MAX_OUTAGE_SUMMARY_IDS]
+    return _validate_outage_summary(summary)
 
 
 def _required(label, value):
@@ -925,6 +989,7 @@ class OfflineProjectSync:
         records = []
         previous_hash = JOURNAL_GENESIS_HASH
         mutations = set()
+        ambiguous = set()
         for expected, (sequence, path) in enumerate(
                 self._record_paths_locked(), start=1):
             if sequence != expected:
@@ -955,15 +1020,27 @@ class OfflineProjectSync:
                 raise OfflineJournalError(
                     "outbox identity/chain mismatch at sequence %d" % sequence)
             kind = record.get("kind")
-            if kind not in {
-                    "mutation", "receipt", "conflict", "resolution",
-                    "converged"}:
+            if kind not in JOURNAL_RECORD_KINDS:
                 raise OfflineJournalError(
                     "unknown outbox record kind %r" % kind)
             mutation_id = record.get("client_mutation_id")
             if not isinstance(mutation_id, str) \
                     or not _MUTATION_ID_RE.fullmatch(mutation_id):
                 raise OfflineJournalError("invalid outbox mutation id")
+            if kind == "ambiguous":
+                if mutation_id in ambiguous:
+                    raise OfflineJournalError(
+                        "duplicate ambiguous record for %s" % mutation_id)
+                self._validate_ambiguous_record(record)
+                ambiguous.add(mutation_id)
+            elif kind == "ambiguous_resolved":
+                if mutation_id not in ambiguous:
+                    raise OfflineJournalError(
+                        "%s references an unknown ambiguous write %s" %
+                        (kind, mutation_id))
+                if record.get("resolution") not in AMBIGUOUS_RESOLUTIONS:
+                    raise OfflineJournalError(
+                        "invalid ambiguous resolution for %s" % mutation_id)
             if kind == "mutation":
                 if mutation_id in mutations:
                     raise OfflineJournalError(
@@ -994,7 +1071,9 @@ class OfflineProjectSync:
                     raise OfflineJournalError(
                         "queued mutation attribution mismatch")
                 mutations.add(mutation_id)
-            elif mutation_id not in mutations:
+            elif kind not in JOURNAL_ROOT_KINDS \
+                    and kind != "ambiguous_resolved" \
+                    and mutation_id not in mutations:
                 raise OfflineJournalError(
                     "%s references an unknown mutation %s" %
                     (kind, mutation_id))
@@ -1016,6 +1095,40 @@ class OfflineProjectSync:
         return records
 
     @staticmethod
+    def _validate_ambiguous_record(record):
+        """Bound one durable record of a live write with an unknown outcome."""
+        value = record.get("ambiguous")
+        expected = {
+            "tool", "operation", "payload", "metadata", "request_sha256",
+            "phase", "attempted_at", "replayable",
+        }
+        if not isinstance(value, dict) or set(value) != expected:
+            raise OfflineJournalError("invalid ambiguous outbox record")
+        if not isinstance(value["tool"], str) or not value["tool"] \
+                or len(value["tool"]) > protocol.MAX_OPERATION_LENGTH:
+            raise OfflineJournalError("ambiguous record tool is invalid")
+        if value["operation"] is not None \
+                and (not isinstance(value["operation"], str)
+                     or len(value["operation"]) >
+                     protocol.MAX_OPERATION_LENGTH):
+            raise OfflineJournalError("ambiguous record operation is invalid")
+        if not isinstance(value["payload"], dict) \
+                or not isinstance(value["metadata"], dict):
+            raise OfflineJournalError("ambiguous record body is invalid")
+        if not isinstance(value["request_sha256"], str) \
+                or not re.fullmatch(
+                    r"sha256:[0-9a-f]{64}", value["request_sha256"]):
+            raise OfflineJournalError("ambiguous record hash is invalid")
+        if value["phase"] not in AMBIGUOUS_PHASES \
+                or not isinstance(value["replayable"], bool):
+            raise OfflineJournalError("ambiguous record phase is invalid")
+        _validate_optional_timestamp(
+            value["attempted_at"], "ambiguous record attempted_at")
+        if value["attempted_at"] is None:
+            raise OfflineJournalError("ambiguous record needs a timestamp")
+        return value
+
+    @staticmethod
     def _projection(records):
         mutations = []
         by_id = {}
@@ -1024,9 +1137,23 @@ class OfflineProjectSync:
         conflict_records = {}
         converged = {}
         resolutions = {}
+        ambiguous = {}
+        ambiguous_resolutions = {}
         for record in records:
             mutation_id = record["client_mutation_id"]
             kind = record["kind"]
+            if kind == "ambiguous":
+                ambiguous[mutation_id] = record
+                status[mutation_id] = "ambiguous"
+                continue
+            if kind == "ambiguous_resolved":
+                ambiguous_resolutions[mutation_id] = record
+                if mutation_id not in by_id:
+                    # A requeued write keeps whatever status its later
+                    # ``mutation`` record assigns; only an id that never
+                    # became a queued mutation ends here.
+                    status[mutation_id] = "ambiguous_%s" % record["resolution"]
+                continue
             if kind == "mutation":
                 mutation = record["mutation"]
                 mutations.append(mutation)
@@ -1069,11 +1196,19 @@ class OfflineProjectSync:
             for item in mutations
             if status[item["client_mutation_id"]] == "awaiting_convergence"
         ]
+        unresolved_ambiguous = [
+            record for mutation_id, record in ambiguous.items()
+            if mutation_id not in ambiguous_resolutions
+            and mutation_id not in by_id
+        ]
         return {
             "mutations": mutations, "by_id": by_id, "status": status,
             "ready": ready, "blocked": blocked, "conflicts": conflicts,
             "receipts": receipts, "awaiting": awaiting,
             "converged": converged, "resolutions": resolutions,
+            "ambiguous": ambiguous,
+            "ambiguous_resolutions": ambiguous_resolutions,
+            "unresolved_ambiguous": unresolved_ambiguous,
         }
 
     def _journal_locked(self):
@@ -1128,12 +1263,21 @@ class OfflineProjectSync:
                 "last_verified_remote_cursor": None,
                 "last_reset_reason": None,
                 "last_converged_ids": [],
+                "live_cursor": None,
+                "last_outage_summary": None,
+                "surfaced_ambiguous_ids": [],
             }
         try:
             state = _read_json_file(self.state_path, 1024 * 1024)
         except OfflineSyncError as error:
             raise OfflineSyncError("cannot load sync state: %s" % error) from error
-        if not isinstance(state, dict) or set(state) != _SYNC_STATE_KEYS:
+        if not isinstance(state, dict):
+            raise OfflineSyncError("sync state has an invalid shape")
+        keys = set(state)
+        legacy_v2 = (keys == _SYNC_STATE_V2_KEYS
+                     and state.get("schema_version")
+                     == SYNC_STATE_SCHEMA_VERSION - 1)
+        if keys != _SYNC_STATE_KEYS and not legacy_v2:
             raise OfflineSyncError("sync state has an invalid shape")
         digest = state.get("state_sha256")
         unsigned = dict(state)
@@ -1142,6 +1286,16 @@ class OfflineProjectSync:
                 or not re.fullmatch(r"[0-9a-f]{64}", digest) \
                 or digest != _sha256(unsigned):
             raise OfflineSyncError("sync state digest mismatch")
+        if legacy_v2:
+            # The digest above already proved this exact older file. Upgrade
+            # it in memory; the next write persists the current schema.
+            state = dict(state)
+            state["schema_version"] = SYNC_STATE_SCHEMA_VERSION
+            state["live_cursor"] = None
+            state["last_outage_summary"] = None
+            state["surfaced_ambiguous_ids"] = []
+            state.pop("state_sha256", None)
+            state["state_sha256"] = _sha256(state)
         if state.get("format") != SYNC_STATE_FORMAT \
                 or state.get("schema_version") != SYNC_STATE_SCHEMA_VERSION \
                 or state.get("storage_key") != self.storage_key \
@@ -1187,6 +1341,17 @@ class OfflineProjectSync:
                        or not _MUTATION_ID_RE.fullmatch(item)
                        for item in converged):
             raise OfflineSyncError("sync state convergence list is invalid")
+        live_cursor = state.get("live_cursor")
+        if live_cursor is not None:
+            try:
+                protocol.validate_cursor(live_cursor)
+            except protocol.SyncProtocolError as error:
+                raise OfflineSyncError(
+                    "sync state live cursor is invalid: %s" % error) from error
+        _validate_mutation_id_list(
+            state.get("surfaced_ambiguous_ids"),
+            "sync state surfaced ambiguous list")
+        _validate_outage_summary(state.get("last_outage_summary"))
         return state
 
     def _write_state_locked(self, state):
@@ -1389,6 +1554,229 @@ class OfflineProjectSync:
             state.update({"mode": "pending", "pending_sync": True})
             self._write_state_locked(state)
             return record
+
+    # -- live hosted writes: ambiguity and mirror freshness ----------------
+
+    @staticmethod
+    def cursor_behind(cursor, live_cursor):
+        """True when ``cursor`` cannot yet contain everything ``live`` proved."""
+        if not live_cursor:
+            return False
+        if not cursor:
+            return True
+        return (int(cursor.get("event_seq") or 0)
+                < int(live_cursor.get("event_seq") or 0)
+                or int(cursor.get("context_version") or 0)
+                < int(live_cursor.get("context_version") or 0))
+
+    def live_cursor(self):
+        """Highest hosted cursor this device observed on a live write."""
+        with self._locked():
+            return _json_copy(self._read_state_locked().get("live_cursor"))
+
+    def record_live_cursor(self, cursor):
+        """Advance the live cursor after a successful hosted mutation.
+
+        The mirror cannot contain a write that was just applied live, so any
+        cached read below this cursor is refused until a pull catches up.
+        This is a state-only write: it never loads or validates the mirror.
+        """
+        try:
+            checked = protocol.validate_cursor(cursor)
+        except protocol.SyncProtocolError as error:
+            raise OfflineSyncError(
+                "live cursor is invalid: %s" % error) from error
+        with self._locked():
+            state = self._read_state_locked()
+            current = state.get("live_cursor")
+            if current is not None and not self.cursor_behind(current, checked):
+                return _json_copy(current)
+            state["live_cursor"] = _json_copy(checked)
+            state["mirror_stale"] = True
+            self._write_state_locked(state)
+            return _json_copy(checked)
+
+    def record_ambiguous_live_write(self, client_mutation_id, tool, payload, *,
+                                    operation=None, metadata=None,
+                                    request_sha256=None, phase=None,
+                                    replayable=True, attempted_at=None):
+        """Durably record one live write whose hosted outcome is unknown.
+
+        The record is fsynced before the caller may answer its user.  It is
+        never replayed blindly: reconnect first asks the server whether that
+        exact client_mutation_id already landed.
+        """
+        client_mutation_id = str(client_mutation_id)
+        if not _MUTATION_ID_RE.fullmatch(client_mutation_id):
+            raise OfflineSyncError(
+                "client_mutation_id must be 8-200 safe characters")
+        payload = _json_copy(payload or {},
+                             max_bytes=protocol.MAX_MUTATION_BYTES)
+        metadata = _json_copy(metadata or {},
+                              max_bytes=protocol.MAX_MUTATION_BYTES)
+        if not isinstance(payload, dict) or not isinstance(metadata, dict):
+            raise OfflineSyncError("ambiguous record body must be an object")
+        if _contains_reserved_attribution(metadata):
+            raise OfflineSyncError(
+                "ambiguous record must not override authenticated attribution")
+        if _contains_reserved_attribution(payload):
+            # Recording the unknown outcome is more important than retaining
+            # a body that may never be replayed anyway.  Keep the record and
+            # its request hash; drop the body and forbid replay.
+            replayable = False
+        if not replayable:
+            payload = {}
+        detail = {
+            "tool": str(tool),
+            "operation": str(operation) if operation else None,
+            "payload": payload,
+            "metadata": metadata,
+            "request_sha256": request_sha256
+            or _sha256({"tool": str(tool), "payload": payload}),
+            "phase": str(phase or "unknown").strip().lower()
+            if str(phase or "unknown").strip().lower() in AMBIGUOUS_PHASES
+            else "unknown",
+            "attempted_at": attempted_at or _utc_now(),
+            "replayable": bool(replayable),
+        }
+        with self._locked():
+            _, projected = self._journal_locked()
+            existing = projected["ambiguous"].get(client_mutation_id)
+            if existing is not None:
+                return _json_copy(existing)
+            if client_mutation_id in projected["by_id"]:
+                raise OfflineJournalError(
+                    "client_mutation_id is already a queued mutation")
+            self._validate_ambiguous_record({"ambiguous": detail})
+            record = self._append_record_locked(
+                "ambiguous", client_mutation_id, {"ambiguous": detail})
+            state = self._read_state_locked()
+            state.update({
+                "mode": "pending", "pending_sync": True,
+                "mirror_stale": True,
+                "last_local_write_at": detail["attempted_at"],
+            })
+            self._write_state_locked(state)
+        if callable(self._wake_callback):
+            try:
+                self._wake_callback()
+            except Exception:
+                pass
+        return _json_copy(record)
+
+    def ambiguous_records(self, unresolved_only=True):
+        with self._locked():
+            _, projected = self._journal_locked()
+            if unresolved_only:
+                return _json_copy(projected["unresolved_ambiguous"])
+            return _json_copy(list(projected["ambiguous"].values()))
+
+    def _resolve_ambiguous_locked(self, client_mutation_id, resolution,
+                                  evidence=None):
+        if resolution not in AMBIGUOUS_RESOLUTIONS:
+            raise OfflineSyncError("invalid ambiguous resolution")
+        return self._append_record_locked(
+            "ambiguous_resolved", client_mutation_id, {
+                "resolution": resolution,
+                "evidence": _json_copy(
+                    evidence, max_bytes=protocol.MAX_MUTATION_BYTES)
+                if evidence is not None else None,
+            })
+
+    @staticmethod
+    def _receipts_unsupported(error):
+        names = {item.__name__ for item in type(error).__mro__}
+        return "SyncReceiptsUnsupportedError" in names
+
+    def reconcile_ambiguous(self, remote):
+        """Resolve every unknown live write before any outbox replay.
+
+        ``landed`` mutations are converged without a second apply; provably
+        absent ones become ordinary queued mutations that replay under their
+        original id; anything the server cannot answer stays ambiguous and is
+        surfaced instead of being guessed.
+        """
+        report = {"landed": [], "replayed": [], "unknown": [],
+                  "abandoned": [], "supported": True}
+        with self._locked():
+            _, projected = self._journal_locked()
+            pending = _json_copy(projected["unresolved_ambiguous"])
+        if not pending:
+            return report
+        identifiers = [item["client_mutation_id"] for item in pending]
+        lookup = getattr(remote, "fetch_receipts", None)
+        if not callable(lookup):
+            report["supported"] = False
+            report["unknown"] = identifiers
+            return report
+        try:
+            receipts = lookup(identifiers[:MAX_OUTAGE_SUMMARY_IDS])
+        except Exception as error:
+            if self._receipts_unsupported(error):
+                report["supported"] = False
+                report["unknown"] = identifiers
+                return report
+            raise
+        if not isinstance(receipts, dict):
+            raise OfflineSyncError(
+                "receipt lookup returned an invalid answer")
+        for record in pending:
+            mutation_id = record["client_mutation_id"]
+            detail = record["ambiguous"]
+            receipt = receipts.get(mutation_id)
+            if isinstance(receipt, dict) and receipt.get("status") == "applied":
+                if receipt.get("request_sha256") != detail["request_sha256"]:
+                    # The id exists but names another body: never claim this
+                    # write landed and never replay it silently.
+                    report["unknown"].append(mutation_id)
+                    continue
+                evidence = {
+                    key: receipt.get(key) for key in (
+                        "canonical_event_id", "canonical_event_seq",
+                        "request_sha256", "recorded_at", "server_cursor")
+                }
+                with self._locked():
+                    self._resolve_ambiguous_locked(
+                        mutation_id, "landed", evidence)
+                cursor = receipt.get("server_cursor")
+                if cursor:
+                    try:
+                        self.record_live_cursor(cursor)
+                    except OfflineSyncError:
+                        pass
+                report["landed"].append(mutation_id)
+                continue
+            provably_absent = receipt is None or (
+                isinstance(receipt, dict) and receipt.get("status") == "failed")
+            if not provably_absent:
+                # ``reserved`` means the server started this write and never
+                # finished recording it.  Unknown is not absent.
+                report["unknown"].append(mutation_id)
+                continue
+            if not detail["replayable"] or not detail["operation"]:
+                with self._locked():
+                    self._resolve_ambiguous_locked(
+                        mutation_id, "abandoned", {
+                            "reason": "authority-changing or cross-project "
+                                      "writes are never replayed automatically",
+                        })
+                report["abandoned"].append(mutation_id)
+                continue
+            try:
+                self.queue_mutation(
+                    detail["operation"], detail["payload"],
+                    metadata=detail["metadata"],
+                    client_mutation_id=mutation_id)
+            except (OfflineSyncError, OfflineJournalError) as error:
+                with self._locked():
+                    self._resolve_ambiguous_locked(
+                        mutation_id, "abandoned", {"reason": str(error)[:500]})
+                report["abandoned"].append(mutation_id)
+                continue
+            with self._locked():
+                self._resolve_ambiguous_locked(mutation_id, "requeued")
+            report["replayed"].append(mutation_id)
+        return report
 
     def _record_at_cursor_locked(self, cursor):
         snapshot = self._current_snapshot_locked()
@@ -1694,6 +2082,25 @@ class OfflineProjectSync:
         report["convergence_awaiting"] = current[
             "convergence_awaiting_receipts"]
         report["convergence_proof"] = current.get("convergence_proof")
+        report["ambiguous_pending_reconcile"] = current[
+            "ambiguous_pending_reconcile"]
+        replayed = list(report.get("ambiguous_replayed") or [])
+        summary = _make_outage_summary(
+            queued_replayed=[
+                item for item in (list(report.get("applied") or [])
+                                  + list(report.get("duplicates") or []))
+                if item not in replayed],
+            ambiguous_landed=report.get("ambiguous_landed"),
+            ambiguous_replayed=replayed,
+            conflicts=(list(report.get("conflicts") or [])
+                       + list(report.get("rejected") or [])),
+            unresolved_ambiguous=current["ambiguous_pending_reconcile"],
+        )
+        if any(summary[name] for name in _OUTAGE_SUMMARY_LISTS):
+            self._set_state(last_outage_summary=summary)
+            report["outage_summary"] = summary
+        else:
+            report["outage_summary"] = None
         return report
 
     def synchronize(self, remote):
@@ -1707,6 +2114,9 @@ class OfflineProjectSync:
             "pulled_before": False, "pulled_after": False,
             "applied": [], "duplicates": [], "conflicts": [],
             "rejected": [], "blocked": [], "converged": [], "error": None,
+            "ambiguous_landed": [], "ambiguous_replayed": [],
+            "ambiguous_unknown": [], "ambiguous_abandoned": [],
+            "receipt_lookup_supported": None,
         }
         try:
             report["pulled_before"], first_converged = \
@@ -1732,6 +2142,29 @@ class OfflineProjectSync:
                 pending_sync=True, mirror_stale=True, last_error=str(error))
             report["error"] = str(error)
             return self._sync_report("offline", report)
+
+        # The pull above is the first proven hosted call of this cycle.
+        # Resolve every unknown live write BEFORE anything is replayed, so a
+        # mutation that already landed is never applied a second time.
+        try:
+            reconciled = self.reconcile_ambiguous(remote)
+        except Exception as error:
+            contract_failure = self._remote_contract_failure_kind(error)
+            if contract_failure:
+                return self._remote_contract_report(
+                    error, report, contract_failure)
+            if not self._is_unavailable(error):
+                raise
+            self._set_state(
+                mode="offline", pending_sync=True, mirror_stale=True,
+                last_error=str(error))
+            report["error"] = str(error)
+            return self._sync_report("offline", report)
+        report["ambiguous_landed"] = list(reconciled["landed"])
+        report["ambiguous_replayed"] = list(reconciled["replayed"])
+        report["ambiguous_unknown"] = list(reconciled["unknown"])
+        report["ambiguous_abandoned"] = list(reconciled["abandoned"])
+        report["receipt_lookup_supported"] = bool(reconciled["supported"])
 
         with self._locked():
             _, projected = self._journal_locked()
@@ -1853,7 +2286,8 @@ class OfflineProjectSync:
             online = bool(
                 state.get("mode") == "online" and not mirror_stale
                 and not awaiting and not projected["ready"]
-                and not projected["blocked"] and not projected["conflicts"])
+                and not projected["blocked"] and not projected["conflicts"]
+                and not projected["unresolved_ambiguous"])
             proof = ConvergenceProof(
                 normalized_server_url=self.normalized_server_url,
                 storage_key=self.storage_key,
@@ -1892,10 +2326,19 @@ class OfflineProjectSync:
                 mode = "conflict"
             awaiting_ids = [
                 item["client_mutation_id"] for item in projected["awaiting"]]
+            ambiguous_ids = [
+                item["client_mutation_id"]
+                for item in projected["unresolved_ambiguous"]]
+            if ambiguous_ids and mode == "online":
+                # An unknown hosted outcome is unfinished work, never "online".
+                mode = "pending"
+            live_cursor = state.get("live_cursor")
+            stale_below_live_cursor = bool(
+                mirror_valid and self.cursor_behind(cursor, live_cursor))
             mirror_stale = bool(state.get("mirror_stale"))
             pending_sync = bool(
                 pending_count or projected["conflicts"] or awaiting_ids
-                or mirror_stale)
+                or ambiguous_ids or mirror_stale)
             if mirror_valid:
                 proof = self.convergence_proof()
             return {
@@ -1919,6 +2362,9 @@ class OfflineProjectSync:
                 "conflict_count": len(projected["conflicts"]),
                 "convergence_awaiting_count": len(awaiting_ids),
                 "convergence_awaiting_receipts": awaiting_ids,
+                "ambiguous_count": len(ambiguous_ids),
+                "ambiguous_pending_reconcile": ambiguous_ids,
+                "mirror_stale_below_live_cursor": stale_below_live_cursor,
                 "acknowledged_count": len(projected["converged"]),
                 "journal_records": len(records),
                 "orphan_temporary_files": sorted(
@@ -2089,4 +2535,6 @@ __all__ = [
     "OfflineVisibilityChangedError",
     "RemoteUnavailableError", "ConvergenceProof", "normalize_server_url",
     "mirror_storage_key", "validate_convergence_proof", "OfflineProjectSync",
+    "JOURNAL_RECORD_KINDS", "JOURNAL_ROOT_KINDS", "AMBIGUOUS_PHASES",
+    "AMBIGUOUS_RESOLUTIONS", "MAX_OUTAGE_SUMMARY_IDS",
 ]

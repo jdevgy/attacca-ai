@@ -8,13 +8,18 @@ and defaults to a bounded ``urllib`` implementation.
 
 from __future__ import annotations
 
+import errno
+import http.client
 import json
 import re
 import socket
+import threading
 from dataclasses import dataclass
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import (
+    HTTPHandler, HTTPRedirectHandler, HTTPSHandler, Request, build_opener,
+)
 
 try:  # Namespace package when imported as ``attacca.sync_client``.
     from . import sync_protocol as protocol
@@ -27,6 +32,26 @@ except (ImportError, ValueError):  # Direct module loading in isolated tests.
 DEFAULT_TIMEOUT_SECONDS = 10
 MAX_ERROR_BODY_BYTES = 64 * 1024
 MAX_TOKEN_BYTES = 16 * 1024
+MAX_RECEIPT_LOOKUP_IDS = 100
+
+# How far one HTTP attempt got before it failed.  ``connect`` covers DNS,
+# TCP connect, and the TLS handshake; ``send`` covers writing request headers
+# and body; ``response`` covers waiting for and reading the reply.
+TRANSPORT_PHASES = ("connect", "send", "response")
+UNDELIVERED = "undelivered"
+AMBIGUOUS = "ambiguous"
+PHASE_ATTRIBUTE = "attacca_transport_phase"
+CLASSIFICATION_ATTRIBUTE = "attacca_transport_classification"
+
+# Errors that prove no byte of a request could have been accepted, even when
+# the phase was not recorded (an older caller, or a re-raised cause).
+_UNDELIVERED_ERRNOS = frozenset(
+    value for value in (
+        getattr(errno, name, None) for name in (
+            "ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH", "ENETDOWN",
+            "EHOSTDOWN", "EADDRNOTAVAIL", "EAFNOSUPPORT", "ENOTCONN",
+        )
+    ) if value is not None)
 
 _SAFE_HEADER_ID_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,199}$")
@@ -45,7 +70,17 @@ class SyncAuthenticationError(SyncClientError):
 
 
 class SyncTransportError(ConnectionError):
-    """The hosted endpoint could not be reached or completed."""
+    """The hosted endpoint could not be reached or completed.
+
+    ``phase`` records how far the attempt got and ``classification`` states
+    whether a request could have been delivered.  ``undelivered`` is proof
+    that queueing the write is safe; ``ambiguous`` never is.
+    """
+
+    def __init__(self, message, *, phase=None, classification=None):
+        super().__init__(message)
+        self.phase = phase
+        self.classification = classification or AMBIGUOUS
 
 
 class SyncResponseError(SyncClientError):
@@ -59,6 +94,10 @@ class SyncResponseError(SyncClientError):
 
 class SyncSchemaCompatibilityError(SyncResponseError):
     """The endpoint is reachable/authenticated but wire schemas differ."""
+
+
+class SyncReceiptsUnsupportedError(SyncResponseError):
+    """This hosted server has no live/outbox receipt lookup route."""
 
 
 class SyncIdentityChangedError(SyncResponseError):
@@ -94,11 +133,174 @@ class _RejectRedirects(HTTPRedirectHandler):
         return None
 
 
+def _iter_causes(error):
+    """Walk an exception and its declared transport causes, never contexts."""
+    seen = set()
+    current = error
+    while isinstance(current, BaseException) and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        reason = getattr(current, "reason", None)
+        current = reason if isinstance(reason, BaseException) \
+            else current.__cause__
+
+
+def proves_request_undelivered(error):
+    """True only when the error proves no request byte reached the server."""
+    for item in _iter_causes(error):
+        if isinstance(item, (ConnectionRefusedError, socket.gaierror)):
+            return True
+        code = getattr(item, "errno", None)
+        if isinstance(code, int) and code in _UNDELIVERED_ERRNOS:
+            return True
+    return False
+
+
+def classify_transport_failure(error, phase=None):
+    """Return ``'undelivered'`` or ``'ambiguous'`` for one transport failure.
+
+    The phase is authoritative: nothing that failed while connecting or while
+    the request body was still being written can have been applied, because a
+    truncated body is not a parsable hosted request.  Once the complete
+    request has been sent, every failure is ambiguous -- the server may have
+    committed the write and lost only its reply.  Without a recorded phase the
+    classification falls back to proof-by-exception and otherwise stays
+    ambiguous, which is the fail-safe answer.
+    """
+    if isinstance(phase, str):
+        normalized = phase.strip().lower()
+        if normalized in ("connect", "send"):
+            return UNDELIVERED
+        if normalized == "response":
+            return AMBIGUOUS
+    recorded = getattr(error, PHASE_ATTRIBUTE, None)
+    if isinstance(recorded, str) and recorded.strip().lower() in TRANSPORT_PHASES:
+        return classify_transport_failure(error, recorded)
+    return UNDELIVERED if proves_request_undelivered(error) else AMBIGUOUS
+
+
+def annotate_transport_failure(error, phase):
+    """Attach the observed phase/classification to a live exception object."""
+    classification = classify_transport_failure(error, phase)
+    try:
+        setattr(error, PHASE_ATTRIBUTE, phase)
+        setattr(error, CLASSIFICATION_ATTRIBUTE, classification)
+    except (AttributeError, TypeError):  # pragma: no cover - exotic exception
+        pass
+    return classification
+
+
+class TransportPhaseTracker:
+    """Mutable record of the phase one HTTP attempt has reached."""
+
+    __slots__ = ("phase",)
+
+    def __init__(self):
+        self.phase = "connect"
+
+
+def _tracking_connection_class(base, tracker):
+    class _TrackedConnection(base):
+        def connect(self):
+            tracker.phase = "connect"
+            base.connect(self)
+            # The socket is established; anything that fails from here until
+            # the reply is requested happened while writing the request.
+            tracker.phase = "send"
+
+        def getresponse(self):
+            tracker.phase = "response"
+            return base.getresponse(self)
+
+    return _TrackedConnection
+
+
+class _TrackingHTTPHandler(HTTPHandler):
+    def __init__(self, tracker_getter):
+        HTTPHandler.__init__(self)
+        self._tracker_getter = tracker_getter
+
+    def http_open(self, req):
+        return self.do_open(
+            _tracking_connection_class(
+                http.client.HTTPConnection, self._tracker_getter()), req)
+
+
+class _TrackingHTTPSHandler(HTTPSHandler):
+    def __init__(self, tracker_getter):
+        HTTPSHandler.__init__(self)
+        self._tracker_getter = tracker_getter
+
+    def https_open(self, req):
+        arguments = {"context": getattr(self, "_context", None)}
+        # ``check_hostname`` exists on 3.8-3.11 handlers and was dropped in
+        # newer ones; forward it only when this interpreter still has it.
+        check_hostname = getattr(self, "_check_hostname", None)
+        if check_hostname is not None:
+            arguments["check_hostname"] = check_hostname
+        return self.do_open(
+            _tracking_connection_class(
+                http.client.HTTPSConnection, self._tracker_getter()), req,
+            **arguments)
+
+
+class PhaseTrackingOpener:
+    """One urllib opener that records the phase of every failed attempt.
+
+    Redirects are refused so an Attacca Bearer credential is never replayed
+    to another host, and each thread keeps its own phase record.
+    """
+
+    def __init__(self):
+        self._local = threading.local()
+        self._opener = build_opener(
+            _TrackingHTTPHandler(self._tracker),
+            _TrackingHTTPSHandler(self._tracker),
+            _RejectRedirects())
+
+    def _tracker(self):
+        tracker = getattr(self._local, "tracker", None)
+        if tracker is None:
+            tracker = TransportPhaseTracker()
+            self._local.tracker = tracker
+        return tracker
+
+    @property
+    def opener(self):
+        """The urllib OpenerDirector, for callers that install it globally."""
+        return self._opener
+
+    @property
+    def phase(self):
+        return self._tracker().phase
+
+    def reset(self):
+        """Start a new attempt; the phase is 'connect' until a socket opens."""
+        self._tracker().phase = "connect"
+        return self
+
+    def open(self, request, timeout=None):
+        tracker = self._tracker()
+        tracker.phase = "connect"
+        try:
+            return self._opener.open(request, timeout=timeout)
+        except HTTPError:
+            # A complete hosted reply arrived; this is not a transport outage.
+            raise
+        except Exception as error:
+            annotate_transport_failure(error, tracker.phase)
+            raise
+
+
 class UrllibJsonTransport:
     """Small bounded transport; it does not retain requests or credentials."""
 
     def __init__(self):
-        self._opener = build_opener(_RejectRedirects())
+        self._opener = PhaseTrackingOpener()
+
+    @property
+    def phase(self):
+        return self._opener.phase
 
     def request(self, method, url, *, headers, body, timeout,
                 max_response_bytes):
@@ -128,8 +330,11 @@ class UrllibJsonTransport:
                 body=raw,
             )
         except (URLError, socket.timeout, TimeoutError, OSError) as error:
+            phase = getattr(error, PHASE_ATTRIBUTE, None) or self._opener.phase
             raise SyncTransportError(
-                "Attacca sync endpoint is unavailable") from error
+                "Attacca sync endpoint is unavailable", phase=phase,
+                classification=classify_transport_failure(
+                    error, phase)) from error
 
 
 class AuthenticatedSyncHttpClient:
@@ -417,6 +622,62 @@ class AuthenticatedSyncHttpClient:
                 visibility_fingerprint=checked["visibility_fingerprint"])
         return checked
 
+    def fetch_receipts(self, ids):
+        """Look up idempotency receipts for this device's mutation ids.
+
+        The answer for each id is a receipt object, or ``None`` when the
+        server holds no record.  ``None`` means "never applied"; a receipt in
+        ``reserved`` state deliberately means "unknown", not "absent".
+        """
+        wanted = []
+        for item in ids or []:
+            item = str(item)
+            if not protocol.is_client_mutation_id(item):
+                raise SyncClientError("receipt lookup id is unsafe")
+            if item not in wanted:
+                wanted.append(item)
+        if not wanted:
+            return {}
+        if len(wanted) > MAX_RECEIPT_LOOKUP_IDS:
+            raise SyncClientError(
+                "receipt lookup accepts at most %d ids" %
+                MAX_RECEIPT_LOOKUP_IDS)
+        try:
+            value = self._request(
+                "GET", "/receipts", query={"ids": ",".join(wanted)},
+                max_response_bytes=protocol.MAX_PUSH_BYTES)
+        except SyncResponseError as error:
+            if getattr(error, "http_status", None) in (404, 405, 501):
+                raise SyncReceiptsUnsupportedError(
+                    "this Attacca server has no receipt lookup route",
+                    http_status=error.http_status) from error
+            raise
+        if not isinstance(value, dict) \
+                or value.get("format") != "attacca.sync.receipts-result" \
+                or not isinstance(value.get("receipts"), dict):
+            raise SyncResponseError("receipt lookup returned an invalid body")
+        self._check_scope(value.get("scope"))
+        receipts = {}
+        for key, item in value["receipts"].items():
+            if key not in wanted:
+                raise SyncResponseError(
+                    "receipt lookup returned an unrequested mutation id")
+            if item is None:
+                receipts[key] = None
+                continue
+            try:
+                checked = protocol.validate_live_receipt(
+                    item, expected_scope=self.scope)
+            except protocol.SyncProtocolError as error:
+                raise SyncResponseError(
+                    "receipt lookup returned an invalid receipt: %s"
+                    % error) from error
+            if checked["client_mutation_id"] != key:
+                raise SyncResponseError(
+                    "receipt lookup returned a mismatched mutation id")
+            receipts[key] = checked
+        return {key: receipts.get(key) for key in wanted}
+
     def push(self, *, mutations, known_receipts=None):
         if self.visibility_fingerprint is None:
             raise SyncIdentityChangedError(
@@ -447,9 +708,14 @@ class AuthenticatedSyncHttpClient:
 
 
 __all__ = [
-    "DEFAULT_TIMEOUT_SECONDS", "MAX_TOKEN_BYTES", "SyncClientError",
+    "DEFAULT_TIMEOUT_SECONDS", "MAX_TOKEN_BYTES", "MAX_RECEIPT_LOOKUP_IDS",
+    "TRANSPORT_PHASES", "UNDELIVERED", "AMBIGUOUS", "PHASE_ATTRIBUTE",
+    "CLASSIFICATION_ATTRIBUTE", "SyncClientError",
     "SyncAuthenticationError", "SyncTransportError", "SyncResponseError",
-    "SyncSchemaCompatibilityError", "SyncIdentityChangedError",
+    "SyncSchemaCompatibilityError", "SyncReceiptsUnsupportedError",
+    "SyncIdentityChangedError",
     "SyncVisibilityChangedError", "JsonHttpResponse", "UrllibJsonTransport",
-    "AuthenticatedSyncHttpClient",
+    "TransportPhaseTracker", "PhaseTrackingOpener",
+    "classify_transport_failure", "annotate_transport_failure",
+    "proves_request_undelivered", "AuthenticatedSyncHttpClient",
 ]

@@ -627,6 +627,42 @@ touched. The Control Panel exposes this as **Resolve all before
 In Claude Code they appear as `mcp__attacca__<name>`. Every tool takes an optional
 `project` argument for cross-project work.
 
+### Compact read projections (`detail`)
+
+`get_handoff`, `task_list`, `task_show`, `check_inbox` and `room_read` answer
+with a **compact** projection by default over MCP and REST. The default is what
+an agent needs to act — ids, titles, states, owners, versions, one-line
+summaries and cursors — and nothing a follow-up call can fetch:
+
+| Read | Compact default | Reach the rest with |
+| --- | --- | --- |
+| `get_handoff` | both handoffs, rules, role scope, governance, warnings, `recent_activity`; `open_tasks`/`decisions` capped at 30 id rows with `open_tasks_total`/`decisions_total`; `your_inbox` counters plus `first_page` (10 pending rows); `cloud_context` as `version`+`sha256` | `task_list`, `decision_list`, `check_inbox`, `cloud_context_get` |
+| `task_list` | board row: ids, state, risk, claimant, lease, plan version, dependencies, first 8 declared scope paths (`expected_scope_total`), `last_report` head (200 chars), `verification_status`, and ONE compact attribution record for the latest action | `task_show` |
+| `task_show` | that row plus the task description, newest 10 actions and 10 history lines | `action_limit`/`history_limit`/`action_sort` paging |
+| `check_inbox`, `room_read` | routing, attention flags, disposition state and the **complete** message body — the nested identity/attribution duplication is dropped | `detail=full` |
+
+Every compact attribution is `{actor_id, actor_type, run_by_user, role,
+runtime, persona, at}` (plus `human_user` for a human actor). The accountable
+human is never dropped.
+
+Pass `detail=full` to restore the complete nested identity, `ledger_actor` and
+per-lifecycle attribution records — the exact pre-compaction response. The
+Control Panel does this wherever it renders an identity chip. `task_list` and
+`task_show` also accept `fields` (a comma-separated row allow-list), and
+`get_handoff` accepts `cloud_context_sha` (send the sha256 your checkout's
+`ATTACCA_CLOUD_CONTEXT` block already holds and the body is returned only when
+it changed) or `cloud_context=full` to force the document.
+
+The same flags are query parameters on the matching REST reads:
+`GET /v1/projects/{id}/tasks?detail=full&fields=status,claimed_by`,
+`GET /v1/projects/{id}/tasks/{tid}?detail=full`,
+`GET /v1/projects/{id}/inbox?detail=full`,
+`GET /v1/projects/{id}/room?detail=full`,
+`GET /v1/projects/{id}/room/history?detail=full`, and
+`GET /v1/projects/{id}/handoff?detail=full&cloud_context=full`.
+Sync, export and the verified offline mirror are separate projections and are
+unchanged by these flags.
+
 ## CLI reference (same data, for humans and non-MCP tools)
 
 ```

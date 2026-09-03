@@ -1152,9 +1152,20 @@ class HttpTestCase(unittest.TestCase):
         source = next(message for message in source_room["messages"]
                       if message["body"] == "only target this connection")
         self.assertEqual(source["mirrored_to"], ["room-target"])
-        _, target_room, _ = self.rest(
+        _, compact_room, _ = self.rest(
             "GET", "/v1/projects/room-target/room")
+        compact_mirrored = compact_room["messages"][-1]
+        # T-86: the compact default keeps routing and the canonical actor and
+        # drops only the nested identity/attribution duplication.
+        self.assertEqual(compact_room["detail"], "compact")
+        self.assertEqual(compact_mirrored["origin_project"], "hub")
+        self.assertTrue(compact_mirrored["actor"].startswith("hub.unassigned."))
+        for dropped in ("identity", "attribution", "ledger_actor"):
+            self.assertNotIn(dropped, compact_mirrored)
+        _, target_room, _ = self.rest(
+            "GET", "/v1/projects/room-target/room?detail=full")
         mirrored = target_room["messages"][-1]
+        self.assertEqual(target_room["detail"], "full")
         self.assertEqual(mirrored["origin_project"], "hub")
         self.assertEqual(mirrored["identity"]["workspace"], "hub")
         self.assertTrue(mirrored["actor"].startswith("hub.unassigned."))

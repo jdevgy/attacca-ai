@@ -18,6 +18,7 @@ import hashlib
 import json
 import math
 import re
+import uuid
 from datetime import datetime, timezone
 
 
@@ -40,6 +41,7 @@ PUSH_RESULT_FORMAT = "attacca.sync.push-result"
 MUTATION_FORMAT = "attacca.sync.client-mutation"
 MUTATION_RESULT_FORMAT = "attacca.sync.mutation-result"
 STORED_RECEIPT_FORMAT = "attacca.sync.stored-receipt"
+LIVE_RECEIPT_FORMAT = "attacca.sync.live-receipt"
 
 GENESIS_HASH = "0" * 64
 
@@ -1345,6 +1347,118 @@ def mutation_sha256(mutation):
     return _sha256(_mutation_unsigned(mutation))
 
 
+def is_client_mutation_id(value):
+    """True only for a bounded, syntactically safe client mutation id."""
+    return (isinstance(value, str)
+            and len(value) <= MAX_IDENTIFIER_LENGTH
+            and bool(_MUTATION_ID_RE.fullmatch(value)))
+
+
+def new_client_mutation_id(client_id, device_id):
+    """Mint one immutable id shared by durable outbox and live hosted writes.
+
+    Offline replay and live idempotency must be able to name the very same
+    intent, so both paths use this single generator and its single bound.
+    """
+    material = "%s|%s" % (client_id or "", device_id or "")
+    prefix = hashlib.sha256(material.encode("utf-8")).hexdigest()[:12]
+    candidate = "cm_%s_%s" % (prefix, uuid.uuid4().hex)
+    if not is_client_mutation_id(candidate):  # pragma: no cover - defensive
+        _error("invalid_identifier", "generated mutation id is unsafe")
+    return candidate
+
+
+def live_request_sha256(tool, payload):
+    """Stable body hash for one live hosted MCP write.
+
+    A live write has no queued schema-v1 envelope, so idempotency binds the
+    exact tool plus its canonical arguments.  Reusing one id for a different
+    body must be detectable on both sides, never silently accepted.
+    """
+    if not isinstance(tool, str) or not tool:
+        _error("invalid_operation", "live request tool must be a string")
+    if not isinstance(payload, dict):
+        _error("invalid_mutation_body", "live request payload must be an object")
+    return _sha256({"tool": tool, "payload": payload})
+
+
+_LIVE_RECEIPT_KEYS = {
+    "format", "schema_version", "scope_fingerprint", "client_mutation_id",
+    "tool", "request_sha256", "status", "canonical_event_id",
+    "canonical_event_seq", "server_cursor", "result", "recorded_at",
+}
+LIVE_RECEIPT_STATUSES = {"applied", "reserved", "failed"}
+
+
+def make_live_receipt(scope, client_mutation_id, tool, request_sha256, *,
+                      status="applied", canonical_event_id=None,
+                      canonical_event_seq=None, server_cursor=None,
+                      result=None, recorded_at=None):
+    receipt = {
+        "format": LIVE_RECEIPT_FORMAT,
+        "schema_version": SCHEMA_VERSION,
+        "scope_fingerprint": scope_fingerprint(validate_scope(scope)),
+        "client_mutation_id": client_mutation_id,
+        "tool": tool,
+        "request_sha256": request_sha256,
+        "status": status,
+        "canonical_event_id": canonical_event_id,
+        "canonical_event_seq": canonical_event_seq,
+        "server_cursor": validate_cursor(server_cursor)
+        if server_cursor is not None else None,
+        "result": result,
+        "recorded_at": recorded_at or utc_now(),
+    }
+    return validate_live_receipt(receipt, expected_scope=scope)
+
+
+def validate_live_receipt(receipt, expected_scope=None):
+    _exact_keys(receipt, _LIVE_RECEIPT_KEYS, label="live receipt")
+    value = _json_copy(receipt, max_bytes=MAX_MUTATION_BYTES * 2)
+    if value["format"] != LIVE_RECEIPT_FORMAT \
+            or value["schema_version"] != SCHEMA_VERSION:
+        _error("unsupported_receipt", "unsupported live receipt")
+    _digest(value["scope_fingerprint"], "live receipt scope fingerprint")
+    if expected_scope is not None \
+            and value["scope_fingerprint"] != scope_fingerprint(expected_scope):
+        _error("cross_principal_receipt",
+               "live receipt belongs to another scope")
+    _identifier("live receipt client_mutation_id",
+                value["client_mutation_id"], mutation=True)
+    if not isinstance(value["tool"], str) \
+            or len(value["tool"]) > MAX_OPERATION_LENGTH \
+            or not _OPERATION_RE.fullmatch(value["tool"]):
+        _error("invalid_operation", "live receipt tool has unsafe syntax")
+    _digest(value["request_sha256"], "live receipt request_sha256")
+    if value["status"] not in LIVE_RECEIPT_STATUSES:
+        _error("invalid_receipt_status", "unsupported live receipt status")
+    applied = value["status"] == "applied"
+    if applied:
+        validate_cursor(value["server_cursor"])
+        # Not every hosted tool returns a canonical ledger event (a guarded
+        # idempotent outcome may not append one).  The mapping is therefore
+        # optional, but it is all-or-nothing: half a mapping is never proof.
+        if value["canonical_event_id"] is not None \
+                or value["canonical_event_seq"] is not None:
+            _identifier("live receipt canonical_event_id",
+                        value["canonical_event_id"])
+            if not _is_int(value["canonical_event_seq"]) \
+                    or value["canonical_event_seq"] <= 0:
+                _error("invalid_event_seq",
+                       "live receipt event sequence must be positive")
+    else:
+        if value["canonical_event_id"] is not None \
+                or value["canonical_event_seq"] is not None:
+            _error("invalid_receipt",
+                   "only an applied live receipt maps a canonical event")
+        if value["server_cursor"] is not None:
+            validate_cursor(value["server_cursor"])
+    if value["result"] is not None and not isinstance(value["result"], dict):
+        _error("invalid_receipt", "live receipt result must be an object")
+    _timestamp(value["recorded_at"], "live receipt recorded_at")
+    return value
+
+
 def make_client_mutation(scope, client_mutation_id, client_id, device_id,
                          client_sequence, operation, payload, base_cursor,
                          depends_on=None, metadata=None, created_at=None):
@@ -1728,6 +1842,10 @@ __all__ = [
     "validate_client_mutation", "make_push_request", "validate_push_request",
     "applied_result", "conflict_result", "rejected_result",
     "validate_mutation_result", "make_stored_receipt",
+    "LIVE_RECEIPT_FORMAT", "LIVE_RECEIPT_STATUSES",
+    "is_client_mutation_id", "new_client_mutation_id",
+    "live_request_sha256", "make_live_receipt",
+    "validate_live_receipt",
     "validate_stored_receipt", "stored_receipt_outcome",
     "make_push_result", "validate_push_result",
 ]

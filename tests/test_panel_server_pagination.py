@@ -1039,6 +1039,108 @@ class PanelServerPaginationContracts(unittest.TestCase):
         self.assertIs(drained["may_have_more"], False)
         self.assertIs(drained["has_more"], False)
 
+    def test_rest_reads_are_compact_by_default_and_honour_detail_full(self):
+        # T-86: the wire default is the compact projection; every Control
+        # Panel view that renders an identity chip asks for detail=full and
+        # gets the exact pre-compaction shape back.
+        headers = self.actor_headers(WORKER)
+        compact_tasks = self.get_json(
+            "/v1/projects/hub/tasks?limit=5&offset=0&sort=newest", headers
+        )
+        self.assertEqual(compact_tasks["detail"], "compact")
+        row = compact_tasks["tasks"][0]
+        for key in ("task_id", "status", "risk_level", "claimed_by",
+                    "updated_at", "verification_status", "attribution"):
+            self.assertIn(key, row)
+        for dropped in ("actions", "description"):
+            self.assertNotIn(dropped, row)
+        for item in compact_tasks["tasks"]:
+            if item.get("attribution"):
+                # Compaction never drops the accountable human.
+                self.assertIn("run_by_user", item["attribution"])
+
+        full_tasks = self.get_json(
+            "/v1/projects/hub/tasks?limit=5&offset=0&sort=newest&detail=full",
+            headers,
+        )
+        self.assertEqual(full_tasks["detail"], "full")
+        full_row = full_tasks["tasks"][0]
+        self.assertIn("actions", full_row)
+        self.assertIn("created", full_row["attribution"])
+        self.assertEqual(compact_tasks["total"], full_tasks["total"])
+        self.assertEqual(
+            [item["task_id"] for item in compact_tasks["tasks"]],
+            [item["task_id"] for item in full_tasks["tasks"]],
+        )
+
+        narrowed = self.get_json(
+            "/v1/projects/hub/tasks?limit=5&offset=0&sort=newest"
+            "&fields=status,claimed_by",
+            headers,
+        )
+        self.assertEqual(sorted(narrowed["tasks"][0]),
+                         ["claimed_by", "status", "task_id"])
+
+        task_id = full_row["task_id"]
+        compact_task = self.get_json(
+            "/v1/projects/hub/tasks/%s" % task_id, headers)
+        self.assertEqual(compact_task["detail"], "compact")
+        self.assertLessEqual(len(compact_task["actions"]), 10)
+        full_task = self.get_json(
+            "/v1/projects/hub/tasks/%s?detail=full" % task_id, headers)
+        self.assertEqual(full_task["actions_pagination"]["limit"], PAGE_SIZE)
+
+        compact_handoff = self.get_json(
+            "/v1/projects/hub/handoff", headers)
+        self.assertEqual(compact_handoff["detail"], "compact")
+        self.assertIn("open_tasks_total", compact_handoff)
+        full_handoff = self.get_json(
+            "/v1/projects/hub/handoff?detail=full&cloud_context=full", headers)
+        self.assertEqual(full_handoff["detail"], "full")
+        self.assertEqual(compact_handoff["context_version"],
+                         full_handoff["context_version"])
+
+        mail_headers = self.actor_headers(MAIL_RECIPIENT)
+        compact_inbox = self.get_json(
+            "/v1/projects/mailbox/inbox?mark_read=0&limit=5", mail_headers)
+        self.assertEqual(compact_inbox["detail"], "compact")
+        full_inbox = self.get_json(
+            "/v1/projects/mailbox/inbox?mark_read=0&limit=5&detail=full",
+            mail_headers,
+        )
+        self.assertEqual(compact_inbox["unread_total"],
+                         full_inbox["unread_total"])
+        # Room reads carry the same rows without depending on a cursor that
+        # a sibling test may already have drained.
+        compact_room = self.get_json(
+            "/v1/projects/mailbox/room?limit=5", mail_headers)
+        full_room = self.get_json(
+            "/v1/projects/mailbox/room?limit=5&detail=full", mail_headers)
+        self.assertEqual(compact_room["detail"], "compact")
+        self.assertEqual(full_room["detail"], "full")
+        self.assertNotIn("identity", compact_room["messages"][0])
+        self.assertIn("identity", full_room["messages"][0])
+        self.assertEqual(compact_room["next_since_seq"],
+                         full_room["next_since_seq"])
+        self.assertEqual(
+            [item["body"] for item in compact_room["messages"]],
+            [item["body"] for item in full_room["messages"]],
+        )
+
+        compact_history = self.get_json(
+            "/v1/projects/hub/room/history?limit=5&offset=0", headers)
+        self.assertEqual(compact_history["detail"], "compact")
+        full_history = self.get_json(
+            "/v1/projects/hub/room/history?limit=5&offset=0&detail=full",
+            headers,
+        )
+        self.assertIn("attribution", full_history["messages"][0])
+        self.assertEqual(compact_history["total"], full_history["total"])
+
+        rejected = self.request(
+            "GET", "/v1/projects/hub/tasks?detail=tiny", headers)
+        self.assertEqual(rejected["status"], 400, rejected["body"])
+
 
 if __name__ == "__main__":
     unittest.main()

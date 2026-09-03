@@ -1985,7 +1985,7 @@
         let page = null;
         for (let batch = 0; batch < 1000; batch += 1) {
           page = await api(pathFor(
-            `/inbox?mark_read=1&limit=${PANEL_PAGE_SIZE}`));
+            `/inbox?mark_read=1&limit=${PANEL_PAGE_SIZE}&detail=full`));
           if (!page?.may_have_more) return page;
         }
         throw new Error("Inbox kept growing while it was being marked read; try again.");
@@ -2027,19 +2027,20 @@
           const roleScopeManager = canManageRoleScopes();
           const endpoints = {
             projectPage: `/v1/projects${listQuery("workspaces", { q: state.workspaceSearch })}`,
-            sharedHandoff: pathFor("/handoff"),
+            sharedHandoff: pathFor("/handoff") + "?detail=full",
             sharedHandoffHistory: pathFor(`/handoff/history${listQuery("sharedHandoff", {
               q: state.sharedHandoffSearch
             })}`),
-            overviewHandoff: pathFor("/handoff"),
+            overviewHandoff: pathFor("/handoff") + "?detail=full",
             roleScopes: pathFor(`/role-scopes${roleScopeManager ? "?include_all=1" : ""}`),
             status: pathFor("/status"),
             bridges: pathFor(`/bridges${listQuery("bridges", { q: state.bridgeSearch })}`),
             bridgeOptions: pathFor("/bridges?options=1"),
-            tasks: pathFor(`/tasks${listQuery("tasks", { q: state.taskSearch, status: state.taskFilter })}`),
-            inbox: pathFor(`/inbox?mark_read=0&limit=${PANEL_PAGE_SIZE}`),
+            tasks: pathFor(`/tasks${listQuery("tasks", { q: state.taskSearch, status: state.taskFilter, detail: "full" })}`),
+            inbox: pathFor(`/inbox?mark_read=0&limit=${PANEL_PAGE_SIZE}&detail=full`),
             room: pathFor(`/room/history${feedQuery("room", {
-              conversation: state.roomConversation, q: state.roomFilter
+              conversation: state.roomConversation, q: state.roomFilter,
+              detail: "full"
             })}`),
             decisions: pathFor(`/decisions${listQuery("decisions", {
               q: state.decisionSearch, status: state.decisionFilter
@@ -2049,7 +2050,7 @@
             agents: pathFor(`/agents${listQuery("agents", { q: state.agentSearch })}`),
             agentOptions: pathFor("/agents?options=1"),
             log: pathFor(`/log${listQuery("log", { q: state.logSearch })}`),
-            overviewTasks: pathFor(`/tasks?limit=7&offset=0&sort=newest&status=active`),
+            overviewTasks: pathFor(`/tasks?limit=7&offset=0&sort=newest&status=active&detail=full`),
             overviewDecisions: pathFor(`/decisions?limit=1&offset=0&sort=newest`),
             overviewAgents: pathFor(`/agents?limit=7&offset=0&sort=newest`),
             overviewLog: pathFor(`/log?limit=7&offset=0&sort=newest`),
