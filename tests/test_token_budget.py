@@ -20,6 +20,12 @@ A10 pulse = ping  · a managed pulse injects only new mail + one marker line,
                     and its network probe backs off during an outage
 A11 rules banner  · pinned every prompt turn, full only on change/start/10th
 A13 compaction    · source parity, Kimi PostCompact rebrief, brief budget
+
+T-85 section E extends A9 to what the offline sync layer reports after the
+host comes back: one reconnect summary per outage, one line per change in the
+count of writes that could not be journaled, and a cached-read refusal folded
+into the outage state itself - each once per state, counts only, never at Stop
+and never consumed by a managed pulse.
 """
 
 import contextlib
@@ -62,6 +68,42 @@ def mail(index, body, seq=None, **extra):
     }
     row.update(extra)
     return row
+
+
+class SyncStatus:
+    """Minimal stand-in for the identity-scoped offline sync adapter.
+
+    The hook reads reconnect state through ``status()`` exactly as it reads
+    every other offline field, so a dict is all a budget test needs.
+    """
+
+    def __init__(self, **fields):
+        self.current = dict(fields)
+
+    def status(self):
+        return json.loads(json.dumps(self.current))
+
+
+def outage_summary(at="2026-09-03T09:30:00.000Z", queued_replayed=2,
+                   ambiguous_landed=1, ambiguous_replayed=0, conflicts=0,
+                   unresolved_ambiguous=0):
+    """One offline_sync ``last_outage_summary`` with the given counts."""
+    counts = {
+        "queued_replayed": queued_replayed,
+        "ambiguous_landed": ambiguous_landed,
+        "ambiguous_replayed": ambiguous_replayed,
+        "conflicts": conflicts,
+        "unresolved_ambiguous": unresolved_ambiguous,
+    }
+    summary = {"at": at}
+    index = 0
+    for name, count in counts.items():
+        rows = []
+        for _ in range(count):
+            index += 1
+            rows.append("cm_%s_%04d" % (name[:6], index))
+        summary[name] = rows
+    return summary
 
 
 def context_of(output, event_name, runtime="codex"):
@@ -180,18 +222,21 @@ class TokenBudgetTestCase(unittest.TestCase):
                                "last_poll_at": hook.time.time()})))
             yield snapshot
 
-    def periodic(self, event_name, runtime="codex", payload=None, **mocks):
+    def periodic(self, event_name, runtime="codex", payload=None,
+                 adapter=None, **mocks):
         with self.lifecycle_mocks(runtime, **mocks) as snapshot:
             output = hook._periodic_output(
-                self.status, event_name, offline_adapter=object(),
+                self.status, event_name, offline_adapter=adapter or object(),
                 hook_payload=payload)
         self.snapshot_calls = snapshot.call_count
         return output
 
-    def session_start(self, runtime="codex", payload=None, **mocks):
+    def session_start(self, runtime="codex", payload=None, adapter=None,
+                      **mocks):
         with self.lifecycle_mocks(runtime, **mocks) as snapshot:
             output = hook._active_output(
-                self.status, offline_adapter=object(), hook_payload=payload)
+                self.status, offline_adapter=adapter or object(),
+                hook_payload=payload)
         self.snapshot_calls = snapshot.call_count
         return output
 
@@ -901,6 +946,145 @@ class TokenBudgetTestCase(unittest.TestCase):
         entry = self.entry()
         self.assertNotIn("pulse_probe_failures", entry)
         self.assertNotIn("outage_notice_signature", entry)
+
+    # ------------------------------- T-85 E · reconnect results, once
+    def test_reconnect_summary_renders_once_after_a_pulse_and_a_stop(self):
+        adapter = SyncStatus(last_outage_summary=outage_summary(
+            queued_replayed=3, ambiguous_landed=1, ambiguous_replayed=2,
+            conflicts=0, unresolved_ambiguous=1))
+        # A managed pulse is a machine ping (D-24): it may not render the
+        # block, and it may not consume the once-per-summary latch either.
+        pulse = context_of(
+            self.periodic("UserPromptSubmit", payload=self.pulse_payload(),
+                          adapter=adapter), "UserPromptSubmit")
+        self.assertEqual(pulse.strip(), "ATTACCA_PULSE: nothing_new")
+        # Stop drops status notices, so recording there would silence the
+        # reconnect result forever (the A9 rule).
+        self.assertIsNone(self.periodic("Stop", adapter=adapter))
+        first = context_of(self.periodic("UserPromptSubmit", adapter=adapter),
+                           "UserPromptSubmit")
+        self.assertIn(
+            "ATTACCA RECONNECT SUMMARY \u00b7 shared: queued replayed 3 "
+            "\u00b7 ambiguous landed 1 \u00b7 ambiguous replayed 2 \u00b7 "
+            "conflicts 0 \u00b7 still ambiguous 1", first)
+        self.assertIn("do NOT resend", first)
+        self.assertIn("attacca_status", first)
+        self.assertEqual(first.count("RECONNECT SUMMARY"), 1)
+        # Counts only: no mutation id is ever echoed into the turn.
+        for mutation_id in adapter.current["last_outage_summary"][
+                "queued_replayed"]:
+            self.assertNotIn(mutation_id, first)
+        for _ in range(3):
+            repeat = self.periodic("UserPromptSubmit", adapter=adapter)
+            self.assertTrue(
+                repeat is None or "RECONNECT SUMMARY" not in
+                context_of(repeat, "UserPromptSubmit"), repeat)
+        self.assertIsNone(self.periodic("Stop", adapter=adapter))
+
+    def test_a_second_newer_reconnect_summary_renders_once_more(self):
+        adapter = SyncStatus(last_outage_summary=outage_summary())
+        first = context_of(self.periodic("UserPromptSubmit", adapter=adapter),
+                           "UserPromptSubmit")
+        self.assertIn("queued replayed 2", first)
+        # Nothing resolved and nothing unknown: no follow-up instruction.
+        self.assertNotIn("do NOT resend", first)
+        repeat = self.periodic("UserPromptSubmit", adapter=adapter)
+        self.assertTrue(repeat is None or "RECONNECT SUMMARY" not in
+                        context_of(repeat, "UserPromptSubmit"), repeat)
+        # A later outage is a different reconnect result and reports once.
+        adapter.current["last_outage_summary"] = outage_summary(
+            at="2026-09-03T11:00:00.000Z", queued_replayed=1,
+            ambiguous_landed=0, conflicts=2)
+        second = context_of(self.periodic("UserPromptSubmit", adapter=adapter),
+                            "UserPromptSubmit")
+        self.assertIn("queued replayed 1", second)
+        self.assertIn("conflicts 2", second)
+        self.assertIn("do NOT resend", second)
+        self.assertTrue(self.entry()["outage_summary_signature"].startswith(
+            "2026-09-03T11:00:00.000Z|"))
+        # A paused watcher still hears the result: it is read from local
+        # sync state, and that user most needs to know what replayed.
+        self.set_entry_fields(interval_seconds=0)
+        adapter.current["last_outage_summary"] = outage_summary(
+            at="2026-09-03T12:00:00.000Z", queued_replayed=4,
+            ambiguous_landed=0)
+        paused = context_of(self.periodic("UserPromptSubmit", adapter=adapter),
+                            "UserPromptSubmit")
+        self.assertIn("queued replayed 4", paused)
+
+    def test_session_start_and_prompt_share_one_reconnect_latch(self):
+        adapter = SyncStatus(last_outage_summary=outage_summary())
+        start = json.dumps(self.session_start(
+            adapter=adapter, mcp=ConnectionRefusedError("offline")))
+        self.assertIn("ATTACCA RECONNECT SUMMARY", start)
+        repeat = self.periodic("UserPromptSubmit", adapter=adapter)
+        self.assertTrue(repeat is None or "RECONNECT SUMMARY" not in
+                        context_of(repeat, "UserPromptSubmit"), repeat)
+
+    def test_unjournaled_ambiguous_count_reports_once_per_change(self):
+        adapter = SyncStatus(
+            ambiguous_unjournaled_count=2,
+            ambiguous_unjournaled_log="/tmp/offline/unjournaled.log")
+        first = context_of(self.periodic("UserPromptSubmit", adapter=adapter),
+                           "UserPromptSubmit")
+        self.assertIn(
+            "ATTACCA: 2 ambiguous hosted write(s) could not be journaled; "
+            "verify the hosted workspace before resending "
+            "(see /tmp/offline/unjournaled.log)", first)
+        for _ in range(2):
+            repeat = self.periodic("UserPromptSubmit", adapter=adapter)
+            self.assertTrue(repeat is None or "could not be journaled" not in
+                            context_of(repeat, "UserPromptSubmit"), repeat)
+        adapter.current["ambiguous_unjournaled_count"] = 3
+        # Stop never carries it and never consumes the changed count.
+        self.assertIsNone(self.periodic("Stop", adapter=adapter))
+        changed = context_of(
+            self.periodic("UserPromptSubmit", adapter=adapter),
+            "UserPromptSubmit")
+        self.assertIn("ATTACCA: 3 ambiguous hosted write(s)", changed)
+        self.assertEqual(self.entry()["unjournaled_notice_count"], 3)
+        # Back to zero clears the latch so a later failure is not swallowed.
+        adapter.current["ambiguous_unjournaled_count"] = 0
+        quiet = self.periodic("UserPromptSubmit", adapter=adapter)
+        self.assertTrue(quiet is None or "could not be journaled" not in
+                        context_of(quiet, "UserPromptSubmit"), quiet)
+        self.assertNotIn("unjournaled_notice_count", self.entry())
+        adapter.current["ambiguous_unjournaled_count"] = 3
+        again = context_of(self.periodic("UserPromptSubmit", adapter=adapter),
+                           "UserPromptSubmit")
+        self.assertIn("ATTACCA: 3 ambiguous hosted write(s)", again)
+
+    def test_stale_mirror_refusal_rides_the_outage_notice_once_per_state(self):
+        outage = ConnectionRefusedError("hosted endpoint refused")
+        adapter = SyncStatus(mirror_stale_below_live_cursor=True)
+        first = context_of(
+            self.periodic("UserPromptSubmit", refresh=outage, adapter=adapter),
+            "UserPromptSubmit")
+        self.assertIn("ATTACCA AUTOMATIC INBOX CHECK FAILED", first)
+        self.assertIn(
+            "ATTACCA CACHED READS ARE REFUSED until the watcher pulls", first)
+        self.assertEqual(first.count("CACHED READS ARE REFUSED"), 1)
+        self.assertTrue(self.entry()["outage_notice_signature"].endswith(
+            "|stale_reads_refused"))
+        for _ in range(2):
+            repeat = self.periodic("UserPromptSubmit", refresh=outage,
+                                   adapter=adapter)
+            self.assertTrue(repeat is None or "CACHED READS ARE REFUSED" not in
+                            context_of(repeat, "UserPromptSubmit"), repeat)
+        # The watcher pulled: same error, genuinely different state. The
+        # outage is restated exactly once more, now without the refusal.
+        adapter.current["mirror_stale_below_live_cursor"] = False
+        pulled = context_of(
+            self.periodic("UserPromptSubmit", refresh=outage, adapter=adapter),
+            "UserPromptSubmit")
+        self.assertIn("ATTACCA AUTOMATIC INBOX CHECK FAILED", pulled)
+        self.assertNotIn("CACHED READS ARE REFUSED", pulled)
+        settled = self.periodic("UserPromptSubmit", refresh=outage,
+                                adapter=adapter)
+        self.assertTrue(settled is None or "INBOX CHECK FAILED" not in
+                        context_of(settled, "UserPromptSubmit"), settled)
+        self.assertIsNone(self.periodic("Stop", refresh=outage,
+                                        adapter=adapter))
 
     # -------------------------------------------------------- A10 · pulse
     def test_managed_pulse_injects_only_new_items_and_one_marker(self):

@@ -520,6 +520,68 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
         self.assertEqual(len(adapter.sync_calls), 2)
         self.assertNotIn("event_cursor", entry)
 
+    def test_reconnect_summary_is_rendered_once_across_three_boundaries(self):
+        """T-85 E · one reconnect block per outage: prompt, never Stop."""
+        summary = {
+            "at": "2026-09-03T09:30:00.000Z",
+            "queued_replayed": ["cm_replayed_0001", "cm_replayed_0002"],
+            "ambiguous_landed": ["cm_ambiguous_0003"],
+            "ambiguous_replayed": [],
+            "conflicts": [],
+            "unresolved_ambiguous": ["cm_ambiguous_0004"],
+        }
+        adapter = FakeOfflineAdapter(
+            self.verified_status(mode="online", pending_sync=False,
+                                 pending_count=0,
+                                 last_outage_summary=summary,
+                                 ambiguous_count=1,
+                                 ambiguous_pending_reconcile=[
+                                     "cm_ambiguous_0004"]),
+            self.snapshot())
+        outputs = []
+        with mock.patch.object(
+                hook, "_plugin_and_config",
+                return_value=(ROOT, self.config)), \
+             mock.patch.object(
+                 hook, "_ensure_background_watcher",
+                 return_value={"ok": True, "already_running": True}), \
+             mock.patch.object(hook, "_watcher_pending_notice",
+                               return_value=None), \
+             mock.patch.object(hook, "_watcher_refresh_inbox_attention",
+                               return_value={"ok": True}), \
+             mock.patch.object(hook, "_settings_interval", return_value=60), \
+             mock.patch.object(hook, "_update_offer", return_value=None), \
+             mock.patch.object(
+                 hook, "_poll_entry",
+                 return_value=({"key": "actor", "runtime": "codex",
+                                "actor": "codex"},
+                               {"snapshot": {},
+                                "last_poll_at": hook.time.time()})):
+            for event_name in ("UserPromptSubmit", "Stop", "UserPromptSubmit"):
+                outputs.append(hook._periodic_output(
+                    self.status, event_name, offline_adapter=adapter))
+        serialized = [json.dumps(output or {}) for output in outputs]
+        self.assertEqual(
+            sum(blob.count("ATTACCA RECONNECT SUMMARY") for blob in
+                serialized), 1)
+        self.assertIn(
+            "ATTACCA RECONNECT SUMMARY \u00b7 shared: queued replayed 2 "
+            "\u00b7 ambiguous landed 1 \u00b7 ambiguous replayed 0 \u00b7 "
+            "conflicts 0 \u00b7 still ambiguous 1",
+            outputs[0]["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("do NOT resend", serialized[0])
+        # Counts only: no client mutation id reaches the turn.
+        self.assertNotIn("cm_replayed_0001", serialized[0])
+        self.assertNotIn("cm_ambiguous_0004", serialized[0])
+        # Stop drops status notices, so it renders nothing and - crucially -
+        # consumes nothing: the prompt before it already reported once.
+        self.assertIsNone(outputs[1])
+        self.assertNotIn("RECONNECT SUMMARY", serialized[2])
+        entry = self.watcher_state()["subscriptions"][self.key]
+        self.assertEqual(
+            entry["outage_summary_signature"],
+            "2026-09-03T09:30:00.000Z|2/1/0/0/1")
+
     def test_conflict_delta_is_queued_and_later_writes_stay_blocked(self):
         adapter = FakeOfflineAdapter(
             self.verified_status(), self.snapshot(), result={

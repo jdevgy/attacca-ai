@@ -4452,14 +4452,23 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
             "cursor_initialized": initialized or not may_have_more}
 
 
-def _outage_signature(err):
-    """Identify one outage state: the error class plus its exact message."""
+def _outage_signature(err, stale_reads_refused=False):
+    """Identify one outage state: the error class plus its exact message.
+
+    T-85 E · whether this device's own hosted write is ahead of the verified
+    mirror belongs to that state rather than decorating it: while it is true
+    the offline proxy refuses cached reads, so a false->true flip under an
+    unchanged error is a genuinely different situation and re-renders the
+    notice exactly once more.
+    """
     if err is None:
         return None
-    return "%s|%s" % (type(err).__name__, _trim(err, 200))
+    return "%s|%s%s" % (
+        type(err).__name__, _trim(err, 200),
+        "|stale_reads_refused" if stale_reads_refused else "")
 
 
-def _watcher_outage_notice(key, err):
+def _watcher_outage_notice(key, err, stale_reads_refused=False):
     """A9 · surface a hosted-unreachable notice once per distinct state.
 
     The measured failure was one 'AUTOMATIC INBOX CHECK FAILED' block per
@@ -4467,7 +4476,7 @@ def _watcher_outage_notice(key, err):
     only the first turn (and any turn whose error class/message differs)
     carries the notice; recovery clears the latch and reports once.
     """
-    signature = _outage_signature(err)
+    signature = _outage_signature(err, stale_reads_refused)
     if not signature:
         return None
     seen = False
@@ -4488,13 +4497,19 @@ def _watcher_outage_notice(key, err):
         pass
     if seen:
         return None
+    context = (
+        "ATTACCA AUTOMATIC INBOX CHECK FAILED: %s. Previously staged "
+        "mail remains pinned and the watcher retries with back-off; do "
+        "not assume an empty inbox. This is reported once until the "
+        "connection state changes." % _trim(err, 240))
+    if stale_reads_refused:
+        context += (
+            "\nATTACCA CACHED READS ARE REFUSED until the watcher pulls: a "
+            "hosted write from this device is ahead of the verified mirror, "
+            "so the cached projection cannot answer project reads.")
     return {
         "system_message": "Attacca automatic inbox check will retry",
-        "context": (
-            "ATTACCA AUTOMATIC INBOX CHECK FAILED: %s. Previously staged "
-            "mail remains pinned and the watcher retries with back-off; do "
-            "not assume an empty inbox. This is reported once until the "
-            "connection state changes." % _trim(err, 240)),
+        "context": context,
     }
 
 
@@ -4526,6 +4541,172 @@ def _watcher_outage_recovered_notice(key):
                     "check succeeded again and the managed pulse resumed its "
                     "normal one-minute probe."),
     }
+
+
+# T-85 section E · the exact per-field lists offline_sync records in one
+# reconnect summary. Only their counts are ever rendered (D-23).
+OUTAGE_SUMMARY_FIELDS = ("queued_replayed", "ambiguous_landed",
+                         "ambiguous_replayed", "conflicts",
+                         "unresolved_ambiguous")
+
+
+def _offline_adapter_view(adapter, entry, factory=None):
+    """Bind the identity-scoped sync adapter once and read its status.
+
+    Returns ``(adapter, status)``; either may be None. Every continuity
+    notice built from this view is additive, so a mirror that cannot be
+    opened stays silent instead of breaking the boundary that carries the
+    real brief. Binding here also keeps the outage path from loading the
+    sync runtime a second time later in the same boundary.
+    """
+    if adapter is None:
+        try:
+            adapter = _watcher_build_offline_adapter(entry, factory=factory)
+        except Exception:
+            adapter = None
+    try:
+        return adapter, _watcher_adapter_status(adapter)
+    except Exception:
+        return adapter, None
+
+
+def _outage_summary_counts(summary):
+    """Per-field counts of one offline_sync reconnect summary, or None."""
+    if not isinstance(summary, dict):
+        return None
+    counts = {}
+    for name in OUTAGE_SUMMARY_FIELDS:
+        value = summary.get(name)
+        if not isinstance(value, list):
+            return None
+        counts[name] = len(value)
+    return counts
+
+
+def _outage_summary_signature(summary):
+    """One reconnect result: its timestamp plus the counts it reports."""
+    counts = _outage_summary_counts(summary)
+    if counts is None:
+        return None
+    at = str(summary.get("at") or "").strip()
+    if not at:
+        return None
+    return "%s|%s" % (at, "/".join(
+        str(counts[name]) for name in OUTAGE_SUMMARY_FIELDS))
+
+
+def _reconnect_summary_notice(key, project_id, adapter_status):
+    """T-85 E · one compact reconnect result per outage, counts only.
+
+    ``synchronize()`` persists ``last_outage_summary`` once the host is
+    reachable again. Rendering it from that durable state on every boundary
+    would re-send the same paragraph for the rest of the session, so the
+    rendered signature is latched on the subscription exactly like the
+    hosted-outage notice; a later outage produces a new timestamp and
+    therefore renders once more.
+    """
+    summary = (adapter_status or {}).get("last_outage_summary")
+    signature = _outage_summary_signature(summary)
+    counts = _outage_summary_counts(summary)
+    if not signature or not any(counts.values()):
+        return None
+    found = False
+    rendered = False
+
+    def mutate(state):
+        nonlocal found, rendered
+        entry = (state.get("subscriptions") or {}).get(key)
+        if not entry:
+            return
+        found = True
+        rendered = entry.get("outage_summary_signature") == signature
+        if not rendered:
+            entry["outage_summary_signature"] = signature
+            entry["outage_summary_rendered_at"] = datetime.now(
+                timezone.utc).isoformat()
+
+    try:
+        _mutate_state(_watcher_state_path(), mutate)
+    except Exception:
+        return None
+    # Fail closed. Unlike the outage notice this runs at every boundary, so
+    # an unrecorded marker would repeat the block for the whole session.
+    if not found or rendered:
+        return None
+    lines = [
+        "ATTACCA RECONNECT SUMMARY \u00b7 %s: queued replayed %d \u00b7 "
+        "ambiguous landed %d \u00b7 ambiguous replayed %d \u00b7 conflicts "
+        "%d \u00b7 still ambiguous %d" % (
+            project_id, counts["queued_replayed"],
+            counts["ambiguous_landed"], counts["ambiguous_replayed"],
+            counts["conflicts"], counts["unresolved_ambiguous"])]
+    if counts["unresolved_ambiguous"] or counts["conflicts"]:
+        lines.append(
+            "Call attacca_status before writing again and do NOT resend "
+            "those writes: their hosted outcome is already recorded or "
+            "still unknown.")
+    return {"system_message": "Attacca reconnect summary",
+            "context": "\n".join(lines)}
+
+
+def _ambiguous_unjournaled_notice(key, adapter_status):
+    """T-88 · report hosted writes whose outcome could not be journaled.
+
+    The last-resort trace has no automatic resolution path, so the count is
+    reported once and again only when it changes. A return to zero clears
+    the latch so a later failure is never swallowed.
+    """
+    try:
+        count = int((adapter_status or {}).get(
+            "ambiguous_unjournaled_count") or 0)
+    except (TypeError, ValueError):
+        return None
+    log_path = (adapter_status or {}).get("ambiguous_unjournaled_log")
+    found = False
+    rendered = False
+
+    def mutate(state):
+        nonlocal found, rendered
+        entry = (state.get("subscriptions") or {}).get(key)
+        if not entry:
+            return
+        found = True
+        if count <= 0:
+            entry.pop("unjournaled_notice_count", None)
+            return
+        rendered = entry.get("unjournaled_notice_count") == count
+        if not rendered:
+            entry["unjournaled_notice_count"] = count
+
+    try:
+        _mutate_state(_watcher_state_path(), mutate)
+    except Exception:
+        return None
+    if count <= 0 or not found or rendered:
+        return None
+    return {
+        "system_message": "Attacca ambiguous write needs verification",
+        "context": (
+            "ATTACCA: %d ambiguous hosted write(s) could not be journaled; "
+            "verify the hosted workspace before resending (see %s)" % (
+                count, log_path or "the identity-scoped offline directory")),
+    }
+
+
+def _offline_continuity_notices(key, project_id, event_name, adapter_status):
+    """D-23/D-24 · reconnect results as count lines, never at Stop.
+
+    Stop drops status notices, so building them there would consume the
+    once-per-state latch and silence the result forever - the same A9 rule
+    that governs the hosted-outage notice. A managed pulse never reaches
+    this call at all: it answers the ping and returns first.
+    """
+    if event_name == "Stop" or not adapter_status:
+        return ()
+    return tuple(notice for notice in (
+        _reconnect_summary_notice(key, project_id, adapter_status),
+        _ambiguous_unjournaled_notice(key, adapter_status),
+    ) if notice)
 
 
 def _snapshot_reconciled_count(snapshot):
@@ -7269,20 +7450,24 @@ def _active_output(status, offline_adapter=None, offline_factory=None,
     pending_preview = _watcher_pending_notice(
         status, config, consume=False, event_name=event_name)
     offline_key, offline_entry = _watcher_subscription_entry(status, config)
+    # Bind the identity-scoped adapter before the hosted probe. The same
+    # status answers both the stale-read refusal carried by the outage
+    # notice and the reconnect summary below, and this replaces the later
+    # build rather than adding a second sync-runtime load.
+    offline_adapter, offline_status = _offline_adapter_view(
+        offline_adapter, offline_entry, factory=offline_factory)
     inbox_check_notice = None
     try:
         _watcher_refresh_inbox_attention(status, config)
         inbox_check_notice = _watcher_outage_recovered_notice(offline_key)
     except Exception as err:
-        inbox_check_notice = _watcher_outage_notice(offline_key, err)
+        inbox_check_notice = _watcher_outage_notice(
+            offline_key, err, stale_reads_refused=bool(
+                (offline_status or {}).get("mirror_stale_below_live_cursor")))
     terminal_notice = _terminal_migration_notice(
         status, config, event_name, offline_entry)
-    if offline_adapter is None:
-        try:
-            offline_adapter = _watcher_build_offline_adapter(
-                offline_entry, factory=offline_factory)
-        except Exception:
-            offline_adapter = None
+    offline_notices = _offline_continuity_notices(
+        offline_key, status["project_id"], event_name, offline_status)
     # Release discovery is independent of MCP/project compatibility: an update
     # may be exactly what repairs a stale link or older protocol client.
     update_notice = _update_offer(status, plugin_root, config)
@@ -7362,6 +7547,7 @@ handoff before further writes.
         output = _append_notice(output, claude_loop_notice)
         output = _append_notice(output, terminal_notice)
         output = _append_notice(output, inbox_check_notice)
+        output = _append_notices(output, event_name, offline_notices)
         output = _append_notice(
             output, _disposition_reconciled_notice(offline_key, snapshot))
         # Append last: _insert_after_rules_banner places the newest notice
@@ -7381,7 +7567,7 @@ handoff before further writes.
              _watcher_consume_pending(
                 status, config, pending_preview,
                 event_name=event_name),
-             inbox_check_notice))
+             inbox_check_notice) + offline_notices)
     except Exception as err:
         auth_blocked = _authentication_required_error(err) or bool(
             isinstance(offline_entry, dict) and
@@ -7414,7 +7600,8 @@ handoff before further writes.
                 status, config, pending_preview,
                 event_name=event_name),
              update_notice, watcher_notice, claude_loop_notice,
-             terminal_notice, inbox_check_notice, attention_notice))
+             terminal_notice, inbox_check_notice) + offline_notices +
+            (attention_notice,))
 
 
 def _task_change_lines(previous_tasks, current_tasks):
@@ -7632,6 +7819,22 @@ def _periodic_output(status, event_name, offline_adapter=None,
                         "fallback." % _trim(err, 240)),
         }
     offline_key, offline_entry = _watcher_subscription_entry(status, config)
+    offline_status_bound = []
+
+    def offline_status_view():
+        """Bind the identity-scoped adapter at most once per boundary.
+
+        A managed pulse must stay a machine ping, so the sync runtime is
+        loaded lazily: a quiet pulse never reaches this, and an outage on a
+        pulse pays for it exactly once.
+        """
+        nonlocal offline_adapter
+        if not offline_status_bound:
+            offline_adapter, view = _offline_adapter_view(
+                offline_adapter, offline_entry, factory=offline_factory)
+            offline_status_bound.append(view)
+        return offline_status_bound[0]
+
     identity, entry = _poll_entry(status, config)
     polling_disabled = bool(
         (offline_entry or {}).get("interval_seconds") == 0 or
@@ -7702,7 +7905,10 @@ def _periodic_output(status, event_name, offline_adapter=None,
                     offline_key)
         except Exception as err:
             if event_name != "Stop":
-                inbox_check_notice = _watcher_outage_notice(offline_key, err)
+                inbox_check_notice = _watcher_outage_notice(
+                    offline_key, err, stale_reads_refused=bool(
+                        (offline_status_view() or {}).get(
+                            "mirror_stale_below_live_cursor")))
             if is_pulse:
                 _record_pulse_probe_failure(offline_key, checked_at)
     if is_pulse:
@@ -7744,12 +7950,10 @@ def _periodic_output(status, event_name, offline_adapter=None,
              inbox_check_notice))
     terminal_notice = _terminal_migration_notice(
         status, config, event_name, offline_entry)
-    if offline_adapter is None:
-        try:
-            offline_adapter = _watcher_build_offline_adapter(
-                offline_entry, factory=offline_factory)
-        except Exception:
-            offline_adapter = None
+    # Binds the adapter for _offline_failure_output below when the lazy
+    # outage path has not already done so.
+    offline_notices = _offline_continuity_notices(
+        offline_key, status["project_id"], event_name, offline_status_view())
     # Claude/Codex already checked this release on SessionStart. Their
     # prompt/stop hooks stay focused on shared-state changes.
     update_notice = _update_offer(
@@ -7757,7 +7961,7 @@ def _periodic_output(status, event_name, offline_adapter=None,
         check_interval_seconds=UPDATE_CHECK_INTERVAL_SECONDS) \
         if is_kimi_prompt else None
     status_notices = (watcher_notice, update_notice, terminal_notice,
-                      inbox_check_notice)
+                      inbox_check_notice) + offline_notices
 
     def deliver(output, delta_notices=(), include_attention=True):
         return _deliver_periodic_notices(
