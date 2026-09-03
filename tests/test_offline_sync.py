@@ -776,6 +776,165 @@ class OfflineIdentitySyncTest(unittest.TestCase):
         with self.assertRaises(offline.OfflineJournalError):
             engine.status()
 
+    def test_unwritable_journal_still_leaves_a_last_resort_ambiguous_trace(self):
+        """A journal that refuses the record must not erase the evidence."""
+        engine = self.engine("unjournaled")
+        self.initialize(engine)
+        payload = {"body": "outcome unknown and journal broken"}
+        mutation_id = "cm_unjournaled_0001"
+
+        def record():
+            return engine.record_ambiguous_live_write(
+                mutation_id, "room_send", payload, operation="room.send",
+                request_sha256=protocol.live_request_sha256(
+                    "room_send", payload),
+                phase="response")
+
+        # A merely read-only journal directory is NOT the failure mode: every
+        # locked operation runs _ensure_layout first, which repairs 0o700 on a
+        # directory this identity owns.  Prove that self-heal rather than
+        # asserting a failure the outbox recovers from on its own.
+        original_mode = stat.S_IMODE(engine.journal_directory.stat().st_mode)
+        self.addCleanup(
+            lambda: os.chmod(engine.journal_directory, original_mode))
+        os.chmod(engine.journal_directory, 0o500)
+        self.assertEqual(record()["kind"], "ambiguous")
+        self.assertEqual(
+            stat.S_IMODE(engine.journal_directory.stat().st_mode), 0o700)
+        self.assertFalse(engine.unjournaled_log_path.exists())
+
+        # A journal that genuinely cannot accept the record does fail: here
+        # the append-only record set no longer validates.
+        (engine.journal_directory / "not-a-record.txt").write_text("junk")
+        with self.assertRaises(offline.OfflineJournalError):
+            engine.record_ambiguous_live_write(
+                "cm_unjournaled_0009", "room_send", payload,
+                operation="room.send", phase="response")
+        # ... and so does an outbox whose records directory is not a
+        # directory at all, which fails before any permission repair.
+        (engine.journal_directory / "not-a-record.txt").unlink()
+        for path in list(engine.journal_directory.iterdir()):
+            path.unlink()
+        engine.journal_directory.rmdir()
+        engine.journal_directory.write_text("clobbered")
+        with self.assertRaises(FileExistsError):
+            engine.record_ambiguous_live_write(
+                "cm_unjournaled_0010", "room_send", payload,
+                operation="room.send", phase="response")
+        # Nothing was written anywhere yet: that is the gap being closed.
+        self.assertFalse(engine.unjournaled_log_path.exists())
+
+        # The last-resort trace lives beside the journal, so it still writes.
+        self.assertTrue(engine.record_unjournaled_ambiguous_write(
+            mutation_id, "room_send", operation="room.send",
+            request_sha256=protocol.live_request_sha256("room_send", payload),
+            phase="response", error="outbox record could not be created"))
+        entries = engine.unjournaled_ambiguous_records()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["client_mutation_id"], mutation_id)
+        self.assertEqual(entries[0]["tool"], "room_send")
+        self.assertEqual(entries[0]["phase"], "response")
+        self.assertEqual(entries[0]["device_id"], "device_unjournaled")
+        self.assertIn("verify the hosted workspace", entries[0]["hint"])
+        # The trace is a plain append-only text file, never a journal record.
+        self.assertEqual(
+            engine.unjournaled_log_path.name,
+            offline.UNJOURNALED_AMBIGUOUS_LOG_NAME)
+        self.assertEqual(engine.unjournaled_log_path.parent,
+                         engine.outbox_directory)
+        self.assertEqual(
+            engine.unjournaled_log_path.read_text().count("\n"), 1)
+
+        # It appends: a second unknown outcome never overwrites the first.
+        self.assertTrue(engine.record_unjournaled_ambiguous_write(
+            "cm_unjournaled_0002", "task_create", operation="task.create"))
+        self.assertEqual(
+            [item["client_mutation_id"]
+             for item in engine.unjournaled_ambiguous_records()],
+            [mutation_id, "cm_unjournaled_0002"])
+
+        # Once the outbox is usable again the counter is surfaced in status.
+        engine.journal_directory.unlink()
+        engine.journal_directory.mkdir(mode=0o700)
+        status = engine.status()
+        self.assertEqual(status["ambiguous_unjournaled_count"], 2)
+        self.assertEqual(
+            status["ambiguous_unjournaled_ids"],
+            [mutation_id, "cm_unjournaled_0002"])
+        self.assertEqual(status["ambiguous_unjournaled_log"],
+                         str(engine.unjournaled_log_path))
+        self.assertEqual(status["ambiguous_count"], 0)
+        self.assertEqual(status["ambiguous_pending_reconcile"], [])
+        self.assertEqual(status["pending_count"], 0)
+
+    def test_last_resort_ambiguous_trace_never_pins_the_device_to_pending(self):
+        """The log has no resolution path, so it is not pending work."""
+        engine = self.engine("unjournaled_mode")
+        self.initialize(engine)
+        engine.synchronize(self.remote)
+        before = engine.status()
+        self.assertEqual(before["ambiguous_unjournaled_count"], 0)
+        self.assertIsNone(before["ambiguous_unjournaled_log"])
+
+        self.assertTrue(engine.record_unjournaled_ambiguous_write(
+            "cm_mode_0001", "room_send", operation="room.send"))
+        after = engine.status()
+        self.assertEqual(after["ambiguous_unjournaled_count"], 1)
+        # Mode and pending_sync are deliberately unchanged: an unresolvable
+        # trace must never leave this device permanently "pending".
+        self.assertEqual(after["mode"], before["mode"])
+        self.assertEqual(after["pending_sync"], before["pending_sync"])
+        self.assertFalse(after["pending_sync"])
+        self.assertEqual(after["mode"], "online")
+
+    def test_last_resort_ambiguous_log_is_capped_and_never_raises(self):
+        """Best effort means bounded, silent, and safe on a hostile path."""
+        engine = self.engine("capped")
+        self.initialize(engine)
+        engine.unjournaled_log_path.write_text(
+            "x" * (offline.MAX_UNJOURNALED_LOG_BYTES - 10))
+        self.assertFalse(engine.record_unjournaled_ambiguous_write(
+            "cm_over_cap_0001", "room_send"))
+        # Unparsable content is skipped rather than raising into a brief.
+        self.assertEqual(engine.unjournaled_ambiguous_records(), [])
+        self.assertEqual(engine.status()["ambiguous_unjournaled_count"], 0)
+
+        engine.unjournaled_log_path.unlink()
+        # Every field is bounded, so an ordinary entry stays well inside the
+        # per-entry limit even when the journal error is enormous.
+        self.assertTrue(engine.record_unjournaled_ambiguous_write(
+            "cm_big_0001", "room_send",
+            error="e" * (offline.MAX_UNJOURNALED_ENTRY_BYTES * 2)))
+        self.assertLessEqual(
+            engine.unjournaled_log_path.stat().st_size,
+            offline.MAX_UNJOURNALED_ENTRY_BYTES)
+        self.assertEqual(
+            len(engine.unjournaled_ambiguous_records()[0]["journal_error"]),
+            500)
+
+        # If an entry ever did exceed the limit it degrades to the
+        # identifiers rather than writing truncated, unparsable JSON.
+        original_limit = offline.MAX_UNJOURNALED_ENTRY_BYTES
+        offline.MAX_UNJOURNALED_ENTRY_BYTES = 120
+        self.addCleanup(
+            setattr, offline, "MAX_UNJOURNALED_ENTRY_BYTES", original_limit)
+        self.assertTrue(engine.record_unjournaled_ambiguous_write(
+            "cm_big_0002", "room_send", error="still too large"))
+        minimal = engine.unjournaled_ambiguous_records()[1]
+        self.assertEqual(minimal["client_mutation_id"], "cm_big_0002")
+        self.assertNotIn("journal_error", minimal)
+        self.assertNotIn("storage_key", minimal)
+
+        # A symlinked trace path is refused instead of followed.
+        engine.unjournaled_log_path.unlink()
+        target = self.root / "elsewhere.log"
+        target.write_text("")
+        engine.unjournaled_log_path.symlink_to(target)
+        self.assertFalse(engine.record_unjournaled_ambiguous_write(
+            "cm_symlink_0001", "room_send"))
+        self.assertEqual(target.read_text(), "")
+        self.assertEqual(engine.unjournaled_ambiguous_records(), [])
+
     def test_reconnect_reconciles_landed_and_absent_ambiguous_writes(self):
         engine = self.engine("reconcile")
         self.initialize(engine)

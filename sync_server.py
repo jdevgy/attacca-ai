@@ -29,6 +29,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 try:  # Namespace package when imported as ``attacca.sync_server``.
     from . import sync_protocol as protocol
@@ -38,6 +39,32 @@ except (ImportError, ValueError):  # Direct module loading in isolated tests.
 
 JOURNAL_SCHEMA_VERSION = 1
 MAX_RECEIPT_LOOKUP_IDS = 100
+
+# ---------------------------------------------------------------------------
+# Live receipt retention
+#
+# A live receipt answers "did my write land?".  Deleting an ``applied`` row
+# would answer "no record at all", which every client is entitled to read as
+# *provably absent* and therefore safe to replay -- so hard-deleting applied
+# rows would turn retention into a double-apply bug for any client whose
+# outage outlived the window.  Retention therefore only *tombstones* applied
+# rows: the retained result body (up to 16 KB) is dropped while the durable
+# proof (status, request hash, canonical event mapping, server cursor,
+# timestamp) is kept forever.  ``failed`` rows already mean "nothing applied",
+# so they are deleted outright, and ``reserved`` rows are never touched at all
+# because their outcome is still unknown.
+# ---------------------------------------------------------------------------
+LIVE_RETENTION_MAX_AGE_DAYS = 30
+LIVE_RETENTION_MAX_ROWS_PER_DEVICE = 5000
+LIVE_RETENTION_MAX_ROWS_PER_PASS = 500
+# A reservation whose process died is finalized only after this long, so a
+# slow-but-honest dispatch is never declared failed underneath itself.
+LIVE_RESERVATION_GRACE_SECONDS = 300
+LIVE_RECOVERY_SCAN_LIMIT = 500
+_LIVE_RETENTION_KEYS = {
+    "max_age_days", "max_rows_per_device", "max_rows_per_pass",
+    "reservation_grace_seconds",
+}
 
 _RESERVED_ATTRIBUTION_KEYS = {
     "actor_id", "actor_type", "authenticated_scope", "attribution",
@@ -172,6 +199,50 @@ def _wire_identifier(label, value):
     return value
 
 
+def _live_retention_policy(value=None):
+    """Validate one live-receipt retention policy, filling in the defaults."""
+    policy = {
+        "max_age_days": LIVE_RETENTION_MAX_AGE_DAYS,
+        "max_rows_per_device": LIVE_RETENTION_MAX_ROWS_PER_DEVICE,
+        "max_rows_per_pass": LIVE_RETENTION_MAX_ROWS_PER_PASS,
+        "reservation_grace_seconds": LIVE_RESERVATION_GRACE_SECONDS,
+    }
+    if value is None:
+        return policy
+    if not isinstance(value, dict):
+        raise TypeError("live_retention must be a mapping")
+    unknown = sorted(set(value) - _LIVE_RETENTION_KEYS)
+    if unknown:
+        raise ValueError(
+            "unknown live_retention key(s): %s" % ", ".join(unknown))
+    for key, item in value.items():
+        if isinstance(item, bool) or not isinstance(item, int) or item < 1:
+            raise ValueError("live_retention.%s must be a positive int" % key)
+        policy[key] = int(item)
+    return policy
+
+
+def _parse_timestamp(value):
+    """Parse one canonical schema-v1 timestamp, or return None."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _age_seconds(value, now=None):
+    """Seconds since ``value``; None when it cannot be compared."""
+    parsed = _parse_timestamp(value)
+    if parsed is None:
+        return None
+    return ((now or datetime.now(timezone.utc)) - parsed).total_seconds()
+
+
 def _sanitize_metadata(value):
     if isinstance(value, dict):
         return {
@@ -187,7 +258,8 @@ def _sanitize_metadata(value):
 class SyncServerEngine:
     """Identity-scoped snapshot/pull/push engine with an idempotency journal."""
 
-    def __init__(self, connection, adapters, busy_timeout_ms=5000):
+    def __init__(self, connection, adapters, busy_timeout_ms=5000,
+                 live_retention=None):
         if not isinstance(connection, sqlite3.Connection):
             raise TypeError("connection must be sqlite3.Connection")
         if not isinstance(adapters, SyncServerAdapters):
@@ -207,6 +279,7 @@ class SyncServerEngine:
             raise TypeError("fault_injector adapter must be callable")
         self.connection = connection
         self.adapters = adapters
+        self.live_retention = _live_retention_policy(live_retention)
         self._lock = threading.RLock()
         self._savepoint_numbers = itertools.count(1)
         timeout = int(busy_timeout_ms)
@@ -298,6 +371,38 @@ class SyncServerEngine:
         if not live_required <= live_columns:
             raise SyncServerStateError(
                 "sync_live_operations table has an incompatible schema")
+        # Nullable additions, so a database written by an older generation
+        # keeps working and one written here stays readable by it.  They are
+        # added in place rather than behind a schema-version bump because no
+        # wire envelope, digest, or stored receipt shape changes.
+        #
+        #   reserved_at_seq   ledger head when the id was claimed.  Its
+        #                     presence also marks a row written by the
+        #                     generation that applies the domain write and its
+        #                     receipt in one transaction, so a stale
+        #                     reservation from that generation *proves*
+        #                     nothing was applied.
+        #   applied_event_*   the canonical event this mutation produced, so
+        #                     recovery and retention never have to parse the
+        #                     receipt body to find it.
+        #   pruned_at         when retention last trimmed this row, so the
+        #                     opportunistic trigger is idempotent.
+        for column, definition in (
+                ("reserved_at_seq", "INTEGER"),
+                ("applied_event_id", "TEXT"),
+                ("applied_event_seq", "INTEGER"),
+                ("pruned_at", "TEXT")):
+            if column not in live_columns:
+                self.connection.execute(
+                    "ALTER TABLE sync_live_operations ADD COLUMN %s %s"
+                    % (column, definition))
+        self.connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sync_live_operations_retention
+            ON sync_live_operations (
+              project_id, principal_id, actor_id, device_id, state,
+              pruned_at, created_at
+            )
+        """)
 
     @contextmanager
     def _sqlite_savepoint(self):
@@ -882,6 +987,333 @@ class SyncServerEngine:
             status="failed" if row.get("state") == "failed" else "reserved",
             recorded_at=row.get("committed_at") or row["created_at"])
 
+    # -- bounded live-receipt retention -----------------------------------
+
+    def live_retention_policy(self):
+        """The retention bounds and per-state rules this engine applies."""
+        policy = dict(self.live_retention)
+        policy.update({
+            "applied_rows": "tombstoned",
+            "failed_rows": "deleted",
+            "reserved_rows": "retained",
+            "note": "An applied receipt is never deleted: absence of a row "
+                    "means provably absent, which a client may replay.",
+        })
+        return policy
+
+    def _live_partition(self, scope, device_id):
+        return (
+            scope["project_id"], scope["principal_id"], scope["actor_id"],
+            device_id,
+        )
+
+    _LIVE_PARTITION_SQL = (
+        "project_id=? AND principal_id=? AND actor_id=? AND device_id=?")
+    # ``reserved`` is absent from every retention query on purpose.
+    _LIVE_PRUNABLE_SQL = (
+        _LIVE_PARTITION_SQL
+        + " AND state IN ('applied','failed') AND pruned_at IS NULL")
+
+    def _live_retention_cutoff(self, now=None):
+        moment = (now or datetime.now(timezone.utc)) - timedelta(
+            days=self.live_retention["max_age_days"])
+        return moment.isoformat(timespec="milliseconds").replace(
+            "+00:00", "Z")
+
+    def _live_retention_due_locked(self, scope, device_id, now=None):
+        """One indexed count/min decides whether a pass is worth running."""
+        cursor = self.connection.execute(
+            "SELECT COUNT(*) AS prunable, MIN(created_at) AS oldest "
+            "FROM sync_live_operations WHERE " + self._LIVE_PRUNABLE_SQL,
+            self._live_partition(scope, device_id))
+        row = _row_dict(cursor, cursor.fetchone())
+        if not row or not row.get("prunable"):
+            return False
+        if int(row["prunable"]) > self.live_retention["max_rows_per_device"]:
+            return True
+        oldest = row.get("oldest")
+        return bool(oldest and oldest < self._live_retention_cutoff(now))
+
+    def _live_retention_victims_locked(self, scope, device_id, now=None):
+        partition = self._live_partition(scope, device_id)
+        limit = self.live_retention["max_rows_per_pass"]
+        columns = "client_mutation_id, state, receipt_json"
+        victims = {}
+        cursor = self.connection.execute(
+            "SELECT " + columns + " FROM sync_live_operations WHERE "
+            + self._LIVE_PRUNABLE_SQL
+            + " AND created_at < ? ORDER BY created_at LIMIT ?",
+            (*partition, self._live_retention_cutoff(now), limit))
+        for row in cursor.fetchall():
+            row = _row_dict(cursor, row)
+            victims[row["client_mutation_id"]] = row
+        # Everything past the newest ``max_rows_per_device`` prunable rows.
+        cursor = self.connection.execute(
+            "SELECT " + columns + " FROM sync_live_operations WHERE "
+            + self._LIVE_PRUNABLE_SQL
+            + " ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?",
+            (*partition, limit, self.live_retention["max_rows_per_device"]))
+        for row in cursor.fetchall():
+            row = _row_dict(cursor, row)
+            victims.setdefault(row["client_mutation_id"], row)
+        return list(victims.values())[:limit]
+
+    def _tombstone_receipt(self, receipt_json):
+        """Drop the retained result body, keep the durable proof."""
+        try:
+            receipt = json.loads(receipt_json)
+            if not isinstance(receipt, dict) or receipt.get("result") is None:
+                return None
+            receipt["result"] = None
+            protocol.validate_live_receipt(receipt)
+        except (TypeError, ValueError, json.JSONDecodeError,
+                protocol.SyncProtocolError):
+            # A receipt this engine can no longer parse still fails closed on
+            # read.  Mark it pruned so retention stops revisiting it.
+            return None
+        return protocol.canonical_json_bytes(receipt).decode("utf-8")
+
+    def _prune_live_operations_locked(self, scope, device_id, now=None):
+        summary = {"tombstoned": 0, "deleted": 0, "scanned": 0}
+        victims = self._live_retention_victims_locked(scope, device_id, now)
+        summary["scanned"] = len(victims)
+        if not victims:
+            return summary
+        partition = self._live_partition(scope, device_id)
+        stamp = protocol.utc_now()
+        for row in victims:
+            key = (*partition, row["client_mutation_id"])
+            if row["state"] == "failed":
+                # "Nothing applied" and "no row at all" mean the same thing
+                # to a client, so a failed row is safe to remove entirely.
+                self.connection.execute(
+                    "DELETE FROM sync_live_operations WHERE "
+                    + self._LIVE_PARTITION_SQL
+                    + " AND client_mutation_id=? AND state='failed'", key)
+                summary["deleted"] += 1
+                continue
+            replacement = self._tombstone_receipt(row["receipt_json"])
+            if replacement is None:
+                self.connection.execute(
+                    "UPDATE sync_live_operations SET pruned_at=? WHERE "
+                    + self._LIVE_PARTITION_SQL + " AND client_mutation_id=?",
+                    (stamp, *key))
+                continue
+            self.connection.execute(
+                "UPDATE sync_live_operations SET receipt_json=?, pruned_at=? "
+                "WHERE " + self._LIVE_PARTITION_SQL
+                + " AND client_mutation_id=? AND state='applied'",
+                (replacement, stamp, *key))
+            summary["tombstoned"] += 1
+        return summary
+
+    def prune_live_operations(self, authenticated_scope, device_id,
+                              force=False, now=None):
+        """Apply bounded retention to one device's live receipts.
+
+        Reserved rows are never pruned, applied rows keep their proof, and
+        failed rows are removed.  Returns a summary of what the pass did.
+        """
+        scope = self._trusted_scope(authenticated_scope)
+        self._require_authorized(scope, "sync.push")
+        device_id = _wire_identifier("device_id", device_id)
+        with self._lock:
+            with self._transaction(write=True):
+                if not force \
+                        and not self._live_retention_due_locked(
+                            scope, device_id, now):
+                    return {"tombstoned": 0, "deleted": 0, "scanned": 0,
+                            "due": False}
+                summary = self._prune_live_operations_locked(
+                    scope, device_id, now)
+                summary["due"] = True
+                return summary
+
+    def _maybe_prune_live(self, scope, device_id):
+        """Opportunistic retention that never breaks the operation it rides.
+
+        Retention is a housekeeping side effect of a live write and of the
+        watcher's receipt lookup, which is where an otherwise idle device
+        reappears.  A failure here -- a busy database on the read path, a
+        receipt this generation cannot parse -- must leave the caller's
+        answer untouched, so nothing propagates out of this method.
+        """
+        try:
+            if not self._live_retention_due_locked(scope, device_id):
+                return None
+            with self._transaction(write=True):
+                return self._prune_live_operations_locked(scope, device_id)
+        except (sqlite3.Error, SyncServerError, protocol.SyncProtocolError):
+            return None
+
+    # -- stranded reservation recovery ------------------------------------
+    #
+    # A live write is reserved, applied, and receipted.  The apply and the
+    # receipt commit in one transaction, so a process killed mid-write rolls
+    # both back -- but a reservation can still be stranded: the process may
+    # die after the reservation commits and before the write starts, or an
+    # older generation may have crashed between a separately committed apply
+    # and its receipt.  Either way the row stays ``reserved``, which every
+    # client correctly reads as "unknown" forever.  Recovery finalizes such a
+    # row once it is provably no longer in flight.
+    # ---------------------------------------------------------------------
+
+    @staticmethod
+    def _event_device_matches(value, device_id):
+        """One physical device, with or without a client-instance suffix."""
+        return value == device_id or (
+            isinstance(value, str) and value.startswith(device_id + "/"))
+
+    def _live_claimed_event_seqs_locked(self, scope, device_id):
+        cursor = self.connection.execute(
+            "SELECT applied_event_seq FROM sync_live_operations WHERE "
+            + self._LIVE_PARTITION_SQL + " AND applied_event_seq IS NOT NULL",
+            self._live_partition(scope, device_id))
+        return {int(item[0]) for item in cursor.fetchall()
+                if item[0] is not None}
+
+    def _live_recovery_candidates_locked(self, scope, device_id, row, head):
+        """Ledger events that could belong to one stranded reservation.
+
+        Returns ``(candidates, truncated)``.  ``truncated`` means the scan
+        could not cover the whole possible range, so "found nothing" must
+        never be reported as "nothing happened".
+        """
+        lower = row.get("reserved_at_seq")
+        truncated = False
+        if lower is None:
+            # A row from before reservation marking carries no lower bound,
+            # so only the recent tail of the ledger can be inspected.
+            lower = max(0, int(head["event_seq"]) - LIVE_RECOVERY_SCAN_LIMIT)
+            truncated = lower > 0
+        events = self.adapters.read_events(
+            self.connection, scope["project_id"], int(lower),
+            int(head["event_seq"]), LIVE_RECOVERY_SCAN_LIMIT + 1) or []
+        if len(events) > LIVE_RECOVERY_SCAN_LIMIT:
+            truncated = True
+            events = events[:LIVE_RECOVERY_SCAN_LIMIT]
+        claimed = self._live_claimed_event_seqs_locked(scope, device_id)
+        reserved_at = _parse_timestamp(row.get("created_at"))
+        candidates = []
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            if event.get("actor_id") != scope["actor_id"] \
+                    or event.get("owner") != scope["principal_id"] \
+                    or not self._event_device_matches(
+                        event.get("device_id"), device_id):
+                continue
+            try:
+                sequence = int(event.get("seq"))
+            except (TypeError, ValueError):
+                continue
+            if sequence in claimed:
+                # Another receipt already proved which mutation wrote this
+                # event, so it can never be this one.
+                continue
+            created = _parse_timestamp(event.get("created_at"))
+            if reserved_at is not None and created is not None \
+                    and created < reserved_at:
+                continue
+            candidates.append(event)
+        return candidates, truncated
+
+    def _finalize_live_recovery_locked(self, scope, device_id, row, status,
+                                       source, event=None):
+        key = self._live_key(scope, device_id, row["client_mutation_id"])
+        if status == "failed":
+            self.connection.execute("""
+                UPDATE sync_live_operations
+                SET state='failed', receipt_json=NULL, committed_at=?
+                WHERE project_id=? AND principal_id=? AND actor_id=?
+                  AND device_id=? AND client_mutation_id=?
+                  AND state='reserved'
+            """, (protocol.utc_now(), *key))
+            return self._live_row(scope, device_id, row["client_mutation_id"])
+        event = event or {}
+        event_id = event.get("event_id") or row.get("applied_event_id")
+        event_seq = event.get("seq") or row.get("applied_event_seq")
+        event_seq = int(event_seq) if event_seq else None
+        receipt = protocol.make_live_receipt(
+            scope, row["client_mutation_id"], row["tool"],
+            row["request_sha256"], status="applied",
+            canonical_event_id=event_id if event_seq else None,
+            canonical_event_seq=event_seq if event_id else None,
+            server_cursor=self._head(scope),
+            result={"recovered": True, "recovery_source": source})
+        self.connection.execute("""
+            UPDATE sync_live_operations
+            SET state='applied', receipt_json=?, committed_at=?,
+                applied_event_id=?, applied_event_seq=?
+            WHERE project_id=? AND principal_id=? AND actor_id=?
+              AND device_id=? AND client_mutation_id=? AND state='reserved'
+        """, (protocol.canonical_json_bytes(receipt).decode("utf-8"),
+              protocol.utc_now(), event_id, event_seq, *key))
+        return self._live_row(scope, device_id, row["client_mutation_id"])
+
+    def _recover_stale_live_reservation_locked(self, scope, device_id, row,
+                                               applied_only=False):
+        """Finalize one reservation that is provably no longer in flight.
+
+        ``applied_only`` is used by the reserve path, where releasing an id
+        must never happen: a duplicate request arriving while a genuine
+        dispatch is merely slow would otherwise be handed the freed id and
+        apply the write a second time.  Turning a stranded *landed* write
+        into ``duplicate`` is safe and is all the reserve path needs; the
+        receipt lookup finalizes absence one round trip later.
+        """
+        if not row or row.get("state") != "reserved":
+            return row
+        age = _age_seconds(row.get("created_at"))
+        if age is None or age < self.live_retention[
+                "reservation_grace_seconds"]:
+            # Still inside the window where an honest slow dispatch may be
+            # holding this id: never declare an in-flight write finished.
+            return row
+        if row.get("applied_event_seq"):
+            # The write applied but its receipt could not be stored; the
+            # canonical event was stamped on the row at that moment.
+            return self._finalize_live_recovery_locked(
+                scope, device_id, row, "applied", "apply_stamp")
+        if row.get("reserved_at_seq") is not None:
+            # Written by the generation that commits the domain write and its
+            # receipt together: a surviving reservation therefore proves the
+            # write never applied.  No ledger guessing is needed or wanted.
+            if applied_only:
+                return row
+            return self._finalize_live_recovery_locked(
+                scope, device_id, row, "failed", "atomic_reservation")
+        head = self._head(scope)
+        candidates, truncated = self._live_recovery_candidates_locked(
+            scope, device_id, row, head)
+        if len(candidates) == 1:
+            return self._finalize_live_recovery_locked(
+                scope, device_id, row, "applied", "ledger_scan",
+                event=candidates[0])
+        if not candidates and not truncated and not applied_only:
+            return self._finalize_live_recovery_locked(
+                scope, device_id, row, "failed", "ledger_scan")
+        # Several possible events, or a range this scan could not cover:
+        # unknown stays unknown rather than becoming a guess.
+        return row
+
+    def _live_reserved_at_seq(self, scope):
+        """Ledger head when an id is claimed; None when it cannot be read."""
+        try:
+            return int(self._head(scope)["event_seq"])
+        except (SyncServerError, protocol.SyncProtocolError,
+                TypeError, ValueError, KeyError):
+            return None
+
+    def _recover_stale_live_reservation(self, scope, device_id, row):
+        """Best-effort recovery; a failure leaves the row exactly as it was."""
+        try:
+            with self._transaction(write=True):
+                return self._recover_stale_live_reservation_locked(
+                    scope, device_id, row)
+        except (sqlite3.Error, SyncServerError, protocol.SyncProtocolError):
+            return row
+
     def live_reserve(self, authenticated_scope, device_id, mutation_id, tool,
                      request_sha256):
         """Claim one live write id, or report the recorded prior outcome.
@@ -905,6 +1337,14 @@ class SyncServerEngine:
                         return {"status": "conflict", "receipt": None,
                                 "reason": "client_mutation_id was already "
                                           "used for a different request"}
+                    if row["state"] == "reserved":
+                        # A repeat of the same write is one of the two places
+                        # a reservation stranded by a dead process is noticed.
+                        # It may only *upgrade* the row to applied: freeing
+                        # the id here would let this very request apply a
+                        # still-running write twice.
+                        row = self._recover_stale_live_reservation_locked(
+                            scope, device_id, row, applied_only=True) or row
                     if row["state"] == "applied":
                         return {
                             "status": "duplicate",
@@ -920,24 +1360,28 @@ class SyncServerEngine:
                     self.connection.execute("""
                         UPDATE sync_live_operations
                         SET state='reserved', receipt_json=NULL,
-                            created_at=?, committed_at=NULL
+                            created_at=?, committed_at=NULL,
+                            reserved_at_seq=?, applied_event_id=NULL,
+                            applied_event_seq=NULL, pruned_at=NULL
                         WHERE project_id=? AND principal_id=? AND actor_id=?
                           AND device_id=? AND client_mutation_id=?
-                    """, (protocol.utc_now(),
+                    """, (protocol.utc_now(), self._live_reserved_at_seq(scope),
                           *self._live_key(scope, device_id, mutation_id)))
                     return {"status": "reserved", "receipt": None}
                 self.connection.execute("""
                     INSERT INTO sync_live_operations (
                       schema_version, project_id, principal_id, actor_id,
                       device_id, client_mutation_id, tool, request_sha256,
-                      state, receipt_json, created_at, committed_at
-                    ) VALUES (?,?,?,?,?,?,?,?, 'reserved', NULL, ?, NULL)
+                      state, receipt_json, created_at, committed_at,
+                      reserved_at_seq
+                    ) VALUES (?,?,?,?,?,?,?,?, 'reserved', NULL, ?, NULL, ?)
                 """, (
                     JOURNAL_SCHEMA_VERSION, scope["project_id"],
                     scope["principal_id"], scope["actor_id"], device_id,
                     mutation_id, str(tool), str(request_sha256),
-                    protocol.utc_now(),
+                    protocol.utc_now(), self._live_reserved_at_seq(scope),
                 ))
+                self._maybe_prune_live(scope, device_id)
                 return {"status": "reserved", "receipt": None}
 
     def live_commit(self, authenticated_scope, device_id, mutation_id, tool,
@@ -955,22 +1399,81 @@ class SyncServerEngine:
             server_cursor=server_cursor, result=result)
         with self._lock:
             with self._transaction(write=True):
+                # ``failed`` is accepted alongside ``reserved`` only for the
+                # identical request body: recovery may have speculatively
+                # released a reservation whose dispatch outlived the grace
+                # period, and the genuine writer must be able to reclaim it
+                # rather than be told its own write vanished.
                 updated = self.connection.execute("""
                     UPDATE sync_live_operations
-                    SET state='applied', receipt_json=?, committed_at=?
+                    SET state='applied', receipt_json=?, committed_at=?,
+                        applied_event_id=?, applied_event_seq=?,
+                        pruned_at=NULL
                     WHERE project_id=? AND principal_id=? AND actor_id=?
                       AND device_id=? AND client_mutation_id=?
-                      AND state='reserved' AND request_sha256=?
+                      AND state IN ('reserved','failed')
+                      AND request_sha256=?
                 """, (
                     protocol.canonical_json_bytes(receipt).decode("utf-8"),
                     protocol.utc_now(),
+                    canonical_event_id, canonical_event_seq,
                     *self._live_key(scope, device_id, mutation_id),
                     str(request_sha256),
                 )).rowcount
                 if updated != 1:
                     raise SyncServerStateError(
                         "live reservation disappeared before its receipt")
+            self._maybe_prune_live(scope, device_id)
         return receipt
+
+    def live_record_applied_event(self, authenticated_scope, device_id,
+                                  mutation_id, canonical_event_id,
+                                  canonical_event_seq):
+        """Stamp the event a still-reserved row applied, best effort.
+
+        The receipt itself could not be stored (a validation or state error
+        after the domain write committed).  Recording the canonical event
+        keeps the row honest: recovery must never later read it as "nothing
+        applied".  When even the stamp is impossible the reservation marker
+        is cleared instead, which downgrades that row to the conservative
+        ledger scan rather than to a false absence.  Returns what it managed.
+        """
+        try:
+            scope = self._trusted_scope(authenticated_scope)
+            device_id = _wire_identifier("device_id", device_id)
+            mutation_id = _wire_identifier("client_mutation_id", mutation_id)
+        except (SyncServerError, protocol.SyncProtocolError):
+            return "unrecorded"
+        key = self._live_key(scope, device_id, mutation_id)
+        exact = (isinstance(canonical_event_id, str)
+                 and isinstance(canonical_event_seq, int)
+                 and not isinstance(canonical_event_seq, bool)
+                 and canonical_event_seq > 0)
+        try:
+            with self._lock:
+                with self._transaction(write=True):
+                    if exact:
+                        updated = self.connection.execute("""
+                            UPDATE sync_live_operations
+                            SET applied_event_id=?, applied_event_seq=?
+                            WHERE project_id=? AND principal_id=?
+                              AND actor_id=? AND device_id=?
+                              AND client_mutation_id=? AND state='reserved'
+                        """, (canonical_event_id, canonical_event_seq,
+                              *key)).rowcount
+                        if updated == 1:
+                            return "stamped"
+                    degraded = self.connection.execute("""
+                        UPDATE sync_live_operations SET reserved_at_seq=NULL
+                        WHERE project_id=? AND principal_id=? AND actor_id=?
+                          AND device_id=? AND client_mutation_id=?
+                          AND state='reserved'
+                    """, key).rowcount
+                    # Never claim a stamp that did not happen: the row may
+                    # have been finalized or pruned by somebody else.
+                    return "degraded" if degraded == 1 else "unrecorded"
+        except (sqlite3.Error, SyncServerError, protocol.SyncProtocolError):
+            return "unrecorded"
 
     def live_fail(self, authenticated_scope, device_id, mutation_id):
         """Release one reservation whose operation provably did not apply."""
@@ -988,6 +1491,7 @@ class SyncServerEngine:
                       AND state='reserved'
                 """, (protocol.utc_now(),
                       *self._live_key(scope, device_id, mutation_id)))
+            self._maybe_prune_live(scope, device_id)
         return True
 
     def _outbox_receipt_as_live(self, scope, device_id, mutation_id):
@@ -1037,12 +1541,32 @@ class SyncServerEngine:
         answer = {}
         with self._lock:
             for item in wanted:
-                receipt = self._live_receipt_from_row(
-                    self._live_row(scope, device_id, item), scope)
-                if receipt is None:
-                    receipt = self._outbox_receipt_as_live(
+                row = self._live_row(scope, device_id, item)
+                if row is not None and row.get("state") == "reserved":
+                    # "Did my write land?" is exactly when a reservation
+                    # stranded by a dead process must stop answering
+                    # "unknown" forever.
+                    row = self._recover_stale_live_reservation(
+                        scope, device_id, row) or row
+                receipt = self._live_receipt_from_row(row, scope)
+                if receipt is None or receipt.get("status") != "applied":
+                    # The same id may have landed through the queued
+                    # transport instead -- for example after this very
+                    # lookup reported the live attempt absent and the client
+                    # replayed it.  A live row proves only what the *live*
+                    # attempt did, so an applied outbox receipt must never
+                    # stay hidden behind it: absence is the one answer a
+                    # client is entitled to replay.
+                    queued = self._outbox_receipt_as_live(
                         scope, device_id, item)
+                    if queued is not None and (
+                            receipt is None
+                            or queued.get("status") == "applied"):
+                        receipt = queued
                 answer[item] = receipt
+            # An idle device reappears here, so this is also where its old
+            # receipts are trimmed; it never affects the answer above.
+            self._maybe_prune_live(scope, device_id)
         return answer
 
     def journal_receipt(self, authenticated_scope, device_id, mutation_id):
@@ -1057,7 +1581,10 @@ class SyncServerEngine:
 
 
 __all__ = [
-    "JOURNAL_SCHEMA_VERSION", "MAX_RECEIPT_LOOKUP_IDS", "SyncServerError",
+    "JOURNAL_SCHEMA_VERSION", "MAX_RECEIPT_LOOKUP_IDS",
+    "LIVE_RETENTION_MAX_AGE_DAYS", "LIVE_RETENTION_MAX_ROWS_PER_DEVICE",
+    "LIVE_RETENTION_MAX_ROWS_PER_PASS", "LIVE_RESERVATION_GRACE_SECONDS",
+    "LIVE_RECOVERY_SCAN_LIMIT", "SyncServerError",
     "SyncServerAuthorizationError", "SyncServerStateError",
     "MutationConflict", "MutationRejected", "ApplyRequest",
     "SyncServerAdapters", "SyncServerEngine",

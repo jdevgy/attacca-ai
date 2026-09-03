@@ -14201,8 +14201,42 @@ def _live_idempotent_dispatch(session, context, name, args, mutation_id):
         raise AttaccaError(
             "client_mutation_id was already used for a different request; "
             "mint a new id for %s" % name)
+    receipt = None
+    unrecorded_reason = None
+    canonical_event_id = canonical_event_seq = None
     try:
-        result = session.dispatch_tool(name, args)
+        # The domain write and its receipt commit together.  write_tx nests
+        # every inner mutator as a savepoint, so a process killed anywhere in
+        # here rolls back both: a surviving 'reserved' row then *proves* the
+        # write never applied instead of reporting an unknown outcome for
+        # ever.  Only the reservation itself is committed separately, and its
+        # whole purpose is to be visible to a concurrent duplicate.
+        with write_tx(conn):
+            result = session.dispatch_tool(name, args)
+            event = result.get("event") if isinstance(result, dict) else None
+            canonical_event_id = event.get("event_id") \
+                if isinstance(event, dict) else None
+            canonical_event_seq = event.get("seq") \
+                if isinstance(event, dict) else None
+            if not isinstance(canonical_event_id, str) \
+                    or not isinstance(canonical_event_seq, int) \
+                    or isinstance(canonical_event_seq, bool):
+                canonical_event_id = None
+                canonical_event_seq = None
+            try:
+                receipt = engine.live_commit(
+                    scope, device_id, mutation_id, name, request_hash,
+                    canonical_event_id=canonical_event_id,
+                    canonical_event_seq=canonical_event_seq,
+                    server_cursor=_sync_head_cursor(
+                        conn, scope["project_id"]),
+                    result=_bounded_live_receipt_result(result))
+            except (protocol.SyncProtocolError, server.SyncServerError) \
+                    as error:
+                # The receipt could not be stored, but the write itself is
+                # about to commit.  Report that honestly rather than
+                # pretending the operation failed and inviting a duplicate.
+                unrecorded_reason = str(error)[:500]
     except BaseException:
         # Nothing was applied, so the id must become reusable rather than
         # blocking an honest retry of the same intent.
@@ -14211,32 +14245,19 @@ def _live_idempotent_dispatch(session, context, name, args, mutation_id):
         except Exception:
             pass
         raise
-    event = result.get("event") if isinstance(result, dict) else None
-    canonical_event_id = event.get("event_id") if isinstance(event, dict) \
-        else None
-    canonical_event_seq = event.get("seq") if isinstance(event, dict) else None
-    if not isinstance(canonical_event_id, str) \
-            or not isinstance(canonical_event_seq, int) \
-            or isinstance(canonical_event_seq, bool):
-        canonical_event_id = None
-        canonical_event_seq = None
-    try:
-        receipt = engine.live_commit(
-            scope, device_id, mutation_id, name, request_hash,
-            canonical_event_id=canonical_event_id,
-            canonical_event_seq=canonical_event_seq,
-            server_cursor=_sync_head_cursor(conn, scope["project_id"]),
-            result=_bounded_live_receipt_result(result))
-    except (protocol.SyncProtocolError, server.SyncServerError) as error:
-        # The write itself succeeded.  Report it honestly instead of
-        # pretending the operation failed and inviting a duplicate retry.
-        answer = dict(result) if isinstance(result, dict) else {"result": result}
+    answer = dict(result) if isinstance(result, dict) else {"result": result}
+    if receipt is None:
+        # Leave the applied event on the still-reserved row so recovery can
+        # never mistake this committed write for one that never happened.
+        stamp = engine.live_record_applied_event(
+            scope, device_id, mutation_id, canonical_event_id,
+            canonical_event_seq)
         answer[LIVE_RECEIPT_RESULT_KEY] = {
             "status": "unrecorded", "client_mutation_id": str(mutation_id),
-            "reason": str(error)[:500],
+            "reason": unrecorded_reason or "the live receipt was not stored",
+            "applied_event_record": stamp,
         }
         return answer
-    answer = dict(result) if isinstance(result, dict) else {"result": result}
     answer[LIVE_RECEIPT_RESULT_KEY] = receipt
     return answer
 
@@ -17484,8 +17505,9 @@ def _r_sync_receipts(h, m, q):
         if not identifiers:
             raise protocol.SyncProtocolError(
                 "missing_field", "receipt lookup needs one or more ids")
-        receipts = _sync_engine(h, scope).receipts(
-            scope, device_id, identifiers)
+        engine = _sync_engine(h, scope)
+        receipts = engine.receipts(scope, device_id, identifiers)
+        retention = engine.live_retention_policy()
     except protocol.SyncProtocolError as error:
         _sync_protocol_error(h, error)
         return
@@ -17500,6 +17522,10 @@ def _r_sync_receipts(h, m, q):
         "schema_version": protocol.SCHEMA_VERSION,
         "scope": scope,
         "receipts": receipts,
+        # The bounds under which these receipts are retained: an applied
+        # receipt is kept for ever (its result body may be dropped), a failed
+        # one is eventually deleted, and a reserved one is never pruned.
+        "live_retention": retention,
         "generated_at": protocol.utc_now(),
     }, {
         "Cache-Control": "private, no-store, max-age=0",
@@ -18721,6 +18747,12 @@ def _offline_proxy_marker(adapter, proof):
             # state until reconnect proves what happened.
             "ambiguous_pending_reconcile": ambiguous,
             "ambiguous_count": len(ambiguous),
+            # A write the outbox itself could not record can never reconcile
+            # automatically, so it is surfaced separately for a human.
+            "ambiguous_unjournaled_count": status.get(
+                "ambiguous_unjournaled_count", 0),
+            "ambiguous_unjournaled_log": status.get(
+                "ambiguous_unjournaled_log"),
             "live_cursor": status.get("live_cursor"),
             "mirror_stale_below_live_cursor": bool(
                 status.get("mirror_stale_below_live_cursor")),
@@ -18914,6 +18946,10 @@ class OfflineProxySession:
             "ambiguous_pending_reconcile": status[
                 "ambiguous_pending_reconcile"],
             "ambiguous_count": status["ambiguous_count"],
+            "ambiguous_unjournaled_count": status.get(
+                "ambiguous_unjournaled_count", 0),
+            "ambiguous_unjournaled_log": status.get(
+                "ambiguous_unjournaled_log"),
             "live_cursor": status.get("live_cursor"),
             "mirror_stale_below_live_cursor": status[
                 "mirror_stale_below_live_cursor"],
@@ -19715,12 +19751,34 @@ class OfflineProxySession:
             except Exception as error:  # durability failure must be visible
                 error_detail = str(error)
         if recorded is None:
+            # The hash-chained outbox refused the record, so reconciliation
+            # can never resolve this id automatically.  Leave a last-resort
+            # plain-text trace next to the outbox before answering, so the
+            # unknown hosted outcome is at least recoverable by hand.
+            traced = False
+            if mutation_id:
+                fallback = getattr(
+                    adapter, "record_unjournaled_ambiguous_write", None)
+                if callable(fallback):
+                    try:
+                        traced = bool(fallback(
+                            mutation_id, name, operation=operation,
+                            request_sha256=protocol.live_request_sha256(
+                                name, sent),
+                            phase=failure.get("phase"), error=error_detail))
+                    except Exception:
+                        traced = False
             raise AttaccaError(
                 "%s reached the hosted workspace before the connection "
                 "failed, so its outcome is ambiguous, and this client could "
-                "not record it for reconciliation (%s). Do not resend it "
+                "not record it for reconciliation (%s).%s Do not resend it "
                 "blindly; verify the hosted workspace once it is reachable"
-                % (name, error_detail or "no live mutation id was assigned"))
+                % (name, error_detail or "no live mutation id was assigned",
+                   (" It is noted locally as %s in the unjournaled-ambiguous "
+                    "trace log beside the outbox and counted in "
+                    "attacca_status as ambiguous_unjournaled_count."
+                    % mutation_id) if traced
+                   else " Nothing could be written locally either."))
         raise AttaccaError(
             "%s may already have been applied by the hosted workspace: the "
             "complete request was sent and the reply was lost, so the "

@@ -1,7 +1,6 @@
 """Isolated acceptance and threat tests for the embeddable sync server."""
 
 import hashlib
-import importlib.util
 import json
 import sqlite3
 import sys
@@ -10,26 +9,23 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-# ``unittest discover -s tests`` places the repository root on sys.path, so
-# the application file ``attacca.py`` shadows the namespace package.  Load the
-# two pure modules by path just as the protocol suite does; registering them is
-# also required by dataclasses and the server's direct-module fallback import.
-PROTOCOL_SPEC = importlib.util.spec_from_file_location(
-    "sync_protocol", ROOT / "sync_protocol.py")
-p = importlib.util.module_from_spec(PROTOCOL_SPEC)
-sys.modules[PROTOCOL_SPEC.name] = p
-PROTOCOL_SPEC.loader.exec_module(p)
-
-SERVER_SPEC = importlib.util.spec_from_file_location(
-    "attacca_sync_server_test", ROOT / "sync_server.py")
-s = importlib.util.module_from_spec(SERVER_SPEC)
-sys.modules[SERVER_SPEC.name] = s
-SERVER_SPEC.loader.exec_module(s)
+# Import both pure modules exactly the way every other suite does.  Loading
+# them by path used to register a *second* ``sync_protocol`` object in
+# sys.modules, so whichever suite imported first decided whether
+# ``offline_sync.protocol`` and this module's ``p`` were the same class
+# namespace; running tests.test_sync_compatibility before tests.test_sync_client
+# then failed on protocol exceptions raised by the other instance.  One import
+# per module keeps every suite order-independent.
+import sync_protocol as p  # noqa: E402
+import sync_server as s  # noqa: E402
 
 
 def scope(principal="usr_jack", role="director", runtime="codex"):
@@ -301,6 +297,36 @@ class Harness:
             check_precondition=self.check_precondition,
             fault_injector=self.fault_injector,
         )
+
+
+class ModuleIdentityTests(unittest.TestCase):
+    """One module object per file, whatever order the suites are imported.
+
+    A second ``sync_protocol`` instance makes ``SyncProtocolError`` raised by
+    one copy invisible to ``except`` clauses compiled against the other, which
+    is exactly how ``tests.test_sync_compatibility`` used to break
+    ``tests.test_sync_client``.
+    """
+
+    def test_protocol_and_server_modules_are_process_singletons(self):
+        import offline_sync
+        import sync_client
+        import sync_protocol
+        import sync_server
+
+        self.assertIs(sys.modules["sync_protocol"], p)
+        self.assertIs(sync_protocol, p)
+        self.assertIs(sync_server, s)
+        self.assertIs(s.protocol, p)
+        self.assertIs(offline_sync.protocol, p)
+        self.assertIs(sync_client.protocol, p)
+        # An error raised through one import path is catchable through the
+        # other, which is the property the ordering bug destroyed.
+        with self.assertRaises(sync_protocol.SyncProtocolError):
+            p.validate_scope(dict(scope(), actor_id=""))
+
+    def test_no_module_was_registered_under_a_private_alias(self):
+        self.assertNotIn("attacca_sync_server_test", sys.modules)
 
 
 class SyncServerTestCase(unittest.TestCase):
@@ -640,6 +666,450 @@ class CrashAndConcurrencyTests(SyncServerTestCase):
             self.engine.push(self.scope, self.push_envelope([mutation]))
         self.assertEqual(
             self.counts(), {"domain": 0, "journal": 0, "events": 3})
+
+
+class LiveReceiptTestCase(SyncServerTestCase):
+    """Shared helpers for the live (hosted-write) receipt partition."""
+
+    DEVICE = "device_home"
+
+    def live_engine(self, **policy):
+        return s.SyncServerEngine(
+            self.conn, self.harness.adapters(), busy_timeout_ms=5000,
+            live_retention=policy or None)
+
+    def request_hash(self, body=None):
+        return p.live_request_sha256("room_send", body or {"body": "live"})
+
+    def reserve(self, engine, mutation_id, tool="room_send", body=None,
+                device=None):
+        return engine.live_reserve(
+            self.scope, device or self.DEVICE, mutation_id, tool,
+            self.request_hash(body))
+
+    def commit(self, engine, mutation_id, tool="room_send", body=None,
+               device=None, event_id="ev_0003", event_seq=3, result=None):
+        return engine.live_commit(
+            self.scope, device or self.DEVICE, mutation_id, tool,
+            self.request_hash(body), canonical_event_id=event_id,
+            canonical_event_seq=event_seq,
+            server_cursor=self.harness.head_cursor(self.conn, "agentg"),
+            result=result if result is not None else {"ok": True,
+                                                      "body": "x" * 256})
+
+    def applied_row(self, engine, mutation_id, **kwargs):
+        self.reserve(engine, mutation_id, **{
+            key: value for key, value in kwargs.items()
+            if key in ("tool", "body", "device")})
+        return self.commit(engine, mutation_id, **kwargs)
+
+    def row(self, mutation_id, device=None):
+        cursor = self.conn.execute(
+            "SELECT * FROM sync_live_operations WHERE client_mutation_id=?"
+            " AND device_id=?", (mutation_id, device or self.DEVICE))
+        columns = [item[0] for item in cursor.description]
+        found = cursor.fetchone()
+        return dict(zip(columns, found)) if found else None
+
+    def backdate(self, mutation_id, days=0, seconds=0, device=None):
+        moment = datetime.now(timezone.utc) - timedelta(
+            days=days, seconds=seconds)
+        stamp = moment.isoformat(timespec="milliseconds").replace(
+            "+00:00", "Z")
+        self.conn.execute(
+            "UPDATE sync_live_operations SET created_at=? "
+            "WHERE client_mutation_id=? AND device_id=?",
+            (stamp, mutation_id, device or self.DEVICE))
+        return stamp
+
+    def append_event(self, seq, actor=None, owner="usr_jack",
+                     device=None, created_at=None):
+        """Append one canonical event the recovery scan can find."""
+        previous = self.conn.execute(
+            "SELECT event_json FROM events WHERE project_id='agentg' "
+            "ORDER BY seq DESC LIMIT 1").fetchone()
+        previous_hash = json.loads(previous[0])["hash"] if previous \
+            else p.GENESIS_HASH
+        event = canonical_event(
+            seq, previous_hash, actor=actor or self.scope["actor_id"])
+        event["owner"] = owner
+        event["device_id"] = device if device is not None else self.DEVICE
+        if created_at:
+            event["created_at"] = created_at
+        self.conn.execute(
+            "INSERT INTO events VALUES (?,?,?)",
+            ("agentg", seq, json.dumps(event, sort_keys=True)))
+        return event
+
+
+class LiveReceiptRetentionTests(LiveReceiptTestCase):
+    """Bounded retention that can never turn 'applied' into 'absent'."""
+
+    def test_policy_is_reported_and_validated(self):
+        default = self.engine.live_retention_policy()
+        self.assertEqual(default["max_age_days"],
+                         s.LIVE_RETENTION_MAX_AGE_DAYS)
+        self.assertEqual(default["max_rows_per_device"],
+                         s.LIVE_RETENTION_MAX_ROWS_PER_DEVICE)
+        self.assertEqual(default["reservation_grace_seconds"],
+                         s.LIVE_RESERVATION_GRACE_SECONDS)
+        # The per-state rules are part of the published policy: they are what
+        # makes a missing row safe to read as "provably absent".
+        self.assertEqual(default["applied_rows"], "tombstoned")
+        self.assertEqual(default["failed_rows"], "deleted")
+        self.assertEqual(default["reserved_rows"], "retained")
+        self.assertEqual(
+            self.live_engine(max_age_days=2)["max_age_days"]
+            if isinstance(self.live_engine(max_age_days=2), dict)
+            else self.live_engine(max_age_days=2).live_retention[
+                "max_age_days"], 2)
+        for bad in ({"max_age_days": 0}, {"max_age_days": "30"},
+                    {"max_age_days": True}, {"max_rows_per_device": -1}):
+            with self.assertRaises(ValueError):
+                self.live_engine(**bad)
+        with self.assertRaises(ValueError):
+            self.live_engine(retain_everything=1)
+
+    def test_age_bound_tombstones_applied_and_deletes_failed_rows(self):
+        engine = self.live_engine(max_age_days=1)
+        self.applied_row(engine, "cm_live_applied_0001")
+        self.reserve(engine, "cm_live_failed_0001")
+        engine.live_fail(self.scope, self.DEVICE, "cm_live_failed_0001")
+        self.reserve(engine, "cm_live_reserved_0001")
+        for mutation_id in ("cm_live_applied_0001", "cm_live_failed_0001",
+                            "cm_live_reserved_0001"):
+            self.backdate(mutation_id, days=10)
+
+        summary = engine.prune_live_operations(self.scope, self.DEVICE)
+        self.assertTrue(summary["due"])
+        self.assertEqual(summary["tombstoned"], 1)
+        self.assertEqual(summary["deleted"], 1)
+
+        # The applied row keeps its proof and loses only the retained body,
+        # because a missing row means "safe to replay" to every client.
+        applied = self.row("cm_live_applied_0001")
+        self.assertEqual(applied["state"], "applied")
+        self.assertIsNotNone(applied["pruned_at"])
+        receipt = json.loads(applied["receipt_json"])
+        self.assertIsNone(receipt["result"])
+        self.assertEqual(receipt["status"], "applied")
+        self.assertEqual(receipt["canonical_event_id"], "ev_0003")
+        self.assertEqual(receipt["canonical_event_seq"], 3)
+        self.assertIsNotNone(receipt["server_cursor"])
+        self.assertEqual(receipt["request_sha256"], self.request_hash())
+        self.assertLess(len(applied["receipt_json"]), 700)
+
+        # A failed row already meant "nothing applied", so removing it is the
+        # same answer in fewer bytes.
+        self.assertIsNone(self.row("cm_live_failed_0001"))
+        # A reserved row is never pruned: its outcome is still unknown.
+        reserved = self.row("cm_live_reserved_0001")
+        self.assertEqual(reserved["state"], "reserved")
+        self.assertIsNone(reserved["pruned_at"])
+
+        answer = engine.receipts(
+            self.scope, self.DEVICE,
+            ["cm_live_applied_0001", "cm_live_failed_0001"])
+        self.assertEqual(answer["cm_live_applied_0001"]["status"], "applied")
+        self.assertIsNone(answer["cm_live_applied_0001"]["result"])
+        self.assertIsNone(answer["cm_live_failed_0001"])
+
+        # A second pass is a no-op: pruned rows are not revisited.
+        again = engine.prune_live_operations(self.scope, self.DEVICE)
+        self.assertEqual(
+            (again["tombstoned"], again["deleted"]), (0, 0))
+
+    def test_recent_rows_are_left_alone_until_the_window_passes(self):
+        engine = self.live_engine(max_age_days=1)
+        self.applied_row(engine, "cm_live_fresh_0001")
+        summary = engine.prune_live_operations(self.scope, self.DEVICE)
+        self.assertFalse(summary["due"])
+        self.assertIsNotNone(
+            json.loads(self.row("cm_live_fresh_0001")["receipt_json"])
+            ["result"])
+
+    def test_per_device_cap_trims_oldest_prunable_rows_only(self):
+        # Seed under a cap that never fires, so the explicit pass below is
+        # the only thing that can trim anything.
+        writer = self.live_engine(max_rows_per_device=1000, max_age_days=3650)
+        engine = self.live_engine(max_rows_per_device=3, max_age_days=3650)
+        for index in range(6):
+            mutation_id = "cm_live_cap_%04d" % index
+            self.applied_row(writer, mutation_id)
+            self.backdate(mutation_id, days=60 - index)
+        # Reserved rows share the partition and must neither be trimmed nor
+        # block the cap from trimming the prunable ones.
+        for index in range(2):
+            self.reserve(writer, "cm_live_cap_reserved_%04d" % index)
+        # Another device's receipts belong to another partition entirely.
+        for index in range(4):
+            other = "cm_live_other_%04d" % index
+            self.applied_row(writer, other, device="device_laptop")
+            self.backdate(other, days=90, device="device_laptop")
+
+        summary = engine.prune_live_operations(self.scope, self.DEVICE)
+        self.assertEqual(summary["tombstoned"], 3)
+        self.assertEqual(summary["deleted"], 0)
+        trimmed = [index for index in range(6)
+                   if json.loads(self.row("cm_live_cap_%04d" % index)
+                                 ["receipt_json"])["result"] is None]
+        # created_at descends with the index, so the three oldest go.
+        self.assertEqual(trimmed, [0, 1, 2])
+        for index in range(2):
+            reserved = self.row("cm_live_cap_reserved_%04d" % index)
+            self.assertEqual(reserved["state"], "reserved")
+            self.assertIsNone(reserved["pruned_at"])
+        for index in range(4):
+            other = self.row("cm_live_other_%04d" % index, "device_laptop")
+            self.assertIsNotNone(json.loads(other["receipt_json"])["result"])
+
+    def test_retention_runs_opportunistically_on_the_write_path(self):
+        engine = self.live_engine(max_age_days=1)
+        self.applied_row(engine, "cm_live_auto_0001")
+        self.backdate("cm_live_auto_0001", days=10)
+        # No explicit prune call: committing the next live write trims.
+        self.applied_row(engine, "cm_live_auto_0002")
+        self.assertIsNone(
+            json.loads(self.row("cm_live_auto_0001")["receipt_json"])
+            ["result"])
+        self.assertIsNotNone(
+            json.loads(self.row("cm_live_auto_0002")["receipt_json"])
+            ["result"])
+
+    def test_a_broken_retention_pass_never_breaks_the_lookup(self):
+        engine = self.live_engine(max_age_days=1)
+        self.applied_row(engine, "cm_live_guard_0001")
+        self.backdate("cm_live_guard_0001", days=10)
+        with mock.patch.object(
+                engine, "_prune_live_operations_locked",
+                side_effect=sqlite3.OperationalError("database is locked")):
+            answer = engine.receipts(
+                self.scope, self.DEVICE, ["cm_live_guard_0001"])
+        self.assertEqual(answer["cm_live_guard_0001"]["status"], "applied")
+
+
+class StrandedReservationRecoveryTests(LiveReceiptTestCase):
+    """A reservation whose process died stops answering 'unknown' for ever."""
+
+    def receipt_status(self, engine, mutation_id):
+        answer = engine.receipts(self.scope, self.DEVICE, [mutation_id])
+        return answer[mutation_id]
+
+    def test_reservation_inside_the_grace_period_stays_unknown(self):
+        engine = self.live_engine(reservation_grace_seconds=300)
+        self.reserve(engine, "cm_live_inflight_0001")
+        receipt = self.receipt_status(engine, "cm_live_inflight_0001")
+        self.assertEqual(receipt["status"], "reserved")
+        self.assertEqual(
+            self.row("cm_live_inflight_0001")["state"], "reserved")
+
+    def test_atomic_generation_reservation_becomes_provably_absent(self):
+        """Apply and receipt commit together, so a survivor never applied."""
+        engine = self.live_engine(reservation_grace_seconds=30)
+        self.reserve(engine, "cm_live_crashed_0001")
+        self.assertIsNotNone(self.row("cm_live_crashed_0001")
+                             ["reserved_at_seq"])
+        self.backdate("cm_live_crashed_0001", seconds=600)
+
+        receipt = self.receipt_status(engine, "cm_live_crashed_0001")
+        self.assertEqual(receipt["status"], "failed")
+        self.assertIsNone(receipt["canonical_event_id"])
+        self.assertEqual(self.row("cm_live_crashed_0001")["state"], "failed")
+
+    def test_pre_atomic_stranded_reservation_is_finalized_from_the_ledger(self):
+        """The crash window: applied, then killed before the receipt.
+
+        An unmarked row is exactly what the earlier generation left behind
+        when it committed the domain write in its own transaction and died
+        before recording the receipt.
+        """
+        engine = self.live_engine(reservation_grace_seconds=30)
+        self.reserve(engine, "cm_live_stranded_0001")
+        self.conn.execute(
+            "UPDATE sync_live_operations SET reserved_at_seq=NULL")
+        created = self.backdate("cm_live_stranded_0001", seconds=600)
+        landed = self.append_event(4, created_at=created)
+
+        receipt = self.receipt_status(engine, "cm_live_stranded_0001")
+        self.assertEqual(receipt["status"], "applied")
+        self.assertEqual(receipt["canonical_event_id"], landed["event_id"])
+        self.assertEqual(receipt["canonical_event_seq"], 4)
+        self.assertEqual(receipt["request_sha256"], self.request_hash())
+        self.assertEqual(receipt["result"],
+                         {"recovered": True, "recovery_source": "ledger_scan"})
+        row = self.row("cm_live_stranded_0001")
+        self.assertEqual(row["state"], "applied")
+        self.assertEqual(row["applied_event_seq"], 4)
+        # A repeat of the same live write now answers duplicate instead of
+        # blocking for ever on "another request is still applying this".
+        self.assertEqual(
+            self.reserve(engine, "cm_live_stranded_0001")["status"],
+            "duplicate")
+
+    def test_a_repeat_request_never_frees_a_reservation_it_could_reapply(self):
+        """Reserve-path recovery may upgrade to applied, never release."""
+        engine = self.live_engine(reservation_grace_seconds=30)
+        self.reserve(engine, "cm_live_slowdup_0001")
+        self.backdate("cm_live_slowdup_0001", seconds=600)
+
+        # The original dispatch may simply be slow.  Handing this id back to
+        # the duplicate would apply the very same write twice.
+        repeat = self.reserve(engine, "cm_live_slowdup_0001")
+        self.assertEqual(repeat["status"], "in_progress")
+        self.assertEqual(repeat["receipt"]["status"], "reserved")
+        self.assertEqual(self.row("cm_live_slowdup_0001")["state"], "reserved")
+
+        # The receipt lookup is where absence is finalized instead.
+        self.assertEqual(
+            self.receipt_status(engine, "cm_live_slowdup_0001")["status"],
+            "failed")
+
+    def test_pre_atomic_reservation_with_no_ledger_event_is_absent(self):
+        engine = self.live_engine(reservation_grace_seconds=30)
+        self.reserve(engine, "cm_live_nothing_0001")
+        self.conn.execute(
+            "UPDATE sync_live_operations SET reserved_at_seq=NULL")
+        self.backdate("cm_live_nothing_0001", seconds=600)
+        self.assertEqual(
+            self.receipt_status(engine, "cm_live_nothing_0001")["status"],
+            "failed")
+
+    def test_recovery_refuses_to_guess_between_two_candidate_events(self):
+        engine = self.live_engine(reservation_grace_seconds=30)
+        self.reserve(engine, "cm_live_two_0001")
+        self.conn.execute(
+            "UPDATE sync_live_operations SET reserved_at_seq=NULL")
+        created = self.backdate("cm_live_two_0001", seconds=600)
+        self.append_event(4, created_at=created)
+        self.append_event(5, created_at=created)
+        # Unknown is never upgraded to a guess, and never downgraded to
+        # "absent" either: the client keeps reporting it as unresolved.
+        self.assertEqual(
+            self.receipt_status(engine, "cm_live_two_0001")["status"],
+            "reserved")
+        self.assertEqual(self.row("cm_live_two_0001")["state"], "reserved")
+
+    def test_recovery_never_claims_an_event_another_receipt_owns(self):
+        engine = self.live_engine(reservation_grace_seconds=30)
+        created = None
+        self.reserve(engine, "cm_live_owner_0001")
+        self.commit(engine, "cm_live_owner_0001", event_id="ev_0004",
+                    event_seq=4)
+        self.reserve(engine, "cm_live_orphan_0001")
+        self.conn.execute(
+            "UPDATE sync_live_operations SET reserved_at_seq=NULL "
+            "WHERE client_mutation_id='cm_live_orphan_0001'")
+        created = self.backdate("cm_live_orphan_0001", seconds=600)
+        self.append_event(4, created_at=created)
+
+        # Event 4 is already proven to belong to another mutation, so the
+        # stranded row has no candidate at all.
+        self.assertEqual(
+            self.receipt_status(engine, "cm_live_orphan_0001")["status"],
+            "failed")
+
+    def test_recovery_ignores_events_from_another_actor_or_device(self):
+        engine = self.live_engine(reservation_grace_seconds=30)
+        self.reserve(engine, "cm_live_foreign_0001")
+        self.conn.execute(
+            "UPDATE sync_live_operations SET reserved_at_seq=NULL")
+        created = self.backdate("cm_live_foreign_0001", seconds=600)
+        self.append_event(4, actor="agentg.worker.claude", created_at=created)
+        self.append_event(5, device="device_laptop", created_at=created)
+        self.append_event(6, owner="usr_mallory", created_at=created)
+        self.assertEqual(
+            self.receipt_status(engine, "cm_live_foreign_0001")["status"],
+            "failed")
+
+    def test_a_stamped_reservation_reports_the_write_it_actually_applied(self):
+        """The receipt could not be stored, but the event id was recorded."""
+        engine = self.live_engine(reservation_grace_seconds=30)
+        self.reserve(engine, "cm_live_stamped_0001")
+        landed = self.append_event(4)
+        self.assertEqual(
+            engine.live_record_applied_event(
+                self.scope, self.DEVICE, "cm_live_stamped_0001",
+                landed["event_id"], 4),
+            "stamped")
+        self.backdate("cm_live_stamped_0001", seconds=600)
+
+        receipt = self.receipt_status(engine, "cm_live_stamped_0001")
+        self.assertEqual(receipt["status"], "applied")
+        self.assertEqual(receipt["canonical_event_id"], landed["event_id"])
+        self.assertEqual(receipt["result"],
+                         {"recovered": True, "recovery_source": "apply_stamp"})
+
+    def test_an_unstampable_reservation_degrades_instead_of_lying(self):
+        engine = self.live_engine(reservation_grace_seconds=30)
+        self.reserve(engine, "cm_live_degraded_0001")
+        # No canonical event was returned by the tool, so the exact stamp is
+        # impossible; the reservation marker is cleared so recovery falls
+        # back to the ledger scan rather than reporting a false absence.
+        self.assertEqual(
+            engine.live_record_applied_event(
+                self.scope, self.DEVICE, "cm_live_degraded_0001", None, None),
+            "degraded")
+        row = self.row("cm_live_degraded_0001")
+        self.assertIsNone(row["reserved_at_seq"])
+        self.assertEqual(row["state"], "reserved")
+        created = self.backdate("cm_live_degraded_0001", seconds=600)
+        landed = self.append_event(4, created_at=created)
+        receipt = self.receipt_status(engine, "cm_live_degraded_0001")
+        self.assertEqual(receipt["status"], "applied")
+        self.assertEqual(receipt["canonical_event_id"], landed["event_id"])
+
+    def test_a_late_genuine_commit_reclaims_a_released_reservation(self):
+        """Recovery must never make a slow writer look like a lost write."""
+        engine = self.live_engine(reservation_grace_seconds=30)
+        self.reserve(engine, "cm_live_slow_0001")
+        self.backdate("cm_live_slow_0001", seconds=600)
+        self.assertEqual(
+            self.receipt_status(engine, "cm_live_slow_0001")["status"],
+            "failed")
+
+        receipt = self.commit(engine, "cm_live_slow_0001", event_id="ev_0004",
+                              event_seq=4)
+        self.assertEqual(receipt["status"], "applied")
+        self.assertEqual(
+            self.receipt_status(engine, "cm_live_slow_0001")["status"],
+            "applied")
+        self.assertEqual(self.row("cm_live_slow_0001")["applied_event_seq"], 4)
+
+    def test_a_queued_replay_is_never_hidden_behind_a_released_live_row(self):
+        """After recovery frees an id, the replay's receipt is the truth."""
+        engine = self.live_engine(reservation_grace_seconds=30)
+        mutation_id = "cm_device_0001"
+        body = {"title": "Offline"}
+        self.reserve(engine, mutation_id, tool="task_create", body=body)
+        self.backdate(mutation_id, seconds=600)
+        self.assertEqual(
+            self.receipt_status(engine, mutation_id)["status"], "failed")
+
+        # The client did exactly what "absent" entitles it to do: replay the
+        # same id through the queued transport.
+        engine.push(self.scope, self.push_envelope([
+            self.mutation(mutation_id=mutation_id)]))
+        receipt = self.receipt_status(engine, mutation_id)
+        self.assertEqual(receipt["status"], "applied")
+        # It is the queued receipt that answers, not the released live row.
+        self.assertEqual(receipt["tool"], "task.create")
+        self.assertIsNotNone(receipt["server_cursor"])
+        # The released live row is still there; it just no longer answers.
+        self.assertEqual(self.row(mutation_id)["state"], "failed")
+
+    def test_recovery_is_scoped_to_the_asking_device_and_principal(self):
+        engine = self.live_engine(reservation_grace_seconds=30)
+        self.reserve(engine, "cm_live_scoped_0001")
+        self.backdate("cm_live_scoped_0001", seconds=600)
+        # Another device may not see, recover, or resolve this reservation.
+        self.assertIsNone(engine.receipts(
+            self.scope, "device_laptop", ["cm_live_scoped_0001"])
+            ["cm_live_scoped_0001"])
+        self.assertEqual(
+            self.row("cm_live_scoped_0001")["state"], "reserved")
+        self.assertIsNone(engine.receipts(
+            scope(principal="usr_mallory"), self.DEVICE,
+            ["cm_live_scoped_0001"])["cm_live_scoped_0001"])
 
 
 if __name__ == "__main__":

@@ -92,6 +92,17 @@ JOURNAL_RECORD_KINDS = frozenset({
 AMBIGUOUS_PHASES = frozenset({"connect", "send", "response", "unknown"})
 AMBIGUOUS_RESOLUTIONS = frozenset({"landed", "requeued", "abandoned"})
 MAX_OUTAGE_SUMMARY_IDS = 100
+# Last-resort trace for an ambiguous live write whose hash-chained journal
+# append itself failed (unreadable/unwritable outbox, exhausted disk, corrupt
+# record set).  It is deliberately a plain append-only text file next to the
+# journal rather than a second chained store: it must succeed when the journal
+# cannot, so it is never validated, replayed, or trusted as authority.  It only
+# preserves the identifiers a human or a later session needs to verify the
+# hosted workspace by hand.
+UNJOURNALED_AMBIGUOUS_LOG_NAME = "ambiguous-unjournaled.log"
+MAX_UNJOURNALED_LOG_BYTES = 256 * 1024
+MAX_UNJOURNALED_ENTRY_BYTES = 4 * 1024
+MAX_UNJOURNALED_ENTRIES_READ = 100
 _OUTAGE_SUMMARY_LISTS = (
     "queued_replayed", "ambiguous_landed", "ambiguous_replayed",
     "conflicts", "unresolved_ambiguous",
@@ -621,6 +632,11 @@ class OfflineProjectSync:
         self.outbox_directory = self.outboxes_directory / self.outbox_key
         self.journal_directory = self.outbox_directory / "records"
         self.temporary_directory = self.outbox_directory / ".pending"
+        # Deliberately a sibling of the journal directory, not a child: the
+        # fallback exists precisely for the case where the journal directory
+        # itself cannot be read or written.
+        self.unjournaled_log_path = (
+            self.outbox_directory / UNJOURNALED_AMBIGUOUS_LOG_NAME)
         # Journal records are shared across compatible projection upgrades so
         # an already-fsynced write is never lost.  Mutable mirror freshness is
         # capability-specific and must not let a newer client mark an older
@@ -1664,6 +1680,108 @@ class OfflineProjectSync:
                 pass
         return _json_copy(record)
 
+    def record_unjournaled_ambiguous_write(self, client_mutation_id, tool, *,
+                                           operation=None, request_sha256=None,
+                                           phase=None, error=None,
+                                           attempted_at=None):
+        """Append one last-resort trace when the journal itself refused.
+
+        This runs only after :meth:`record_ambiguous_live_write` raised, so
+        the durable outbox is already unusable.  It therefore takes no lock,
+        loads no records, validates nothing, and never raises: a single
+        bounded JSON line is appended to a size-capped plain-text file beside
+        the outbox so the unknown hosted outcome leaves a local trace instead
+        of vanishing.  Returns True only when those bytes reached the disk.
+
+        The entry is evidence for a human, never an instruction to a client:
+        nothing replays from this file, and reconciliation still requires the
+        hash-chained journal.
+        """
+        entry = {
+            "format": "attacca.offline.unjournaled-ambiguous",
+            "schema_version": OFFLINE_SYNC_SCHEMA_VERSION,
+            "client_mutation_id": str(client_mutation_id)[:200],
+            "tool": str(tool)[:200],
+            "operation": str(operation)[:200] if operation else None,
+            "request_sha256": str(request_sha256)[:100]
+            if request_sha256 else None,
+            "phase": str(phase or "unknown").strip().lower()[:20],
+            "journal_error": str(error)[:500] if error else None,
+            "storage_key": self.storage_key,
+            "device_id": self.device_id,
+            "actor_id": self.scope.get("actor_id"),
+            "attempted_at": attempted_at or _utc_now(),
+            "hint": "Outcome unknown; verify the hosted workspace by hand.",
+        }
+        try:
+            line = json.dumps(
+                entry, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"))
+            if len(line.encode("utf-8")) > MAX_UNJOURNALED_ENTRY_BYTES:
+                # Never write a truncated (and therefore unparsable) object:
+                # drop the descriptive fields instead of the identifiers.
+                line = json.dumps({
+                    "format": entry["format"],
+                    "schema_version": entry["schema_version"],
+                    "client_mutation_id": entry["client_mutation_id"],
+                    "tool": entry["tool"],
+                    "attempted_at": entry["attempted_at"],
+                }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            data = (line + "\n").encode("utf-8")
+            path = self.unjournaled_log_path
+            _reject_symlink_components(path)
+            if path.is_symlink():
+                return False
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+            if size + len(data) > MAX_UNJOURNALED_LOG_BYTES:
+                # A capped file is never rotated or rewritten here: silently
+                # dropping the oldest evidence would be worse than refusing,
+                # and status still reports the entries already retained.
+                return False
+            descriptor = os.open(
+                str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                os.write(descriptor, data)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            _fsync_directory(path.parent)
+            return True
+        except Exception:  # last resort: a failure here must stay silent
+            return False
+
+    def unjournaled_ambiguous_records(self, limit=MAX_UNJOURNALED_ENTRIES_READ):
+        """Read the last-resort trace file; unreadable is reported as empty.
+
+        The file is written by a path that had already lost the journal, so
+        it may be partial or corrupt.  Unparsable lines are skipped rather
+        than allowed to break a session brief.
+        """
+        result = []
+        try:
+            path = self.unjournaled_log_path
+            if path.is_symlink() or not path.exists():
+                return result
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        value = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(value, dict):
+                        result.append(value)
+                    if len(result) >= int(limit):
+                        break
+        except Exception:
+            return result
+        return result
+
     def ambiguous_records(self, unresolved_only=True):
         with self._locked():
             _, projected = self._journal_locked()
@@ -2339,6 +2457,11 @@ class OfflineProjectSync:
             pending_sync = bool(
                 pending_count or projected["conflicts"] or awaiting_ids
                 or ambiguous_ids or mirror_stale)
+            # Deliberately outside pending_sync/mode: the last-resort log has
+            # no resolution path, so counting it as pending work would pin
+            # this device to "pending" forever.  It is surfaced as its own
+            # counter for the hook to report and a human to act on.
+            unjournaled = self.unjournaled_ambiguous_records()
             if mirror_valid:
                 proof = self.convergence_proof()
             return {
@@ -2364,6 +2487,12 @@ class OfflineProjectSync:
                 "convergence_awaiting_receipts": awaiting_ids,
                 "ambiguous_count": len(ambiguous_ids),
                 "ambiguous_pending_reconcile": ambiguous_ids,
+                "ambiguous_unjournaled_count": len(unjournaled),
+                "ambiguous_unjournaled_ids": [
+                    item.get("client_mutation_id") for item in unjournaled
+                    if item.get("client_mutation_id")],
+                "ambiguous_unjournaled_log": str(self.unjournaled_log_path)
+                if unjournaled else None,
                 "mirror_stale_below_live_cursor": stale_below_live_cursor,
                 "acknowledged_count": len(projected["converged"]),
                 "journal_records": len(records),

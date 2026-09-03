@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 import unittest
+import unittest.mock
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -210,6 +211,69 @@ class ProxyClassificationFallbackTests(unittest.TestCase):
             self.core._offline_proxy_transport_classification(
                 socket.timeout("timed out"), "connect"),
             "undelivered")
+
+
+class UnjournaledAmbiguousFallbackTests(unittest.TestCase):
+    """A journal that refuses the record must not silence the write."""
+
+    class _Adapter:
+        """Stands in for the outbox: journalling fails, tracing works."""
+
+        def __init__(self, trace_ok=True):
+            self.trace_ok = trace_ok
+            self.traced = []
+
+        def record_ambiguous_live_write(self, *_, **__):
+            raise RuntimeError("outbox record could not be created")
+
+        def record_unjournaled_ambiguous_write(self, mutation_id, tool,
+                                               **details):
+            self.traced.append((mutation_id, tool, details))
+            return self.trace_ok
+
+    def _record(self, adapter):
+        import attacca as core
+        session = core.OfflineProxySession.__new__(core.OfflineProxySession)
+        session.root = str(Path(__file__).resolve().parent)
+        snapshot = {"scope": {
+            "server_id": "srv", "project_id": "proj",
+            "principal_id": "owner1", "actor_id": "proj.director.codex",
+            "actor_type": "agent", "role": "director",
+        }}
+        with self.assertRaises(core.AttaccaError) as raised:
+            session._record_ambiguous(
+                "room_send",
+                {"project": "proj", "body": "unknown outcome",
+                 core.LIVE_IDEMPOTENCY_ARGUMENT: "cm_proxy_fallback_0001"},
+                adapter, snapshot, {"phase": "response"})
+        return str(raised.exception)
+
+    def test_the_last_resort_trace_is_written_and_reported(self):
+        adapter = self._Adapter()
+        message = self._record(adapter)
+        self.assertEqual(len(adapter.traced), 1)
+        mutation_id, tool, details = adapter.traced[0]
+        self.assertEqual(mutation_id, "cm_proxy_fallback_0001")
+        self.assertEqual(tool, "room_send")
+        self.assertEqual(details["operation"], "room.send")
+        self.assertEqual(details["phase"], "response")
+        self.assertEqual(
+            details["request_sha256"],
+            protocol.live_request_sha256("room_send", {"body": "unknown "
+                                                               "outcome",
+                                                       "project": "proj"}))
+        self.assertIn("outbox record could not be created", details["error"])
+        # The user is still told to verify the hosted workspace by hand.
+        self.assertIn("ambiguous", message)
+        self.assertIn("unjournaled-ambiguous", message)
+        self.assertIn("ambiguous_unjournaled_count", message)
+        self.assertIn("verify the hosted workspace", message)
+        self.assertNotIn("Nothing could be written locally", message)
+
+    def test_a_failed_trace_is_reported_as_no_local_record_at_all(self):
+        message = self._record(self._Adapter(trace_ok=False))
+        self.assertIn("Nothing could be written locally either.", message)
+        self.assertIn("verify the hosted workspace", message)
 
 
 class _ForwardingShim:
@@ -803,6 +867,194 @@ class OfflineProxyAmbiguityTests(unittest.TestCase):
         self.assertEqual(self.engine.pending_mutations(), [])
         self.assertEqual(
             self._room_bodies().count("unknown outcome sentinel"), 0)
+
+    def _crash_after_apply(self, mutation_id, payload, *, marked=False,
+                           age_seconds=3600):
+        """Rehearse a host that applied a live write and died before its receipt.
+
+        The reservation is claimed, the tool really runs, and no receipt is
+        ever stored.  ``marked=False`` reproduces the generation that
+        committed the domain write in its own transaction, which is exactly
+        the row shape this recovery path exists for.
+        """
+        scope = self.snapshot["scope"]
+        request_sha = protocol.live_request_sha256("room_send", payload)
+        conn = attacca.connect(self.fx.db)
+        try:
+            engine = attacca._live_receipt_engine(conn)
+            reserved = engine.live_reserve(
+                scope, "device_primary", mutation_id, "room_send",
+                request_sha)
+            self.assertEqual(reserved["status"], "reserved")
+            attacca.set_current_owner(scope["principal_id"])
+            attacca.set_current_git_context(None, None, "device_primary")
+            applied = attacca.room_send(
+                conn, "proj", scope["actor_id"], "agent", payload["body"])
+            stale = (time.time() - age_seconds)
+            stamp = time.strftime(
+                "%Y-%m-%dT%H:%M:%S", time.gmtime(stale)) + ".000Z"
+            conn.execute(
+                "UPDATE sync_live_operations SET created_at=?%s"
+                " WHERE client_mutation_id=?"
+                % ("" if marked else ", reserved_at_seq=NULL"),
+                (stamp, mutation_id))
+            conn.commit()
+            return applied["event"]
+        finally:
+            attacca.set_current_git_context(None, None, None)
+            conn.close()
+
+    def _receipt_lookup(self, mutation_id):
+        status, value, _ = self.fx.request(
+            "GET", "/v1/projects/proj/sync/receipts?ids=" + mutation_id,
+            token=self.fx.director_token, device="device_primary")
+        self.assertEqual(status, 200)
+        return value
+
+    def test_a_crashed_live_write_is_recovered_from_the_hosted_ledger(self):
+        """Reserve -> apply -> crash stops meaning 'unknown' for ever."""
+        mutation_id = protocol.new_client_mutation_id(
+            self._client_id, "device_primary")
+        payload = {"body": "applied but never receipted"}
+        self.engine.record_ambiguous_live_write(
+            mutation_id, "room_send", payload, operation="room.send",
+            request_sha256=protocol.live_request_sha256("room_send", payload),
+            phase="response")
+        landed = self._crash_after_apply(mutation_id, payload)
+
+        value = self._receipt_lookup(mutation_id)
+        receipt = value["receipts"][mutation_id]
+        self.assertEqual(receipt["status"], "applied")
+        self.assertEqual(receipt["canonical_event_id"], landed["event_id"])
+        self.assertEqual(receipt["canonical_event_seq"], landed["seq"])
+        self.assertEqual(
+            receipt["request_sha256"],
+            protocol.live_request_sha256("room_send", payload))
+        self.assertTrue(receipt["result"]["recovered"])
+        # The retention policy these receipts live under is part of the
+        # answer, so a client can see how long a proof is kept.
+        self.assertEqual(value["live_retention"]["applied_rows"],
+                         "tombstoned")
+        self.assertEqual(value["live_retention"]["reserved_rows"], "retained")
+
+        # Reconciliation now converges instead of reporting unknown, and the
+        # write is never replayed.
+        report = self.engine.reconcile_ambiguous(self._remote())
+        self.assertEqual(report["landed"], [mutation_id], report)
+        self.assertEqual(report["replayed"], [])
+        self.assertEqual(report["unknown"], [])
+        self.assertEqual(self.engine.pending_mutations(), [])
+        self.assertEqual(
+            self._room_bodies().count("applied but never receipted"), 1)
+        self.assertEqual(
+            self.engine.status()["ambiguous_pending_reconcile"], [])
+
+    def test_a_crash_before_the_write_is_reported_absent_and_replayed(self):
+        """The same recovery must not invent a write that never happened."""
+        mutation_id = protocol.new_client_mutation_id(
+            self._client_id, "device_primary")
+        payload = {"body": "reserved but never applied"}
+        self.engine.record_ambiguous_live_write(
+            mutation_id, "room_send", payload, operation="room.send",
+            request_sha256=protocol.live_request_sha256("room_send", payload),
+            phase="response")
+        scope = self.snapshot["scope"]
+        conn = attacca.connect(self.fx.db)
+        try:
+            attacca._live_receipt_engine(conn).live_reserve(
+                scope, "device_primary", mutation_id, "room_send",
+                protocol.live_request_sha256("room_send", payload))
+            stamp = time.strftime(
+                "%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - 3600)) \
+                + ".000Z"
+            conn.execute(
+                "UPDATE sync_live_operations SET created_at=?"
+                " WHERE client_mutation_id=?", (stamp, mutation_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+        # The reservation carries the atomicity marker, so its survival is
+        # proof that nothing was applied: absent, not unknown.
+        receipt = self._receipt_lookup(mutation_id)["receipts"][mutation_id]
+        self.assertEqual(receipt["status"], "failed")
+        self.assertEqual(
+            self._room_bodies().count("reserved but never applied"), 0)
+
+        report = self.engine.synchronize(self._remote())
+        self.assertEqual(report["ambiguous_replayed"], [mutation_id], report)
+        self.assertEqual(
+            self._room_bodies().count("reserved but never applied"), 1)
+        # And exactly once: the replay owns the id from here on.
+        self.engine.synchronize(self._remote())
+        self.assertEqual(
+            self._room_bodies().count("reserved but never applied"), 1)
+
+    def test_an_unstorable_receipt_still_records_the_write_it_applied(self):
+        """The one way a committed live write can survive as 'reserved'.
+
+        Apply and receipt share a transaction, so a *marked* reservation
+        normally proves nothing applied.  When ``live_commit`` itself fails
+        the write is still committed on purpose (reporting it honestly beats
+        inviting a duplicate), so the canonical event must be stamped on the
+        row -- otherwise recovery would later read that same row as "never
+        applied" and the client would replay an applied write.
+        """
+        scope = self.snapshot["scope"]
+        mutation_id = protocol.new_client_mutation_id(
+            self._client_id, "device_primary")
+        body = "receipt storage failed but the write landed"
+        session = attacca.McpSession(
+            str(self.fx.db), default_project="proj",
+            actor=scope["actor_id"], actor_type="agent", detect_cwd=False,
+            owner=scope["principal_id"], device_id="device_primary",
+            authorized_project="proj", preserve_actor_identity=True)
+        self.addCleanup(
+            lambda: session.conn.close() if session.conn else None)
+        _, server_module = attacca._sync_runtime()
+        with unittest.mock.patch.object(
+                server_module.SyncServerEngine, "live_commit",
+                side_effect=server_module.SyncServerStateError(
+                    "receipt store is unavailable")):
+            answer = attacca._live_idempotent_dispatch(
+                session, {"scope": scope, "device_id": "device_primary"},
+                "room_send", {"project": "proj", "body": body}, mutation_id)
+
+        receipt = answer[attacca.LIVE_RECEIPT_RESULT_KEY]
+        self.assertEqual(receipt["status"], "unrecorded")
+        self.assertEqual(receipt["client_mutation_id"], mutation_id)
+        self.assertEqual(receipt["applied_event_record"], "stamped")
+        # The write really did apply, exactly once.
+        self.assertEqual(self._room_bodies().count(body), 1)
+
+        conn = attacca.connect(self.fx.db)
+        try:
+            row = conn.execute(
+                "SELECT state, applied_event_id, applied_event_seq"
+                " FROM sync_live_operations WHERE client_mutation_id=?",
+                (mutation_id,)).fetchone()
+            self.assertEqual(row["state"], "reserved")
+            self.assertEqual(row["applied_event_id"],
+                             answer["event"]["event_id"])
+            stamp = time.strftime(
+                "%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - 3600)) \
+                + ".000Z"
+            conn.execute(
+                "UPDATE sync_live_operations SET created_at=?"
+                " WHERE client_mutation_id=?", (stamp, mutation_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Recovery must read the stamp, never the "marked reservation means
+        # nothing applied" shortcut.
+        recovered = self._receipt_lookup(mutation_id)["receipts"][mutation_id]
+        self.assertEqual(recovered["status"], "applied")
+        self.assertEqual(recovered["canonical_event_id"],
+                         answer["event"]["event_id"])
+        self.assertEqual(recovered["result"]["recovery_source"],
+                         "apply_stamp")
+        self.assertEqual(self._room_bodies().count(body), 1)
 
     def test_absent_receipt_requeues_the_write_under_its_original_id(self):
         """Provably absent means safe to replay -- once, under the same id."""
