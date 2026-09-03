@@ -675,5 +675,138 @@ class OfflineIdentitySyncTest(unittest.TestCase):
                 "client_bad", "device_bad", self.remote.visibility())
 
 
+class OfflineDispositionParityTest(unittest.TestCase):
+    """T-80: the mirror and the hosted store agree on what is still pending."""
+
+    def setUp(self):
+        import attacca as core
+        self.core = core
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.db = Path(self.temp.name) / "parity.db"
+        self.conn = core.connect(self.db)
+        self.addCleanup(self.conn.close)
+        checkout = Path(self.temp.name) / "checkout"
+        checkout.mkdir()
+        core.project_init(self.conn, "fixture", "human", path=checkout,
+                          project_id="p", name="Parity")
+        self.sender = "p.director.claude"
+        self.actor = "p.director.codex"
+        for actor_id, runtime in ((self.sender, "claude"),
+                                  (self.actor, "codex")):
+            core.agent_register(self.conn, "p", "fixture", "human",
+                                agent_id=actor_id, role="director",
+                                runtime=runtime)
+
+    def scope(self):
+        return {
+            "server_id": "srv_parity", "project_id": "p",
+            "principal_id": "fixture", "actor_id": self.actor,
+            "actor_type": "agent", "role": "director",
+        }
+
+    def send(self, body, **kwargs):
+        kwargs.setdefault("mentions", [self.actor])
+        return self.core.room_send(
+            self.conn, "p", self.sender, "agent", body, **kwargs)["event"]
+
+    def test_projection_pending_matches_the_hosted_rules(self):
+        core = self.core
+        answered = self.send("Please verify the export")
+        core.room_send(self.conn, "p", self.actor, "agent", "verified",
+                       reply_to=answered["event_id"])
+        retracted = self.send("Ignore this after all")
+        core.append_event(self.conn, "p", self.sender, "agent",
+                          core.MESSAGE_RETRACTION_EVENT_TYPE,
+                          {"message_event_id": retracted["event_id"]})
+        task_id = core.task_create(self.conn, "p", self.sender, "agent",
+                                   "Ship it")["task_id"]
+        completed = self.send("Finish the task", task_id=task_id)
+        core.task_set_status(self.conn, "p", self.sender, "agent", task_id,
+                             "done", reason="shipped")
+        historical = self.send("Historical assignment")
+        self.conn.execute(
+            "INSERT INTO inbox_cursors (project_id, actor_id, last_read_seq,"
+            " updated_at) VALUES ('p',?,?,?)",
+            (self.actor, historical["seq"], core.now_iso()))
+        deferred = self.send("Deferred on purpose")
+        still_open = self.send("Genuinely open")
+        hosted = core.pending_message_dispositions(
+            self.conn, "p", self.actor, actor_type="agent",
+            allow_baseline_write=True)
+        core.message_dispose(self.conn, "p", self.actor, "agent",
+                             deferred["event_id"], "deferred",
+                             note="waiting on review")
+        hosted = core.pending_message_dispositions(
+            self.conn, "p", self.actor, actor_type="agent")
+        self.assertEqual(
+            [item["event_id"] for item in hosted["pending"]],
+            [deferred["event_id"], still_open["event_id"]])
+
+        projection = core._sync_projection(self.conn, self.scope())
+        # The extended cursor record must remain a legal schema-v1 payload.
+        protocol.validate_identity_projection(projection, self.scope())
+        self.assertEqual(
+            projection["inbox_cursor"]["disposition_baseline_seq"],
+            historical["seq"])
+        offline_state = core._projection_pending_dispositions(
+            projection, self.actor, project_id="p", principal_id="fixture")
+        self.assertEqual(
+            [item["event_id"] for item in offline_state["pending"]],
+            [item["event_id"] for item in hosted["pending"]])
+        self.assertEqual(offline_state["baseline_seq"],
+                         hosted["baseline_seq"])
+        for event_id in (answered["event_id"], retracted["event_id"],
+                         completed["event_id"], historical["event_id"]):
+            hosted_record = hosted["dispositions"][event_id]
+            offline_record = offline_state["dispositions"][event_id]
+            self.assertTrue(hosted_record["implicit"])
+            self.assertEqual(offline_record["disposition"],
+                             hosted_record["disposition"])
+            self.assertEqual(offline_record["reason"], hosted_record["reason"])
+        self.assertEqual(
+            offline_state["dispositions"][deferred["event_id"]][
+                "disposition"], "deferred")
+
+    def test_queued_offline_bulk_disposition_clears_the_same_rows(self):
+        core = self.core
+        first = self.send("First assignment")
+        second = self.send("Second assignment")
+        projection = core._sync_projection(self.conn, self.scope())
+        overlays = [{
+            "operation": "message.dispose_bulk",
+            "client_mutation_id": "mut_offline_bulk_0001",
+            "sync_state": "pending",
+            "payload": {
+                "event_ids": [first["event_id"]],
+                "disposition": "acknowledged",
+                "note": "handled before the outage",
+            },
+        }]
+        state = core._projection_pending_dispositions(
+            projection, self.actor, overlays=overlays, project_id="p",
+            principal_id="fixture")
+        self.assertEqual([item["event_id"] for item in state["pending"]],
+                         [second["event_id"]])
+        record = state["dispositions"][first["event_id"]]
+        self.assertTrue(record["pending_sync"])
+        self.assertEqual(record["client_mutation_id"],
+                         "mut_offline_bulk_0001")
+        baselined = core._projection_pending_dispositions(
+            projection, self.actor, project_id="p", principal_id="fixture",
+            overlays=[{
+                "operation": "message.dispose_bulk",
+                "client_mutation_id": "mut_offline_bulk_0002",
+                "sync_state": "pending",
+                "payload": {
+                    "disposition": "acknowledged",
+                    "note": "reconciled offline",
+                    "filter": {"before_seq": second["seq"]},
+                },
+            }])
+        self.assertEqual(baselined["pending"], [])
+        self.assertEqual(baselined["baseline_seq"], second["seq"])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

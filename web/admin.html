@@ -845,6 +845,7 @@
         taskPlan: newTaskPlanState(),
         roomConversation: "local",
         roomFilter: "",
+        bulkDisposeBefore: "",
         activityFilter: "",
         ruleFilter: "",
         decisionFilter: "",
@@ -1511,6 +1512,50 @@
 
       function currentProject() { return state.projects.find(project => project.project_id === state.projectId) || null; }
 
+      function dispositionLabel(value) {
+        return String(value || "").replace(/_/g, " ");
+      }
+      function pendingDispositions() {
+        return state.data.inbox?.pending_dispositions || [];
+      }
+      function dispositionChip(message) {
+        if (!message.requires_disposition) return "";
+        const record = message.disposition;
+        if (!record) return `<span class="chip" title="This addressed message still needs an explicit outcome.">needs disposition</span>`;
+        if (record.implicit) return `<span class="chip" title="Resolved implicitly: ${h(record.detail || record.reason || "")}">auto · ${h(dispositionLabel(record.disposition))}</span>`;
+        return `<span class="chip" title="${h(record.note || dispositionLabel(record.disposition))}">${h(dispositionLabel(record.disposition))}${record.pending_sync ? " · pending sync" : ""}</span>`;
+      }
+      function bulkDisposeMatchCount(before) {
+        return pendingDispositions().filter(
+          item => (Number(item.seq) || 0) <= Number(before || 0)).length;
+      }
+      function updateBulkDisposePreview() {
+        const input = $("#bulk-dispose-before");
+        const preview = $("#bulk-dispose-preview");
+        const submit = $("#bulk-dispose-submit");
+        if (!input || !preview) return;
+        const before = Number(input.value) || 0;
+        const matched = bulkDisposeMatchCount(before);
+        preview.textContent = `${matched} of ${pendingDispositions().length} pending messages match #${before}`;
+        if (submit) submit.textContent = `Resolve all before #${before}…`;
+      }
+      function renderPendingDispositions(inbox) {
+        const pending = inbox.pending_dispositions || [];
+        if (!pending.length) return "";
+        const total = Number(inbox.pending_disposition_total || pending.length);
+        const highest = pending.reduce(
+          (max, item) => Math.max(max, Number(item.seq) || 0), 0);
+        const before = Number(state.bulkDisposeBefore || highest) || highest;
+        const matched = bulkDisposeMatchCount(before);
+        return `<section class="card section-gap" id="pending-dispositions"><div class="card-head"><div><h2>Pending assignments</h2><span class="faint small">${h(total)} addressed message${total === 1 ? "" : "s"} still need an explicit outcome from ${h(attributionText(state.prefs.actor, state.prefs.actorType, state.prefs.owner))}</span></div>${inbox.disposition_baseline_seq ? `<span class="badge">reconciled through #${h(inbox.disposition_baseline_seq)}</span>` : ""}</div><div class="card-body">
+          <div class="stack">${pending.slice(0, 20).map(item => `<div class="plan-review-row"><div class="cluster"><span>#${h(item.seq)}</span><strong>${h(actorDisplay(item.actor))}</strong>${statusBadge(item.msg_type)}${dispositionChip(item)}<span class="faint small">${h(fmtTime(item.at))}</span></div><div class="prose small section-gap">${h(String(item.body || "").slice(0, 220))}</div></div>`).join("")}</div>
+          <form data-form="bulk-dispose" class="section-gap">
+            <div class="form-grid"><div class="field"><label for="bulk-dispose-before">Resolve all before #N</label><input id="bulk-dispose-before" name="before_seq" type="number" min="1" value="${h(before)}"><span class="help">Every pending message at or below this event number is resolved, and your reconciliation baseline moves to it.</span></div><div class="field"><label for="bulk-dispose-disposition">Outcome</label><select id="bulk-dispose-disposition" name="disposition">${["acknowledged", "not_actionable", "deferred"].map(option => `<option value="${option}">${dispositionLabel(option)}</option>`).join("")}</select><span class="help">claimed and completed stay per-message because both must name a task.</span></div></div>
+            <div class="field section-gap"><label for="bulk-dispose-note">Note</label><textarea id="bulk-dispose-note" name="note" required placeholder="Why is this batch being resolved?"></textarea><span class="help">A note is mandatory: the ledger records one bulk event naming every message closed.</span></div>
+            <div class="form-actions"><span class="faint small" id="bulk-dispose-preview">${h(matched)} of ${h(pending.length)} pending messages match #${h(before)}</span><button class="button primary" id="bulk-dispose-submit" type="submit">Resolve all before #${h(before)}…</button></div>
+          </form>
+        </div></section>`;
+      }
       function inboxUnreadTotal(inbox = {}) {
         if (Number.isFinite(Number(inbox.unread_total))) return Number(inbox.unread_total);
         const messages = (inbox.messages || []).length;
@@ -2398,9 +2443,10 @@
               scopeMismatch ? "The room response did not match the requested conversation; no messages were rendered." : ""
             ].filter(Boolean).join(" · ")) : "") +
           `<section class="card"><div class="card-body"><div class="form-grid"><div class="field"><label for="room-workspace">Source workspace</label><select id="room-workspace">${state.projects.map(item => `<option value="${h(item.project_id)}" ${item.project_id === state.projectId ? "selected" : ""}>${h(projectName(item.project_id))} · ${h(item.project_id)}</option>`).join("")}</select><span class="help">Every conversation below is read from this workspace's retained room events.</span></div><div class="field"><label for="room-conversation">Conversation</label><select id="room-conversation"><optgroup label="Local"><option value="local" ${localConversation ? "selected" : ""}>Local workspace room · ${h(sourceName)}</option></optgroup>${bridges.length ? `<optgroup label="Inter-project">${bridges.map(bridge => `<option value="${h(bridge.with)}" ${requestedConversation === bridge.with ? "selected" : ""}>${h(sourceName)} ↔ ${h(projectName(bridge.with))} · ${h(bridge.relation)}${bridge.can_participate === false ? " · access denied" : ""}</option>`).join("")}</optgroup>` : ""}${conversationMetadataUnavailable ? `<optgroup label="Unavailable"><option value="${h(requestedConversation)}" selected disabled>${h(sourceName)} ↔ ${h(projectName(requestedConversation))} · metadata unavailable</option></optgroup>` : ""}</select><span class="help">The server filters this exact conversation before applying the 60-message page.</span></div><div class="field wide"><label for="room-search">Search this full conversation</label><input id="room-search" type="search" value="${h(state.roomFilter)}" placeholder="Search message body, actor, type, or task…"><span class="help">Search runs over the authorized conversation history, not only this page.</span></div></div>${activeBridge && !conversationMetadataUnavailable ? `<div class="form-actions"><button class="button quiet small" type="button" data-action="swap-room-workspace" data-project="${h(activeBridge.with)}" data-conversation="${h(state.projectId)}">View this pair from ${h(projectName(activeBridge.with))}</button></div>` : ""}<div class="notice ${conversationDenied || conversationMetadataUnavailable ? "error" : ""} section-gap"><span>${localConversation ? "L" : conversationDenied || conversationMetadataUnavailable ? "!" : "↔"}</span><div><strong>${h(conversationTitle)}</strong><br>${localConversation ? "Local workspace messages only; incoming and outgoing bridge traffic is excluded." : conversationDenied ? `${h(attributionText(state.prefs.actor, state.prefs.actorType, state.prefs.owner))} is denied by ${h(sourceName)}'s ${h(bridgeParticipationLabel(activeBridge.participation))} participation policy. The ${h(activeBridge.relation)} relationship still exists; a human or registered Director can change access in AI Network without deleting it.` : conversationMetadataUnavailable ? "The exact requested inter-project scope is preserved, but bridge metadata could not be loaded. Sending stays disabled until it is verified." : `Inter-project messages retained in ${h(sourceName)} only; unrelated origins and local-only messages are excluded.`}</div></div></div></section>` +
+          renderPendingDispositions(inbox) +
           `<div class="grid main-side section-gap">
             <section class="card" id="room-conversation-feed"><div class="card-head"><div><h2>${h(conversationTitle)}</h2><span class="faint small">${conversationDenied ? `Messages are hidden by ${h(sourceName)}'s participation policy` : `${h(roomPage.total)} authorized conversation messages`}</span></div>${unreadTotal ? `<button class="button quiet small" type="button" data-action="mark-inbox-read">Mark group room read · ${h(Number(unreadTotal).toLocaleString())} unread</button>` : `<span class="badge fresh">caught up</span>`}<span class="badge ${conversationDenied ? "error" : localConversation ? "fresh" : "accepted"}">${conversationDenied ? "Access denied" : localConversation ? "Local" : "Inter-project"}</span></div><div class="card-body">
-              ${conversationDenied ? empty("Conversation access denied", `${attributionText(state.prefs.actor, state.prefs.actorType, state.prefs.owner)} cannot read or send in this inter-project conversation. The relationship remains connected; change its participation policy in AI Network.`) : scopeMismatch ? empty("Conversation response rejected", "Refresh after the server can prove the exact requested conversation scope.") : `${roomPage.total || roomPage.offset ? feedToolbar("room", roomPage, `${pagedMessages.length} messages returned by full-history query`) : ""}${pagedMessages.length ? `<div class="room-feed" id="room-feed" role="log" aria-label="${h(conversationTitle)} message history" aria-live="off" tabindex="0" data-feed-scope="${h(roomScope)}">${pagedMessages.map(message => `<article class="message" data-feed-key="${h(message.seq)}"><div class="message-head"><span class="message-actor" title="Ledger actor: ${h(message.ledger_actor || message.actor)}">${h(attributionText(message.actor, message.actor_type, message.owner, message.attribution))}</span>${statusBadge(message.msg_type)}${message.broadcast_to_everyone ? `<span class="chip">to everyone</span>` : message.addressed_to_you ? `<span class="chip">your attention</span>` : message.group_context ? `<span class="chip">group context</span>` : ""}${message.origin_project ? `<span class="chip">from ${h(projectName(message.origin_project))}</span>` : (message.mirrored_to || []).length ? `<span class="chip">to ${h(message.mirrored_to.map(projectName).join(", "))}</span>` : `<span class="chip">local · ${h(sourceName)}</span>`}${message.authority ? `<span class="badge">${h(message.authority)}</span>` : ""}</div><div class="message-body">${h(message.body)}</div><div class="message-foot"><span>#${h(message.seq)}</span><span>${h(fmtTime(message.at))}</span>${message.task_id ? `<span>${h(message.task_id)}</span>` : ""}${message.mentions?.length ? `<span>expected responder: ${h(message.mentions.map(actorDisplay).join(", "))}</span>` : ""}${message.reply_to ? `<span>reply ${h(String(message.reply_to).slice(0, 16))}</span>` : ""}</div></article>`).join("")}</div>` : empty(state.roomFilter ? "No matching conversation messages" : roomPage.offset ? "No messages at this offset" : localConversation ? "No local workspace messages" : "No retained messages for this workspace pair", state.roomFilter ? "Change or clear the full-history search." : roomPage.offset ? "Use Newer to return to an available page." : localConversation ? "Send the first local-only message." : "Send the first message across this workspace bridge.")}`}
+              ${conversationDenied ? empty("Conversation access denied", `${attributionText(state.prefs.actor, state.prefs.actorType, state.prefs.owner)} cannot read or send in this inter-project conversation. The relationship remains connected; change its participation policy in AI Network.`) : scopeMismatch ? empty("Conversation response rejected", "Refresh after the server can prove the exact requested conversation scope.") : `${roomPage.total || roomPage.offset ? feedToolbar("room", roomPage, `${pagedMessages.length} messages returned by full-history query`) : ""}${pagedMessages.length ? `<div class="room-feed" id="room-feed" role="log" aria-label="${h(conversationTitle)} message history" aria-live="off" tabindex="0" data-feed-scope="${h(roomScope)}">${pagedMessages.map(message => `<article class="message" data-feed-key="${h(message.seq)}"><div class="message-head"><span class="message-actor" title="Ledger actor: ${h(message.ledger_actor || message.actor)}">${h(attributionText(message.actor, message.actor_type, message.owner, message.attribution))}</span>${statusBadge(message.msg_type)}${message.broadcast_to_everyone ? `<span class="chip">to everyone</span>` : message.addressed_to_you ? `<span class="chip">your attention</span>` : message.group_context ? `<span class="chip">group context</span>` : ""}${dispositionChip(message)}${message.origin_project ? `<span class="chip">from ${h(projectName(message.origin_project))}</span>` : (message.mirrored_to || []).length ? `<span class="chip">to ${h(message.mirrored_to.map(projectName).join(", "))}</span>` : `<span class="chip">local · ${h(sourceName)}</span>`}${message.authority ? `<span class="badge">${h(message.authority)}</span>` : ""}</div><div class="message-body">${h(message.body)}</div><div class="message-foot"><span>#${h(message.seq)}</span><span>${h(fmtTime(message.at))}</span>${message.task_id ? `<span>${h(message.task_id)}</span>` : ""}${message.mentions?.length ? `<span>expected responder: ${h(message.mentions.map(actorDisplay).join(", "))}</span>` : ""}${message.reply_to ? `<span>reply ${h(String(message.reply_to).slice(0, 16))}</span>` : ""}</div></article>`).join("")}</div>` : empty(state.roomFilter ? "No matching conversation messages" : roomPage.offset ? "No messages at this offset" : localConversation ? "No local workspace messages" : "No retained messages for this workspace pair", state.roomFilter ? "Change or clear the full-history search." : roomPage.offset ? "Use Newer to return to an available page." : localConversation ? "Send the first local-only message." : "Send the first message across this workspace bridge.")}`}
             </div></section>
             <aside class="card"><div class="card-head"><h2>Send message</h2></div><div class="card-body">
               ${conversationDenied || conversationMetadataUnavailable ? `<div class="notice error"><span>!</span><div><strong>Sending is disabled for this conversation.</strong><br>${conversationMetadataUnavailable ? "Bridge metadata must load successfully before the panel can prove the destination." : "Participation is an access policy, not a relationship state. Ask a human or registered Director to update access in AI Network; do not delete the bridge just to grant access."}</div></div>` : `<form data-form="send-room">
@@ -3212,6 +3258,11 @@
           queueTaskPlanFilterRefresh(event.target, "action");
           return;
         }
+        if (event.target.id === "bulk-dispose-before") {
+          state.bulkDisposeBefore = event.target.value;
+          updateBulkDisposePreview();
+          return;
+        }
         const filters = {
           "workspace-search": ["workspaceSearch", "workspaces", false],
           "task-search": ["taskSearch", "tasks", false],
@@ -3348,6 +3399,18 @@
             body.target_project = values.target_project || state.projectId;
             await mutate("Message sent", () => api(pathFor("/room"), { method: "POST", body }));
             form.reset();
+          }
+          if (kind === "bulk-dispose") {
+            const before = Number(values.before_seq);
+            if (!Number.isFinite(before) || before < 1) throw new Error("Enter the event number to resolve through.");
+            const note = String(values.note || "").trim();
+            if (!note) throw new Error("A bulk resolution requires a note explaining it.");
+            const matched = bulkDisposeMatchCount(before);
+            if (!confirm(`Resolve ${matched} pending message${matched === 1 ? "" : "s"} at or below #${before} as ${dispositionLabel(values.disposition)}? One disposition is written per message, the ledger records a single bulk event, and your reconciliation baseline moves to #${before}.`)) return;
+            const outcome = await mutate("Pending assignments resolved", () => api(pathFor("/messages/dispose-bulk"), { method: "POST", body: { disposition: values.disposition, note, filter: { before_seq: before } } }));
+            state.bulkDisposeBefore = "";
+            form.reset();
+            if (outcome) toast(`${outcome.disposed_count} resolved · ${outcome.remaining_pending} still pending`);
           }
           if (kind === "propose-decision") {
             await mutate("Decision proposed", () => api(pathFor("/decisions"), { method: "POST", body: { title: values.title, detail: values.detail || null, rationale: values.rationale || null } }));

@@ -451,6 +451,7 @@ POST /v1/auth/activation
 GET/PUT /v1/settings
 GET  /v1/projects                          POST /v1/projects
 GET  /v1/projects/{id}/status              GET  /v1/projects/{id}/inbox
+POST /v1/projects/{id}/inbox/dispositions  POST /v1/projects/{id}/messages/dispose-bulk
 PUT  /v1/projects/{id}/lead
 GET/POST /v1/projects/{id}/bridges         DELETE /v1/projects/{id}/bridges/{other}
 GET  /v1/projects/{id}/handoff             PUT  /v1/projects/{id}/handoff
@@ -550,12 +551,70 @@ receive R-0 once when opened by the upgraded product; because it is a normal
 Project Rule, authorized governance may edit or disable it and Attacca will not
 overwrite that choice.
 
+## Message dispositions
+
+Reading a room message is not the same as handling it. Every message directed
+at you (a mention, a reply to your own message) and every broadcast directive
+requires an explicit outcome recorded with `message_dispose`
+(`acknowledged`, `claimed`, `deferred`, `blocked`, `completed`, or
+`not_actionable`; `claimed`/`completed` must name a task in the matching board
+state). `deferred`, `blocked`, and `claimed` deliberately stay pending.
+
+Some outcomes are already proven by the project's own history, so Attacca
+resolves them **implicitly** instead of demanding a second manual record:
+
+| Rule | Implied disposition |
+| --- | --- |
+| You already replied to the message in the room | `acknowledged` |
+| The message was retracted — a `room.message_retracted` ledger event names it, appended by its own sender or by a human | `not_actionable` |
+| Its linked task — its own `task_id`, or the one carried by the message it replies to — is `done` or `cancelled` | `completed` |
+| Its `seq` is at or below your reconciliation baseline | `acknowledged` |
+
+Nothing is hidden: `check_inbox` and `room_read` still return the message with
+`requires_disposition: true` and
+`disposition: {disposition, implicit: true, reason}`, and the Control Panel
+room feed shows an `auto · …` badge. An explicit disposition row always wins
+over an implicit rule, so a message you deliberately deferred stays pending
+even below a baseline.
+
+**Reconciliation baseline.** An identity that has never recorded a single
+disposition is reconciled exactly once, from its own persisted inbox read
+cursor: history it had already read before implicit resolution existed is not
+resurrected as mandatory work by an upgrade. The baseline is stored per actor
+(`message_disposition_baselines`), appended to the ledger as
+`room.disposition_baseline` with the number of rows it reconciled, and may only
+move forward. Identities that were already disposing messages by hand are never
+auto-baselined. Read-only surfaces (`get_handoff`, `check_freshness`, a
+`mark_read=0` inbox) apply the baseline but never persist it; only a
+write-capable call (`check_inbox` marking read, or a dispose) records it. A
+verified offline mirror applies only the baseline the server has already
+persisted — it never derives one from a read cursor, so an outage can never
+close addressed work on its own.
+
+**Bulk resolution.** `message_dispose_bulk` (REST:
+`POST /v1/projects/{id}/messages/dispose-bulk`) closes up to 100 of your own
+pending messages in one audited write. It takes either `event_ids` (max 100;
+more is an error) or a bounded `filter`
+(`{before_seq, older_than_hours?, task_state?}`, which truncates at 100 and
+reports `remaining_pending`), plus `disposition` limited to
+`acknowledged | not_actionable | deferred` and a mandatory `note`. It writes
+one `message_dispositions` row per message and a single
+`room.message_dispositions_bulk` ledger event naming every message closed, and
+returns `{disposed, skipped, remaining_pending, baseline_seq}`. A
+`before_seq`-only filter also moves your reconciliation baseline to
+`before_seq`; adding `older_than_hours` or `task_state` narrows the selection
+and deliberately leaves the baseline alone, so a narrowing call can never
+silently close the rows it excluded. Another identity's rows are never
+touched. The Control Panel exposes this as **Resolve all before
+#N…** in the Room / Inbox view, with a live count preview and a confirm step.
+
 ## MCP tools
 
 `attacca_status`, `get_handoff`, `update_handoff`, `get_identity_handoff`,
 `update_identity_handoff`, `identity_handoff_history`, `get_project_log`,
 `role_scope_get`, `role_scope_set`, `role_scope_history`,
 `room_send`, `room_read`, `check_inbox`, `message_dispose`,
+`message_dispose_bulk`,
 `set_lead_director`, `bridge_add`, `bridge_update_access`, `bridge_list`,
 `bridge_remove`, `search`, `task_create`, `task_list`, `task_show`,
 `task_plan_get`, `task_plan_set`, `task_plan_submit`, `task_plan_review`,

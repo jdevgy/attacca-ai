@@ -817,6 +817,8 @@ _PERSONA_HISTORY_COLUMNS = (
     ("inbox_cursors", (("actor_id", "updated_at"),)),
     ("message_dispositions", (("actor_id", "updated_at"),
                               ("updated_by", "updated_at"))),
+    ("message_disposition_baselines", (("actor_id", "at"),
+                                       ("set_by", "at"))),
     ("tasks", (("claimed_by", "updated_at"),
                ("created_by", "created_at"))),
     ("task_plan_revisions", (("authored_by", "authored_at"),)),
@@ -1541,6 +1543,17 @@ CREATE TABLE IF NOT EXISTS message_dispositions (
 );
 CREATE INDEX IF NOT EXISTS idx_message_dispositions_actor
   ON message_dispositions (project_id, actor_id, disposition, updated_at);
+CREATE TABLE IF NOT EXISTS message_disposition_baselines (
+  project_id   TEXT NOT NULL,
+  actor_id     TEXT NOT NULL,
+  baseline_seq INTEGER NOT NULL DEFAULT 0,
+  source       TEXT NOT NULL,
+  set_by       TEXT,
+  set_owner    TEXT,
+  note         TEXT,
+  at           TEXT NOT NULL,
+  PRIMARY KEY (project_id, actor_id)
+);
 CREATE INDEX IF NOT EXISTS idx_events_type_time_project
     ON events (event_type, created_at, project_id);
 CREATE TABLE IF NOT EXISTS tasks (
@@ -5962,6 +5975,9 @@ def room_read(conn, project_id, since_seq=None, limit=30, actor_id=None,
         message["attribution"] = attribution
         message.update(_inbox_message_attention(conn, actor_ids, message))
         visible_messages.append(message)
+    _attach_message_dispositions(
+        conn, project_id, actor_id, actor_type, visible_messages,
+        actor_ids=actor_ids)
     if since_seq is None:
         older_messages_available = len(visible_messages) > limit
         visible_messages = visible_messages[-limit:]
@@ -6059,6 +6075,9 @@ def room_history(conn, project_id, actor_id=None, actor_type="agent",
         message["attribution"] = attribution
         message.update(_inbox_message_attention(conn, actor_ids, message))
         messages.append(message)
+    _attach_message_dispositions(
+        conn, project_id, actor_id, actor_type, messages,
+        actor_ids=actor_ids)
     return {"project": project_id, "conversation": conversation,
             "messages": messages, "total": total,
             "unfiltered_total": unfiltered_total, "limit": limit,
@@ -6133,9 +6152,299 @@ def _message_requires_disposition(attention, payload):
         payload.get("msg_type") == "directive"))
 
 
+MESSAGE_DISPOSITION_BASELINE_SOURCES = ("upgrade", "manual")
+# claimed/completed stay per-message: both must name the task they belong to.
+BULK_MESSAGE_DISPOSITIONS = ("acknowledged", "not_actionable", "deferred")
+MAX_BULK_MESSAGE_DISPOSITIONS = 100
+# Attacca has no retract API.  The only representation a project can produce
+# today is a ledger event appended for one exact room message, so retraction
+# detection reads that event and invents no new write surface.
+MESSAGE_RETRACTION_EVENT_TYPE = "room.message_retracted"
+
+
+def _message_disposition_baseline_row(conn, project_id, actor_id):
+    return conn.execute(
+        "SELECT * FROM message_disposition_baselines"
+        " WHERE project_id=? AND actor_id=?",
+        (project_id, actor_id)).fetchone()
+
+
+def _record_message_disposition_baseline(conn, project_id, actor_id, actor_type,
+                                         baseline_seq, source, note=None,
+                                         resolved_count=0, in_tx=False):
+    """Move one actor's reconciliation baseline forward, auditably and once.
+
+    The baseline records which already-handled history an identity reconciled
+    at an upgrade (or explicitly resolved in bulk).  It may only move forward,
+    is never rewritten backwards, and every change appends a ledger event so
+    the reconciliation is visible instead of silently clearing assignments.
+    """
+    source = str(source or "").strip().lower()
+    if source not in MESSAGE_DISPOSITION_BASELINE_SOURCES:
+        raise AttaccaError(
+            "disposition baseline source must be one of %s" %
+            ", ".join(MESSAGE_DISPOSITION_BASELINE_SOURCES))
+    try:
+        baseline_seq = int(baseline_seq)
+    except (TypeError, ValueError):
+        raise AttaccaError("baseline_seq must be an integer")
+    if baseline_seq < 0:
+        raise AttaccaError("baseline_seq cannot be negative")
+    note = str(note or "").strip() or None
+    nowi = now_iso()
+
+    def _write():
+        # Read the current baseline inside the write transaction: two sessions
+        # sharing one canonical actor must not both record the first upgrade
+        # reconciliation.
+        existing = _message_disposition_baseline_row(
+            conn, project_id, actor_id)
+        current = int(existing["baseline_seq"]) if existing else None
+        if current is not None and baseline_seq < current:
+            raise AttaccaError(
+                "disposition baseline may only move forward: %s is already "
+                "reconciled through #%d" % (actor_id, current))
+        if current is not None and baseline_seq == current:
+            return None, current, existing["source"]
+        conn.execute(
+            "INSERT INTO message_disposition_baselines"
+            " (project_id,actor_id,baseline_seq,source,set_by,set_owner,note,at)"
+            " VALUES (?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(project_id,actor_id) DO UPDATE SET"
+            " baseline_seq=excluded.baseline_seq,source=excluded.source,"
+            " set_by=excluded.set_by,set_owner=excluded.set_owner,"
+            " note=excluded.note,at=excluded.at",
+            (project_id, actor_id, baseline_seq, source, actor_id,
+             current_owner(), note, nowi))
+        return append_event(
+            conn, project_id, actor_id, actor_type,
+            "room.disposition_baseline", {
+                "baseline_seq": baseline_seq,
+                "source": source,
+                "resolved_count": int(resolved_count or 0),
+                "previous_baseline_seq": current,
+                "note": note,
+            }, in_tx=True), baseline_seq, source
+
+    if in_tx:
+        event, recorded_seq, recorded_source = _write()
+    else:
+        with write_tx(conn):
+            event, recorded_seq, recorded_source = _write()
+    return {"baseline_seq": recorded_seq, "source": recorded_source,
+            "event": event, "changed": event is not None}
+
+
+def _retracted_room_message_ids(conn, project_id, sender_by_event):
+    """Room messages withdrawn through the existing ledger retraction event.
+
+    Only the message's own sender (through any of its aliases) or a human
+    operator may retract it.  ``append_event`` is available to every
+    registered agent, so an unchecked retraction event would let one AI clear
+    another AI's addressed work without any authority check.
+    """
+    retracted = set()
+    rows = conn.execute(
+        "SELECT actor_id, actor_type, payload FROM events"
+        " WHERE project_id=? AND event_type=?",
+        (project_id, MESSAGE_RETRACTION_EVENT_TYPE)).fetchall()
+    alias_cache = {}
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        target = payload.get("message_event_id") or payload.get("event_id")
+        if not isinstance(target, str) or not target.strip():
+            continue
+        target = target.strip()
+        sender = (sender_by_event or {}).get(target)
+        if not sender:
+            continue
+        if row["actor_type"] == "human":
+            retracted.add(target)
+            continue
+        actor = row["actor_id"]
+        aliases = alias_cache.get(actor)
+        if aliases is None:
+            aliases = _actor_alias_ids(conn, project_id, actor)
+            alias_cache[actor] = aliases
+        if sender == actor or sender in aliases:
+            retracted.add(target)
+    return retracted
+
+
+def _project_task_status_index(conn, project_id):
+    return {row["task_id"]: row["status"] for row in conn.execute(
+        "SELECT task_id, status FROM tasks WHERE project_id=?",
+        (project_id,)).fetchall()}
+
+
+def _message_senders(message):
+    return {message.get("actor"), message.get("actor_id"),
+            message.get("ledger_actor")}
+
+
+def _build_disposition_index(messages, actor_ids, task_status,
+                             retracted_event_ids=(), baseline_seq=0):
+    """Shared inputs for implicit resolution (hosted store and offline mirror).
+
+    ``messages`` are minimally shaped room messages -- event_id, seq, sender,
+    task_id, reply_to -- so one rule implementation serves both the server and
+    the verified offline projection instead of a copied predicate.
+    """
+    actor_ids = {value for value in (actor_ids or ()) if value}
+    replied_to = set()
+    message_task = {}
+    for message in messages or ():
+        event_id = message.get("event_id")
+        if event_id:
+            message_task[event_id] = \
+                str(message.get("task_id") or "").strip() or None
+        reply_to = message.get("reply_to")
+        if reply_to and _message_senders(message) & actor_ids:
+            replied_to.add(reply_to)
+    return {
+        "replied_to": replied_to,
+        "retracted": {value for value in (retracted_event_ids or ()) if value},
+        "task_status": dict(task_status or {}),
+        "message_task": message_task,
+        "baseline_seq": max(0, int(baseline_seq or 0)),
+    }
+
+
+def _message_implicitly_resolved(message, index):
+    """Implied outcome for an addressed message, or None while it stays open.
+
+    Implicit resolution never hides a row: read surfaces still return the
+    implied disposition with ``implicit: True`` and the reason it applied.
+    An explicit disposition row always wins over these rules.
+    """
+    if not index:
+        return None
+    event_id = message.get("event_id")
+    if event_id and event_id in index.get("replied_to", ()):
+        return {"disposition": "acknowledged", "implicit": True,
+                "reason": "answered_in_room",
+                "detail": "you replied to this message in the room"}
+    if event_id and event_id in index.get("retracted", ()):
+        return {"disposition": "not_actionable", "implicit": True,
+                "reason": "retracted",
+                "detail": "the message was retracted by its workspace"}
+    task_id = str(message.get("task_id") or "").strip() or None
+    task_source = "message"
+    if not task_id and message.get("reply_to"):
+        task_id = (index.get("message_task") or {}).get(message["reply_to"])
+        task_source = "reply_to"
+    status = (index.get("task_status") or {}).get(task_id) if task_id else None
+    if status in ("done", "cancelled"):
+        return {"disposition": "completed", "implicit": True,
+                "reason": "linked_task_%s" % status,
+                "task_id": task_id, "task_link": task_source,
+                "detail": "linked task %s is %s" % (task_id, status)}
+    baseline_seq = int((index.get("baseline_seq") or 0))
+    if baseline_seq and int(message.get("seq") or 0) <= baseline_seq:
+        return {"disposition": "acknowledged", "implicit": True,
+                "reason": "reconciliation_baseline",
+                "baseline_seq": baseline_seq,
+                "detail": "read and reconciled through #%d" % baseline_seq}
+    return None
+
+
+def _resolve_message_disposition(message, inputs):
+    """Return (disposition record or None, still_pending).
+
+    Precedence is fixed: an explicit row always decides -- resolved closes the
+    row, and deliberate deferred/blocked/claimed state stays pending even
+    below a reconciliation baseline.  Only rows with no explicit disposition
+    can be closed implicitly.
+    """
+    explicit = (inputs.get("explicit") or {}).get(message.get("event_id"))
+    if explicit is not None:
+        record = dict(explicit)
+        return record, record.get("disposition") in \
+            UNRESOLVED_MESSAGE_DISPOSITIONS
+    implicit = _message_implicitly_resolved(message, inputs.get("index"))
+    return implicit, implicit is None
+
+
+def _message_disposition_inputs(conn, project_id, actor_id, actor_ids=None,
+                                room_rows=None, baseline_source_seq=None):
+    """Explicit rows, reconciliation baseline, and the shared rule index.
+
+    An actor that has never been baselined and has never recorded a single
+    disposition is reconciled from its persisted inbox read cursor: it read
+    that history before implicit resolution existed.  The value is provisional
+    until a write-capable caller persists it, so read-only surfaces report the
+    same numbers without appending a ledger event.
+    """
+    actor_ids = set(actor_ids or _actor_alias_ids(conn, project_id, actor_id))
+    explicit_rows = conn.execute(
+        "SELECT * FROM message_dispositions WHERE project_id=? AND actor_id=?",
+        (project_id, actor_id)).fetchall()
+    explicit = {row["message_event_id"]: dict(row) for row in explicit_rows}
+    baseline_row = _message_disposition_baseline_row(
+        conn, project_id, actor_id)
+    provisional = False
+    if baseline_row is not None:
+        baseline_seq = int(baseline_row["baseline_seq"] or 0)
+    elif explicit_rows:
+        # This identity was already disposing messages by hand when implicit
+        # reconciliation shipped, so none of its history is auto-reconciled.
+        baseline_seq = 0
+    else:
+        if baseline_source_seq is None:
+            cursor_row = conn.execute(
+                "SELECT last_read_seq FROM inbox_cursors"
+                " WHERE project_id=? AND actor_id=?",
+                (project_id, actor_id)).fetchone()
+            baseline_source_seq = \
+                int(cursor_row["last_read_seq"]) if cursor_row else 0
+        baseline_seq = max(0, int(baseline_source_seq or 0))
+        provisional = True
+    if room_rows is None:
+        room_rows = conn.execute(
+            "SELECT event_id, seq, actor_id, task_id, payload FROM events"
+            " WHERE project_id=? AND event_type='room.message' ORDER BY seq",
+            (project_id,)).fetchall()
+    messages = []
+    for row in room_rows:
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, ValueError):
+            payload = {}
+        messages.append({
+            "event_id": row["event_id"], "seq": row["seq"],
+            "actor_id": row["actor_id"], "task_id": row["task_id"],
+            "reply_to": payload.get("reply_to")
+            if isinstance(payload, dict) else None})
+    index = _build_disposition_index(
+        messages, actor_ids, _project_task_status_index(conn, project_id),
+        retracted_event_ids=_retracted_room_message_ids(
+            conn, project_id,
+            {message["event_id"]: message.get("actor_id")
+             for message in messages if message.get("event_id")}),
+        baseline_seq=baseline_seq)
+    return {"explicit": explicit, "index": index,
+            "baseline_seq": baseline_seq,
+            "baseline_row": dict(baseline_row) if baseline_row else None,
+            "baseline_provisional": provisional,
+            "has_explicit_rows": bool(explicit_rows),
+            "actor_ids": actor_ids}
+
+
 def pending_message_dispositions(conn, project_id, actor_id,
-                                 actor_type="agent", limit=100):
-    """Return addressed work that was read but never explicitly disposed."""
+                                 actor_type="agent", limit=100,
+                                 allow_baseline_write=False,
+                                 baseline_source_seq=None):
+    """Return addressed work that is neither explicitly nor implicitly closed.
+
+    ``allow_baseline_write`` gates the one-per-actor upgrade reconciliation
+    write.  GET-only read surfaces pass False so no ledger event is smuggled
+    through a read; they still see the provisional baseline's effect.
+    """
     get_project(conn, project_id)
     limit = max(1, min(int(limit or 100), 500))
     actor_ids = _actor_alias_ids(conn, project_id, actor_id)
@@ -6145,12 +6454,13 @@ def pending_message_dispositions(conn, project_id, actor_id,
         (project_id,)).fetchall()
     candidate_rows = [row for row in rows if row["actor_id"] not in actor_ids]
     payloads = _room_policy_payloads(conn, project_id, candidate_rows)
-    disposition_rows = conn.execute(
-        "SELECT * FROM message_dispositions WHERE project_id=? AND actor_id=?",
-        (project_id, actor_id)).fetchall()
-    dispositions = {row["message_event_id"]: dict(row)
-                    for row in disposition_rows}
+    inputs = _message_disposition_inputs(
+        conn, project_id, actor_id, actor_ids=actor_ids, room_rows=rows,
+        baseline_source_seq=baseline_source_seq)
+    baseline_seq = inputs["baseline_seq"]
     pending = []
+    records = {}
+    reconciled = 0
     for row, payload in zip(candidate_rows, payloads):
         if not _bridge_message_visible(
                 conn, project_id, payload, actor_id, actor_type):
@@ -6158,11 +6468,14 @@ def pending_message_dispositions(conn, project_id, actor_id,
         attention = _inbox_message_attention(conn, actor_ids, payload)
         if not _message_requires_disposition(attention, payload):
             continue
-        disposition = dispositions.get(row["event_id"])
-        if disposition and disposition["disposition"] not in \
-                UNRESOLVED_MESSAGE_DISPOSITIONS:
-            continue
         message = _room_message_dict(row, payload)
+        record, still_pending = _resolve_message_disposition(message, inputs)
+        records[row["event_id"]] = record
+        if row["event_id"] not in inputs["explicit"] \
+                and int(row["seq"]) <= baseline_seq:
+            reconciled += 1
+        if not still_pending:
+            continue
         message.update(attention)
         identity_project = message.get("origin_project") or project_id
         attribution = immutable_event_attribution(
@@ -6173,14 +6486,61 @@ def pending_message_dispositions(conn, project_id, actor_id,
         message["identity"] = attribution["identity"]
         message["attribution"] = attribution
         message["requires_disposition"] = True
-        message["disposition"] = disposition
+        message["disposition"] = record
         pending.append(message)
+    baseline_event = None
+    if inputs["baseline_provisional"] and allow_baseline_write:
+        try:
+            recorded = _record_message_disposition_baseline(
+                conn, project_id, actor_id, actor_type, baseline_seq,
+                "upgrade", resolved_count=reconciled,
+                note="addressed history already read before implicit "
+                     "disposition reconciliation shipped")
+            baseline_event = recorded.get("event")
+        except AttaccaError:
+            # Two sessions may share one canonical actor.  If the other one
+            # already reconciled further ahead, this read simply reports the
+            # rows it computed; it never rewrites that identity's baseline.
+            baseline_event = None
     has_more = len(pending) > limit
     return {
         "pending": pending[:limit],
         "pending_total": len(pending),
         "may_have_more": has_more,
+        # Disposition state for EVERY message that requires one, so read
+        # surfaces can show an implicit outcome instead of hiding the row.
+        "dispositions": records,
+        "baseline_seq": baseline_seq,
+        "baseline_provisional": bool(
+            inputs["baseline_provisional"] and baseline_event is None),
+        "baseline_event": baseline_event,
+        "reconciled_count": reconciled,
     }
+
+
+def _attach_message_dispositions(conn, project_id, actor_id, actor_type,
+                                 messages, actor_ids=None):
+    """Annotate already-authorized room messages with disposition state.
+
+    Read surfaces keep implicitly resolved rows visible: each addressed
+    message carries ``requires_disposition`` plus the explicit row or the
+    implied ``{disposition, implicit: True, reason}`` outcome.
+    """
+    if not actor_id or not messages:
+        return messages
+    actor_ids = set(actor_ids or _actor_alias_ids(conn, project_id, actor_id))
+    requiring = [message for message in messages
+                 if not (_message_senders(message) & actor_ids)
+                 and _message_requires_disposition(message, message)]
+    if not requiring:
+        return messages
+    inputs = _message_disposition_inputs(
+        conn, project_id, actor_id, actor_ids=actor_ids)
+    for message in requiring:
+        record, _ = _resolve_message_disposition(message, inputs)
+        message["requires_disposition"] = True
+        message["disposition"] = record
+    return messages
 
 
 def message_dispose(conn, project_id, actor_id, actor_type, event_id,
@@ -6252,14 +6612,355 @@ def message_dispose(conn, project_id, actor_id, actor_type, event_id,
                 "task_id": effective_task,
             }, task_id=effective_task, in_tx=True)
     pending = pending_message_dispositions(
-        conn, project_id, actor_id, actor_type=actor_type, limit=1)
+        conn, project_id, actor_id, actor_type=actor_type, limit=1,
+        allow_baseline_write=True)
     return {
         "ok": True,
         "message_event_id": event_id,
         "disposition": disposition,
         "task_id": effective_task,
         "pending_disposition_total": pending["pending_total"],
+        "baseline_seq": pending["baseline_seq"],
         "event": event,
+    }
+
+
+def _bulk_disposition_filter(message_filter):
+    """Validate the bounded filter form of a bulk disposition request."""
+    if not isinstance(message_filter, dict):
+        raise AttaccaError("filter must be an object")
+    unknown = sorted(set(message_filter) -
+                     {"before_seq", "older_than_hours", "task_state"})
+    if unknown:
+        raise AttaccaError(
+            "filter does not support %s; use before_seq, older_than_hours, "
+            "or task_state" % ", ".join(unknown))
+    try:
+        before_seq = int(message_filter.get("before_seq"))
+    except (TypeError, ValueError):
+        raise AttaccaError("filter.before_seq must be an integer event seq")
+    if before_seq < 1:
+        raise AttaccaError("filter.before_seq must be a positive event seq")
+    older_than_hours = message_filter.get("older_than_hours")
+    if older_than_hours is not None:
+        try:
+            older_than_hours = float(older_than_hours)
+        except (TypeError, ValueError):
+            raise AttaccaError("filter.older_than_hours must be a number")
+        if older_than_hours < 0:
+            raise AttaccaError("filter.older_than_hours cannot be negative")
+    task_state = message_filter.get("task_state")
+    if task_state is not None:
+        task_state = str(task_state).strip().lower()
+        if task_state not in ("done", "cancelled", "any"):
+            raise AttaccaError(
+                "filter.task_state must be done, cancelled, or any")
+    return {"before_seq": before_seq, "older_than_hours": older_than_hours,
+            "task_state": task_state}
+
+
+def message_dispose_bulk(conn, project_id, actor_id, actor_type, disposition,
+                         note=None, event_ids=None, message_filter=None):
+    """Resolve up to 100 of THIS actor's pending messages in one audited write.
+
+    Bulk resolution exists for reconciliation, not for silently clearing
+    assignments: it accepts only acknowledged/not_actionable/deferred, demands
+    a note, touches no other identity's rows, and records one ledger event
+    naming every message it closed.  A pure ``before_seq`` filter additionally
+    moves this actor's reconciliation baseline forward so the same history
+    cannot come back as pending after another upgrade; a filter that narrows
+    by age or task state closes only what it selected and leaves the baseline
+    alone.
+    """
+    get_project(conn, project_id)
+    disposition = str(disposition or "").strip().lower()
+    if disposition not in BULK_MESSAGE_DISPOSITIONS:
+        raise AttaccaError(
+            "bulk disposition must be one of %s; claimed/completed remain "
+            "per-message because they require a linked task" %
+            ", ".join(BULK_MESSAGE_DISPOSITIONS))
+    note = str(note or "").strip()
+    if not note:
+        raise AttaccaError("bulk disposition requires a note")
+    if event_ids is not None and message_filter is not None:
+        raise AttaccaError(
+            "pass either event_ids or a filter, not both")
+    selected_filter = None
+    requested_ids = None
+    if event_ids is not None:
+        requested_ids = _require_str_list("event_ids", event_ids)
+        if not requested_ids:
+            raise AttaccaError("event_ids cannot be empty")
+        if len(requested_ids) > MAX_BULK_MESSAGE_DISPOSITIONS:
+            raise AttaccaError(
+                "at most %d messages can be disposed per call" %
+                MAX_BULK_MESSAGE_DISPOSITIONS)
+    elif message_filter is not None:
+        selected_filter = _bulk_disposition_filter(message_filter)
+    else:
+        raise AttaccaError("event_ids or a filter is required")
+    # A narrowing filter says "close only these rows".  Moving the
+    # reconciliation baseline would silently close exactly the rows the caller
+    # excluded, so only a pure before_seq filter advances it.
+    narrows_selection = bool(selected_filter and (
+        selected_filter["older_than_hours"] is not None
+        or selected_filter["task_state"] is not None))
+    state = pending_message_dispositions(
+        conn, project_id, actor_id, actor_type=actor_type, limit=500,
+        allow_baseline_write=True)
+    pending_by_id = {message["event_id"]: message
+                     for message in state["pending"]}
+    baseline_seq = state["baseline_seq"]
+    if selected_filter and not narrows_selection \
+            and selected_filter["before_seq"] < baseline_seq:
+        raise AttaccaError(
+            "disposition baseline may only move forward: %s is already "
+            "reconciled through #%d" % (actor_id, baseline_seq))
+    skipped = []
+    selected = []
+    if requested_ids is not None:
+        seen = set()
+        for event_id in requested_ids:
+            if event_id in seen:
+                continue
+            seen.add(event_id)
+            message = pending_by_id.get(event_id)
+            if message is not None:
+                selected.append(message)
+                continue
+            skipped.append({"event_id": event_id,
+                            "reason": _bulk_skip_reason(
+                                conn, project_id, actor_id, actor_type,
+                                event_id, state)})
+    else:
+        cutoff = None
+        if selected_filter["older_than_hours"] is not None:
+            cutoff = datetime.now(timezone.utc) - timedelta(
+                hours=selected_filter["older_than_hours"])
+        task_status = _project_task_status_index(conn, project_id)
+        for message in state["pending"]:
+            if int(message.get("seq") or 0) > selected_filter["before_seq"]:
+                continue
+            if cutoff is not None:
+                sent_at = _room_message_time(message.get("at"))
+                if sent_at is None or sent_at > cutoff.timestamp():
+                    skipped.append({"event_id": message["event_id"],
+                                    "reason": "newer_than_filter"})
+                    continue
+            state_filter = selected_filter["task_state"]
+            if state_filter:
+                task_id = str(message.get("task_id") or "").strip() or None
+                status = task_status.get(task_id) if task_id else None
+                if not task_id or (state_filter != "any"
+                                   and status != state_filter):
+                    skipped.append({"event_id": message["event_id"],
+                                    "reason": "task_state_mismatch"})
+                    continue
+            if len(selected) >= MAX_BULK_MESSAGE_DISPOSITIONS:
+                skipped.append({"event_id": message["event_id"],
+                                "reason": "bulk_cap_reached"})
+                continue
+            selected.append(message)
+    nowi = now_iso()
+    disposed_ids = [message["event_id"] for message in selected]
+    baseline_result = None
+    with write_tx(conn):
+        for message in selected:
+            conn.execute(
+                "INSERT INTO message_dispositions"
+                " (project_id,actor_id,message_event_id,disposition,note,"
+                " task_id,updated_by,updated_owner,updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(project_id,actor_id,message_event_id) DO UPDATE"
+                " SET disposition=excluded.disposition,note=excluded.note,"
+                " task_id=excluded.task_id,updated_by=excluded.updated_by,"
+                " updated_owner=excluded.updated_owner,"
+                " updated_at=excluded.updated_at",
+                (project_id, actor_id, message["event_id"], disposition, note,
+                 str(message.get("task_id") or "").strip() or None,
+                 actor_id, current_owner(), nowi))
+        event = append_event(
+            conn, project_id, actor_id, actor_type,
+            "room.message_dispositions_bulk", {
+                "message_event_ids": disposed_ids,
+                "disposition": disposition,
+                "note": note,
+                "count": len(disposed_ids),
+                "skipped_count": len(skipped),
+                "filter": selected_filter,
+            }, in_tx=True)
+        if selected_filter and narrows_selection is False:
+            baseline_result = _record_message_disposition_baseline(
+                conn, project_id, actor_id, actor_type,
+                selected_filter["before_seq"], "manual", note=note,
+                resolved_count=len(disposed_ids), in_tx=True)
+    remaining = pending_message_dispositions(
+        conn, project_id, actor_id, actor_type=actor_type, limit=1,
+        allow_baseline_write=True)
+    return {
+        "ok": True,
+        "disposition": disposition,
+        "note": note,
+        "disposed": disposed_ids,
+        "disposed_count": len(disposed_ids),
+        "skipped": skipped,
+        "remaining_pending": remaining["pending_total"],
+        "baseline_seq": (baseline_result["baseline_seq"]
+                         if baseline_result else remaining["baseline_seq"]),
+        "event": event,
+    }
+
+
+def _bulk_skip_reason(conn, project_id, actor_id, actor_type, event_id, state):
+    """Explain precisely why a requested message was not disposed."""
+    row = conn.execute(
+        "SELECT * FROM events WHERE project_id=? AND event_id=?"
+        " AND event_type='room.message'", (project_id, event_id)).fetchone()
+    if not row:
+        return "unknown_message"
+    actor_ids = _actor_alias_ids(conn, project_id, actor_id)
+    if row["actor_id"] in actor_ids:
+        return "own_message"
+    payload = _room_policy_payload(conn, project_id, row)
+    if not _bridge_message_visible(
+            conn, project_id, payload, actor_id, actor_type):
+        return "not_visible"
+    attention = _inbox_message_attention(conn, actor_ids, payload)
+    if not _message_requires_disposition(attention, payload):
+        return "group_context"
+    record = (state.get("dispositions") or {}).get(event_id)
+    if record and record.get("implicit"):
+        return "already_resolved_implicitly:%s" % record.get("reason")
+    if record:
+        return "already_disposed:%s" % record.get("disposition")
+    return "not_pending"
+
+
+def _projection_message_attention(message, actor_ids, messages_by_id):
+    """Attention routing for a mirrored room message (no DB available)."""
+    mentions = set(message.get("mentions") or [])
+    mentioned = bool(actor_ids & mentions)
+    reply_to = message.get("reply_to")
+    replied = bool(reply_to and (
+        _message_senders(messages_by_id.get(reply_to) or {}) & actor_ids))
+    broadcast = bool(message.get("msg_type") in ("chat", "directive")
+                     and not mentions and not reply_to)
+    direct = mentioned or replied
+    addressed = direct or broadcast
+    return {
+        "mentioned_to_you": mentioned,
+        "reply_to_you": replied,
+        "directed_to_you": direct,
+        "broadcast_to_everyone": broadcast,
+        "addressed_to_you": addressed,
+        "group_context": not addressed,
+    }
+
+
+def _projection_pending_dispositions(projection, actor_id, alias_ids=None,
+                                     overlays=(), limit=100, project_id=None,
+                                     principal_id=None):
+    """Pending addressed work computed from a verified offline projection.
+
+    The hosted store and the offline mirror share the same requires/implicit/
+    explicit rule functions; only their inputs differ.  A mirror therefore
+    cannot drift into a second definition of what is still pending.
+    """
+    limit = max(1, min(int(limit or 100), 500))
+    actor_ids = {value for value in set(alias_ids or ()) | {actor_id} if value}
+    messages = sorted(
+        [dict(item) for item in projection.get("room_messages") or []],
+        key=lambda item: int(item.get("seq") or 0))
+    messages_by_id = {item.get("event_id"): item for item in messages}
+    explicit = {item.get("message_event_id"): dict(item)
+                for item in projection.get("message_dispositions") or []
+                if item.get("message_event_id")}
+    cursor_row = projection.get("inbox_cursor") or {}
+    # The reconciliation baseline is a hosted, persisted fact.  A mirror
+    # mirrors it and never derives one from a read cursor: an offline client
+    # must not close addressed work the server has not itself reconciled.
+    baseline_seq = max(0, int(cursor_row.get("disposition_baseline_seq") or 0))
+
+    def _local_record(event_id, overlay, disposition, note=None, task_id=None):
+        explicit[event_id] = {
+            "project_id": project_id,
+            "actor_id": actor_id,
+            "message_event_id": event_id,
+            "disposition": disposition,
+            "note": note,
+            "task_id": task_id,
+            "updated_by": actor_id,
+            "updated_owner": principal_id,
+            "pending_sync": True,
+            "local_only": True,
+            "client_mutation_id": overlay.get("client_mutation_id"),
+            "sync_state": overlay.get("sync_state"),
+        }
+
+    # A disposition queued during the outage is authoritative for this exact
+    # local identity view, but remains visibly pending_sync until the hosted
+    # ledger accepts it.
+    for overlay in overlays or ():
+        operation = overlay.get("operation")
+        payload = overlay.get("payload") or {}
+        if operation == "message.dispose":
+            event_id = payload.get("event_id")
+            if event_id:
+                _local_record(event_id, overlay, payload.get("disposition"),
+                              note=payload.get("note"),
+                              task_id=payload.get("task_id"))
+        elif operation == "message.dispose_bulk":
+            for event_id in payload.get("event_ids") or ():
+                if event_id:
+                    _local_record(event_id, overlay,
+                                  payload.get("disposition"),
+                                  note=payload.get("note"))
+            queued_filter = payload.get("filter") or {}
+            # Same rule as the server: only a pure before_seq filter moves the
+            # baseline, so a narrowing queued call cannot close rows it
+            # deliberately excluded.
+            if queued_filter.get("older_than_hours") is None \
+                    and queued_filter.get("task_state") is None:
+                try:
+                    queued_baseline = int(queued_filter.get("before_seq"))
+                except (TypeError, ValueError):
+                    queued_baseline = 0
+                baseline_seq = max(baseline_seq, queued_baseline)
+    task_status = {task.get("task_id"): task.get("status")
+                   for task in projection.get("tasks") or ()
+                   if task.get("task_id")}
+    retracted = {item.get("event_id") for item in messages
+                 if item.get("retracted")}
+    inputs = {
+        "explicit": explicit,
+        "index": _build_disposition_index(
+            messages, actor_ids, task_status,
+            retracted_event_ids=retracted, baseline_seq=baseline_seq),
+    }
+    pending = []
+    records = {}
+    for item in messages:
+        if _message_senders(item) & actor_ids:
+            continue
+        message = dict(item)
+        message.update(
+            _projection_message_attention(message, actor_ids, messages_by_id))
+        if not _message_requires_disposition(message, message):
+            continue
+        record, still_pending = _resolve_message_disposition(message, inputs)
+        records[message.get("event_id")] = record
+        if not still_pending:
+            continue
+        message["requires_disposition"] = True
+        message["disposition"] = record
+        pending.append(message)
+    return {
+        "pending": pending[:limit],
+        "pending_total": len(pending),
+        "may_have_more": len(pending) > limit,
+        "dispositions": records,
+        "baseline_seq": baseline_seq,
+        "baseline_provisional": False,
     }
 
 
@@ -6482,8 +7183,18 @@ def inbox_read(conn, project_id, actor_id, mark_read=True, limit=50,
                 " last_read_seq=excluded.last_read_seq,"
                 " updated_at=excluded.updated_at",
                 (project_id, actor_id, new_cursor, now_iso()))
+    # The reconciliation baseline is the cursor as it stood BEFORE this read.
+    # Marking this page read must never retroactively resolve the messages it
+    # is delivering.  Only a read that may write persists that baseline.
     disposition_state = pending_message_dispositions(
-        conn, project_id, actor_id, actor_type=actor_type, limit=limit)
+        conn, project_id, actor_id, actor_type=actor_type, limit=limit,
+        allow_baseline_write=bool(mark_read), baseline_source_seq=cursor)
+    for message in messages:
+        record = (disposition_state["dispositions"] or {}).get(
+            message.get("event_id"), False)
+        if record is not False:
+            message["requires_disposition"] = True
+            message["disposition"] = record
     return {
         "project": project_id,
         "actor": actor_id,
@@ -6508,6 +7219,7 @@ def inbox_read(conn, project_id, actor_id, mark_read=True, limit=50,
         "pending_dispositions": disposition_state["pending"],
         "pending_disposition_total": disposition_state["pending_total"],
         "pending_disposition_may_have_more": disposition_state["may_have_more"],
+        "disposition_baseline_seq": disposition_state["baseline_seq"],
         "hint": ("more unread group messages remain — call check_inbox again"
                  if may_have_more else
                  "all participation-visible unread room messages are included; "
@@ -8789,6 +9501,34 @@ def _migrate_actor_references_in_tx(conn, project_id, aliases, canonical_id,
                  disposition_row["task_id"], updated_by,
                  disposition_row["updated_owner"],
                  disposition_row["updated_at"]))
+    # The reconciliation baseline is keyed by exact actor.  Migrating that KEY
+    # keeps the identity's already-reconciled history reconciled; the recorded
+    # baseline VALUE is never lowered and the ledger events that produced it
+    # remain untouched.
+    baseline_rows = conn.execute(
+        "SELECT * FROM message_disposition_baselines WHERE project_id=?"
+        " AND actor_id IN (%s) ORDER BY baseline_seq" %
+        ",".join("?" for _ in ([canonical_id] + aliases)),
+        [project_id, canonical_id] + aliases).fetchall()
+    if any(row["actor_id"] in aliases for row in baseline_rows):
+        winner = max(baseline_rows, key=lambda row: int(row["baseline_seq"]))
+        conn.execute(
+            "DELETE FROM message_disposition_baselines WHERE project_id=?"
+            " AND actor_id IN (%s)" % placeholders,
+            [project_id] + aliases)
+        conn.execute(
+            "INSERT INTO message_disposition_baselines"
+            " (project_id,actor_id,baseline_seq,source,set_by,set_owner,note,at)"
+            " VALUES (?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(project_id,actor_id) DO UPDATE SET"
+            " baseline_seq=MAX(baseline_seq,excluded.baseline_seq),"
+            " source=excluded.source,set_by=excluded.set_by,"
+            " set_owner=excluded.set_owner,note=excluded.note,at=excluded.at",
+            (project_id, canonical_id, int(winner["baseline_seq"]),
+             winner["source"],
+             canonical_id if winner["set_by"] in aliases
+             else winner["set_by"],
+             winner["set_owner"], winner["note"], winner["at"]))
     claims = conn.execute(
         "UPDATE tasks SET claimed_by=?, updated_at=? WHERE project_id=?"
         " AND claimed_by IN (%s) AND status NOT IN ('done','cancelled')" %
@@ -10334,6 +11074,41 @@ MCP_TOOLS = [
         }, "required": ["event_id", "disposition"]},
     },
     {
+        "name": "message_dispose_bulk",
+        "description": "Resolve up to 100 of YOUR pending addressed messages "
+                       "in one audited write. Use it to reconcile historical "
+                       "mail after an upgrade, not to clear live assignments: "
+                       "only acknowledged/not_actionable/deferred are allowed "
+                       "(claimed/completed stay per-message because they need "
+                       "a task link), a note is mandatory, and one ledger "
+                       "event records every message closed. A before_seq-only "
+                       "filter also moves your reconciliation baseline to "
+                       "before_seq so the same history stays resolved; adding "
+                       "older_than_hours/task_state narrows the selection and "
+                       "leaves the baseline untouched.",
+        "inputSchema": {"type": "object", "properties": {
+            "event_ids": {"type": "array", "items": {"type": "string"},
+                          "description": "Exact room message event_ids "
+                                         "(max 100). Use this OR filter."},
+            "filter": {"type": "object", "description":
+                       "Bounded selection of your pending messages: "
+                       "before_seq (required event seq, also becomes your "
+                       "reconciliation baseline), older_than_hours "
+                       "(optional), task_state (optional: done | cancelled | "
+                       "any linked task).",
+                       "properties": {
+                           "before_seq": _i("Resolve pending messages at or "
+                                            "below this event seq."),
+                           "older_than_hours": {"type": "number"},
+                           "task_state": _s("done | cancelled | any."),
+                       }},
+            "disposition": _s("One of: %s." %
+                              " | ".join(BULK_MESSAGE_DISPOSITIONS)),
+            "note": _s("Required: why this batch is being resolved."),
+            "project": PROJECT_PROP,
+        }, "required": ["disposition", "note"]},
+    },
+    {
         "name": "set_lead_director",
         "description": "Designate or change the project's Lead Director — the "
                        "actor whose directives assign work and break ties "
@@ -11271,6 +12046,13 @@ class McpSession:
                 args.get("disposition"), note=args.get("note"),
                 task_id=args.get("task_id")))
 
+        if name == "message_dispose_bulk":
+            project, actor = self._project_actor(args)
+            return self._guarded_write(project, lambda: message_dispose_bulk(
+                conn, project, actor, atype, args.get("disposition"),
+                note=args.get("note"), event_ids=args.get("event_ids"),
+                message_filter=args.get("filter")))
+
         if name == "set_lead_director":
             project, actor = self._project_actor(args)
             return self._guarded_write(project, lambda: set_lead_director(
@@ -12123,6 +12905,8 @@ SYNC_OPERATION_TO_TOOL = {
     "room.send": "room_send", "room_send": "room_send",
     "message.dispose": "message_dispose",
     "message_dispose": "message_dispose",
+    "message.dispose_bulk": "message_dispose_bulk",
+    "message_dispose_bulk": "message_dispose_bulk",
     "task.create": "task_create", "task_create": "task_create",
     "task.claim": "task_claim", "task_claim": "task_claim",
     "task.report": "task_report", "task_report": "task_report",
@@ -12492,6 +13276,17 @@ def _sync_projection(conn, scope):
         message["identity"] = attribution["identity"]
         message["attribution"] = attribution
         room_messages.append(message)
+    # Retraction lives in the ledger, which a mirror never replays.  Project
+    # the derived fact onto the exact message so the offline rules can reach
+    # the same conclusion as the hosted store.
+    retracted_ids = _retracted_room_message_ids(
+        conn, scope["project_id"],
+        {message["event_id"]: (message.get("ledger_actor")
+                               or message.get("actor"))
+         for message in room_messages if message.get("event_id")})
+    for message in room_messages:
+        if message.get("event_id") in retracted_ids:
+            message["retracted"] = True
 
     listed_bridges = bridge_list(
         conn, scope["project_id"], actor_id=scope["actor_id"],
@@ -12507,6 +13302,21 @@ def _sync_projection(conn, scope):
     cursor = conn.execute(
         "SELECT * FROM inbox_cursors WHERE project_id=? AND actor_id=?",
         (scope["project_id"], scope["actor_id"])).fetchone()
+    inbox_cursor = dict(cursor) if cursor else None
+    # The reconciliation baseline rides on this actor's own cursor record.
+    # It is identity-scoped state the offline rules need, and it keeps the
+    # negotiated projection resource list unchanged for older mirrors.
+    baseline_row = _message_disposition_baseline_row(
+        conn, scope["project_id"], scope["actor_id"])
+    if baseline_row is not None:
+        if inbox_cursor is None:
+            inbox_cursor = {"project_id": scope["project_id"],
+                            "actor_id": scope["actor_id"],
+                            "last_read_seq": 0,
+                            "updated_at": baseline_row["at"]}
+        inbox_cursor["disposition_baseline_seq"] = int(
+            baseline_row["baseline_seq"] or 0)
+        inbox_cursor["disposition_baseline_source"] = baseline_row["source"]
     dispositions = [dict(row) for row in conn.execute(
         "SELECT * FROM message_dispositions"
         " WHERE project_id=? AND actor_id=?"
@@ -12558,7 +13368,7 @@ def _sync_projection(conn, scope):
         "room_messages": room_messages,
         "agents": snapshot["agents"],
         "bridges": accessible_bridges,
-        "inbox_cursor": dict(cursor) if cursor else None,
+        "inbox_cursor": inbox_cursor,
         "task_plans": [plan for task in snapshot["tasks"]
                        for plan in task.get("plan_revisions", [])],
         "full_log": [
@@ -16112,6 +16922,15 @@ def _r_message_dispose(h, m, q):
         task_id=body.get("task_id")))
 
 
+def _r_message_dispose_bulk(h, m, q):
+    actor, atype = h._actor()
+    body = h._body_json()
+    h._reply_json(200, message_dispose_bulk(
+        h._conn(), m.group(1), actor, atype, body.get("disposition"),
+        note=body.get("note"), event_ids=body.get("event_ids"),
+        message_filter=body.get("filter")))
+
+
 def _r_handoff_set(h, m, q):
     actor, atype = h._actor()
     body = h._body_json()
@@ -16687,6 +17506,8 @@ ROUTES = [
     (*_route_def("GET", "/v1/projects/%s/inbox" % _PID), _r_inbox_get),
     (*_route_def("POST", "/v1/projects/%s/inbox/dispositions" % _PID),
      _r_message_dispose),
+    (*_route_def("POST", "/v1/projects/%s/messages/dispose-bulk" % _PID),
+     _r_message_dispose_bulk),
     (*_route_def("PUT", "/v1/projects/%s/lead" % _PID), _r_lead_set),
     (*_route_def("GET", "/v1/projects/%s/bridges" % _PID), _r_bridges_list),
     (*_route_def("POST", "/v1/projects/%s/bridges" % _PID), _r_bridges_add),
@@ -16808,6 +17629,7 @@ OFFLINE_PROXY_READ_TOOLS = {
 OFFLINE_PROXY_WRITE_OPERATIONS = {
     "room_send": "room.send",
     "message_dispose": "message.dispose",
+    "message_dispose_bulk": "message.dispose_bulk",
     "task_create": "task.create",
     "task_claim": "task.claim",
     "task_report": "task.report",
@@ -17305,85 +18127,35 @@ class OfflineProxySession:
 
         def classify_room(item):
             message = dict(item)
-            mentions = set(message.get("mentions") or [])
-            mentioned = bool(aliases.intersection(mentions))
-            replied = bool(
-                message.get("reply_to") and
-                ((cached_room_by_id.get(message["reply_to"]) or {}).get(
-                    "actor") or
-                 (cached_room_by_id.get(message["reply_to"]) or {}).get(
-                    "actor_id")) in aliases)
-            broadcast = bool(
-                message.get("msg_type") in ("chat", "directive") and
-                not mentions and not message.get("reply_to"))
-            direct = mentioned or replied
-            addressed = direct or broadcast
-            message.update({
-                "mentioned_to_you": mentioned,
-                "reply_to_you": replied,
-                "directed_to_you": direct,
-                "broadcast_to_everyone": broadcast,
-                "addressed_to_you": addressed,
-                "group_context": not addressed,
-            })
+            message.update(_projection_message_attention(
+                message, aliases, cached_room_by_id))
             return message
 
         def cached_pending_dispositions(limit=100):
-            """Project cursor-independent assignment state plus local writes."""
-            limit = max(1, min(int(limit or 100), 500))
-            dispositions = {
-                item.get("message_event_id"): dict(item)
-                for item in projection.get("message_dispositions") or []
-                if item.get("message_event_id")
-            }
-            # A disposition queued during the outage is authoritative for this
-            # exact local identity view, but remains visibly pending_sync until
-            # the hosted ledger accepts it.
-            for overlay in adapter.pending_overlays("message_dispositions"):
-                if overlay.get("operation") != "message.dispose":
-                    continue
-                payload = overlay.get("payload") or {}
-                event_id = payload.get("event_id")
-                if not event_id:
-                    continue
-                dispositions[event_id] = {
-                    "project_id": project_id,
-                    "actor_id": scope["actor_id"],
-                    "message_event_id": event_id,
-                    "disposition": payload.get("disposition"),
-                    "note": payload.get("note"),
-                    "task_id": payload.get("task_id"),
-                    "updated_by": scope["actor_id"],
-                    "updated_owner": scope["principal_id"],
-                    "pending_sync": True,
-                    "local_only": True,
-                    "client_mutation_id": overlay.get(
-                        "client_mutation_id"),
-                    "sync_state": overlay.get("sync_state"),
-                }
-            pending = []
-            for item in cached_room:
-                sender = item.get("actor") or item.get("actor_id")
-                if sender in aliases:
-                    continue
-                message = classify_room(item)
-                requires = bool(message.get("directed_to_you") or (
-                    message.get("broadcast_to_everyone") and
-                    message.get("msg_type") == "directive"))
-                if not requires:
-                    continue
-                disposition = dispositions.get(message.get("event_id"))
-                if disposition and disposition.get("disposition") not in \
-                        UNRESOLVED_MESSAGE_DISPOSITIONS:
-                    continue
-                message["requires_disposition"] = True
-                message["disposition"] = disposition
-                pending.append(message)
-            return {
-                "pending": pending[:limit],
-                "pending_total": len(pending),
-                "may_have_more": len(pending) > limit,
-            }
+            """Project cursor-independent assignment state plus local writes.
+
+            The rules are the hosted ones: this calls the same shared
+            implementation rather than a second copied predicate.
+            """
+            return _projection_pending_dispositions(
+                projection, scope["actor_id"], alias_ids=aliases,
+                overlays=adapter.pending_overlays("message_dispositions"),
+                limit=limit, project_id=project_id,
+                principal_id=scope["principal_id"])
+
+        def annotate_cached_dispositions(messages, state=None):
+            """Mirror the hosted read surface: keep resolved rows visible."""
+            if not messages:
+                return messages
+            state = state if state is not None \
+                else cached_pending_dispositions(limit=500)
+            records = state.get("dispositions") or {}
+            for message in messages:
+                record = records.get(message.get("event_id"), False)
+                if record is not False:
+                    message["requires_disposition"] = True
+                    message["disposition"] = record
+            return messages
 
         def cached_inbox(mark_read=True, limit=50):
             limit = max(1, min(int(limit or 50), 500))
@@ -17420,6 +18192,7 @@ class OfflineProxySession:
             group_count = sum(
                 bool(item.get("group_context")) for item in page)
             disposition_state = cached_pending_dispositions(limit=limit)
+            annotate_cached_dispositions(page, disposition_state)
             return {
                 "project": project_id, "actor": scope["actor_id"],
                 "messages": page, "messages_include_all_visible": True,
@@ -17439,6 +18212,7 @@ class OfflineProxySession:
                     disposition_state["pending_total"],
                 "pending_disposition_may_have_more":
                     disposition_state["may_have_more"],
+                "disposition_baseline_seq": disposition_state["baseline_seq"],
                 "hint": ("cached group inbox page; call check_inbox again "
                          "while may_have_more is true. This process remembers "
                          "the page locally, but the hosted cursor advances "
@@ -17665,6 +18439,7 @@ class OfflineProxySession:
                 # Initial room reads return the latest visible page and then
                 # follow the mirror's raw event head for future polling.
                 next_since = int(snapshot["cursor"]["event_seq"] or 0)
+            annotate_cached_dispositions(page)
             return _offline_proxy_mark({
                 "project": project_id, "messages": page,
                 "next_since_seq": next_since,
