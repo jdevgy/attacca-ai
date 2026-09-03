@@ -735,6 +735,11 @@ class TokenBudgetTestCase(unittest.TestCase):
             {"event_type": "task.updated",
              "operational_actor_id": "peer.director.claude"}, entry))
 
+        # T-75: an identity handoff is a per-actor record, so its ledger
+        # event must obey the same self-echo rule as every other write.
+        self.assertTrue(hook._watcher_event_is_self(
+            {"event_type": "identity_handoff.updated",
+             "operational_actor_id": "shared.director.codex"}, entry))
         events = [
             {"seq": 11, "event_id": "ev-self", "event_type": "task.updated",
              "operational_actor_id": "shared.director.codex",
@@ -744,6 +749,22 @@ class TokenBudgetTestCase(unittest.TestCase):
              "operational_actor_id": "peer.director.claude",
              "task_id": "T-2", "created_at": "2026-09-03T00:00:01+00:00",
              "payload": {"title": "PEER-TASK-EDIT"}},
+            {"seq": 13, "event_id": "ev-self-handoff",
+             "event_type": "identity_handoff.updated",
+             "operational_actor_id": "shared.director.codex",
+             "created_at": "2026-09-03T00:00:02+00:00",
+             "payload": {"fields": ["objective"],
+                         "handoff_actor": "shared.director.codex",
+                         "handoff_version": 4,
+                         "handoff": {"objective": "SELF-IDENTITY-HANDOFF"}}},
+            {"seq": 14, "event_id": "ev-peer-handoff",
+             "event_type": "identity_handoff.updated",
+             "operational_actor_id": "peer.director.claude",
+             "created_at": "2026-09-03T00:00:03+00:00",
+             "payload": {"fields": ["objective"],
+                         "handoff_actor": "peer.director.claude",
+                         "handoff_version": 3,
+                         "handoff": {"objective": "PEER-IDENTITY-HANDOFF"}}},
         ]
         with mock.patch.object(hook, "_settings_interval", return_value=60), \
              mock.patch.object(hook, "_watcher_refresh_inbox_entry",
@@ -756,12 +777,27 @@ class TokenBudgetTestCase(unittest.TestCase):
             hook._watcher_tick(
                 self.key, now=60, force=True,
                 delta_loader=lambda after: {
-                    "events": events, "next_after": 12,
+                    "events": events, "next_after": 14,
                     "may_have_more": False},
                 offline_factory=lambda *_: None, notifier=lambda *_: None)
         staged = json.dumps(self.entry()["pending"])
         self.assertIn("PEER-TASK-EDIT", staged)
         self.assertNotIn("SELF-TASK-EDIT", staged)
+        # The peer's identity handoff renders as its own labeled line; this
+        # actor's own identity handoff write is never echoed back to it.
+        summaries = "\n".join(row["summary"]
+                              for row in self.entry()["pending"])
+        self.assertIn(
+            "identity handoff updated \u00b7 peer.director.claude \u00b7 v3",
+            summaries)
+        self.assertNotIn("shared.director.codex", staged)
+        self.assertIn("identity-handoff:peer.director.claude",
+                      [row.get("entity_key")
+                       for row in self.entry()["pending"]])
+        self.assertEqual(
+            hook._watcher_event_line(events[3]),
+            "identity handoff updated \u00b7 peer.director.claude \u00b7 v3 "
+            "(objective)")
 
         # A self-authored row already queued by an older build is dropped at
         # render and never blocks Stop.
@@ -1067,6 +1103,84 @@ class TokenBudgetTestCase(unittest.TestCase):
         self.assertEqual(brief["recent_activity"], [])
         self.assertIn("HANDOFF-OBJECTIVE-MUST-SURVIVE", context)
         self.assertIn("RULE-BODY-FULL-TEXT", context)
+
+    def test_identity_handoff_change_surfaces_as_a_periodic_delta(self):
+        """T-75: the caller's own identity handoff is tracked shared state."""
+        snapshot = self.hosted_snapshot(rules=[self.RULE])
+        snapshot["handoff"].update({
+            "identity_handoff_actor": "shared.director.codex",
+            "identity_handoff_version": 5,
+            "identity_handoff": {"objective": "IDENTITY-DELTA-OBJECTIVE"},
+        })
+        current = hook._poll_view(snapshot)
+        self.assertEqual(current["identity_handoff_version"], 5)
+        self.assertEqual(current["identity_handoff_actor"],
+                         "shared.director.codex")
+        baseline = dict(current)
+        baseline["identity_handoff_version"] = 4
+        baseline["identity_handoff"] = {"objective": "the older note"}
+        # Direct-poll fallback: only a boundary that actually polls the host
+        # can compare the recorded baseline with current shared state.
+        context = context_of(
+            self.periodic("UserPromptSubmit", mcp=snapshot,
+                          watcher={"ok": True},
+                          poll={"snapshot": baseline,
+                                "last_poll_at": hook.time.time() - 600}),
+            "UserPromptSubmit")
+        self.assertIn("Identity handoff shared.director.codex: v5", context)
+        self.assertIn("IDENTITY-DELTA-OBJECTIVE", context)
+        # A baseline recorded before identity handoffs were tracked must not
+        # manufacture a delta line on the first turn after an upgrade.
+        legacy = {key: value for key, value in current.items()
+                  if not key.startswith("identity_handoff")}
+        upgraded = context_of(
+            self.periodic("UserPromptSubmit", mcp=snapshot,
+                          watcher={"ok": True},
+                          poll={"snapshot": legacy,
+                                "last_poll_at": hook.time.time() - 600}),
+            "UserPromptSubmit")
+        self.assertNotIn("Identity handoff", upgraded)
+
+    def test_fit_session_brief_never_trims_either_handoff_block(self):
+        """T-75: both continuity records are resume-critical."""
+        brief = hook._compact_snapshot(self.hosted_snapshot(
+            rules=[self.RULE], tasks=8, decisions=6, activity=8, room=8))
+        brief["identity_handoff_actor"] = "shared.director.codex"
+        brief["identity_handoff_version"] = 5
+        brief["identity_handoff"] = {
+            "objective": "IDENTITY-OBJECTIVE-MUST-SURVIVE",
+            "next_actions": "IDENTITY-NEXT-MUST-SURVIVE"}
+        trimmed, sections = hook._fit_session_brief(brief, budget=1_200)
+        self.assertTrue(sections)
+        rendered = json.dumps(trimmed)
+        for marker in ("HANDOFF-OBJECTIVE-MUST-SURVIVE",
+                       "IDENTITY-OBJECTIVE-MUST-SURVIVE",
+                       "IDENTITY-NEXT-MUST-SURVIVE",
+                       "SHARED PROJECT HANDOFF", "IDENTITY HANDOFF"):
+            self.assertIn(marker, rendered)
+        self.assertEqual(trimmed["handoff"], brief["handoff"])
+        self.assertEqual(trimmed["identity_handoff"],
+                         brief["identity_handoff"])
+        self.assertEqual(trimmed["identity_handoff_actor"],
+                         "shared.director.codex")
+        self.assertEqual(trimmed["identity_handoff_version"], 5)
+        # The shared block keeps its own scope/version/attribution.
+        self.assertEqual(trimmed["handoff_scope"], "project")
+        # A real SessionStart under the same squeeze keeps both blocks.
+        snapshot = self.hosted_snapshot(rules=[self.RULE], tasks=8,
+                                        decisions=6, activity=8, room=8)
+        snapshot["handoff"].update({
+            "identity_handoff_actor": "shared.director.codex",
+            "identity_handoff_version": 5,
+            "identity_handoff": {
+                "objective": "IDENTITY-OBJECTIVE-MUST-SURVIVE"},
+        })
+        with mock.patch.object(hook, "SESSION_BRIEF_MAX_BYTES", 2_000):
+            context = self.session_start(mcp=snapshot)[
+                "hookSpecificOutput"]["additionalContext"]
+        self.assertIn("HANDOFF-OBJECTIVE-MUST-SURVIVE", context)
+        self.assertIn("IDENTITY-OBJECTIVE-MUST-SURVIVE", context)
+        self.assertIn("update_identity_handoff", context)
 
     def test_slow_or_failed_snapshot_falls_back_instead_of_emitting_nothing(
             self):

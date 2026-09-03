@@ -2825,6 +2825,7 @@ def _watcher_relevant_event(event):
             event_type.startswith("cloud_context.") or
             event_type.startswith("decision.") or
             event_type.startswith("handoff.") or
+            event_type.startswith("identity_handoff.") or
             event_type.startswith("bridge."))
 
 
@@ -3439,6 +3440,11 @@ def _watcher_entity_key(event):
     if event_type.startswith("decision."):
         return "decision:%s" % (
             payload.get("decision_id") or "unknown")
+    if event_type.startswith("identity_handoff."):
+        # One key per identity: a peer's newer revision supersedes only that
+        # identity's queued row, never the shared project handoff.
+        return "identity-handoff:%s" % (
+            payload.get("handoff_actor") or _watcher_event_actor(event))
     if event_type.startswith("handoff."):
         return "handoff"
     if event_type.startswith("bridge."):
@@ -3522,6 +3528,16 @@ def _watcher_event_line(event):
             if payload.get("title") else ""
         return "Decision %s %s%s · %s%s" % (
             decision_id, verb, state, actor, title)
+    if event_type.startswith("identity_handoff."):
+        # The exact identity that owns the note, not merely the writer.
+        owner = payload.get("handoff_actor") or actor
+        version = " · v%s" % payload["handoff_version"] \
+            if payload.get("handoff_version") is not None else ""
+        fields = payload.get("fields") or []
+        changed = " (%s)" % ", ".join(str(item) for item in fields) \
+            if fields else ""
+        return "identity handoff %s · %s%s%s" % (
+            verb, owner, version, changed)
     if event_type.startswith("handoff."):
         fields = payload.get("fields") or []
         changed = " (%s)" % ", ".join(str(item) for item in fields) \
@@ -5199,6 +5215,150 @@ def _compact_handoff(value):
     return result
 
 
+def _handoff_brief(handoff):
+    """Render BOTH continuity records returned by ``get_handoff``.
+
+    They are separate stores with separate authority: one Director-governed
+    shared project handoff that every role reads, and one exact identity
+    handoff owned by the calling AI alone.  Labeling either as the other
+    would resume a session from somebody else's continuity note, so each
+    block carries its own scope, version, attribution and update tool.
+    """
+    handoff = handoff if isinstance(handoff, dict) else {}
+    shared_version = handoff.get("handoff_version") or 0
+    identity_actor = handoff.get("identity_handoff_actor")
+    identity_version = handoff.get("identity_handoff_version") or 0
+    view = {
+        "handoff_label": (
+            "SHARED PROJECT HANDOFF · the one project-wide brief; every "
+            "role reads it and only a registered Director may write it"),
+        "handoff_scope": handoff.get("handoff_scope") or "project",
+        "handoff_version": shared_version,
+        "handoff_updated_by": handoff.get("handoff_updated_by"),
+        "handoff_updated_owner": handoff.get("handoff_updated_owner"),
+        "handoff_updated_at": handoff.get("handoff_updated_at"),
+        "handoff": _compact_handoff(handoff.get("handoff")),
+        "handoff_next_action": (
+            "A registered Director updates it with update_handoff "
+            "(expected_handoff_version=%s). It is never a per-AI continuity "
+            "note." % shared_version),
+    }
+    # The server hint belongs to the shared record it describes; it is never
+    # reused as the identity line.
+    if handoff.get("hint"):
+        view["handoff_note"] = handoff["hint"]
+    if identity_actor:
+        view.update({
+            "identity_handoff_label": (
+                "IDENTITY HANDOFF · the exact continuity note owned by "
+                "%s; no other identity may overwrite it" % identity_actor),
+            "identity_handoff_actor": identity_actor,
+            "identity_handoff_version": identity_version,
+            "identity_handoff_updated_by": handoff.get(
+                "identity_handoff_updated_by"),
+            "identity_handoff_updated_owner": handoff.get(
+                "identity_handoff_updated_owner"),
+            "identity_handoff_updated_at": handoff.get(
+                "identity_handoff_updated_at"),
+            "identity_handoff": _compact_handoff(
+                handoff.get("identity_handoff")),
+            "identity_handoff_next_action": (
+                "Update your own record with update_identity_handoff "
+                "(expected_handoff_version=%s) after reporting task evidence "
+                "and at meaningful transitions." % identity_version),
+        })
+    else:
+        view.update({
+            "identity_handoff_label": (
+                "IDENTITY HANDOFF · none for this caller"),
+            "identity_handoff_actor": None,
+            "identity_handoff": None,
+            "identity_handoff_note": (
+                handoff.get("identity_handoff_hint") or
+                "This caller owns no identity handoff: only a registered AI "
+                "does. Humans, console and unregistered identities resume "
+                "from the shared project handoff above."),
+        })
+    return view
+
+
+def _offline_handoff_brief(snapshot, actor_id):
+    """Split a verified mirror's cached handoff resources without relabeling.
+
+    ``project_handoffs`` is the negotiated schema-v3 shared history;
+    ``identity_handoffs`` (aliased by the schema-v1 ``handoffs`` name) holds
+    this exact actor's own rows.  A v1/v2 mirror predates the shared resource
+    and must say so rather than promote an identity row into the project-wide
+    block.
+    """
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+
+    def newest(rows):
+        rows = [row for row in (rows or []) if isinstance(row, dict)]
+        if not rows:
+            return None
+        try:
+            return sorted(
+                rows, key=lambda row: int(row.get("version") or 0))[-1]
+        except (TypeError, ValueError):
+            return rows[-1]
+
+    def content(row):
+        if row is None:
+            return None
+        value = row.get("content") if "content" in row else row
+        return _compact_handoff(value) if isinstance(value, dict) else None
+
+    shared_rows = snapshot.get("project_handoffs")
+    has_shared_resource = isinstance(shared_rows, list)
+    shared_latest = newest(shared_rows)
+    identity_rows = snapshot.get("identity_handoffs")
+    if identity_rows is None:
+        identity_rows = snapshot.get("handoffs")
+    identity_latest = newest([
+        row for row in (identity_rows or [])
+        if isinstance(row, dict) and
+        row.get("actor_id") in (None, actor_id)])
+    view = {
+        "handoff_label": (
+            "SHARED PROJECT HANDOFF (cached) · the Director-governed "
+            "project-wide brief every role reads"),
+        "handoff_scope": "project",
+        "handoff_version": (shared_latest or {}).get("version") or 0,
+        "handoff_updated_by": (shared_latest or {}).get("updated_by"),
+        "handoff_updated_at": (shared_latest or {}).get("updated_at"),
+        "handoff": content(shared_latest),
+        "identity_handoff_label": (
+            "IDENTITY HANDOFF (cached) · the continuity note owned by "
+            "this exact identity"),
+        "identity_handoff_actor": (
+            (identity_latest or {}).get("actor_id") or
+            (actor_id if identity_latest else None)),
+        "identity_handoff_version": (
+            (identity_latest or {}).get("version") or 0),
+        "identity_handoff_updated_at": (
+            (identity_latest or {}).get("updated_at")),
+        "identity_handoff": content(identity_latest),
+        "identity_handoff_next_action": (
+            "Queue your own update through update_identity_handoff; the "
+            "shared project handoff stays a Director write."),
+    }
+    if not has_shared_resource:
+        view["handoff_note"] = (
+            "This mirror's negotiated resource set contains no "
+            "project_handoffs, so the shared project handoff is NOT cached "
+            "here. The identity handoff below is this actor's own record; "
+            "reconnect to re-seed the shared brief.")
+    elif shared_latest is None:
+        view["handoff_note"] = (
+            "No shared project handoff has been written in this workspace "
+            "yet; a registered Director initializes it with update_handoff.")
+    if identity_latest is None:
+        view["identity_handoff_note"] = (
+            "This mirror caches no identity handoff for %s yet." % actor_id)
+    return view
+
+
 def _compact_rule_view(rule):
     result = {key: rule.get(key) for key in (
         "project_id", "rule_id", "scope", "priority", "enabled", "version",
@@ -5544,6 +5704,14 @@ def _poll_view(snapshot):
         "context_version": handoff.get("context_version"),
         "lead_director": handoff.get("lead_director"),
         "handoff": handoff.get("handoff"),
+        "handoff_version": handoff.get("handoff_version"),
+        # A change to this caller's OWN identity handoff is shared state on
+        # the periodic path too: a second session of the same actor, or a
+        # panel/human write, must surface as a delta instead of silently
+        # replacing the note this session was briefed on.
+        "identity_handoff": handoff.get("identity_handoff"),
+        "identity_handoff_actor": handoff.get("identity_handoff_actor"),
+        "identity_handoff_version": handoff.get("identity_handoff_version"),
         "decisions": handoff.get("decisions") or [],
         "project_rules": compact_rules,
         "project_rules_omitted_count": len(omitted_rule_ids),
@@ -5672,7 +5840,8 @@ def _compact_snapshot(snapshot):
             else handoff.get("cloud_context")),
         "role_scope": _compact_role_scope(snapshot.get("role_scope")),
         "lead_director": handoff.get("lead_director"),
-        "handoff": _compact_handoff(handoff.get("handoff")),
+        # Both continuity records, each explicitly labeled with its scope.
+        **_handoff_brief(handoff),
         "unread_room": unread_messages,
         "unread_room_counts": {
             "total": inbox.get("unread_total", len(unread_messages)),
@@ -5714,10 +5883,11 @@ def _fit_session_brief(brief, overhead=0, budget=None):
     """Trim the lowest-priority brief sections until the host cap is met.
 
     Codex refuses additionalContext over 65536 bytes, so an over-budget brief
-    reaches the model as nothing at all. Rules, Cloud Context, handoff, unread
-    inbox and the open task ids are the resume-critical core and are never
-    dropped: recent activity goes first, then decision detail, then task
-    detail, each replaced by an explicit pointer to the tool that returns it.
+    reaches the model as nothing at all. Rules, Cloud Context, BOTH handoff
+    blocks (the shared project handoff and this identity's own), unread inbox
+    and the open task ids are the resume-critical core and are never dropped:
+    recent activity goes first, then decision detail, then task detail, each
+    replaced by an explicit pointer to the tool that returns it.
     """
     budget = SESSION_BRIEF_MAX_BYTES if budget is None else budget
 
@@ -6254,10 +6424,6 @@ def _offline_session_payload(status, adapter, entry=None, failure=None,
     rules.sort(key=lambda item: (
         int(item.get("priority") or 100), str(item.get("rule_id") or "")))
 
-    handoffs = snapshot.get("handoffs") or []
-    latest_handoff = handoffs[-1] if handoffs else None
-    if isinstance(latest_handoff, dict) and "content" in latest_handoff:
-        latest_handoff = latest_handoff.get("content")
     pending_method = getattr(adapter, "pending_mutations", None)
     conflict_method = getattr(adapter, "conflicts", None)
     pending = pending_method() if callable(pending_method) else []
@@ -6394,7 +6560,7 @@ def _offline_session_payload(status, adapter, entry=None, failure=None,
             "group messages remain behind this page."
             if len(unread_rows) > len(unread_page) else None),
         "offline_read_cursor_deferred": True,
-        "handoff": _compact_handoff(latest_handoff),
+        **_offline_handoff_brief(snapshot, actor_id),
         "tasks": [_task_view(item) for item in
                   (snapshot.get("tasks") or [])[:50]
                   if isinstance(item, dict)],
@@ -6472,7 +6638,10 @@ def _offline_failure_output(status, config, event_name, err, adapter,
         "mirror passed integrity and workspace checks. CONTINUE WORK from "
         "this cached state. It is authoritative through the recorded mirror "
         "cursor, not beyond it. Read cached history/logs/rules/tasks/decisions/"
-        "handoff locally. Record every mutation through the durable offline "
+        "handoff locally: `handoff` is the shared Director-governed project "
+        "handoff (update_handoff) and `identity_handoff` is this exact "
+        "identity's own note (update_identity_handoff). Record every "
+        "mutation through the durable offline "
         "outbox; do not describe a pending write as hosted until automatic "
         "reconciliation confirms it. The machine-global watcher retries with "
         "backoff and injects accepted/conflict results.\n\n%s" %
@@ -7021,7 +7190,13 @@ rule_list, room_read, task_list, agent_list, and attacca_status
 through the configured MCP connection
 for this workspace. Use this state before working; do not rediscover the
 repository from scratch. Before writes, honor existing task claims and
-claim/create the relevant Attacca task. The project room is a group conversation:
+claim/create the relevant Attacca task. Two separate continuity records are
+rendered below: `handoff` is the ONE shared project handoff (scope "project")
+that every role reads and only a registered Director writes with
+update_handoff; `identity_handoff` is your own exact identity's note, which you
+update with update_identity_handoff passing expected_handoff_version =
+identity_handoff_version. Never write another identity's handoff.
+The project room is a group conversation:
 read every message in unread_room and recent_room, including messages mentioning
 or replying to another participant. Mentions/replies identify the expected
 responder; they never limit visibility. A chat or directive with neither is sent
@@ -7147,9 +7322,23 @@ def _change_summary(status, previous, current, snapshot, interval):
         objective = (current.get("handoff") or {}).get("objective")
         version = "context v%s→v%s" % (old_version, new_version) \
             if old_version is not None else "context v%s" % new_version
-        details.append("Handoff: %s%s" % (
+        details.append("Shared project handoff: %s%s" % (
             version, "; objective: %s" % _trim(objective, 120)
             if objective else ""))
+    # Key presence, not inequality: a baseline recorded before the identity
+    # handoff was tracked must not manufacture a delta on the first turn
+    # after an upgrade.
+    if "identity_handoff_version" in previous and \
+            current.get("identity_handoff_actor") and (
+                previous.get("identity_handoff") !=
+                current.get("identity_handoff") or
+                previous.get("identity_handoff_version") !=
+                current.get("identity_handoff_version")):
+        objective = (current.get("identity_handoff") or {}).get("objective")
+        details.append("Identity handoff %s: v%s%s" % (
+            current.get("identity_handoff_actor"),
+            current.get("identity_handoff_version"),
+            "; objective: %s" % _trim(objective, 120) if objective else ""))
     if previous.get("lead_director") != current.get("lead_director"):
         details.append("Lead director: %s" % (
             current.get("lead_director") or "not set"))

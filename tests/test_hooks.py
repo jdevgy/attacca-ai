@@ -612,15 +612,34 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             self.assertIn("MCP startup", payload["systemMessage"])
             context = payload["hookSpecificOutput"]["additionalContext"]
             self.assertIn("through the configured MCP connection", context)
-            # The startup brief currently renders the shared project handoff.
-            # Rendering the exact identity handoff beside it is the pending
-            # hooks/session_start.py change; the store separation is asserted
-            # directly below so this contract is not silently lost.
+            # T-75: the brief renders BOTH continuity records — the one
+            # shared project handoff every role reads, and this exact
+            # identity's own note. Neither may be relabeled as the other.
+            self.assertIn("SHARED PROJECT HANDOFF", context)
+            self.assertIn("IDENTITY HANDOFF", context)
             self.assertIn("ship the shared panel", context)
+            self.assertIn("ship the Codex panel", context)
+            self.assertNotIn("review the Claude panel", context)
+            # The instruction text must name the right tool for each store.
+            self.assertIn("update_handoff", context)
+            self.assertIn("update_identity_handoff", context)
+            self.assertIn("expected_handoff_version", context)
             self.assertIn("please check this", context)
             self.assertNotIn("ATTACCA CLAUDE SESSION LOOP", context)
             brief = json.loads(context.rsplit("\n\n", 1)[1])
             self.assertEqual(brief["actor"], "shared.worker.codex")
+            self.assertEqual(brief["handoff_scope"], "project")
+            self.assertEqual(brief["handoff"]["objective"],
+                             "ship the shared panel")
+            self.assertEqual(brief["handoff_version"], 1)
+            self.assertEqual(brief["handoff_updated_by"],
+                             "shared.director.claude")
+            self.assertEqual(brief["identity_handoff_actor"],
+                             "shared.worker.codex")
+            self.assertEqual(brief["identity_handoff"]["objective"],
+                             "ship the Codex panel")
+            self.assertEqual(brief["identity_handoff_version"], 1)
+            self.assertTrue(brief["identity_handoff_updated_at"])
             self.assertEqual(
                 [rule["title"] for rule in brief["project_rules"]],
                 [c.DEFAULT_AUTHORITY_RULE_TITLE, "Build on v2"])
@@ -631,6 +650,14 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             self.assertEqual(claude_brief["actor"],
                              "shared.director.claude")
             self.assertIn("ship the shared panel", claude_context)
+            self.assertIn("review the Claude panel", claude_context)
+            self.assertNotIn("ship the Codex panel", claude_context)
+            self.assertEqual(claude_brief["handoff"]["objective"],
+                             "ship the shared panel")
+            self.assertEqual(claude_brief["identity_handoff_actor"],
+                             "shared.director.claude")
+            self.assertEqual(claude_brief["identity_handoff"]["objective"],
+                             "review the Claude panel")
             self.assertIn("please check this", claude_context)
             conn = c.connect(db)
             try:
@@ -649,6 +676,54 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                 claude_context.count("ATTACCA CLAUDE SESSION LOOP"), 1)
             self.assertIn("`/loop 1m /attacca:inbox`", claude_context)
             self.assertIn("CronList", claude_context)
+
+    def test_caller_without_an_identity_handoff_still_reads_the_shared_one(
+            self):
+        """A human/console/unregistered caller owns no identity handoff."""
+        snapshot = {
+            "project": "shared",
+            "checked_at": "2026-09-03T00:00:00+00:00",
+            "handoff": {
+                "context_version": 4,
+                "handoff": {"objective": "SHARED-OBJECTIVE"},
+                "handoff_scope": "project",
+                "handoff_version": 3,
+                "handoff_updated_by": "shared.director.claude",
+                "handoff_updated_at": "2026-09-03T00:00:00+00:00",
+                "identity_handoff": {"objective": None},
+                "identity_handoff_actor": None,
+                "identity_handoff_version": 0,
+                "decisions": [],
+            },
+            "rules": {"rules": []},
+            "inbox": {"messages": [], "unread_total": 0},
+            "room": {"messages": []},
+            "tasks": {"tasks": []},
+            "status": {"counts": {}, "you": {"actor_id": "web.jack"}},
+        }
+        brief = hook_module._compact_snapshot(snapshot)
+        self.assertEqual(brief["handoff"]["objective"], "SHARED-OBJECTIVE")
+        self.assertEqual(brief["handoff_scope"], "project")
+        self.assertEqual(brief["handoff_version"], 3)
+        self.assertIn("SHARED PROJECT HANDOFF", brief["handoff_label"])
+        self.assertIsNone(brief["identity_handoff"])
+        self.assertIsNone(brief["identity_handoff_actor"])
+        self.assertIn("owns no identity handoff",
+                      brief["identity_handoff_note"])
+        # The absent identity record never borrows the shared block's text.
+        self.assertNotIn("SHARED-OBJECTIVE",
+                         json.dumps({k: v for k, v in brief.items()
+                                     if k.startswith("identity_handoff")}))
+        # A hosted hint describes the record it belongs to and no other.
+        hinted = dict(snapshot)
+        hinted["handoff"] = dict(
+            snapshot["handoff"], handoff_version=0, handoff={},
+            hint="No shared project handoff exists.")
+        hinted_brief = hook_module._compact_snapshot(hinted)
+        self.assertEqual(hinted_brief["handoff_note"],
+                         "No shared project handoff exists.")
+        self.assertNotIn("shared project handoff exists",
+                         hinted_brief["identity_handoff_note"])
 
     def test_newer_server_prompts_without_replacing_brief_and_persists_choice(self):
         with tempfile.TemporaryDirectory() as tmp:

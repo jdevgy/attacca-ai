@@ -339,7 +339,7 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
         value.update(updates)
         return value
 
-    def snapshot(self):
+    def snapshot(self, project_handoffs=None):
         identity_handoffs = [{
             "project_id": "shared", "actor_id": "shared.director.codex",
             "version": 9,
@@ -389,6 +389,10 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
             "full_log": ["line %d" % number for number in range(41)],
             "actor_aliases": [],
         }
+        # Omitted by default: a v1/v2 mirror predates the negotiated shared
+        # project handoff resource, and that legacy branch stays covered.
+        if project_handoffs is not None:
+            projection["project_handoffs"] = list(project_handoffs)
         return protocol.make_snapshot(
             self.scope, self.visibility,
             protocol.make_cursor(0, protocol.GENESIS_HASH, 9),
@@ -579,6 +583,71 @@ class OfflineHookIntegrationTestCase(unittest.TestCase):
         self.assertIn("cm_pending_0001", context)
         self.assertIn("cm_conflict_0001", context)
         self.assertIn("work may continue", output["systemMessage"])
+        # T-75: this mirror carries no project_handoffs resource. The identity
+        # rows are rendered as the identity handoff and are never promoted
+        # into the shared project block.
+        brief = json.loads(context.rsplit("\n\n", 1)[1])
+        self.assertIsNone(brief["handoff"])
+        self.assertIn("project_handoffs", brief["handoff_note"])
+        self.assertIn("NOT cached here", brief["handoff_note"])
+        self.assertEqual(brief["identity_handoff"]["objective"],
+                         "Continue from local state")
+        self.assertEqual(brief["identity_handoff_actor"],
+                         "shared.director.codex")
+        self.assertEqual(brief["identity_handoff_version"], 9)
+        self.assertIn("update_identity_handoff", context)
+
+    def test_offline_brief_separates_shared_and_identity_handoffs(self):
+        """T-75: project_handoffs is shared; identity rows stay this actor's."""
+        shared_rows = [{
+            "project_id": "shared", "version": 4,
+            "content": {"objective": "SHARED-MIRROR-OBJECTIVE"},
+            "updated_by": "shared.director.claude",
+            "updated_owner": "jack",
+            "updated_at": "2026-08-24T05:00:00.000Z",
+            "event_id": "ev_project_handoff_0004",
+            "legacy_source_version": None,
+        }]
+        adapter = FakeOfflineAdapter(
+            self.verified_status(),
+            self.snapshot(project_handoffs=shared_rows))
+        with mock.patch.object(
+                hook, "_plugin_and_config",
+                return_value=(ROOT, self.config)), \
+             mock.patch.object(
+                 hook, "_ensure_background_watcher",
+                 return_value={"ok": True, "already_running": True}), \
+             mock.patch.object(hook, "_watcher_pending_notice",
+                               return_value=None), \
+             mock.patch.object(hook, "_settings_interval", return_value=60), \
+             mock.patch.object(hook, "_update_offer", return_value=None), \
+             mock.patch.object(hook, "_mcp_snapshot",
+                               side_effect=RuntimeError("connection refused")):
+            output = hook._active_output(
+                self.status, offline_adapter=adapter)
+        context = output["hookSpecificOutput"]["additionalContext"]
+        brief = json.loads(context.rsplit("\n\n", 1)[1])
+        self.assertEqual(brief["handoff_scope"], "project")
+        self.assertEqual(brief["handoff"]["objective"],
+                         "SHARED-MIRROR-OBJECTIVE")
+        self.assertEqual(brief["handoff_version"], 4)
+        self.assertEqual(brief["handoff_updated_by"],
+                         "shared.director.claude")
+        self.assertNotIn("handoff_note", brief)
+        self.assertEqual(brief["identity_handoff"]["objective"],
+                         "Continue from local state")
+        self.assertEqual(brief["identity_handoff_actor"],
+                         "shared.director.codex")
+        self.assertEqual(brief["identity_handoff_version"], 9)
+        # Neither record may borrow the other's text or version.
+        identity_block = json.dumps({
+            key: value for key, value in brief.items()
+            if key.startswith("identity_handoff")})
+        shared_block = json.dumps({
+            key: value for key, value in brief.items()
+            if key.startswith("handoff")})
+        self.assertNotIn("SHARED-MIRROR-OBJECTIVE", identity_block)
+        self.assertNotIn("Continue from local state", shared_block)
 
     def test_revoked_client_key_blocks_valid_old_mirror_at_session_start(self):
         adapter = FakeOfflineAdapter(self.verified_status(), self.snapshot())
