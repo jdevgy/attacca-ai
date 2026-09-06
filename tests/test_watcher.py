@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import threading
@@ -910,6 +911,230 @@ class AutonomousWatcherTestCase(unittest.TestCase):
         entry = self.state()["subscriptions"][key]
         self.assertEqual(entry["event_cursor"], 41)
         self.assertTrue(entry["event_cursor_initialized"])
+
+    # --- private watcher state: concurrent atomic replace (T-96) -------------
+    #
+    # A lifecycle hook in another session (or a second daemon) replaces
+    # watcher-state.json with ``os.replace``. The post-open identity check in
+    # ``_open_private_watcher_file`` can observe that rename and used to raise
+    # ``WatcherStateSecurityError`` straight out of ``_read_state``,
+    # killing the daemon. A replace whose new target is still one of our
+    # own private files is benign and must be retried; anything else
+    # must still fail closed.
+
+    def private_replacement(self, path, payload, suffix="race"):
+        """Write one 0600 sibling that a race can rename over ``path``."""
+        replacement = Path(str(path) + "." + suffix)
+        descriptor = os.open(
+            str(replacement), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload) + "\n")
+        os.chmod(str(replacement), 0o600)
+        return replacement
+
+    def replace_during_open(self, make_replacement, limit=1):
+        """Patch fchmod so a replace lands between open() and the id check."""
+        races = []
+        real_fchmod = os.fchmod
+
+        def racing_fchmod(descriptor, mode):
+            real_fchmod(descriptor, mode)
+            if len(races) < limit and stat.S_ISREG(
+                    os.fstat(descriptor).st_mode):
+                races.append(len(races) + 1)
+                make_replacement(len(races))
+
+        return races, mock.patch.object(
+            watch.os, "fchmod", side_effect=racing_fchmod)
+
+    def test_benign_state_replace_race_is_retried_and_reads_new_content(self):
+        path = watch._watcher_state_path()
+        watch._write_state(path, {"generation": "old"})
+        replacement = self.private_replacement(path, {"generation": "new"})
+        races, patch = self.replace_during_open(
+            lambda _: os.replace(str(replacement), str(path)))
+        with patch, mock.patch.object(watch.time, "sleep") as sleep:
+            state = watch._read_state(path)
+        self.assertEqual(races, [1])
+        self.assertEqual(state, {"generation": "new"})
+        self.assertEqual(sleep.call_count, 1)
+        self.assertEqual(
+            stat.S_IMODE(os.lstat(str(path)).st_mode), 0o600)
+
+    def test_state_replace_race_survives_a_real_concurrent_writer(self):
+        path = watch._watcher_state_path()
+        watch._write_state(path, {"generation": "old"})
+        races, patch = self.replace_during_open(
+            lambda _: watch._write_state(path, {"generation": "written"}))
+        with patch:
+            state = watch._read_state(path)
+        self.assertEqual(races, [1])
+        self.assertEqual(state, {"generation": "written"})
+
+    def test_replace_race_with_unsafe_target_still_fails_closed(self):
+        victim = self.root / "victim"
+        victim.write_text("file victim\n")
+        os.chmod(str(victim), 0o644)
+        path = watch._watcher_state_path()
+
+        def group_readable(_):
+            swapped = Path(str(path) + ".loose")
+            descriptor = os.open(
+                str(swapped), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(descriptor)
+            os.chmod(str(swapped), 0o644)
+            os.replace(str(swapped), str(path))
+
+        def symlink_swap(_):
+            swapped = Path(str(path) + ".link")
+            os.symlink(str(victim), str(swapped))
+            os.replace(str(swapped), str(path))
+
+        def directory_swap(_):
+            swapped = Path(str(path) + ".dir")
+            swapped.mkdir()
+            os.rename(str(swapped), str(path) + ".kept")
+            os.unlink(str(path))
+            os.rename(str(path) + ".kept", str(path))
+
+        for name, swap in (("group-readable", group_readable),
+                           ("symlink", symlink_swap),
+                           ("directory", directory_swap)):
+            with self.subTest(replacement=name):
+                for stale in self.root.glob("watcher/watcher-state.json*"):
+                    if stale.is_dir():
+                        shutil.rmtree(str(stale))
+                    else:
+                        stale.unlink()
+                watch._write_state(path, {"generation": "old"})
+                races, patch = self.replace_during_open(swap)
+                with patch, mock.patch.object(watch.time, "sleep") as sleep:
+                    with self.assertRaises(
+                            watch.WatcherStateSecurityError) as caught:
+                        watch._read_state(path)
+                self.assertEqual(races, [1])
+                self.assertNotIsInstance(
+                    caught.exception, watch.WatcherStateBusyError)
+                self.assertIn("changed while it was opened",
+                              str(caught.exception))
+                sleep.assert_not_called()
+                self.assertEqual(victim.read_text(), "file victim\n")
+                self.assertEqual(
+                    stat.S_IMODE(os.lstat(str(victim)).st_mode), 0o644)
+
+    def test_endless_replace_race_exhausts_retries_and_stays_closed(self):
+        path = watch._watcher_state_path()
+        watch._write_state(path, {"generation": "old"})
+        replacements = [self.private_replacement(
+            path, {"generation": index}, suffix="race-%d" % index)
+            for index in range(watch.WATCHER_REPLACE_RETRY_ATTEMPTS)]
+        races, patch = self.replace_during_open(
+            lambda attempt: os.replace(
+                str(replacements[attempt - 1]), str(path)),
+            limit=len(replacements))
+        with patch, mock.patch.object(watch.time, "sleep") as sleep:
+            with self.assertRaises(watch.WatcherStateBusyError) as caught:
+                watch._read_state(path)
+        self.assertEqual(len(races), watch.WATCHER_REPLACE_RETRY_ATTEMPTS)
+        self.assertEqual(sleep.call_count,
+                         watch.WATCHER_REPLACE_RETRY_ATTEMPTS - 1)
+        self.assertIsInstance(
+            caught.exception, watch.WatcherStateSecurityError)
+        self.assertIn("atomically replaced", str(caught.exception))
+
+    def test_unlocked_readers_never_see_a_security_error_under_writers(self):
+        """Real threads: an unlocked read races a locked atomic writer."""
+        path = watch._watcher_state_path()
+        watch._write_state(path, {"generation": 0})
+        stop = threading.Event()
+        start = threading.Barrier(3)
+        seen = []
+        unsafe = []
+
+        def writer():
+            start.wait(timeout=5)
+            generation = 0
+            while not stop.is_set() and generation < 200:
+                generation += 1
+                watch._mutate_state(
+                    path, lambda state: state.update(
+                        {"generation": generation}))
+
+        def reader():
+            start.wait(timeout=5)
+            while not stop.is_set():
+                try:
+                    seen.append(watch._read_state(path).get("generation"))
+                except watch.WatcherStateBusyError:
+                    seen.append(None)  # tolerated: retries were exhausted
+                except BaseException as error:
+                    unsafe.append(error)
+                    return
+
+        threads = [threading.Thread(target=writer),
+                   threading.Thread(target=reader)]
+        for thread in threads:
+            thread.start()
+        start.wait(timeout=5)
+        threads[0].join(timeout=30)
+        stop.set()
+        threads[1].join(timeout=30)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(
+            [repr(error) for error in unsafe], [],
+            "a benign concurrent replace must never fail closed")
+        self.assertTrue(seen)
+        self.assertTrue(any(value is not None for value in seen))
+
+    def test_daemon_loop_survives_a_busy_state_read_and_keeps_ticking(self):
+        key = self.register()
+        ticks = []
+        waits = []
+
+        def tick(subscription_key, now=None, **options):
+            ticks.append(subscription_key)
+            if len(ticks) == 1:
+                raise watch.WatcherStateBusyError(
+                    "watcher path was atomically replaced by a concurrent "
+                    "writer 5 times while it was opened: %s"
+                    % watch._watcher_state_path())
+            return {"ok": True}
+
+        with mock.patch.object(watch, "_watcher_tick", side_effect=tick), \
+                mock.patch.object(watch, "_watcher_daemon_log") as logged:
+            result = watch._watcher_daemon_loop(
+                ROOT, "busy-daemon", wait=waits.append, clock=lambda: 0,
+                max_ticks=3)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["ticks"], 3)
+        self.assertEqual(ticks, [key, key, key])
+        self.assertEqual(waits, [watch.WATCHER_WAKE_SECONDS] * 2)
+        self.assertEqual(logged.call_count, 1)
+        self.assertIn("atomically replaced", logged.call_args[0][0])
+        daemon = self.state()["daemon"]
+        self.assertEqual(daemon["nonce"], "busy-daemon")
+        self.assertIn("heartbeat_at_epoch", daemon)
+        self.assertEqual(daemon["subscription_count"], 1)
+
+    def test_daemon_loop_still_exits_on_a_real_state_security_failure(self):
+        self.register()
+        ticks = []
+
+        def tick(subscription_key, now=None, **options):
+            ticks.append(subscription_key)
+            raise watch.WatcherStateSecurityError(
+                "watcher path changed while it was opened: %s"
+                % watch._watcher_state_path())
+
+        with mock.patch.object(watch, "_watcher_tick", side_effect=tick), \
+                mock.patch.object(watch, "_watcher_daemon_log") as logged:
+            with self.assertRaises(watch.WatcherStateSecurityError):
+                watch._watcher_daemon_loop(
+                    ROOT, "unsafe-daemon", wait=lambda _: None,
+                    clock=lambda: 0, max_ticks=3)
+        self.assertEqual(len(ticks), 1)
+        logged.assert_not_called()
 
 
 if __name__ == "__main__":

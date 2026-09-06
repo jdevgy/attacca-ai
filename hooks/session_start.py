@@ -45,6 +45,12 @@ WATCHER_ATTENTION_PAGE_SIZE = 25
 WATCHER_INBOX_MAX_PAGES = 20
 WATCHER_INBOX_MAX_BYTES = 1024 * 1024
 WATCHER_WAKE_SECONDS = 5
+# A lifecycle hook in another session, or a second daemon, atomically
+# replaces the private watcher state while this process is opening it.
+# That rename is benign, not tampering, so the open is retried a bounded
+# number of times before the caller is told the path stayed busy.
+WATCHER_REPLACE_RETRY_ATTEMPTS = 5
+WATCHER_REPLACE_RETRY_SLEEP_SECONDS = 0.02
 WATCHER_EVENT_PAGE_SIZE = 200
 WATCHER_EVENT_MAX_PAGES = 20
 WATCHER_OUTAGE_BACKOFF_MAX_SECONDS = 15 * 60
@@ -315,6 +321,19 @@ class WatcherStateSecurityError(RuntimeError):
     """The watcher cannot safely use its machine-local private state."""
 
 
+class WatcherStateBusyError(WatcherStateSecurityError):
+    """A benign concurrent replace kept winning the private-state open.
+
+    Deliberately a ``WatcherStateSecurityError`` subclass so every
+    existing caller keeps failing closed. Only the long-lived daemon loop
+    treats it as transient and retries on its next tick.
+    """
+
+
+class _WatcherPathReplaced(Exception):
+    """Internal: the path now holds a different, equally private file."""
+
+
 def _is_watcher_state_path(path):
     return Path(path).name == WATCHER_STATE_NAME
 
@@ -379,15 +398,72 @@ def _ensure_private_watcher_directory(path):
     return path
 
 
-def _open_private_watcher_file(path, flags, create=False):
+def _replaced_watcher_file_is_private(path, parent):
+    """True when a concurrent atomic replace left an equally private file.
+
+    A benign replace is one of our own writers: ``_write_state`` renames a
+    regular file that it created 0600 and owns, inside the same watcher
+    directory. Anything else — a foreign owner, a group/world-readable mode, a
+    symlink, a non-regular file, or a swapped parent directory — is a real
+    identity change that must still fail closed.
+    """
+    try:
+        current = os.lstat(str(path))
+        directory = os.lstat(str(Path(path).parent))
+    except OSError:
+        return False
+    if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode):
+        return False
+    if stat.S_IMODE(current.st_mode) != 0o600:
+        return False
+    owner = getattr(os, "getuid", None)
+    if owner is not None and current.st_uid != owner():
+        return False
+    if (directory.st_dev, directory.st_ino) != (parent.st_dev, parent.st_ino):
+        return False
+    # A rename cannot cross filesystems, so a replacement on another device
+    # was never renamed into this directory by one of our writers.
+    return current.st_dev == directory.st_dev
+
+
+def _open_private_watcher_file(path, flags, create=False, attempts=None):
     """Open one private watcher file without following links.
 
     Existing safe regular files are repaired to 0600 through the opened file
     descriptor, avoiding a chmod-by-path race.  The post-open inode check also
     rejects a concurrent path substitution before callers consume the file.
+
+    A concurrent atomic replace by another lifecycle session or daemon is
+    ordinary, not tampering, so an identity change whose new target passes
+    every private-file check is retried a bounded number of times and only
+    then reported as ``WatcherStateBusyError``. Re-opening is non-destructive:
+    no caller passes ``O_TRUNC``, and every attempt repeats the full pre-open
+    validation.
     """
     path = Path(path).expanduser().absolute()
+    attempts = WATCHER_REPLACE_RETRY_ATTEMPTS if attempts is None \
+        else max(1, int(attempts))
+    for attempt in range(attempts):
+        try:
+            return _open_private_watcher_file_once(path, flags, create=create)
+        except _WatcherPathReplaced:
+            if attempt + 1 >= attempts:
+                break
+            time.sleep(WATCHER_REPLACE_RETRY_SLEEP_SECONDS)
+    raise WatcherStateBusyError(
+        "watcher path was atomically replaced by a concurrent writer %d times "
+        "while it was opened: %s" % (attempts, path))
+
+
+def _open_private_watcher_file_once(path, flags, create=False):
+    """One validated open attempt for an already normalized watcher path."""
     _ensure_private_watcher_directory(path.parent)
+    try:
+        parent = os.lstat(str(path.parent))
+    except OSError as error:
+        raise WatcherStateSecurityError(
+            "cannot inspect watcher storage directory %s: %s" %
+            (path.parent, error)) from None
     _reject_watcher_symlink_components(path)
     try:
         existing = os.lstat(str(path))
@@ -421,6 +497,8 @@ def _open_private_watcher_file(path, flags, create=False):
         if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode) \
                 or (current.st_dev, current.st_ino) != \
                 (opened.st_dev, opened.st_ino):
+            if _replaced_watcher_file_is_private(path, parent):
+                raise _WatcherPathReplaced(str(path))
             raise WatcherStateSecurityError(
                 "watcher path changed while it was opened: %s" % path)
     except BaseException:
@@ -5105,6 +5183,16 @@ def _watcher_lock_available():
         return True
 
 
+def _watcher_daemon_log(message):
+    """Write one diagnostic line to the daemon's redirected stderr log."""
+    try:
+        sys.stderr.write("[attacca-watcher] %s %s\n" % (
+            datetime.now(timezone.utc).isoformat(), message))
+        sys.stderr.flush()
+    except Exception:  # pragma: no cover - logging never ends the daemon
+        pass
+
+
 def _watcher_daemon_loop(plugin_root, nonce, wait=None, clock=None,
                          max_ticks=None, offline_factory=None,
                          remote_factory=None, launch_identity=None):
@@ -5152,29 +5240,57 @@ def _watcher_daemon_loop(plugin_root, nonce, wait=None, clock=None,
             started_at=datetime.now(timezone.utc).isoformat(),
             heartbeat_at_epoch=clock())
         while True:
-            prune = _prune_missing_watcher_subscriptions(now=clock())
-            state = _read_state(path)
-            keys = list((state.get("subscriptions") or {}).keys())
-            for key in keys:
-                options = {}
-                if offline_factory is not None:
-                    options["offline_factory"] = offline_factory
-                if remote_factory is not None:
-                    options["remote_factory"] = remote_factory
-                _watcher_tick(key, now=clock(), **options)
+            # A concurrent atomic replace of the private state that outlasted
+            # the bounded open retry is transient: skip this tick and re-read
+            # on the next one instead of dying and waiting for a lifecycle
+            # hook to relaunch the daemon. A genuine identity change is still
+            # a WatcherStateSecurityError and still stops the daemon.
+            prune = None
+            state = {}
+            keys = []
+            try:
+                prune = _prune_missing_watcher_subscriptions(now=clock())
+                state = _read_state(path)
+                keys = list((state.get("subscriptions") or {}).keys())
+                for key in keys:
+                    options = {}
+                    if offline_factory is not None:
+                        options["offline_factory"] = offline_factory
+                    if remote_factory is not None:
+                        options["remote_factory"] = remote_factory
+                    _watcher_tick(key, now=clock(), **options)
+            except WatcherStateBusyError as error:
+                _watcher_daemon_log(
+                    "tick skipped, private watcher state stayed busy: %s: %s"
+                    % (type(error).__name__, error))
             ticks += 1
-            prior_pruned = ((state.get("daemon") or {}).get(
-                "pruned_subscription_count"))
-            if not isinstance(prior_pruned, int) or prior_pruned < 0:
-                prior_pruned = 0
-            _watcher_mark_daemon(
-                nonce, plugin_root, launch_identity=launch_identity,
-                running=True,
-                heartbeat_at=datetime.now(timezone.utc).isoformat(),
-                heartbeat_at_epoch=clock(), subscription_count=len(keys),
-                missing_subscription_count=len(prune["observed"]),
-                pruned_subscription_count=(prior_pruned
-                                           + len(prune["removed"])))
+            # The heartbeat is guarded separately: a skipped tick must not
+            # stall it, or another session concludes this daemon is dead and
+            # starts the second writer that caused the race.
+            heartbeat = {
+                "running": True,
+                "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+                "heartbeat_at_epoch": clock(),
+            }
+            if prune is not None:
+                prior_pruned = ((state.get("daemon") or {}).get(
+                    "pruned_subscription_count"))
+                if not isinstance(prior_pruned, int) or prior_pruned < 0:
+                    prior_pruned = 0
+                heartbeat.update({
+                    "subscription_count": len(keys),
+                    "missing_subscription_count": len(prune["observed"]),
+                    "pruned_subscription_count": (prior_pruned
+                                                  + len(prune["removed"])),
+                })
+            try:
+                _watcher_mark_daemon(
+                    nonce, plugin_root, launch_identity=launch_identity,
+                    **heartbeat)
+            except WatcherStateBusyError as error:
+                _watcher_daemon_log(
+                    "heartbeat skipped, private watcher state stayed busy: "
+                    "%s: %s" % (type(error).__name__, error))
             if max_ticks is not None and ticks >= max_ticks:
                 break
             wait(WATCHER_WAKE_SECONDS)
