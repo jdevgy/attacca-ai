@@ -15992,6 +15992,13 @@ class AttaccaHandler(BaseHTTPRequestHandler):
             if path.endswith("/export"):
                 raise AuthorizationError(
                     "client_export_denied: full export requires browser sign-in")
+            # Membership administration is account authority, so it is denied
+            # ahead of the registered-actor exemption below: a client key with
+            # an exact AI actor is still not a human who may hand out access.
+            if re.match(r"^/v1/projects/[^/]+/members(?:/|$)", path):
+                raise AuthorizationError(
+                    "client_members_denied: workspace membership is granted"
+                    " and revoked from a browser session, not a client key")
             if principal.get("actor_type") == "agent":
                 return
             if principal.get("client_setup_discovery") and method == "GET" \
@@ -17525,6 +17532,215 @@ def _r_auth_invitation_accept(h, m, q):
     h._reply_json(201, result, {"Cache-Control": "no-store"})
 
 
+# --- workspace membership administration -----------------------------------
+#
+# ``auth_project_memberships`` carries no role column: workspace access is a
+# single durable grant.  AI authority still comes from the registered agent
+# role, and account-wide authority from ``auth_users.is_admin``, so these
+# routes deliberately expose no per-membership role to set or return.
+
+
+def _workspace_membership_project(h, m):
+    """Resolve the addressed workspace row, or reply 404 and return None."""
+    project_id = m.group(1)
+    row = h._conn().execute(
+        "SELECT * FROM projects WHERE project_id=?", (project_id,)).fetchone()
+    if not row:
+        h._reply_json(404, {
+            "error": "workspace '%s' was not found" % project_id,
+            "project": project_id,
+        }, {"Cache-Control": "no-store"})
+        return None
+    return dict(row)
+
+
+def _require_workspace_membership_admin(h, project):
+    """Membership is governed by a server admin or the workspace owner.
+
+    The same browser-session requirement as the invitation routes applies:
+    bearer credentials identify a client access channel, never the human
+    authority that may hand out workspace access.
+    """
+    principal = _require_auth_session(h)
+    if principal.get("is_admin"):
+        return principal
+    if principal.get("username") in _project_export_owner_usernames(
+            h._conn(), project):
+        return principal
+    raise AuthorizationError(
+        "workspace_membership_admin_required: only a server administrator or"
+        " an owner of workspace '%s' may manage its members"
+        % project["project_id"])
+
+
+def _workspace_member_rows(conn, project_id):
+    return conn.execute(
+        "SELECT m.user_id AS user_id, m.granted_at AS granted_at,"
+        " m.granted_by AS granted_by, u.username AS username,"
+        " u.display_name AS display_name, u.is_admin AS is_admin,"
+        " u.disabled_at AS disabled_at"
+        " FROM auth_project_memberships m"
+        " JOIN auth_users u ON u.user_id=m.user_id"
+        " WHERE m.project_id=? AND m.revoked_at IS NULL"
+        " ORDER BY u.username", (project_id,)).fetchall()
+
+
+def _workspace_member_is_privileged(row, owner_usernames):
+    """Whether one active membership row can still administer the workspace.
+
+    A disabled account cannot sign in, so it never counts as remaining
+    administration.  Note that a server administrator keeps account-wide
+    access even without a membership row; this predicate protects the
+    workspace's own administrator/owner listing, not an admin's access.
+    """
+    if row["disabled_at"]:
+        return False
+    return bool(row["is_admin"]) or row["username"] in owner_usernames
+
+
+def _workspace_member_record(row, owner_usernames):
+    return {
+        "user_id": row["user_id"],
+        "username": row["username"],
+        "display_name": row["display_name"],
+        "is_admin": bool(row["is_admin"]),
+        "is_workspace_owner": row["username"] in owner_usernames,
+        "disabled": bool(row["disabled_at"]),
+        "granted_at": row["granted_at"],
+        "granted_by": row["granted_by"],
+    }
+
+
+def _workspace_member_user(h, username):
+    """Resolve one exact account, or reply 404 and return None."""
+    row = h._conn().execute(
+        "SELECT * FROM auth_users WHERE username=?", (username,)).fetchone()
+    if not row:
+        h._reply_json(404, {
+            "error": "Attacca user '%s' was not found; the account must exist"
+                     " before it can be added to a workspace" % username,
+            "username": username,
+        }, {"Cache-Control": "no-store"})
+        return None
+    return row
+
+
+def _r_workspace_members(h, m, q):
+    project = _workspace_membership_project(h, m)
+    if project is None:
+        return
+    _require_workspace_membership_admin(h, project)
+    conn = h._conn()
+    owners = _project_export_owner_usernames(conn, project)
+    members = [_workspace_member_record(row, owners)
+               for row in _workspace_member_rows(conn, project["project_id"])]
+    page = _collection_page(
+        members, "members", query=q.get("q"),
+        limit=q.get("limit") or PANEL_COLLECTION_LIMIT,
+        offset=q.get("offset") or 0, sort=q.get("sort") or "newest",
+        date_fields=("granted_at",), id_fields=("username",))
+    page["project"] = project["project_id"]
+    h._reply_json(200, page, {"Cache-Control": "no-store"})
+
+
+def _r_workspace_member_add(h, m, q):
+    project = _workspace_membership_project(h, m)
+    if project is None:
+        return
+    principal = _require_workspace_membership_admin(h, project)
+    conn = h._conn()
+    project_id = project["project_id"]
+    body = h._body_json()
+    # Normalize before lookup so a differently spelled but existing account is
+    # recognized rather than reported as unknown.
+    username = _clean_username(body.get("username"))
+    user = _workspace_member_user(h, username)
+    if user is None:
+        return
+    # auth_has_project_membership is not the duplicate test: it answers True
+    # for every server administrator, which would make granting an admin an
+    # unconditional conflict.  Only an active membership row is a duplicate,
+    # and a previously revoked row is re-granted rather than refused.
+    if conn.execute(
+            "SELECT 1 FROM auth_project_memberships"
+            " WHERE user_id=? AND project_id=? AND revoked_at IS NULL",
+            (user["user_id"], project_id)).fetchone():
+        h._reply_json(409, {
+            "error": "Attacca user '%s' is already a member of workspace '%s'"
+                     % (username, project_id),
+            "project": project_id, "username": username,
+        }, {"Cache-Control": "no-store"})
+        return
+    auth_grant_project_membership(
+        conn, {"user_id": user["user_id"], "username": username},
+        project_id, granted_by=principal["username"])
+    append_event(
+        conn, project_id, "web.%s" % principal["username"], "human",
+        "auth.workspace_member_granted", {
+            "username": username,
+            "user_id": user["user_id"],
+            "granted_by": principal["username"],
+        })
+    owners = _project_export_owner_usernames(conn, project)
+    row = next((item for item in _workspace_member_rows(conn, project_id)
+                if item["user_id"] == user["user_id"]), None)
+    h._reply_json(201, {
+        "ok": True, "project": project_id,
+        "member": _workspace_member_record(row, owners) if row else None,
+    }, {"Cache-Control": "no-store"})
+
+
+def _r_workspace_member_remove(h, m, q):
+    project = _workspace_membership_project(h, m)
+    if project is None:
+        return
+    principal = _require_workspace_membership_admin(h, project)
+    conn = h._conn()
+    project_id = project["project_id"]
+    username = _clean_username(m.group(2))
+    user = _workspace_member_user(h, username)
+    if user is None:
+        return
+    rows = _workspace_member_rows(conn, project_id)
+    current = next((item for item in rows
+                    if item["user_id"] == user["user_id"]), None)
+    if current is None:
+        h._reply_json(404, {
+            "error": "Attacca user '%s' is not a member of workspace '%s'"
+                     % (username, project_id),
+            "project": project_id, "username": username,
+        }, {"Cache-Control": "no-store"})
+        return
+    owners = _project_export_owner_usernames(conn, project)
+    if _workspace_member_is_privileged(current, owners) and not any(
+            _workspace_member_is_privileged(item, owners) for item in rows
+            if item["user_id"] != user["user_id"]):
+        h._reply_json(409, {
+            "error": "Attacca user '%s' is the last administrator or owner"
+                     " listed on workspace '%s'; add another administrator or"
+                     " owner before removing this one" % (username, project_id),
+            "project": project_id, "username": username,
+            "last_workspace_admin": True,
+        }, {"Cache-Control": "no-store"})
+        return
+    with write_tx(conn):
+        conn.execute(
+            "UPDATE auth_project_memberships SET revoked_at=?"
+            " WHERE user_id=? AND project_id=? AND revoked_at IS NULL",
+            (now_iso(), user["user_id"], project_id))
+    append_event(
+        conn, project_id, "web.%s" % principal["username"], "human",
+        "auth.workspace_member_revoked", {
+            "username": username,
+            "user_id": user["user_id"],
+            "revoked_by": principal["username"],
+        })
+    h._reply_json(200, {
+        "ok": True, "project": project_id, "username": username,
+        "revoked": True,
+    }, {"Cache-Control": "no-store"})
+
+
 def _r_auth_migration_scope(h, m, q):
     principal = _require_owner_session(h)
     body = h._body_json()
@@ -18731,6 +18947,12 @@ ROUTES = [
     (*_route_def("POST", "/v1/projects"), _r_projects_create),
     (*_route_def("GET", "/v1/projects/%s/status" % _PID), _r_project_status),
     (*_route_def("GET", "/v1/projects/%s/export" % _PID), _r_project_export),
+    (*_route_def("GET", "/v1/projects/%s/members" % _PID),
+     _r_workspace_members),
+    (*_route_def("POST", "/v1/projects/%s/members" % _PID),
+     _r_workspace_member_add),
+    (*_route_def("DELETE", "/v1/projects/%s/members/%s" % (_PID, _PID)),
+     _r_workspace_member_remove),
     (*_route_def("GET", "/v1/projects/%s/sync/snapshot" % _PID),
      _r_sync_snapshot),
     (*_route_def("GET", "/v1/projects/%s/sync/pull" % _PID), _r_sync_pull),

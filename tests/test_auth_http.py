@@ -613,6 +613,316 @@ class AuthHttpTestCase(unittest.TestCase):
         finally:
             restarted.server_close()
 
+    # -- T-97: admin-governed workspace membership --------------------------
+
+    def members(self, headers, project="one", suffix=""):
+        return self.request(
+            "GET", "/v1/projects/%s/members%s" % (project, suffix),
+            headers=headers)
+
+    def grant_member(self, headers, username, project="one"):
+        return self.request(
+            "POST", "/v1/projects/%s/members" % project,
+            {"username": username}, headers)
+
+    def revoke_member(self, headers, username, project="one"):
+        return self.request(
+            "DELETE", "/v1/projects/%s/members/%s" % (project, username),
+            {}, headers)
+
+    def ledger_events(self, project, event_type):
+        conn = c.connect(self.db)
+        try:
+            return [dict(row) for row in conn.execute(
+                "SELECT actor_id, actor_type, owner, payload FROM events"
+                " WHERE project_id=? AND event_type=? ORDER BY seq",
+                (project, event_type)).fetchall()]
+        finally:
+            conn.close()
+
+    def test_admin_grants_membership_and_the_account_reads_the_workspace(self):
+        self.bootstrap()
+        self.seed_projects_and_agent()
+        self.open_self_registration()
+        member = self.session_headers(self.register())
+        admin = self.session_headers(self.login())
+
+        listed = self.members(admin)
+        self.assertEqual(listed["status"], 200, listed["body"])
+        self.assertEqual(listed["body"]["members"], [])
+        self.assertEqual(listed["body"]["project"], "one")
+
+        # The grant normalizes the submitted spelling to the exact account.
+        granted = self.grant_member(admin, "Bob")
+        self.assertEqual(granted["status"], 201, granted["body"])
+        record = granted["body"]["member"]
+        self.assertEqual(record["username"], "bob")
+        self.assertIs(record["is_admin"], False)
+        self.assertEqual(record["granted_by"], "alice")
+        self.assertTrue(record["granted_at"])
+
+        after = self.members(admin)
+        self.assertEqual(
+            [row["username"] for row in after["body"]["members"]], ["bob"])
+
+        # The point of the grant: the account can now read the workspace.
+        status = self.request(
+            "GET", "/v1/projects/one/status", headers=member)
+        self.assertEqual(status["status"], 200, status["body"])
+        visible = self.request("GET", "/v1/projects", headers=member)
+        self.assertEqual(
+            [row["project_id"] for row in visible["body"]["projects"]], ["one"])
+
+        # The grant is attributed in the workspace ledger to the web human.
+        events = self.ledger_events("one", "auth.workspace_member_granted")
+        self.assertEqual(len(events), 1, events)
+        self.assertEqual(events[0]["actor_id"], "web.alice")
+        self.assertEqual(events[0]["actor_type"], "human")
+        self.assertEqual(events[0]["owner"], "alice")
+        self.assertEqual(json.loads(events[0]["payload"])["username"], "bob")
+
+    def test_duplicate_and_unknown_grants_are_reported_distinctly(self):
+        self.bootstrap()
+        self.seed_projects_and_agent()
+        self.open_self_registration()
+        self.register()
+        admin = self.session_headers(self.login())
+        self.assertEqual(self.grant_member(admin, "bob")["status"], 201)
+
+        original = self.members(admin)["body"]["members"][0]
+
+        duplicate = self.grant_member(admin, "bob")
+        self.assertEqual(duplicate["status"], 409, duplicate["body"])
+        self.assertIn("already a member", duplicate["body"]["error"])
+        # A refused grant leaves the standing membership exactly as it was,
+        # so the audit trail keeps naming the administrator who really added
+        # the account and when.
+        self.assertEqual(self.members(admin)["body"]["members"][0], original)
+
+        unknown = self.grant_member(admin, "nobody")
+        self.assertEqual(unknown["status"], 404, unknown["body"])
+        self.assertIn("was not found", unknown["body"]["error"])
+
+        # An administrator has account-wide access without a membership row,
+        # so granting one must not be mistaken for a duplicate.
+        self.assertEqual(self.grant_member(admin, "alice")["status"], 201)
+
+        missing_workspace = self.request(
+            "POST", "/v1/projects/absent/members", {"username": "bob"}, admin)
+        self.assertEqual(missing_workspace["status"], 404,
+                         missing_workspace["body"])
+        self.assertEqual(
+            self.ledger_events("one", "auth.workspace_member_granted").__len__(),
+            2)
+
+    def test_membership_administration_refuses_members_keys_and_missing_csrf(self):
+        self.bootstrap()
+        self.seed_projects_and_agent()
+        self.open_self_registration()
+        member = self.session_headers(self.register())
+        admin = self.session_headers(self.login())
+        self.assertEqual(self.grant_member(admin, "bob")["status"], 201)
+
+        # A granted member reads its workspace but never its member list.
+        denied = self.members(member)
+        self.assertEqual(denied["status"], 403, denied["body"])
+        self.assertIn("workspace_membership_admin_required",
+                      denied["body"]["error"])
+        escalation = self.grant_member(member, "alice")
+        self.assertEqual(escalation["status"], 403, escalation["body"])
+        self.assertIn("workspace_membership_admin_required",
+                      escalation["body"]["error"])
+        self.assertEqual(self.revoke_member(member, "bob")["status"], 403)
+
+        # An account with no membership at all is stopped one step earlier by
+        # the pre-dispatch workspace gate.
+        outsider = self.session_headers(
+            self.register(username="mallory", password="correct-horse"))
+        outside = self.members(outsider)
+        self.assertEqual(outside["status"], 403, outside["body"])
+        self.assertIn("project_membership_required", outside["body"]["error"])
+
+        # Invariant 14: a client API key is a machine access channel and can
+        # never hand out human workspace access, with or without an actor.
+        # The key's owner is granted the workspace first so the refusal proves
+        # the route rule rather than an ordinary out-of-scope key.
+        self.assertEqual(self.grant_member(admin, "alice")["status"], 201)
+        minted = self.request("POST", "/v1/auth/client-keys", {
+            "label": "laptop", "client_instance": "laptop-1"}, admin)
+        self.assertEqual(minted["status"], 201, minted["body"])
+        bearer = {"Authorization": "Bearer %s" % minted["body"]["token"],
+                  "X-Attacca-Client-Instance": "laptop-1"}
+        # A key with no actor never reaches a project route at all.
+        bare = self.request("GET", "/v1/projects/one/members", headers=bearer)
+        self.assertEqual(bare["status"], 403, bare["body"])
+        self.assertIn("client_actor_required", bare["body"]["error"])
+        # A key carrying its exact registered AI actor authenticates for the
+        # workspace, and is still refused on every membership route.
+        agent = dict(bearer, **{"X-Attacca-Actor": "one.director.codex"})
+        self.assertEqual(self.request(
+            "GET", "/v1/projects/one/status", headers=agent)["status"], 200)
+        for response in (
+                self.request("GET", "/v1/projects/one/members", headers=agent),
+                self.request("POST", "/v1/projects/one/members",
+                             {"username": "mallory"}, agent),
+                self.request("DELETE", "/v1/projects/one/members/bob",
+                             {}, agent)):
+            self.assertEqual(response["status"], 403, response["body"])
+            self.assertIn("client_members_denied", response["body"]["error"])
+
+        # A service credential is a workspace integration, not the human
+        # authority that hands out access -- bound or unbound.
+        for service in ({"label": "unbound", "project_memberships": ["one"]},
+                        {"label": "bound", "project_memberships": ["one"],
+                         "actor_bindings": [
+                             {"project_id": "one",
+                              "actor_id": "one.director.codex"}]}):
+            key = self.request("POST", "/v1/auth/service-keys", service, admin)
+            self.assertEqual(key["status"], 201, key["body"])
+            service_bearer = {
+                "Authorization": "Bearer %s" % key["body"]["token"]}
+            for method, path, payload in (
+                    ("GET", "/v1/projects/one/members", None),
+                    ("POST", "/v1/projects/one/members", {"username": "mallory"}),
+                    ("DELETE", "/v1/projects/one/members/bob", {})):
+                response = self.request(method, path, payload, service_bearer)
+                self.assertEqual(response["status"], 403, response["body"])
+
+        # Browser mutations still require the exact CSRF token.
+        no_csrf = self.session_headers(self.login(), csrf=False)
+        for method, path in (("POST", "/v1/projects/one/members"),
+                             ("DELETE", "/v1/projects/one/members/bob")):
+            response = self.request(
+                method, path, {"username": "mallory"}, no_csrf)
+            self.assertEqual(response["status"], 403, response["body"])
+            self.assertIn("CSRF", response["body"]["error"])
+        self.assertEqual(
+            sorted(row["username"]
+                   for row in self.members(admin)["body"]["members"]),
+            ["alice", "bob"])
+
+    def test_revoking_membership_restores_the_no_access_answer(self):
+        self.bootstrap()
+        self.seed_projects_and_agent()
+        self.open_self_registration()
+        member = self.session_headers(self.register())
+        admin = self.session_headers(self.login())
+        self.assertEqual(self.grant_member(admin, "bob")["status"], 201)
+        self.assertEqual(self.request(
+            "GET", "/v1/projects/one/status", headers=member)["status"], 200)
+
+        revoked = self.revoke_member(admin, "bob")
+        self.assertEqual(revoked["status"], 200, revoked["body"])
+        self.assertIs(revoked["body"]["revoked"], True)
+        self.assertEqual(self.members(admin)["body"]["members"], [])
+
+        denied = self.request(
+            "GET", "/v1/projects/one/status", headers=member)
+        self.assertEqual(denied["status"], 403, denied["body"])
+        self.assertIn("project_membership_required", denied["body"]["error"])
+
+        # Revoking twice is an honest "not a member", not a silent success.
+        again = self.revoke_member(admin, "bob")
+        self.assertEqual(again["status"], 404, again["body"])
+        self.assertIn("is not a member", again["body"]["error"])
+
+        # A revoked row is re-granted rather than treated as a duplicate, and
+        # the standing row names whoever actually restored the access.
+        conn = c.connect(self.db)
+        try:
+            c.auth_create_user(conn, "carol", "correct-horse", is_admin=True)
+        finally:
+            conn.close()
+        carol = self.session_headers(
+            self.login(username="carol", password="correct-horse"))
+        self.assertEqual(self.grant_member(carol, "bob")["status"], 201)
+        self.assertEqual(self.request(
+            "GET", "/v1/projects/one/status", headers=member)["status"], 200)
+        restored = self.members(admin)["body"]["members"][0]
+        self.assertEqual(restored["username"], "bob")
+        self.assertEqual(restored["granted_by"], "carol")
+
+        events = self.ledger_events("one", "auth.workspace_member_revoked")
+        self.assertEqual(len(events), 1, events)
+        self.assertEqual(events[0]["actor_id"], "web.alice")
+        self.assertEqual(events[0]["owner"], "alice")
+        self.assertEqual(json.loads(events[0]["payload"])["username"], "bob")
+        grants = self.ledger_events("one", "auth.workspace_member_granted")
+        self.assertEqual([row["actor_id"] for row in grants],
+                         ["web.alice", "web.carol"])
+        self.assertEqual([row["owner"] for row in grants], ["alice", "carol"])
+        self.assertEqual(
+            json.loads(grants[1]["payload"])["granted_by"], "carol")
+
+    def test_the_last_workspace_administrator_cannot_be_removed(self):
+        self.bootstrap()
+        admin = self.session_headers(self.login())
+        created = self.request(
+            "POST", "/v1/projects", {"name": "Storefront",
+                                     "project_id": "storefront"}, admin)
+        self.assertEqual(created["status"], 200, created["body"])
+        listed = self.members(admin, project="storefront")
+        self.assertEqual(
+            [row["username"] for row in listed["body"]["members"]], ["alice"])
+        self.assertIs(listed["body"]["members"][0]["is_workspace_owner"], True)
+
+        refused = self.revoke_member(admin, "alice", project="storefront")
+        self.assertEqual(refused["status"], 409, refused["body"])
+        self.assertIs(refused["body"]["last_workspace_admin"], True)
+        self.assertIn("last administrator or owner", refused["body"]["error"])
+
+        # An ordinary member is not the administration the guard protects, so
+        # adding one must not unlock the removal.
+        self.open_self_registration()
+        self.register()
+        self.assertEqual(self.grant_member(
+            admin, "bob", project="storefront")["status"], 201)
+        self.assertEqual(self.revoke_member(
+            admin, "alice", project="storefront")["status"], 409)
+        self.assertEqual(self.revoke_member(
+            admin, "bob", project="storefront")["status"], 200)
+
+        # A second administrator does unlock it: the rule is "not the last".
+        conn = c.connect(self.db)
+        try:
+            c.auth_create_user(conn, "carol", "correct-horse", is_admin=True)
+        finally:
+            conn.close()
+        self.assertEqual(self.grant_member(
+            admin, "carol", project="storefront")["status"], 201)
+        removed = self.revoke_member(admin, "alice", project="storefront")
+        self.assertEqual(removed["status"], 200, removed["body"])
+        self.assertEqual(
+            [row["username"] for row in self.members(
+                admin, project="storefront")["body"]["members"]], ["carol"])
+
+    def test_registered_account_reaches_a_workspace_only_after_a_grant(self):
+        # The complete T-90 -> T-97 path: open sign-up, self-register, and the
+        # administrator hands out the access the registration deliberately
+        # withheld.
+        self.bootstrap()
+        self.seed_projects_and_agent()
+        self.open_self_registration()
+        created = self.register(username="bob", display_name="Bob Builder")
+        self.assertEqual(created["status"], 200, created["body"])
+        self.assertIs(created["body"]["user"]["is_admin"], False)
+        member = self.session_headers(created)
+        self.assertEqual(
+            self.request("GET", "/v1/projects", headers=member)["body"]["projects"],
+            [])
+        blocked = self.request(
+            "GET", "/v1/projects/one/status", headers=member)
+        self.assertEqual(blocked["status"], 403, blocked["body"])
+
+        admin = self.session_headers(self.login())
+        self.assertEqual(self.grant_member(admin, "bob")["status"], 201)
+        self.assertEqual(self.request(
+            "GET", "/v1/projects/one/status", headers=member)["status"], 200)
+        # The other seeded workspace stays out of reach: a grant is per
+        # workspace, not an account-wide promotion.
+        self.assertEqual(self.request(
+            "GET", "/v1/projects/two/status", headers=member)["status"], 403)
+
 
 if __name__ == "__main__":
     unittest.main()

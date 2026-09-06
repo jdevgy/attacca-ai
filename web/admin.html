@@ -836,6 +836,8 @@
         projects: [],
         workspaceAgents: {},
         workspaceAgentErrors: {},
+        workspaceMembers: null,
+        workspaceMembersError: "",
         projectId: storageGet("attacca.admin.project"),
         data: {},
         errors: {},
@@ -2063,6 +2065,7 @@
             cloudContext: pathFor("/cloud-context"),
             events: pathFor(`/activity${feedQuery("activity", { q: state.activityFilter })}`),
             agents: pathFor(`/agents${listQuery("agents", { q: state.agentSearch })}`),
+            members: pathFor("/members"),
             agentOptions: pathFor("/agents?options=1"),
             log: pathFor(`/log${listQuery("log", { q: state.logSearch })}`),
             overviewTasks: pathFor(`/tasks?limit=7&offset=0&sort=newest&status=active&detail=full`),
@@ -2111,6 +2114,15 @@
                 state.taskPlan.data = null;
                 state.taskPlan.error = result.reason.message;
               }
+              return;
+            }
+            if (key === "members") {
+              // Membership administration is restricted to a server admin or
+              // a workspace owner. A refusal here is the ordinary answer for
+              // everybody else, so it hides the card instead of surfacing as
+              // a page load error.
+              state.workspaceMembers = result.status === "fulfilled" ? result.value : null;
+              state.workspaceMembersError = result.status === "fulfilled" ? "" : result.reason.message;
               return;
             }
             if (result.status === "fulfilled") state.data[key] = result.value;
@@ -2277,12 +2289,51 @@
           </div>`;
       }
 
+      // POST /v1/projects is open to every authenticated human account, and
+      // the server grants the creator membership on the workspace it makes,
+      // so there is no separate administrator gate to mirror here.  Keep this
+      // the single place the panel answers "may this account create one?".
+      function canCreateWorkspace() { return Boolean(state.auth?.authenticated); }
+
+      const NO_WORKSPACE_NOTICE =
+        "Your account has no workspace yet — ask an administrator to add you, or create a workspace";
+      const NO_WORKSPACE_NOTICE_WITHOUT_CREATE =
+        "Your account has no workspace yet — ask an administrator to add you";
+
+      function noWorkspaceNotice() {
+        const text = canCreateWorkspace()
+          ? NO_WORKSPACE_NOTICE : NO_WORKSPACE_NOTICE_WITHOUT_CREATE;
+        return `<div class="notice"><span>i</span><div><strong>${h(text)}.</strong><br>Workspace access is granted per workspace. Other workspaces may exist on this server; they stay hidden until an administrator or a workspace owner adds your account.</div></div>`;
+      }
+
+      // The Members card is rendered only when the server actually answered
+      // GET /members for this account, so the card is hidden for an ordinary
+      // member without ever guessing the authorization rule in the browser.
+      function renderWorkspaceMembers() {
+        const response = state.workspaceMembers;
+        if (!state.projectId || !response) return "";
+        const page = responsePage(response, "members");
+        const members = page.rows;
+        const rows = members.length
+          ? members.map(member => `<div class="list-row"><div><div class="list-title">@${h(member.username)}${member.display_name && member.display_name !== member.username ? ` · ${h(member.display_name)}` : ""}</div><div class="list-meta"><span>${member.is_admin ? "server administrator" : "workspace member"}</span>${member.is_workspace_owner ? `<span>workspace owner</span>` : ""}${member.disabled ? `<span>account disabled</span>` : ""}<span>Added ${h(fmtTime(member.granted_at))}</span>${member.granted_by ? `<span>by @${h(member.granted_by)}</span>` : ""}</div></div><button class="button danger small" type="button" data-action="revoke-workspace-member" data-member="${h(member.username)}">Remove</button></div>`).join("")
+          : empty("No accounts added yet", "Add an existing account name to give that person access to this workspace.");
+        const truncated = members.length < page.total
+          ? `<div class="faint small section-gap">Showing ${h(members.length)} of ${h(page.total)} members.</div>` : "";
+        return `<div class="grid section-gap"><section class="card"><div class="card-head"><div><h2>Members</h2><span class="faint small">accounts with access to ${h(state.projectId)}</span></div><span class="badge">${h(page.unfilteredTotal)} member${page.unfilteredTotal === 1 ? "" : "s"}</span></div><div class="card-body">
+          <div class="notice"><span>i</span><div><strong>Workspace access is a single durable grant.</strong><br>Adding an account lets that person read and work in this workspace. It carries no separate member role, never creates an account, and never renames or replaces an AI identity.</div></div>
+          <div class="list section-gap">${rows}</div>${truncated}
+          <form data-form="add-workspace-member" class="section-gap"><div class="field"><label for="workspace-member-username">Add account</label><input id="workspace-member-username" name="username" required minlength="2" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._\\-]+" placeholder="account name" autocomplete="off"><span class="help">The account must already exist on this server. Removing the last administrator or owner of a workspace is refused.</span></div><div class="form-actions"><button class="button primary" type="submit">Add account</button></div></form>
+        </div></section></div>`;
+      }
+
       function renderWorkspaces() {
         const response = state.errors.projectPage ? {}
           : state.data.projectPage || { projects: state.projects };
         const projects = responseRows(response, "projects");
+        const noWorkspaces = !projects.length && !state.workspaceSearch;
         return pageHead("Server workspaces", "Workspaces", "Create a logical project or switch which one this panel manages.") +
           (state.errors.projectPage ? errorNotice(state.errors.projectPage) : "") +
+          (noWorkspaces ? noWorkspaceNotice() : "") +
           `<div class="grid main-side">
             <section><div class="grid two">
               <div class="filterbar" style="grid-column:1/-1"><input id="workspace-search" type="search" value="${h(state.workspaceSearch)}" placeholder="Search all workspaces…" aria-label="Search workspaces">${sortControl("workspaces")}</div>${projects.length ? projects.map(project => `<article class="card workspace-card ${project.project_id === state.projectId ? "selected" : ""}">
@@ -2290,7 +2341,7 @@
                 <div class="workspace-stats"><div class="workspace-stat"><strong>${Number(project.events || 0).toLocaleString()}</strong><span>Events</span></div><div class="workspace-stat"><strong>${Number(project.open_tasks || 0).toLocaleString()}</strong><span>Open tasks</span></div></div>
                 <div class="list-meta"><span>Context v${h(project.context_version)}</span><span>Created ${h(fmtTime(project.created_at))}</span></div>
                 ${project.repository_fingerprint ? `<div class="truncate faint mono small" title="${h(project.repository_fingerprint)}" style="margin-top:10px">${h(project.repository_fingerprint)}</div>` : `<div class="faint small" style="margin-top:10px">No Git identity recorded</div>`}
-              </article>`).join("") : `<div class="card" style="grid-column:1/-1">${empty(state.workspaceSearch ? "No matching workspaces" : "No workspaces yet", state.workspaceSearch ? "Change or clear the search." : "Create the first workspace using the form.")}</div>`}
+              </article>`).join("") : `<div class="card" style="grid-column:1/-1">${empty(state.workspaceSearch ? "No matching workspaces" : "No workspaces you can open", state.workspaceSearch ? "Change or clear the search." : "This list shows only the workspaces your account has been granted.")}</div>`}
               <div style="grid-column:1/-1">${pageToolbar("workspaces", response, "projects", "workspaces")}</div>
             </div></section>
             <aside class="card"><div class="card-head"><h2>Create workspace</h2></div><div class="card-body">
@@ -2302,7 +2353,8 @@
               </form>
               <div class="notice section-gap"><span>i</span><div><strong>Prototype boundary</strong><br>The current REST API creates and selects workspaces. Rename, archive, delete, and remote-path attachment are not exposed yet.</div></div>
             </div></aside>
-          </div>`;
+          </div>` +
+          renderWorkspaceMembers();
       }
 
       function renderTasks() {
@@ -2901,6 +2953,8 @@
         invalidateStandaloneRequest("search");
         state.projectId = projectId;
         state.roomConversation = roomConversation;
+        state.workspaceMembers = null;
+        state.workspaceMembersError = "";
         resetProjectPages();
         resetFeed("room");
         resetFeed("activity");
@@ -3024,6 +3078,13 @@
             toast(`Authentication enforcement ${enabled ? "enabled" : "disabled"}`);
           }
           if (action === "select-project") await selectProject(button.dataset.project);
+          if (action === "revoke-workspace-member") {
+            const member = button.dataset.member;
+            if (!confirm(`Remove @${member} from this workspace? Their clients lose access to it immediately.`)) return;
+            await mutate("Account removed from the workspace", () => api(
+              `${pathFor("/members")}/${encodeURIComponent(member)}`,
+              { method: "DELETE", body: {} }));
+          }
           if (action === "view-task-plan") await openTaskPlan(
             button.dataset.task,
             button.dataset.version ? Number(button.dataset.version) : null);
@@ -3397,6 +3458,12 @@
             await loadProjects();
             toast(result.already_existed ? "Workspace already existed; opened it" : "Workspace created");
             await selectProject(result.project_id);
+            form.reset();
+          }
+          if (kind === "add-workspace-member") {
+            await mutate("Account added to the workspace", () => api(
+              pathFor("/members"),
+              { method: "POST", body: { username: String(values.username || "").trim() } }));
             form.reset();
           }
           if (kind === "create-task") {
