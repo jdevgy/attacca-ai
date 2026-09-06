@@ -315,15 +315,14 @@ If the current MCP host cannot hot-reload the new connection, report the exact
 unverified checks and let its native reconnect mechanism run; never infer
 success from configuration files and never make restart the default recovery.
 
-In Claude Code only, finish verification by using CronList to reconcile the
-session's managed inbox pulse. Keep exactly one recurring `* * * * *` job with
-the exact prompt `/attacca:inbox
-[ATTACCA_MANAGED_INBOX_LOOP_V1:WORKSPACE_ID]`; create it with CronCreate when
-missing (durable=true when the host accepts it, otherwise session-only), and
-use CronDelete only for stale or duplicate jobs containing the
-`ATTACCA_MANAGED_INBOX_LOOP_V1:` marker. Preserve every unrelated job. This is
-a host-tool verification step, not another shell command or user decision.
-Skip it when Claude cron is disabled or Attacca background polling is Off.
+In Claude Code only, finish verification by using CronList once to retire the
+managed inbox pulse. Attacca no longer uses a per-minute session job: never
+create one, and use CronDelete only for surviving jobs whose prompt contains
+the `ATTACCA_MANAGED_INBOX_LOOP_V1:` marker. Preserve every unrelated job. New
+mail arrives through the lifecycle hooks at the next turn and the background
+watcher keeps the mirror current between turns. This is a host-tool
+verification step, not another shell command or user decision. Skip it when the
+host's cron tools are unavailable.
 
 ## 6. Offer project migration into Attacca
 

@@ -106,6 +106,12 @@ def outage_summary(at="2026-09-03T09:30:00.000Z", queued_replayed=2,
     return summary
 
 
+LEGACY_CRON_JOB = {
+    "id": "legacy-pulse", "cron": "* * * * *", "recurring": True,
+    "prompt": "/attacca:inbox [%s:shared]" % hook.MANAGED_PULSE_MARKER,
+}
+
+
 def context_of(output, event_name, runtime="codex"):
     if runtime == "kimi":
         return output["message"]
@@ -318,11 +324,15 @@ class TokenBudgetTestCase(unittest.TestCase):
     def test_auth_gate_all_three_events_emit_only_login(self):
         update = {"system_message": "new release",
                   "context": "UPDATE-NOTICE-HIDDEN-WHILE-401 Install now"}
-        loop_payload = {"session_id": "session-401", "session_crons": []}
+        # A surviving legacy cron row: the retirement instruction is due on
+        # SessionStart, so the gate is proven to withhold it rather than
+        # passing vacuously.
+        loop_payload = {"session_id": "session-401",
+                        "session_crons": [LEGACY_CRON_JOB]}
         hidden = (
             "DISPOSITION REQUIRED", "PENDING DISPOSITIONS",
             "ASSIGNMENT-BODY-HIDDEN-WHILE-401", "MAIL-BODY-HIDDEN-WHILE-401",
-            "ATTACCA CLAUDE SESSION LOOP", "CronCreate",
+            "ATTACCA: delete the legacy managed inbox cron", "CronDelete",
             "UPDATE-NOTICE-HIDDEN-WHILE-401", "INBOX CHECK FAILED",
             "BACKGROUND WATCHER", "AUTHORITATIVE VERIFIED LOCAL MIRROR",
             "CONTINUE WORK")
@@ -1123,19 +1133,44 @@ class TokenBudgetTestCase(unittest.TestCase):
         self.assertIn("PULSE-ENTITY-ROW", prompt)
 
     def test_session_loop_instruction_is_session_start_only(self):
-        payload = {"session_id": "loop-session", "session_crons": []}
+        """The retired cron is mentioned once, and only on SessionStart."""
+        payload = {"session_id": "loop-session",
+                   "session_crons": [LEGACY_CRON_JOB]}
         start = self.session_start(
             "claude", payload=payload, mcp=ConnectionRefusedError("offline"))
-        self.assertIn("ATTACCA CLAUDE SESSION LOOP",
-                      json.dumps(start))
+        context = context_of(start, "SessionStart", "claude")
+        self.assertEqual(
+            context.count("ATTACCA: delete the legacy managed inbox cron"), 1)
+        self.assertIn("`legacy-pulse`", context)
+        self.assertNotIn("CronCreate using", context)
+        # Prompt, Stop and a legacy pulse turn stay free of cron text even
+        # while the host keeps reporting the job.
         for event_name in ("UserPromptSubmit", "Stop"):
             output = self.periodic(event_name, "claude", payload=payload)
-            self.assertNotIn("ATTACCA CLAUDE SESSION LOOP",
+            self.assertNotIn("ATTACCA: delete the legacy managed inbox cron",
                              json.dumps(output or {}))
+        pulse_payload = dict(self.pulse_payload(),
+                             session_crons=[LEGACY_CRON_JOB])
         pulse = self.periodic(
-            "UserPromptSubmit", "claude", payload=self.pulse_payload())
-        self.assertNotIn("ATTACCA CLAUDE SESSION LOOP",
+            "UserPromptSubmit", "claude", payload=pulse_payload)
+        self.assertNotIn("ATTACCA: delete the legacy managed inbox cron",
                          json.dumps(pulse or {}))
+
+    def test_session_start_without_a_legacy_cron_says_nothing_about_crons(
+            self):
+        for payload in ({"session_id": "quiet-session"},
+                        {"session_id": "quiet-session", "session_crons": []},
+                        {"session_id": "quiet-session",
+                         "session_crons": [{"id": "other", "cron": "0 9 * * *",
+                                            "prompt": "daily report"}]}):
+            with self.subTest(payload=payload):
+                start = self.session_start(
+                    "claude", payload=payload,
+                    mcp=ConnectionRefusedError("offline"))
+                serialized = json.dumps(start)
+                for marker in ("ATTACCA: delete the legacy", "CronDelete",
+                               "CronCreate", "ESTABLISH NOW"):
+                    self.assertNotIn(marker, serialized)
 
     # ------------------------------------------------- A11 · rules banner
     def test_rules_banner_is_compact_until_change_or_tenth_turn(self):

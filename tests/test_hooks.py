@@ -320,48 +320,30 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                     hook_module._runtime_actor(config, "shared")["runtime"],
                     "claude")
 
-    def test_claude_session_start_requires_one_native_minute_inbox_loop(self):
+    def test_claude_session_start_is_silent_about_crons_without_a_job(self):
+        """The retired pulse is never mentioned unless one still exists."""
+        status = {"project_id": "shared"}
+        unrelated = {"id": "other", "cron": "0 9 * * *",
+                     "prompt": "daily report", "recurring": True}
         with mock.patch.dict(os.environ, {
                 "CLAUDE_PLUGIN_ROOT": str(ROOT),
                 "ATTACCA_RUNTIME": "claude",
         }, clear=True):
-            notice = hook_module._claude_session_loop_notice(
-                {"project_id": "shared"}, 60)
-        self.assertEqual(
-            notice["system_message"],
-            "Attacca Claude one-minute inbox loop required")
-        context = notice["context"]
-        self.assertIn("CronList", context)
-        self.assertIn("CronCreate", context)
-        self.assertIn("CronDelete", context)
-        self.assertIn("`* * * * *`", context)
-        self.assertIn(
-            "`/attacca:inbox [ATTACCA_MANAGED_INBOX_LOOP_V1:shared]`",
-            context)
-        self.assertIn("exactly one", context)
-        self.assertIn("every startup/resume/clear/compact", context)
+            for payload in (None, {}, {"session_crons": None},
+                            {"session_crons": []},
+                            {"session_crons": [unrelated]},
+                            {"session_crons": "not-a-list"}):
+                with self.subTest(payload=payload):
+                    self.assertIsNone(
+                        hook_module._claude_legacy_cron_retirement_notice(
+                            status, payload=payload))
+            self.assertEqual(
+                hook_module._claude_legacy_cron_jobs(
+                    {"session_crons": [unrelated]}), [])
 
-    def test_claude_minute_loop_notice_is_runtime_scoped_and_respects_disable(self):
-        for runtime in ("codex", "kimi"):
-            with self.subTest(runtime=runtime), mock.patch.dict(
-                    os.environ, {"ATTACCA_RUNTIME": runtime}, clear=True):
-                self.assertIsNone(
-                    hook_module._claude_session_loop_notice(
-                        {"project_id": "shared"}, 60))
-        with mock.patch.dict(os.environ, {
-                "ATTACCA_RUNTIME": "claude",
-                "CLAUDE_CODE_DISABLE_CRON": "1",
-        }, clear=True):
-            notice = hook_module._claude_session_loop_notice(
-                {"project_id": "shared"}, 60)
-        self.assertIn("DISABLED", notice["context"])
-        self.assertIn("machine-global Attacca watcher", notice["context"])
-        self.assertNotIn("CronCreate", notice["context"])
-
-    def test_claude_loop_accepts_equivalent_schedule_and_preserves_unrelated(self):
-        status = {"project_id": "shared"}
-        exact = {
-            "id": "owned", "schedule": "*/1 * * * *",
+    def test_claude_session_start_retires_one_legacy_managed_cron_job(self):
+        legacy = {
+            "id": "legacy-pulse", "cron": "* * * * *",
             "prompt": "/attacca:inbox "
                       "[ATTACCA_MANAGED_INBOX_LOOP_V1:shared]",
             "recurring": True,
@@ -370,54 +352,68 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             "id": "other", "cron": "0 9 * * *", "prompt": "daily report",
             "recurring": True,
         }
-        payload = {"session_crons": [unrelated, exact]}
+        with mock.patch.dict(os.environ, {
+                "CLAUDE_PLUGIN_ROOT": str(ROOT),
+                "ATTACCA_RUNTIME": "claude",
+        }, clear=True):
+            jobs = hook_module._claude_legacy_cron_jobs(
+                {"session_crons": [unrelated, legacy]})
+            notice = hook_module._claude_legacy_cron_retirement_notice(
+                {"project_id": "shared"},
+                payload={"session_crons": [unrelated, legacy]})
+        self.assertEqual(jobs, [legacy])
+        self.assertEqual(
+            notice["system_message"],
+            "Attacca legacy inbox cron job must be deleted")
+        context = notice["context"]
+        # Exactly one retirement line, naming only the managed job.
+        self.assertEqual(
+            context.count("ATTACCA: delete the legacy managed inbox cron"), 1)
+        self.assertEqual(context.count("\n"), 0)
+        self.assertIn("`legacy-pulse`", context)
+        self.assertNotIn("`other`", context)
+        self.assertIn("CronDelete", context)
+        self.assertIn("ATTACCA_MANAGED_INBOX_LOOP_V1:", context)
+        self.assertIn("never create a replacement with CronCreate", context)
+        self.assertIn("Leave every unrelated job untouched", context)
+        self.assertIn("no longer uses a per-minute session job", context)
+        self.assertIn("lifecycle hooks", context)
+        self.assertIn("background watcher", context)
+        # The retired instruction itself is gone.
+        self.assertNotIn("ESTABLISH NOW", context)
+        self.assertNotIn("CronList", context)
+
+    def test_claude_cron_retirement_is_runtime_scoped_and_id_tolerant(self):
+        legacy = {
+            "id": "legacy-pulse", "cron": "* * * * *",
+            "prompt": "/attacca:inbox "
+                      "[ATTACCA_MANAGED_INBOX_LOOP_V1:shared]",
+            "recurring": True,
+        }
+        unrelated = {
+            "id": "other", "cron": "0 9 * * *", "prompt": "daily report",
+            "recurring": True,
+        }
+        for runtime in ("codex", "kimi"):
+            with self.subTest(runtime=runtime), mock.patch.dict(
+                    os.environ, {"ATTACCA_RUNTIME": runtime}, clear=True):
+                self.assertIsNone(
+                    hook_module._claude_legacy_cron_retirement_notice(
+                        {"project_id": "shared"},
+                        payload={"session_crons": [legacy]}))
+        # A foreign-workspace or id-less leftover is still named for deletion.
+        foreign = {"schedule": "*/1 * * * *",
+                   "prompt": "/attacca:inbox "
+                             "[ATTACCA_MANAGED_INBOX_LOOP_V1:other-project]"}
         with mock.patch.dict(
                 os.environ, {"ATTACCA_RUNTIME": "claude"}, clear=True):
-            state = hook_module._claude_loop_status(payload, "shared")
-            notice = hook_module._claude_session_loop_notice(
-                status, 60, payload=payload)
-        self.assertTrue(state["healthy"])
-        self.assertEqual(state["managed"], [exact])
-        self.assertIsNone(notice)
-
-    def test_claude_stop_repairs_missing_loop_once_per_session(self):
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
-                os.environ, {"ATTACCA_RUNTIME": "claude"}, clear=True):
-            status = {
-                "project_id": "shared",
-                "state_path": str(Path(tmp) / "hook-state.json"),
-            }
-            payload = {"session_id": "session-a", "session_crons": [{
-                "id": "other", "cron": "0 9 * * *",
-                "prompt": "unrelated job",
-            }]}
-            first = hook_module._claude_stop_loop_notice(
-                status, payload, 60)
-            repeated = hook_module._claude_stop_loop_notice(
-                status, payload, 60)
-            new_session = hook_module._claude_stop_loop_notice(
-                status, {**payload, "session_id": "session-b"}, 60)
-        self.assertIn("CronCreate", first["context"])
-        self.assertIsNone(repeated)
-        self.assertIn("CronCreate", new_session["context"])
-        self.assertIn("never unrelated jobs", first["context"])
-
-    def test_claude_stop_loop_missing_payload_and_disabled_polling_fail_soft(self):
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
-                os.environ, {"ATTACCA_RUNTIME": "claude"}, clear=True):
-            status = {
-                "project_id": "shared",
-                "state_path": str(Path(tmp) / "hook-state.json"),
-            }
-            self.assertIsNone(hook_module._claude_stop_loop_notice(
-                status, {"session_id": "session-a"}, 60))
-            self.assertIsNone(hook_module._claude_stop_loop_notice(
-                status, {"session_id": "session-a", "session_crons": []},
-                0))
-            disabled = hook_module._claude_session_loop_notice(
-                status, 0, payload={"session_crons": []})
-        self.assertIn("background polling is Off", disabled["context"])
-        self.assertNotIn("CronCreate", disabled["context"])
+            notice = hook_module._claude_legacy_cron_retirement_notice(
+                {"project_id": "shared"},
+                payload={"session_crons": [unrelated, foreign, legacy]})
+        context = notice["context"]
+        self.assertIn("[ATTACCA_MANAGED_INBOX_LOOP_V1:other-project]", context)
+        self.assertIn("`legacy-pulse`", context)
+        self.assertNotIn("daily report", context)
 
     def test_kimi_native_manifest_runtime_and_hook_output_contract(self):
         manifest = json.loads((ROOT / "kimi.plugin.json").read_text())
@@ -603,6 +599,16 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                 claude_result = self._hook(
                     nested, root / "claude-plugin-data", home, url=url,
                     runtime="claude")
+                # Same real hook process, but the host now reports one
+                # surviving managed job on stdin.
+                legacy_cron_result = self._hook(
+                    nested, root / "claude-legacy-data", home, url=url,
+                    runtime="claude", session_crons=[{
+                        "id": "legacy-pulse", "cron": "* * * * *",
+                        "recurring": True,
+                        "prompt": "/attacca:inbox "
+                                  "[ATTACCA_MANAGED_INBOX_LOOP_V1:shared]",
+                    }])
             finally:
                 server.shutdown()
                 server.server_close()
@@ -625,7 +631,9 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             self.assertIn("update_identity_handoff", context)
             self.assertIn("expected_handoff_version", context)
             self.assertIn("please check this", context)
-            self.assertNotIn("ATTACCA CLAUDE SESSION LOOP", context)
+            self.assertNotIn(
+                "ATTACCA: delete the legacy managed inbox cron", context)
+            self.assertNotIn("CronDelete", context)
             brief = json.loads(context.rsplit("\n\n", 1)[1])
             self.assertEqual(brief["actor"], "shared.worker.codex")
             self.assertEqual(brief["handoff_scope"], "project")
@@ -672,10 +680,27 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                         identity["handoff"]["objective"], objective)
             finally:
                 conn.close()
+            # The managed per-minute session cron is retired: a real Claude
+            # SessionStart whose host reports no managed job says nothing
+            # about crons at all.
+            self.assertNotIn(
+                "ATTACCA: delete the legacy managed inbox cron",
+                claude_context)
+            for retired in ("ESTABLISH NOW", "CronList", "CronCreate",
+                            "CronDelete", "`/loop 1m /attacca:inbox`"):
+                self.assertNotIn(retired, claude_context)
+            # A surviving legacy job reaches the hook through stdin and gets
+            # exactly one retirement line naming it.
+            legacy_context = json.loads(
+                legacy_cron_result.stdout)[
+                    "hookSpecificOutput"]["additionalContext"]
             self.assertEqual(
-                claude_context.count("ATTACCA CLAUDE SESSION LOOP"), 1)
-            self.assertIn("`/loop 1m /attacca:inbox`", claude_context)
-            self.assertIn("CronList", claude_context)
+                legacy_context.count(
+                    "ATTACCA: delete the legacy managed inbox cron"), 1)
+            self.assertIn("`legacy-pulse`", legacy_context)
+            self.assertIn("CronDelete", legacy_context)
+            self.assertNotIn("ESTABLISH NOW", legacy_context)
+            self.assertNotIn("CronCreate using", legacy_context)
 
     def test_caller_without_an_identity_handoff_still_reads_the_shared_one(
             self):

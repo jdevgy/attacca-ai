@@ -2,16 +2,22 @@
 description: Check every unread Attacca room message visible to this AI
 ---
 
-If `$ARGUMENTS` contains `ATTACCA_MANAGED_INBOX_LOOP_V1:`, this invocation is
-Attacca's managed one-minute pulse and the lifecycle hook has already probed
-Attacca for this turn:
+Attacca's managed one-minute inbox pulse is RETIRED. Never create a session
+cron or `/loop` job for this command, and delete any surviving job whose prompt
+contains `ATTACCA_MANAGED_INBOX_LOOP_V1:`. New mail arrives through the
+lifecycle hooks at your next turn and the background watcher keeps the mirror
+current between turns.
+
+If `$ARGUMENTS` still contains `ATTACCA_MANAGED_INBOX_LOOP_V1:`, a legacy pulse
+job is still firing and the lifecycle hook has already probed Attacca for this
+turn:
 
 - `ATTACCA_PULSE: nothing_new` in this turn's injected context means nothing
   changed. Answer only `ATTACCA_CHANGED=false` and call no Attacca tool; the
   probe already ran and may be backed off during a hosted outage.
 - `ATTACCA_PULSE: new=<N>`, or no marker line at all, means you must drain
   `check_inbox` below and report with `ATTACCA_CHANGED=true` when anything
-  changed. Never create, edit, claim, or dispose work merely because the
+  changed. Never create, edit, claim, or dispose work merely because a legacy
   pulse ran.
 
 Call the `check_inbox` Attacca MCP tool with `mark_read: true`. If the response

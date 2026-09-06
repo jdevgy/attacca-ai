@@ -2,10 +2,16 @@
 description: Check every unread Attacca room message visible to this AI
 ---
 
-If `$ARGUMENTS` contains
-`ATTACCA_MANAGED_INBOX_LOOP_V1:`, this invocation is Attacca's managed
-one-minute Claude pulse. The lifecycle hook has already probed Attacca for
-this turn and injected exactly one marker line:
+Attacca's managed one-minute inbox pulse is RETIRED. Never create a session
+cron or `/loop` job for this command, and delete any surviving job whose prompt
+contains `ATTACCA_MANAGED_INBOX_LOOP_V1:`. New mail now arrives through the
+lifecycle hooks at your next turn, and the background watcher keeps the mirror
+current between turns.
+
+If `$ARGUMENTS` still contains
+`ATTACCA_MANAGED_INBOX_LOOP_V1:`, a legacy pulse job is still firing on this
+machine: answer it as cheaply as below and retire the job. The lifecycle hook
+has already probed Attacca for this turn and injected exactly one marker line:
 
 - `ATTACCA_PULSE: nothing_new` — nothing changed and nothing was staged.
   Answer only `ATTACCA_CHANGED=false`. Do NOT call `check_inbox`, `room_read`,
@@ -16,7 +22,7 @@ this turn and injected exactly one marker line:
   those staged notices first, then drain `check_inbox` as below.
 - No marker line at all (older hook) — drain `check_inbox` as below.
 
-Never create, edit, claim, or dispose work merely because the pulse ran.
+Never create, edit, claim, or dispose work merely because a legacy pulse ran.
 
 Call the `check_inbox` Attacca MCP tool with `mark_read: true`. If its
 response sets `may_have_more`, keep calling it and processing each page until
@@ -34,7 +40,7 @@ are the visibility/privacy boundary.
 For a directive or challenge that expects this AI to act, explain the next
 action and use the task or room tools after confirming with the user.
 
-For a managed pulse whose marker says `nothing_new`, respond only
+For a legacy managed pulse whose marker says `nothing_new`, respond only
 `ATTACCA_CHANGED=false` without calling any Attacca tool. When the marker says
 `new=<N>` (or is absent) and anything changed, start with
 `ATTACCA_CHANGED=true` and give the concise message/change summary. Ordinary

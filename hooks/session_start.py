@@ -7165,7 +7165,6 @@ The authoritative startup snapshot has already been loaded:
 
 
 CLAUDE_INBOX_LOOP_MARKER_PREFIX = "ATTACCA_MANAGED_INBOX_LOOP_V1:"
-CLAUDE_INBOX_LOOP_CRONS = {"* * * * *", "*/1 * * * *"}
 
 
 def _is_managed_pulse(payload):
@@ -7258,142 +7257,65 @@ def _consume_rebrief_pending(status, config, payload, runtime=None):
     return True
 
 
-def _claude_inbox_loop_marker(project_id):
-    return "%s%s" % (CLAUDE_INBOX_LOOP_MARKER_PREFIX, project_id)
+def _claude_legacy_cron_jobs(payload):
+    """Legacy Attacca-managed session cron rows the host still reports.
 
-
-def _claude_inbox_loop_prompt(project_id):
-    return "/attacca:inbox [%s]" % _claude_inbox_loop_marker(project_id)
-
-
-def _claude_loop_status(payload, project_id):
-    """Classify Claude-owned cron rows without touching unrelated jobs."""
+    The managed per-minute inbox job is retired (owner directive
+    2026-09-03): every firing was a visible user turn plus an assistant
+    reply, however cheap the pulse itself became.  Attacca no longer asks
+    any client to create that job, so the only remaining question is
+    whether one still exists.  A row counts as legacy when its prompt
+    carries the managed marker at all — any schedule, any workspace — so a
+    mangled or foreign-project leftover is still named for deletion, and
+    unrelated jobs are never touched.
+    """
     rows = (payload or {}).get("session_crons")
     if not isinstance(rows, list):
-        return None
-    marker = _claude_inbox_loop_marker(project_id)
-    prompt = _claude_inbox_loop_prompt(project_id)
-    managed = []
-    exact = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        row_prompt = str(row.get("prompt") or "")
-        if CLAUDE_INBOX_LOOP_MARKER_PREFIX not in row_prompt:
-            continue
-        managed.append(row)
-        schedule = str(row.get("cron") or row.get("schedule") or "").strip()
-        recurring = row.get("recurring") is not False
-        if marker in row_prompt and row_prompt.strip() == prompt \
-                and schedule in CLAUDE_INBOX_LOOP_CRONS and recurring:
-            exact.append(row)
-    return {"rows": rows, "managed": managed, "exact": exact,
-            "healthy": len(managed) == 1 and len(exact) == 1}
+        return []
+    return [row for row in rows
+            if isinstance(row, dict) and
+            MANAGED_PULSE_MARKER in str(row.get("prompt") or "")]
 
 
-def _claude_loop_disabled():
-    return str(os.environ.get("CLAUDE_CODE_DISABLE_CRON") or "").strip() \
-        .lower() in ("1", "true", "yes", "on")
+def _claude_cron_job_label(row):
+    """Name one cron row for deletion, falling back to its prompt."""
+    for field in ("id", "job_id", "cron_id", "name"):
+        value = str((row or {}).get(field) or "").strip()
+        if value:
+            return value
+    return _trim(str((row or {}).get("prompt") or "").strip(), 80) or "unknown"
 
 
-def _claude_session_loop_notice(status, interval, payload=None):
-    """Ask real Claude sessions to maintain one native one-minute inbox job.
+def _claude_legacy_cron_retirement_notice(status, payload=None):
+    """Ask a real Claude session to delete the retired inbox cron job.
 
-    Claude's ``/loop`` jobs live inside the current coding session, unlike
-    Attacca's machine-global watcher.  A lifecycle hook cannot call Claude's
-    host-owned Cron tools itself, so every fresh/resumed SessionStart injects
-    an idempotent agent instruction: inspect existing jobs, create the missing
-    one, and remove only duplicate Attacca-managed jobs.  Codex deliberately
-    also exports ``CLAUDE_PLUGIN_ROOT`` for hook compatibility; runtime
-    detection keeps this contract out of Codex and Kimi sessions.
+    A lifecycle hook cannot call Claude's host-owned Cron tools itself, so
+    the retirement is an agent instruction — but it is emitted ONLY when the
+    host actually reports a surviving managed job in ``session_crons``.  With
+    no such row (or no crons view at all) the hook says nothing about crons.
+    Codex deliberately also exports ``CLAUDE_PLUGIN_ROOT`` for hook
+    compatibility, so runtime detection keeps this contract out of Codex and
+    Kimi sessions.  The pulse code paths stay intact: a legacy client that
+    still fires the job keeps receiving the cheap marker-only answer until
+    the job is gone.
     """
     if _runtime_name() != "claude":
         return None
-    project_id = status["project_id"]
-    loop_status = _claude_loop_status(payload, project_id)
-    disabled = _claude_loop_disabled() or interval == 0
-    if disabled:
-        reason = "CLAUDE_CODE_DISABLE_CRON is set" \
-            if _claude_loop_disabled() else "Attacca background polling is Off"
-        return {
-            "system_message": "Attacca Claude one-minute loop disabled by host",
-            "context": (
-                "ATTACCA CLAUDE SESSION LOOP DISABLED: %s. Do not change that "
-                "user choice. If CronList remains available, use CronDelete "
-                "to remove only jobs whose prompt "
-                "contains `%s`; leave every unrelated job untouched. The "
-                "machine-global Attacca watcher remains the independent "
-                "continuity "
-                "path when polling is enabled; an inactive Claude session "
-                "cannot be forced to generate a turn." %
-                (reason, CLAUDE_INBOX_LOOP_MARKER_PREFIX)),
-        }
-    if loop_status and loop_status["healthy"]:
+    legacy = _claude_legacy_cron_jobs(payload)
+    if not legacy:
         return None
-    prompt = _claude_inbox_loop_prompt(project_id)
+    names = ", ".join("`%s`" % _claude_cron_job_label(row) for row in legacy)
     return {
-        "system_message": "Attacca Claude one-minute inbox loop required",
+        "system_message": "Attacca legacy inbox cron job must be deleted",
         "context": (
-            "ATTACCA CLAUDE SESSION LOOP — ESTABLISH NOW: Before continuing "
-            "with the user's work, use Claude's CronList tool and ensure "
-            "exactly one recurring session job exists with cron expression "
-            "`* * * * *` whose exact prompt is `%s`. Delete only stale or "
-            "duplicate jobs containing `%s` with CronDelete, never unrelated "
-            "jobs. If the "
-            "current job is absent, create it with CronCreate using "
-            "recurring=true and durable=true when the host accepts durable "
-            "jobs; otherwise create the session-only recurring job. Do not "
-            "ask the user to run the command. This is the managed equivalent "
-            "of `/loop 1m /attacca:inbox`. Claude "
-            "jobs are session-scoped, so this check is intentionally repeated "
-            "on every startup/resume/clear/compact. If those Cron tools are "
-            "unavailable, state that once and rely on the already-running "
-            "machine-global Attacca watcher; never claim the Claude loop was "
-            "created without tool confirmation." %
-            (prompt, CLAUDE_INBOX_LOOP_MARKER_PREFIX)),
+            "ATTACCA: delete the legacy managed inbox cron job(s) %s with "
+            "CronDelete; they are the jobs whose prompt contains `%s`. Leave "
+            "every unrelated job untouched and never create a replacement "
+            "with CronCreate. Attacca no longer uses a per-minute session "
+            "job. New mail arrives through the lifecycle hooks at your next "
+            "turn and the background watcher keeps the mirror current." %
+            (names, CLAUDE_INBOX_LOOP_MARKER_PREFIX)),
     }
-
-
-def _claude_stop_loop_notice(status, payload, interval):
-    """Block one Stop per session when Claude reports a missing managed job."""
-    if _runtime_name() != "claude" or _claude_loop_disabled() or interval == 0:
-        return None
-    loop_status = _claude_loop_status(payload, status["project_id"])
-    session_id = str((payload or {}).get("session_id") or "").strip()
-    if loop_status is None or not session_id:
-        return None
-    key = "%s:%s" % (status["project_id"], session_id)
-    state_path = Path(status["state_path"])
-    if loop_status["healthy"]:
-        def clear_attempt(state):
-            attempts = state.get("claude_loop_attempts") or {}
-            attempts.pop(key, None)
-            if attempts:
-                state["claude_loop_attempts"] = attempts
-            else:
-                state.pop("claude_loop_attempts", None)
-        _mutate_state(state_path, clear_attempt)
-        return None
-    already_attempted = bool(
-        (_read_state(state_path).get("claude_loop_attempts") or {}).get(key))
-    if already_attempted:
-        return None
-
-    def record_attempt(state):
-        attempts = state.setdefault("claude_loop_attempts", {})
-        attempts[key] = {
-            "attempted_at": datetime.now(timezone.utc).isoformat(),
-            "project_id": status["project_id"],
-        }
-        if len(attempts) > 64:
-            for stale_key in sorted(
-                    attempts,
-                    key=lambda item: str(
-                        (attempts.get(item) or {}).get("attempted_at") or ""))[
-                            :-64]:
-                attempts.pop(stale_key, None)
-    _mutate_state(state_path, record_attempt)
-    return _claude_session_loop_notice(status, interval, payload={})
 
 
 def _active_output(status, offline_adapter=None, offline_factory=None,
@@ -7440,10 +7362,12 @@ def _active_output(status, offline_adapter=None, offline_factory=None,
                         "The immediate SessionStart sync still runs; repair "
                         "the watcher so idle checks resume." % _trim(err, 240)),
         }
-    # A7/ruling 7: the ESTABLISH NOW instruction is a SessionStart-only
-    # one-shot. It is never emitted on a prompt rebrief or at Stop.
-    claude_loop_notice = _claude_session_loop_notice(
-        status, interval, payload=hook_payload) \
+    # Owner directive 2026-09-03: the managed per-minute session cron is
+    # retired. SessionStart may only ask a Claude session to DELETE a legacy
+    # job the host still reports; nothing about crons is said otherwise, and
+    # never on a prompt rebrief, Stop, or pulse boundary.
+    legacy_cron_notice = _claude_legacy_cron_retirement_notice(
+        status, payload=hook_payload) \
         if event_name == "SessionStart" else None
     # Peek only: the durable FIFO is consumed at delivery, so a boundary
     # that ends in the authentication gate never drops queued deltas.
@@ -7544,7 +7468,7 @@ handoff before further writes.
         output = _append_notice(
             output, update_notice)
         output = _append_notice(output, watcher_notice)
-        output = _append_notice(output, claude_loop_notice)
+        output = _append_notice(output, legacy_cron_notice)
         output = _append_notice(output, terminal_notice)
         output = _append_notice(output, inbox_check_notice)
         output = _append_notices(output, event_name, offline_notices)
@@ -7562,7 +7486,7 @@ handoff before further writes.
                               event_name=event_name)
         return _append_notices(
             output, event_name,
-            (update_notice, watcher_notice, claude_loop_notice,
+            (update_notice, watcher_notice, legacy_cron_notice,
              terminal_notice,
              _watcher_consume_pending(
                 status, config, pending_preview,
@@ -7599,7 +7523,7 @@ handoff before further writes.
             (_watcher_consume_pending(
                 status, config, pending_preview,
                 event_name=event_name),
-             update_notice, watcher_notice, claude_loop_notice,
+             update_notice, watcher_notice, legacy_cron_notice,
              terminal_notice, inbox_check_notice) + offline_notices +
             (attention_notice,))
 
@@ -7889,9 +7813,9 @@ def _periodic_output(status, event_name, offline_adapter=None,
     # authentication rejection can withhold it.
     pending_preview = _watcher_pending_notice(
         status, config, consume=False, event_name=event_name)
-    # Ruling 7: the Claude session-loop instruction belongs to SessionStart
-    # alone. Re-asking for it at every Stop was pure repeated context.
-    claude_loop_notice = None
+    # The legacy-cron retirement instruction belongs to SessionStart alone.
+    # Prompt, Stop and pulse boundaries never carry cron text.
+    legacy_cron_notice = None
     inbox_check_notice = None
     probe_blocked = is_pulse and _pulse_probe_blocked(offline_entry, checked_at)
     if not polling_disabled and not probe_blocked:
@@ -7966,7 +7890,7 @@ def _periodic_output(status, event_name, offline_adapter=None,
     def deliver(output, delta_notices=(), include_attention=True):
         return _deliver_periodic_notices(
             status, config, event_name, output, pending_preview,
-            (claude_loop_notice,) + tuple(delta_notices), status_notices,
+            (legacy_cron_notice,) + tuple(delta_notices), status_notices,
             include_attention=include_attention)
 
     # Rules are pinned SILENTLY at every UserPromptSubmit (additionalContext,

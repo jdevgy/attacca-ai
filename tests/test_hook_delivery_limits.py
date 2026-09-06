@@ -888,7 +888,7 @@ class WatcherNoLossDeliveryTestCase(unittest.TestCase):
             "DISPOSITION REQUIRED", "PENDING DISPOSITIONS",
             "ASSIGNMENT-BODY-HIDDEN-WHILE-401", "MAIL-BODY-HIDDEN-WHILE-401",
             "QUEUED-DELTA-MUST-SURVIVE-THE-GATE", "INBOX CHECK FAILED",
-            "UPDATE-NOTICE-HIDDEN-WHILE-401", "SESSION LOOP",
+            "UPDATE-NOTICE-HIDDEN-WHILE-401", "CronDelete",
             "BACKGROUND WATCHER")
         prompt = self._periodic_with_mocks("UserPromptSubmit")
         context = prompt["hookSpecificOutput"]["additionalContext"]
