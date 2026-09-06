@@ -374,6 +374,21 @@ class SetupClientAuthorizationTestCase(unittest.TestCase):
         parsed = parser.parse_args(["setup", "--paste-token"])
         self.assertIs(parsed.paste_token, True)
 
+    def test_serve_parser_exposes_the_self_registration_flag(self):
+        parser = c.build_parser()
+        serve_parser = parser._subparsers._group_actions[0].choices["serve"]
+        flag = next(action for action in serve_parser._actions
+                    if action.dest == "allow_self_registration")
+        # A store_true switch: the flag never carries a value, and omitting it
+        # leaves the persisted setting alone rather than closing sign-up.
+        self.assertEqual(flag.nargs, 0)
+        self.assertIn("--allow-self-registration", flag.option_strings)
+        self.assertIs(
+            parser.parse_args(["serve", "--allow-self-registration"])
+            .allow_self_registration, True)
+        self.assertIs(
+            parser.parse_args(["serve"]).allow_self_registration, False)
+
 
 if __name__ == "__main__":
     unittest.main()

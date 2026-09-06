@@ -2301,6 +2301,30 @@ def _auth_setting(conn, key, default=None):
         return default
 
 
+SELF_REGISTRATION_MODES = ("off", "open")
+
+
+def server_self_registration_mode(conn):
+    """Whether people may create their own Attacca account on the sign-in page.
+
+    A local-server deployment usually wants a small team to onboard itself
+    without an invitation for every person, but an upgrade must never silently
+    open account creation on a server that is already running privately, so the
+    default is ``"off"``.  The stored ``server_settings`` row is the single
+    source of truth: the runtime settings payload, the public authentication
+    status and the register route all read it through this accessor, so a
+    direct database edit or a second server process can never leave one of
+    them answering from a stale cached copy.
+    """
+    value = _auth_setting(conn, "self_registration", None)
+    if isinstance(value, bool):
+        # Tolerate a hand-written boolean row rather than failing closed on a
+        # value whose intent is unambiguous.
+        value = "open" if value else "off"
+    value = str(value or "off").strip().lower()
+    return value if value in SELF_REGISTRATION_MODES else "off"
+
+
 def auth_source_sha256():
     """Fingerprint the exact security-critical packaged artifact.
 
@@ -15277,13 +15301,20 @@ class AttaccaServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(self, addr, db_path, default_project=None, verbose=False,
-                 auth=False, auth_mode="auto"):
+                 auth=False, auth_mode="auto", allow_self_registration=False):
         auth_mode = str(auth_mode or "auto").strip().lower()
         if auth_mode not in AUTH_MODES:
             raise AttaccaError(
                 "auth_mode must be one of: %s" % ", ".join(AUTH_MODES))
         settings_conn = connect(db_path)
         try:
+            if allow_self_registration:
+                # One-way switch: the flag opens self-registration and persists
+                # it, so a later restart without the flag keeps the owner's
+                # choice instead of silently closing sign-up again. Closing it
+                # is an explicit Settings change.
+                server_settings_store(
+                    settings_conn, {"self_registration": "open"})
             persisted = server_settings_load(settings_conn)
         finally:
             settings_conn.close()
@@ -16072,7 +16103,7 @@ class AttaccaHandler(BaseHTTPRequestHandler):
                                "/install.sh", "/plugin.zip",
                                "/plugin/marketplace.json",
                                "/v1/auth/status", "/v1/auth/bootstrap",
-                               "/v1/auth/login",
+                               "/v1/auth/login", "/v1/auth/register",
                                "/v1/auth/invitations/accept",
                                "/v1/auth/client-authorizations",
                                "/v1/auth/client-authorizations/poll")
@@ -16760,6 +16791,10 @@ def _auth_status_payload(h):
         # before the panel reads any workspace data.
         "bootstrap_required": not bootstrapped,
         "bootstrap_available": not bootstrapped,
+        # The sign-in page shows its "Create account" link only when this is
+        # "open"; the register route re-checks the same stored setting, so the
+        # panel never decides authorization on its own.
+        "self_registration": server_self_registration_mode(h._conn()),
         "authenticated": bool(principal),
         "user": None,
         "principal": None,
@@ -16877,6 +16912,56 @@ def _r_auth_login(h, m, q):
     if not row:
         raise AuthenticationError("invalid username or password")
     _reply_auth_session(h, 200, auth_create_session(h._conn(), row))
+
+
+def _r_auth_register(h, m, q):
+    """Create your own non-admin account when self-registration is open.
+
+    This is the D-17 browser-account path for a local-server deployment: the
+    credential belongs to the human who created it and never to an AI actor,
+    and the account is deliberately created with no workspace membership, so
+    opening sign-up never exposes an existing workspace.  An administrator
+    grants access afterwards with the ordinary membership path, and the new
+    account can create its own workspace in the meantime.
+
+    Attacca applies no rate limit to this route.  A publicly reachable
+    deployment must place real network controls (reverse proxy, firewall,
+    TLS) in front of it; the prototype server provides none.
+    """
+    conn = h._conn()
+    # Order matters: a server with no accounts at all satisfies both gates, and
+    # the honest answer there is that the first account must be the bootstrap
+    # administrator rather than a self-registered member.
+    if not auth_is_enabled(conn):
+        raise AuthorizationError(
+            "bootstrap_required: this server has no accounts yet; create the"
+            " first administrator with POST /v1/auth/bootstrap before anyone"
+            " can register")
+    if server_self_registration_mode(conn) != "open":
+        raise AuthorizationError(
+            "self_registration_disabled: account creation is closed on this"
+            " server; ask an administrator to enable self_registration in"
+            " Attacca Settings or to send you an invitation")
+    body = h._body_json()
+    # Normalize first so a taken name is reported as a conflict rather than as
+    # a validation failure, and so the caller cannot probe with a spelling the
+    # unique index would still reject.
+    username = _clean_username(body.get("username"))
+    if conn.execute("SELECT 1 FROM auth_users WHERE username=?",
+                    (username,)).fetchone():
+        h._reply_json(409, {
+            "error": "Attacca user '%s' already exists; sign in instead"
+                     % username}, {"Cache-Control": "no-store"})
+        return
+    created = auth_create_user(
+        conn, username, body.get("password"),
+        display_name=body.get("display_name"), is_admin=False)
+    row = conn.execute(
+        "SELECT * FROM auth_users WHERE user_id=?",
+        (created["user"]["user_id"],)).fetchone()
+    # Sign the new account in exactly like /v1/auth/login: same session cookie,
+    # same CSRF token, same status payload shape.
+    _reply_auth_session(h, 200, auth_create_session(conn, row))
 
 
 def _r_auth_logout(h, m, q):
@@ -17413,6 +17498,7 @@ def _settings_payload(h):
         "update_interval_seconds": h.server.update_interval_seconds,
         "authentication": h._auth_enabled(),
         "auth_bootstrapped": auth_is_enabled(h._conn()),
+        "self_registration": server_self_registration_mode(h._conn()),
         "installer": "curl -fsSL %s/install.sh | sh" % base,
         "client_authorization": {
             "api_keys_endpoint": "/v1/auth/client-keys",
@@ -17433,7 +17519,8 @@ def _r_settings_put(h, m, q):
     if h._auth_enabled():
         _require_owner_session(h)
     body = h._body_json()
-    allowed = {"default_project", "verbose", "update_interval_seconds"}
+    allowed = {"default_project", "verbose", "update_interval_seconds",
+               "self_registration"}
     unknown = set(body) - allowed
     if unknown:
         raise AttaccaError("unknown runtime setting(s): %s" %
@@ -17460,6 +17547,24 @@ def _r_settings_put(h, m, q):
                 "update_interval_seconds must be 0 (off) or 60..3600")
         h.server.update_interval_seconds = interval
         persisted["update_interval_seconds"] = interval
+    if "self_registration" in body:
+        if auth_is_enabled(h._conn()):
+            # Opening sign-up is account governance, not a runtime preference.
+            # Once the server has accounts an administrator must own that
+            # choice even before enforcement is activated, so an unauthenticated
+            # compatibility-mode request cannot open the door. (When
+            # enforcement is on, the owner gate above has already run.)
+            _require_admin_session(h)
+        # Deliberately not mirrored onto h.server: every reader resolves the
+        # stored row, so opening or closing sign-up takes effect immediately
+        # for the settings payload, /v1/auth/status and the register route
+        # alike.
+        mode = str(body["self_registration"] or "").strip().lower()
+        if mode not in SELF_REGISTRATION_MODES:
+            raise AttaccaError(
+                "self_registration must be one of: %s"
+                % ", ".join(SELF_REGISTRATION_MODES))
+        persisted["self_registration"] = mode
     if persisted:
         server_settings_store(h._conn(), persisted)
     h._reply_json(200, _settings_payload(h), _distribution_headers())
@@ -18442,6 +18547,7 @@ ROUTES = [
     (*_route_def("GET", "/v1/migration-directive"), _r_migration_directive),
     (*_route_def("POST", "/v1/auth/bootstrap"), _r_auth_bootstrap),
     (*_route_def("POST", "/v1/auth/login"), _r_auth_login),
+    (*_route_def("POST", "/v1/auth/register"), _r_auth_register),
     (*_route_def("POST", "/v1/auth/logout"), _r_auth_logout),
     (*_route_def("GET", "/v1/auth/access"), _r_auth_access),
     (*_route_def("GET", "/v1/auth/client-keys"), _r_auth_client_keys),
@@ -18566,10 +18672,11 @@ ROUTES = [
 
 def run_server(db_path, host="127.0.0.1", port=DEFAULT_PORT,
                default_project=None, verbose=False, auth=False,
-               auth_mode="auto"):
+               auth_mode="auto", allow_self_registration=False):
     server = AttaccaServer((host, port), db_path,
                            default_project=default_project, verbose=verbose,
-                           auth=auth, auth_mode=auth_mode)
+                           auth=auth, auth_mode=auth_mode,
+                           allow_self_registration=allow_self_registration)
     real_port = server.server_address[1]
     base = "http://%s:%d" % (host, real_port)
     print("attacca server listening on %s" % base, flush=True)
@@ -18587,6 +18694,9 @@ def run_server(db_path, host="127.0.0.1", port=DEFAULT_PORT,
     else:
         print("  authentication: optional migration mode (%s)" %
               server.auth_mode, flush=True)
+    if server_self_registration_mode(server.conn()) == "open":
+        print("  self-registration: open (anyone who can reach this server "
+              "may create an account; no rate limiting)", flush=True)
     previous_sigterm = None
     if threading.current_thread() is threading.main_thread() \
             and hasattr(signal, "SIGTERM"):
@@ -26117,6 +26227,10 @@ def build_parser():
     p.add_argument("--auth-mode", choices=AUTH_MODES, default="auto",
                    help="auto follows persisted activation; compatibility "
                         "keeps accounts optional for legacy-client migration")
+    p.add_argument("--allow-self-registration", action="store_true",
+                   help="persist self_registration=open so people can create "
+                        "their own account on the sign-in page; omitting the "
+                        "flag never closes a setting an admin already opened")
 
     p = sub.add_parser(
         "connect", help="hosted stdio MCP client with verified identity-scoped "
@@ -26388,7 +26502,8 @@ def cli_main(argv=None):
     if args.command == "serve":
         run_server(db_path, host=args.host, port=args.port,
                    default_project=default_project, verbose=args.verbose,
-                   auth=args.auth, auth_mode=args.auth_mode)
+                   auth=args.auth, auth_mode=args.auth_mode,
+                   allow_self_registration=args.allow_self_registration)
         return 0
 
     if args.command == "connect":

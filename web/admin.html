@@ -829,6 +829,7 @@
         pendingClientAuthorizationError: "",
         pendingInvitationToken: consumeInvitationTokenFromLocation(),
         invitationAcceptanceError: "",
+        authMode: "sign-in",
         authTokens: [],
         health: null,
         serverSettings: null,
@@ -1598,24 +1599,38 @@
       function renderAuth() {
         const acceptingInvitation = Boolean(state.pendingInvitationToken);
         const bootstrapRequired = Boolean(state.auth?.bootstrap_required);
+        // Self-registration is a server setting the panel only mirrors. The
+        // register route re-checks it, so a stale page can never create an
+        // account on a server that has closed sign-up. Invitation acceptance
+        // and first-run bootstrap keep priority over it.
+        const registrationOpen = !acceptingInvitation && !bootstrapRequired &&
+          state.auth?.self_registration === "open";
+        const creatingAccount = registrationOpen && state.authMode === "register";
         const title = acceptingInvitation ? "Accept your Attacca invitation"
-          : bootstrapRequired ? "Create the first administrator" : "Sign in to Attacca";
+          : bootstrapRequired ? "Create the first administrator"
+          : creatingAccount ? "Create your Attacca account" : "Sign in to Attacca";
         const description = acceptingInvitation
           ? "Create your own human account from this one-time invitation. Its workspace and administrator scope cannot be widened here."
           : bootstrapRequired
           ? "Create the human control account first. Authentication enforcement remains off until the server owner enables it in Settings."
+          : creatingAccount
+          ? "Create your own human account on this server. A new account starts with no workspace access: an administrator grants it, or you create your own workspace."
           : "Use your Attacca account to open the hosted control room.";
         const form = acceptingInvitation
           ? `<form data-form="accept-human-invitation"><div class="form-grid"><div class="field"><label for="invite-accept-username">Account name</label><input id="invite-accept-username" name="username" autocomplete="username" minlength="2" maxlength="64" pattern="[a-z0-9][a-z0-9._-]+" required autofocus><span class="help">This immutable name is used for login and audit attribution.</span></div><div class="field"><label for="invite-accept-password">Create password</label><input id="invite-accept-password" name="password" type="password" autocomplete="new-password" minlength="8" required><span class="help">The invitation token remains only in this page's memory and is submitted once over the same-origin API.</span></div></div><div class="form-actions"><button class="button quiet" type="button" data-action="dismiss-invitation-acceptance">Cancel</button><button class="button primary" type="submit">Accept invitation and sign in</button></div></form>`
           : bootstrapRequired
           ? `<form data-form="auth-bootstrap"><div class="form-grid"><div class="field"><label for="auth-username">Account name</label><input id="auth-username" name="username" autocomplete="username" minlength="2" maxlength="64" pattern="[a-z0-9][a-z0-9._-]+" required><span class="help">This immutable name is used for login and audit attribution.</span></div><div class="field"><label for="auth-password">Password</label><input id="auth-password" name="password" type="password" autocomplete="new-password" minlength="8" required><span class="help">At least 8 characters. The prototype stores a salted password hash, never this plaintext value.</span></div></div><div class="form-actions"><button class="button primary" type="submit">Create administrator and sign in</button></div></form>`
-          : `<form data-form="auth-login"><div class="form-grid"><div class="field"><label for="auth-username">Username</label><input id="auth-username" name="username" autocomplete="username" required autofocus></div><div class="field"><label for="auth-password">Password</label><input id="auth-password" name="password" type="password" autocomplete="current-password" required></div></div><div class="form-actions"><button class="button primary" type="submit">Sign in</button></div></form>`;
+          : creatingAccount
+          ? `<form data-form="auth-register"><div class="form-grid"><div class="field"><label for="auth-username">Account name</label><input id="auth-username" name="username" autocomplete="username" minlength="2" maxlength="64" pattern="[a-z0-9][a-z0-9._-]+" required autofocus><span class="help">This immutable name is used for login and audit attribution.</span></div><div class="field"><label for="auth-password">Password</label><input id="auth-password" name="password" type="password" autocomplete="new-password" minlength="8" required><span class="help">At least 8 characters. The prototype stores a salted password hash, never this plaintext value.</span></div><div class="field"><label for="auth-password-confirm">Confirm password</label><input id="auth-password-confirm" name="confirm_password" type="password" autocomplete="new-password" minlength="8" required></div></div><div class="form-actions"><button class="button quiet" type="button" data-action="dismiss-account-registration">Back to sign in</button><button class="button primary" type="submit">Create account and sign in</button></div></form>`
+          : `<form data-form="auth-login"><div class="form-grid"><div class="field"><label for="auth-username">Username</label><input id="auth-username" name="username" autocomplete="username" required autofocus></div><div class="field"><label for="auth-password">Password</label><input id="auth-password" name="password" type="password" autocomplete="current-password" required></div></div><div class="form-actions">${registrationOpen ? `<button class="button quiet" type="button" data-action="show-account-registration">Create account</button>` : ""}<button class="button primary" type="submit">Sign in</button></div></form>`;
         const context = acceptingInvitation
           ? "Acceptance creates and signs in as a separate human account. It never reuses the inviter's identity or credential, and a consumed, expired, or revoked invitation cannot be replayed."
           : bootstrapRequired
             ? "Creating the administrator does not enable enforcement. The owner can first create client-install API keys, then use the explicit Settings toggle."
+            : creatingAccount
+            ? "Registration creates a human account only: no administrator authority, no workspace membership, and no AI actor identity. This prototype server applies no sign-up rate limiting, so restrict network access before exposing it publicly."
             : "Sign-in identifies the human operator. AI actor identities remain separate and are never replaced by this account.";
-        content.innerHTML = `${pageHead("Hosted access", title, description)}<div class="grid two"><section class="card" style="grid-column:1/-1;max-width:760px"><div class="card-head"><h2>${h(title)}</h2><span class="badge ${bootstrapRequired || acceptingInvitation ? "pending" : "accepted"}">${acceptingInvitation ? "one-time invitation" : bootstrapRequired ? "first run" : "account sign-in"}</span></div><div class="card-body">${state.invitationAcceptanceError ? `<div class="notice error"><span>!</span><div><strong>Invitation could not be accepted.</strong><br>${h(state.invitationAcceptanceError)}</div></div>` : ""}${form}<div class="notice section-gap"><span>i</span><div>${context}</div></div></div></section></div>`;
+        content.innerHTML = `${pageHead("Hosted access", title, description)}<div class="grid two"><section class="card" style="grid-column:1/-1;max-width:760px"><div class="card-head"><h2>${h(title)}</h2><span class="badge ${bootstrapRequired || acceptingInvitation || creatingAccount ? "pending" : "accepted"}">${acceptingInvitation ? "one-time invitation" : bootstrapRequired ? "first run" : creatingAccount ? "new account" : "account sign-in"}</span></div><div class="card-body">${state.invitationAcceptanceError ? `<div class="notice error"><span>!</span><div><strong>Invitation could not be accepted.</strong><br>${h(state.invitationAcceptanceError)}</div></div>` : ""}${form}<div class="notice section-gap"><span>i</span><div>${context}</div></div></div></section></div>`;
         content.setAttribute("aria-busy", "false");
       }
 
@@ -2959,7 +2974,17 @@
           if (action === "dismiss-invitation-acceptance") {
             state.pendingInvitationToken = "";
             state.invitationAcceptanceError = "";
+            state.authMode = "sign-in";
             await bootstrap();
+          }
+          if (action === "show-account-registration") {
+            if (state.auth?.self_registration !== "open") throw new Error("Account creation is closed on this server.");
+            state.authMode = "register";
+            renderAuth();
+          }
+          if (action === "dismiss-account-registration") {
+            state.authMode = "sign-in";
+            renderAuth();
           }
           if (action === "revoke-client-key") {
             if (state.credentialAccess?.capabilities?.client_keys !== true) throw new Error("Client API key management is unavailable on this server.");
@@ -3319,9 +3344,18 @@
           if (kind === "auth-login") {
             state.auth = await api("/v1/auth/login", { method: "POST", body: { username: values.username.trim(), password: values.password } });
             state.invitationAcceptanceError = "";
+            state.authMode = "sign-in";
             form.reset();
             await bootstrap();
             toast("Signed in");
+          }
+          if (kind === "auth-register") {
+            if (values.password !== values.confirm_password) throw new Error("The two passwords do not match.");
+            state.auth = await api("/v1/auth/register", { method: "POST", body: { username: values.username.trim(), password: values.password } });
+            state.authMode = "sign-in";
+            form.reset();
+            await bootstrap();
+            toast("Account created; ask an administrator for workspace access");
           }
           if (kind === "accept-human-invitation") {
             const invitationToken = state.pendingInvitationToken;

@@ -373,6 +373,246 @@ class AuthHttpTestCase(unittest.TestCase):
         finally:
             conn.close()
 
+    # -- self-service account creation (local-server "Create account") ------
+
+    def open_self_registration(self):
+        """Turn self-registration on the way an owner does in Settings."""
+        browser = self.session_headers(self.login())
+        response = self.request(
+            "PUT", "/v1/settings", {"self_registration": "open"}, browser)
+        self.assertEqual(response["status"], 200, response["body"])
+        self.assertEqual(response["body"]["self_registration"], "open")
+        return browser
+
+    def register(self, username="bob", password="correct-horse", **extra):
+        body = {"username": username, "password": password}
+        body.update(extra)
+        return self.request("POST", "/v1/auth/register", body)
+
+    def test_self_registration_defaults_to_off_and_is_refused_before_bootstrap(self):
+        # A freshly created database must never open sign-up on its own: an
+        # upgrade of a running private server would otherwise silently invite
+        # the world in.
+        status = self.request("GET", "/v1/auth/status")
+        self.assertEqual(status["body"]["self_registration"], "off")
+        self.assertIs(status["body"]["bootstrap_required"], True)
+
+        # Both gates are satisfied before bootstrap; the answer must name the
+        # bootstrap route rather than the generic closed-signup message.
+        refused = self.register()
+        self.assertEqual(refused["status"], 403, refused["body"])
+        self.assertIn("bootstrap_required", refused["body"]["error"])
+        self.assertIn("/v1/auth/bootstrap", refused["body"]["error"])
+
+        self.bootstrap()
+        closed = self.register()
+        self.assertEqual(closed["status"], 403, closed["body"])
+        self.assertIn("self_registration_disabled", closed["body"]["error"])
+        conn = c.connect(self.db)
+        try:
+            self.assertEqual(
+                [row["username"] for row in conn.execute(
+                    "SELECT username FROM auth_users")], ["alice"])
+        finally:
+            conn.close()
+
+    def test_admin_opens_registration_and_the_new_account_signs_straight_in(self):
+        self.bootstrap()
+        self.open_self_registration()
+        self.assertEqual(
+            self.request("GET", "/v1/auth/status")["body"]["self_registration"],
+            "open")
+
+        created = self.register(username="Bob", display_name="Bob Builder")
+        self.assertEqual(created["status"], 200, created["body"])
+        self.assertEqual(created["body"]["user"]["username"], "bob")
+        # A self-registered account is never an administrator. auth_create_user
+        # promotes the first row in an empty table, so this is the regression
+        # that a future change to the bootstrap gate would reintroduce.
+        self.assertIs(created["body"]["user"]["is_admin"], False)
+        self.assertIs(created["body"]["authenticated"], True)
+        self.assertTrue(created["body"]["csrf_token"])
+
+        cookies = self.cookies(created)
+        self.assertIn("attacca_session", cookies)
+        self.assertIn("attacca_csrf", cookies)
+        member = self.session_headers(created)
+        whoami = self.request("GET", "/v1/auth/status", headers=member)
+        self.assertEqual(whoami["status"], 200, whoami["body"])
+        self.assertIs(whoami["body"]["authenticated"], True)
+        self.assertEqual(whoami["body"]["user"]["username"], "bob")
+        self.assertIs(whoami["body"]["user"]["is_admin"], False)
+        # A session mutation still needs the CSRF token the registration issued.
+        self.assertEqual(self.request(
+            "POST", "/v1/auth/logout", {}, member)["status"], 200)
+
+    def test_registered_account_sees_the_panel_shell_but_no_workspace(self):
+        self.bootstrap()
+        self.seed_projects_and_agent()
+        self.open_self_registration()
+        member = self.session_headers(self.register())
+
+        # The shell loads: health, the (empty) authorized workspace directory,
+        # runtime settings and the account's own credential list.
+        projects = self.request("GET", "/v1/projects", headers=member)
+        self.assertEqual(projects["status"], 200, projects["body"])
+        self.assertEqual(projects["body"]["projects"], [])
+        self.assertEqual(
+            self.request("GET", "/healthz", headers=member)["status"], 200)
+        self.assertEqual(
+            self.request("GET", "/v1/settings", headers=member)["status"], 200)
+        self.assertEqual(
+            self.request("GET", "/v1/auth/tokens", headers=member)["status"], 200)
+
+        # Reading a workspace still needs an explicit grant.
+        denied = self.request("GET", "/v1/projects/one/status", headers=member)
+        self.assertEqual(denied["status"], 403, denied["body"])
+        self.assertIn("project_membership_required", denied["body"]["error"])
+
+        conn = c.connect(self.db)
+        try:
+            user_id = conn.execute(
+                "SELECT user_id FROM auth_users WHERE username='bob'"
+            ).fetchone()["user_id"]
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) AS n FROM auth_project_memberships"
+                " WHERE user_id=?", (user_id,)).fetchone()["n"], 0)
+            c.auth_grant_project_membership(
+                conn, {"user_id": user_id, "username": "bob"}, "one",
+                granted_by="alice")
+        finally:
+            conn.close()
+        granted = self.request("GET", "/v1/projects/one/status", headers=member)
+        self.assertEqual(granted["status"], 200, granted["body"])
+
+    def test_registration_rejects_collisions_and_invalid_credentials(self):
+        self.bootstrap()
+        self.open_self_registration()
+        self.assertEqual(self.register()["status"], 200)
+
+        collision = self.register()
+        self.assertEqual(collision["status"], 409, collision["body"])
+        self.assertIn("already exists", collision["body"]["error"])
+        # The conflict is decided on the normalized username, so a different
+        # spelling of a taken name cannot probe past it.
+        self.assertEqual(self.register(username="BOB")["status"], 409)
+        # A taken username with an invalid password is a conflict first: the
+        # pre-check runs before auth_create_user validates the secret.
+        self.assertEqual(
+            self.register(username="bob", password="short")["status"], 409)
+
+        weak = self.register(username="carol", password="short")
+        self.assertEqual(weak["status"], 400, weak["body"])
+        self.assertIn("at least 8 characters", weak["body"]["error"])
+        for bad in ("", "a", "Bad Name", "x" * 65):
+            response = self.register(username=bad, password="correct-horse")
+            self.assertEqual(response["status"], 400, (bad, response["body"]))
+            self.assertIn("username must be", response["body"]["error"])
+        # Only the one valid account was ever written.
+        conn = c.connect(self.db)
+        try:
+            self.assertEqual(sorted(
+                row["username"] for row in conn.execute(
+                    "SELECT username FROM auth_users")), ["alice", "bob"])
+        finally:
+            conn.close()
+
+    def test_only_the_owner_may_toggle_registration_and_values_are_bounded(self):
+        self.bootstrap()
+        self.open_self_registration()
+        member = self.session_headers(self.register())
+
+        # Opening or closing sign-up is account governance: a signed-in
+        # non-administrator cannot flip it, and neither can an unauthenticated
+        # compatibility-mode request on a server that already has accounts.
+        denied = self.request(
+            "PUT", "/v1/settings", {"self_registration": "off"}, member)
+        self.assertEqual(denied["status"], 403, denied["body"])
+        anonymous = self.request(
+            "PUT", "/v1/settings", {"self_registration": "off"})
+        self.assertEqual(anonymous["status"], 401, anonymous["body"])
+        self.assertEqual(
+            self.request("GET", "/v1/auth/status")["body"]["self_registration"],
+            "open")
+        # An unrelated runtime setting keeps its existing compatibility-mode
+        # behavior; only the account-governance key gained the gate.
+        self.assertEqual(self.request(
+            "PUT", "/v1/settings", {"verbose": False})["status"], 200)
+
+        browser = self.session_headers(self.login())
+        invalid = self.request(
+            "PUT", "/v1/settings", {"self_registration": "maybe"}, browser)
+        self.assertEqual(invalid["status"], 400, invalid["body"])
+        self.assertIn("self_registration must be one of", invalid["body"]["error"])
+
+        closed = self.request(
+            "PUT", "/v1/settings", {"self_registration": "off"}, browser)
+        self.assertEqual(closed["status"], 200, closed["body"])
+        self.assertEqual(closed["body"]["self_registration"], "off")
+        # Closing takes effect immediately for every reader of the setting.
+        self.assertEqual(
+            self.request("GET", "/v1/auth/status")["body"]["self_registration"],
+            "off")
+        refused = self.register(username="dave")
+        self.assertEqual(refused["status"], 403, refused["body"])
+        self.assertIn("self_registration_disabled", refused["body"]["error"])
+
+    def test_a_client_api_key_cannot_mint_a_human_account(self):
+        # Invariant 14: a credential identifies the human access channel, not
+        # an AI actor. Opening self-registration must not let an installed
+        # coding client create accounts with its own key.
+        self.bootstrap()
+        browser = self.session_headers(self.login())
+        self.open_self_registration()
+        minted = self.request("POST", "/v1/auth/client-keys", {
+            "label": "laptop", "client_instance": "laptop-1"}, browser)
+        self.assertEqual(minted["status"], 201, minted["body"])
+        bearer = {"Authorization": "Bearer %s" % minted["body"]["token"],
+                  "X-Attacca-Client-Instance": "laptop-1"}
+        # The key authenticates fine on its own surfaces...
+        self.assertEqual(self.request(
+            "GET", "/v1/auth/status", headers=bearer)["status"], 200)
+        # ...but the account-creation route stays a human browser surface.
+        denied = self.request("POST", "/v1/auth/register", {
+            "username": "bob", "password": "correct-horse"}, bearer)
+        self.assertEqual(denied["status"], 403, denied["body"])
+        self.assertIn("client_key_route_denied", denied["body"]["error"])
+        conn = c.connect(self.db)
+        try:
+            self.assertEqual(
+                [row["username"] for row in conn.execute(
+                    "SELECT username FROM auth_users")], ["alice"])
+        finally:
+            conn.close()
+
+    def test_serve_flag_opens_registration_and_never_closes_it_again(self):
+        flag_db = Path(self.tmp.name) / "serve-flag.db"
+        conn = c.connect(flag_db)
+        try:
+            self.assertEqual(c.server_self_registration_mode(conn), "off")
+        finally:
+            conn.close()
+
+        opened = c.AttaccaServer(("127.0.0.1", 0), flag_db, auth=True,
+                                 allow_self_registration=True)
+        try:
+            self.assertEqual(
+                c.server_self_registration_mode(opened.conn()), "open")
+            self.assertEqual(
+                c.server_settings_load(opened.conn())["self_registration"],
+                "open")
+        finally:
+            opened.server_close()
+
+        # The flag is one-way: restarting without it must not silently undo an
+        # explicit choice that is already persisted.
+        restarted = c.AttaccaServer(("127.0.0.1", 0), flag_db, auth=True)
+        try:
+            self.assertEqual(
+                c.server_self_registration_mode(restarted.conn()), "open")
+        finally:
+            restarted.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

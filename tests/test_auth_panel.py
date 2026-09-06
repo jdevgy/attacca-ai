@@ -27,6 +27,12 @@ class AuthPanelTestCase(unittest.TestCase):
         return cls.script[start:end]
 
     @classmethod
+    def auth_gate(cls):
+        start = cls.script.index("function renderAuth()")
+        end = cls.script.index("async function bootstrap()", start)
+        return cls.script[start:end]
+
+    @classmethod
     def client_surface(cls):
         start = cls.script.index("function renderClientKeyRow")
         end = cls.script.index("async function openTaskPlan", start)
@@ -159,6 +165,54 @@ class AuthPanelTestCase(unittest.TestCase):
         self.assertNotIn("pairing", hints.lower())
         self.assertNotIn("h(authorizationRequest)", settings)
         self.assertNotIn("data-authorization-request", settings)
+
+    def test_sign_in_gate_offers_account_creation_only_when_the_server_opens_it(self):
+        gate = self.auth_gate()
+        # The panel mirrors the server setting; it never decides on its own.
+        self.assertIn('state.auth?.self_registration === "open"', gate)
+        # Invitation acceptance and first-run bootstrap keep priority.
+        self.assertIn(
+            "const registrationOpen = !acceptingInvitation && !bootstrapRequired &&",
+            gate)
+        self.assertIn(
+            'const creatingAccount = registrationOpen && state.authMode === "register"',
+            gate)
+        # The login card links to the form only while sign-up is open.
+        self.assertIn(
+            '${registrationOpen ? `<button class="button quiet" type="button" '
+            'data-action="show-account-registration">Create account</button>` : ""}',
+            gate)
+        self.assertIn('data-form="auth-register"', gate)
+        self.assertIn('data-action="dismiss-account-registration"', gate)
+        self.assertIn('name="confirm_password"', gate)
+        # The account name is the immutable identity recorded on every
+        # mutation and the store keeps no separate display name, so this form
+        # offers none either -- exactly like bootstrap and invitation accept.
+        self.assertNotIn('id="auth-display-name"', gate)
+        # Bootstrap and invitation modes remain intact.
+        self.assertIn('data-form="auth-bootstrap"', gate)
+        self.assertIn('data-form="accept-human-invitation"', gate)
+        self.assertIn('data-form="auth-login"', gate)
+
+    def test_account_creation_submits_to_the_register_route_and_reloads(self):
+        start = self.script.index('if (kind === "auth-register")')
+        register = self.script[start:self.script.index(
+            'if (kind === "accept-human-invitation")', start)]
+        self.assertIn(
+            'values.password !== values.confirm_password', register)
+        self.assertIn('api("/v1/auth/register", { method: "POST"', register)
+        # Same post-success path as sign-in: reset, re-read auth status through
+        # bootstrap(), and report the result with the shared toast.
+        self.assertIn("form.reset();", register)
+        self.assertIn("await bootstrap();", register)
+        self.assertIn("toast(", register)
+        # No bespoke error rendering: registration failures fall through to the
+        # shared submit catch that toasts the server's message, exactly like
+        # a failed sign-in.
+        self.assertNotIn("catch", register)
+        self.assertIn(
+            'if (state.auth?.self_registration !== "open") throw new Error(',
+            self.script)
 
 
 if __name__ == "__main__":
