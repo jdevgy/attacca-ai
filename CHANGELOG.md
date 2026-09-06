@@ -13,28 +13,68 @@ Git tags in this repository, so versions are dated by their bump commit.
 
 ## [Unreleased]
 
-### Added
-
-- `CONTRIBUTING.md`: local server workflow, the test command, the
-  standard-library-only constraint, the frozen-snapshot restart rule, the
-  installer working-directory rule, and documentation orientation.
-- `CHANGELOG.md` (this file).
-- `SECURITY.md`: reporting process, supported versions, and the prototype
-  known-limits list.
-- `.github/workflows/ci.yml`: GitHub Actions running the unit suite on
-  Python 3.8, 3.10, and 3.12.
-
-### Fixed
-
-- `tests/test_codex_config_repair.py`, `tests/test_server_switch.py`, and
-  `tests/test_codex_toml_concurrency_regression.py` imported `tomllib`
-  (Python 3.11+) at top level, so they failed to import on 3.8/3.10. The
-  import is now guarded, so the modules import on 3.8/3.10 and the tests that
-  need `tomllib` are skipped there.
-
 ### Pending
 
 - No `LICENSE` file yet. One must be chosen before publication.
+- `SECURITY.md` needs a private security contact address before publication.
+
+## [0.5.9] - 2026-09-06
+
+### Added
+
+- Self-service **Create account** flow for local servers (T-90): the
+  `self_registration` server setting (`off` | `open`, default `off`), exposed in
+  the auth status and settings payloads and editable by an admin through
+  `PUT /v1/settings`; `serve --allow-self-registration` opens it at start;
+  `POST /v1/auth/register` creates a non-admin account and signs it in with the
+  same session and CSRF semantics as login (403 before the first-admin
+  bootstrap or while registration is off, 409 on a username collision, 400 on
+  invalid credentials, client API keys denied); the Control Panel sign-in card
+  offers **Create account** only while registration is open.
+- Workspace membership administration (T-97): `GET /v1/projects/{id}/members`,
+  `POST /v1/projects/{id}/members` and
+  `DELETE /v1/projects/{id}/members/{username}` for a server admin or workspace
+  owner (404 unknown account, 409 already a member or last workspace admin,
+  client API keys denied), recorded as `auth.workspace_member_granted` /
+  `auth.workspace_member_revoked` ledger events; a **Members** card on the
+  Control Panel Workspaces view; an account without a workspace is told to ask
+  an administrator or create one.
+- `CONTRIBUTING.md`, `CHANGELOG.md` (this file), `SECURITY.md` and
+  `.github/workflows/ci.yml` (unit suite on Python 3.8, 3.10 and 3.12) (T-93).
+- README opens with a plain-language description and a six-step local-server
+  quick start; the detailed sections follow unchanged (T-91).
+
+### Changed
+
+- `task_report` reads descriptive evidence verdicts leniently and
+  deterministically (`PASS exit0`, `27/27 PASS`, `FAIL 2 errors`, `0 failures`)
+  and names an unrecognized value exactly, with the accepted vocabulary in the
+  reply, instead of reporting "no credible passing evidence attached" (T-92).
+- Sync projections are compact and pulls are deltas (T-94): task rows no longer
+  embed `plan_revisions`; `task_plans` carries only the latest revision's
+  sections (older revisions keep metadata with `sections_omitted`, and the
+  offline plan read says the body is a hosted read); a pull carries only the
+  resources the window's event types can change; `MAX_PULL_BYTES` now equals
+  `MAX_SNAPSHOT_BYTES`; a pull-only `projection_pull_resources` parameter lets
+  the client fetch large resources one at a time when a delta is still
+  oversized; the watcher classifies an oversized response as "host reachable,
+  sync response too large" with bounded backoff instead of an outage. Measured
+  on a large workspace: projection 51.4 MB -> 9.2 MB, a mirror stuck since
+  cursor 1665 converges in three pulls.
+
+### Fixed
+
+- Setup discovery and `agent_register` were rejected for a whole workspace by
+  one free-text history string such as `workspace.director.codex.turing under
+  D74` (`invalid_agent_persona_history`). The persona-history scan now treats
+  only a single whitespace-free token as an exact actor id, scans free text for
+  embedded actors, and folds malformed or look-alike tokens into a reserved
+  normalized name instead of raising; the export module mirrors the same rules
+  (T-95).
+- `tests/test_codex_config_repair.py`, `tests/test_server_switch.py`, and
+  `tests/test_codex_toml_concurrency_regression.py` imported `tomllib`
+  (Python 3.11+) at top level, so they failed to import on 3.8/3.10. The
+  import is now guarded and the dependent tests skip there (T-93).
 
 ## [0.5.8] - 2026-09-06
 

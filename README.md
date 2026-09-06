@@ -50,6 +50,8 @@ settings (`PUT /v1/settings`) — and everyone else joins through the **Create
 account** form on the sign-in page (0.5.9 and later). The alternative: a
 signed-in admin creates one invitation per person with
 `POST /v1/auth/invitations`, and the invited person accepts it in the panel.
+A new account has no workspace yet: an admin adds it from **Workspaces →
+Members** in the panel (or `POST /v1/projects/{id}/members`).
 
 **4. Install the Attacca plugin into your coding tools**
 
@@ -543,10 +545,11 @@ GET  /v1/auth/status
 POST /v1/auth/bootstrap       POST /v1/auth/login         POST /v1/auth/logout
 GET/POST /v1/auth/client-keys
 DELETE /v1/auth/client-keys/{token_id}
-POST /v1/auth/activation
+POST /v1/auth/activation      POST /v1/auth/register
 GET/PUT /v1/settings
 GET  /v1/projects                          POST /v1/projects
 GET  /v1/projects/{id}/status              GET  /v1/projects/{id}/inbox
+GET/POST /v1/projects/{id}/members         DELETE /v1/projects/{id}/members/{username}
 POST /v1/projects/{id}/inbox/dispositions  POST /v1/projects/{id}/messages/dispose-bulk
 PUT  /v1/projects/{id}/lead
 GET/POST /v1/projects/{id}/bridges         DELETE /v1/projects/{id}/bridges/{other}
@@ -585,6 +588,15 @@ the exact project and already-registered actor with `X-Attacca-Project` and
 ownership, and the actor's registered role. The client key never carries the
 AI actor, runtime, or role. Writes return the same payloads (and warnings) as
 the MCP tools.
+
+Accounts and workspace access are separate. `POST /v1/auth/register` creates a
+non-admin account while the `self_registration` setting is `open` (default
+`off`; `serve --allow-self-registration` opens it at start). A new account has
+no workspace until a server admin or the workspace owner grants membership
+with `POST /v1/projects/{id}/members` `{"username": ...}` (the **Members** card
+on the Control Panel Workspaces view does the same); `DELETE
+/v1/projects/{id}/members/{username}` revokes it, and the last workspace
+administrator cannot be removed. Grants and revocations are ledger events.
 
 Long collection reads use one product-wide paging contract across REST, MCP,
 the Control Panel, and the verified offline mirror. A page is capped at 60
