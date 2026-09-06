@@ -22,6 +22,7 @@ import os
 import re
 import sqlite3
 import tempfile
+import unicodedata
 import zipfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -131,32 +132,81 @@ def _valid_persona_slug(value):
     )
 
 
+def _name_slug(text):
+    """Mirror ``attacca.slugify`` without inventing a fallback name.
+
+    The core helper answers ``"project"`` for an empty result; every caller
+    here rejects an empty slug instead, and only ever slugifies a value that
+    already contains an ASCII letter or digit, so the two agree.
+    """
+    out = []
+    for ch in str(text).lower():
+        if ch.isalnum():
+            out.append(ch)
+        elif out and out[-1] != "-":
+            out.append("-")
+    return "".join(out).strip("-")
+
+
+def _fold_history_name_token(token):
+    """Fold one legacy identity part into the ASCII reservation alphabet.
+
+    Twin of ``attacca._fold_history_name_token``.  This module deliberately
+    imports nothing from ``attacca.py``, so the rule is mirrored and the two
+    must stay in step: accents are decomposed and dropped, case is folded,
+    and anything that still cannot be a normalized name is skipped.
+    """
+    decomposed = unicodedata.normalize("NFKD", str(token or "").lower())
+    folded = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    if not re.search(r"[A-Za-z0-9]", folded, re.ASCII):
+        return None
+    value = _name_slug(folded)
+    if not value or not value.isascii() or "--" in value:
+        return None
+    return value
+
+
 def _canonical_persona_actor(actor_id, project_id):
-    """Return a strict named actor, rejecting canonical-shaped bad history."""
+    """Return the named actor one history token denotes, or ``None``.
+
+    Twin of ``attacca._persona_actor_occurrence``.  An already canonical
+    actor is returned as it is stored; a mixed-case or look-alike token is
+    folded into its normalized canonical form so the name it consumed stays
+    reserved rather than being released; anything that cannot carry a persona
+    is skipped.  Durable history never raises here: one stray identity-shaped
+    string must not deny a whole workspace its export.
+    """
     if not isinstance(actor_id, str):
         return None
     text = actor_id.strip()
-    parts = text.split(".")
-    looks_named = len(parts) == 4 \
-        and parts[0].lower() == str(project_id).lower() \
-        and parts[1].lower() in {
-            "director", "advisor", "worker", "unassigned",
-        }
-    if not looks_named:
+    parts = text.lower().split(".")
+    if len(parts) != 4 \
+            or parts[0] != str(project_id).lower() \
+            or parts[1] not in {
+                "director", "advisor", "worker", "unassigned"}:
         return None
-    if text != text.lower() or parts[0] != project_id \
-            or not parts[2].isascii() \
-            or not _WIRE_SLUG_RE.fullmatch(parts[2]) \
-            or "--" in parts[2] \
-            or not _valid_persona_slug(parts[3]):
-        raise ProjectExportError(
-            "durable history contains a non-normalized named actor %r" %
-            actor_id)
-    return {"actor_id": text, "persona": parts[3]}
+    if parts[2].isascii() and _WIRE_SLUG_RE.fullmatch(parts[2]) \
+            and "--" not in parts[2] and _valid_persona_slug(parts[3]):
+        return {"actor_id": text.lower(), "persona": parts[3]}
+    runtime = _fold_history_name_token(parts[2])
+    persona = _fold_history_name_token(parts[3])
+    if not runtime or not _WIRE_SLUG_RE.fullmatch(runtime) \
+            or not persona or not _valid_persona_slug(persona):
+        return None
+    return {
+        "actor_id": "%s.%s.%s.%s" % (parts[0], parts[1], runtime, persona),
+        "persona": persona,
+    }
 
 
 def _persona_actors_in_value(value, project_id):
-    """Find strict named actors in identity columns and structured payloads."""
+    """Find named actors in identity columns and structured payloads.
+
+    Only a single whitespace-free token can be an exact actor id; free text
+    that merely happens to contain dots (``"engine.director.codex.turing
+    under D74"``) is scanned for embedded actors instead.  This is the same
+    rule as ``attacca._persona_actors_in_value``.
+    """
     if value is None:
         return []
     if isinstance(value, (dict, list, tuple)):
@@ -174,19 +224,21 @@ def _persona_actors_in_value(value, project_id):
         except (TypeError, ValueError):
             pass
     result = []
-    exact = _canonical_persona_actor(text, project_id)
-    if exact:
-        result.append(exact)
-    pattern = re.compile(
-        r"(?<![\w.-])(" + re.escape(project_id) +
-        r"\.(?:director|advisor|worker|unassigned)"
-        r"\.[\w-]+\.[\w-]+)(?![\w.-])",
-        re.IGNORECASE,
-    )
-    for match in pattern.finditer(text):
-        parsed = _canonical_persona_actor(match.group(1), project_id)
-        if parsed and parsed not in result:
-            result.append(parsed)
+    if len(text.split()) == 1:
+        exact = _canonical_persona_actor(text, project_id)
+        if exact:
+            result.append(exact)
+    if not result:
+        pattern = re.compile(
+            r"(?<![\w.-])(" + re.escape(project_id) +
+            r"\.(?:director|advisor|worker|unassigned)"
+            r"\.[\w-]+\.[\w-]+)(?![\w.-])",
+            re.IGNORECASE,
+        )
+        for match in pattern.finditer(text):
+            parsed = _canonical_persona_actor(match.group(1), project_id)
+            if parsed and parsed not in result:
+                result.append(parsed)
     return result
 
 

@@ -280,7 +280,8 @@ class NamedIdentityTestCase(unittest.TestCase):
         # One scan per distinct friendly name, not one per listed actor.
         self.assertLessEqual(len(calls), 6)
 
-    def test_unicode_persona_input_and_post_marker_history_fail_closed(self):
+    def test_unicode_persona_input_fails_but_history_normalizes_the_name(self):
+        """User input stays strict; durable history is folded, never fatal."""
         before = self.conn.execute(
             "SELECT COUNT(*) AS n FROM agents WHERE project_id='engine'"
         ).fetchone()["n"]
@@ -295,13 +296,102 @@ class NamedIdentityTestCase(unittest.TestCase):
         ).fetchone()["n"], before)
 
         created = self.new_identity()
+        self.assertEqual(created["identity"]["persona"], "gibbs")
         c.append_event(
             self.conn, "engine", created["agent_id"], "agent",
             "fixture.post_marker_identity_reference",
             {"referenced_actor": "engine.worker.claude.curíe"})
-        with self.assertRaisesRegex(
-                c.AttaccaError, "invalid_agent_persona_history"):
-            self.new_identity()
+
+        # A look-alike historical name reserves its normalized form instead
+        # of denying every later creation, reuse, and setup call.
+        self.assertEqual(
+            self.new_identity()["identity"]["persona"], "turing")
+        reservation = self.conn.execute(
+            "SELECT persona,reserved_actor_id,source"
+            " FROM agent_persona_reservations"
+            " WHERE project_id='engine' AND persona='curie'").fetchone()
+        self.assertIsNotNone(reservation)
+        self.assertEqual(reservation["persona"], "curie")
+        self.assertEqual(reservation["reserved_actor_id"],
+                         "engine.worker.claude.curie")
+        self.assertTrue(
+            reservation["source"].startswith("historical-normalized:"),
+            reservation["source"])
+        # ``curie`` follows ``hopper`` in the name table, so the allocator
+        # proves the folded name is consumed rather than handed out.
+        self.assertEqual(
+            [self.new_identity()["identity"]["persona"] for _ in range(2)],
+            ["hopper", "lovelace"])
+
+    def test_free_text_actor_mention_never_blocks_new_identities(self):
+        """One stray sentence must never deny identity creation workspace-wide.
+
+        Reported from the "sims" workspace: a plain payload sentence whose
+        three dots made it look like a four-part actor id was treated as an
+        exact identity and failed setup discovery plus every registration.
+        """
+        self.assertEqual(
+            c._persona_actors_in_value(
+                "engine.director.codex.turing under D74", "engine"),
+            ["engine.director.codex.turing"])
+
+        created = self.new_identity()
+        c.append_event(
+            self.conn, "engine", created["agent_id"], "agent",
+            "fixture.free_text_identity_reference",
+            {"note": "engine.director.codex.turing under D74"})
+
+        # Creation still succeeds and the embedded name is now historical,
+        # so the allocator skips it instead of reusing it.
+        self.assertEqual(
+            self.new_identity()["identity"]["persona"], "hopper")
+        reservation = self.conn.execute(
+            "SELECT reserved_actor_id,source FROM agent_persona_reservations"
+            " WHERE project_id='engine' AND persona='turing'").fetchone()
+        self.assertIsNotNone(reservation)
+        self.assertEqual(reservation["reserved_actor_id"],
+                         "engine.director.codex.turing")
+        self.assertTrue(reservation["source"].startswith("historical:"),
+                        reservation["source"])
+
+    def test_mixed_case_history_token_reserves_the_lowercase_name(self):
+        created = self.new_identity()
+        c.append_event(
+            self.conn, "engine", created["agent_id"], "agent",
+            "fixture.mixed_case_identity_reference",
+            {"referenced_actor": "Engine.Worker.Claude.Curie"})
+        c._seed_project_persona_reservations(self.conn, "engine", force=True)
+
+        # ``persona`` is COLLATE NOCASE, so the stored value itself proves the
+        # reservation is the normalized lowercase name.
+        reservation = self.conn.execute(
+            "SELECT persona,reserved_actor_id FROM agent_persona_reservations"
+            " WHERE project_id='engine' AND persona='curie'").fetchone()
+        self.assertIsNotNone(reservation)
+        self.assertEqual(reservation["persona"], "curie")
+        self.assertEqual(reservation["reserved_actor_id"],
+                         "engine.worker.claude.curie")
+
+    def test_four_dot_part_free_text_is_not_an_actor_id(self):
+        """Whitespace means free text, even with four dot-separated parts."""
+        self.assertEqual(
+            c._persona_actors_in_value(
+                "engine.director.codex. is the runtime label", "engine"), [])
+
+        created = self.new_identity()
+        c.append_event(
+            self.conn, "engine", created["agent_id"], "agent",
+            "fixture.runtime_label_note",
+            {"note": "engine.director.codex. is the runtime label"})
+        self.assertEqual(
+            self.new_identity()["identity"]["persona"], "turing")
+        # Free text must reserve nothing at all: only the two allocated
+        # identities may appear in the append-only registry.
+        self.assertEqual(
+            {row["persona"] for row in self.conn.execute(
+                "SELECT persona FROM agent_persona_reservations"
+                " WHERE project_id='engine'")},
+            {"gibbs", "turing"})
 
     def test_search_finds_inactive_name_without_reservation_audit_leakage(self):
         gibbs = self.new_identity()

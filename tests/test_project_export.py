@@ -556,6 +556,117 @@ class ProjectExportTestCase(unittest.TestCase):
                                     "coverage is incomplete.*@Hopper"):
             self.build()
 
+    def named_workspace(self):
+        """Create a canonical named-identity workspace in the same database."""
+        repo = self.root / "engine"
+        repo.mkdir()
+        c.project_init(
+            self.conn, "owner", "human", path=repo,
+            project_id="engine", name="Engine")
+        return c.agent_register(
+            self.conn, "engine", "codex", "agent", role="director",
+            runtime="codex", canonical_identity=True,
+            allocate_persona=True, distinct_identity=True)
+
+    def test_free_text_and_look_alike_history_still_export(self):
+        """A stray identity-shaped string must not deny a workspace its export.
+
+        Reported from the "sims" workspace: a plain sentence whose three dots
+        made it look like a four-part actor id was read as an exact identity,
+        so the coverage scan refused the whole export.
+        """
+        director = self.named_workspace()
+        self.assertEqual(director["agent_id"], "engine.director.codex.gibbs")
+        c.append_event(
+            self.conn, "engine", director["agent_id"], "agent",
+            "fixture.identity_reference",
+            {"note": "engine.director.codex.turing under D74",
+             "referenced_actor": "engine.worker.claude.curíe"})
+        # The next canonical registration reseeds history-derived names, so
+        # both folded names reach the append-only registry before the export.
+        second = c.agent_register(
+            self.conn, "engine", "claude", "agent", role="worker",
+            runtime="claude", canonical_identity=True,
+            allocate_persona=True, distinct_identity=True)
+        self.assertEqual(second["agent_id"], "engine.worker.claude.hopper")
+
+        export = exporter.build_project_export(
+            self.conn, "engine", log_renderer=c.render_log_line)
+        self.assertTrue(exporter.validate_project_export(export)["ok"])
+        self.assertTrue(export["ledger"]["verification"]["ok"])
+        self.assertEqual(
+            export,
+            exporter.build_project_export(
+                self.conn, "engine", log_renderer=c.render_log_line))
+
+        reservations = {row["persona"]: row
+                        for row in export["agent_persona_reservations"]}
+        self.assertEqual(set(reservations),
+                         {"gibbs", "turing", "hopper", "curie"})
+        self.assertEqual(reservations["turing"]["reserved_actor_id"],
+                         "engine.director.codex.turing")
+        self.assertEqual(reservations["curie"]["reserved_actor_id"],
+                         "engine.worker.claude.curie")
+        self.assertTrue(
+            reservations["curie"]["source"].startswith(
+                "historical-normalized:"),
+            reservations["curie"]["source"])
+        coverage = export["manifest"]["compatibility"][
+            "agent_persona_reservations"]["coverage"]
+        self.assertTrue(coverage["complete"])
+        self.assertEqual(coverage["history_personas"], 4)
+
+        # The portable ZIP and the exported chain stay verifiable, and the
+        # registry slice restores into a fresh database unchanged.
+        with zipfile.ZipFile(BytesIO(
+                exporter.project_export_zip_bytes(export))) as archive:
+            self.assertIn("project-export.json", archive.namelist())
+        self.assertTrue(exporter.verify_exported_ledger(
+            export["ledger"]["events"], "engine")["ok"])
+        restored = c.connect(self.root / "restored-engine.db")
+        self.addCleanup(restored.close)
+        restored.execute(
+            "INSERT INTO projects (project_id,name,root_path,created_by,"
+            "created_at,context_version) VALUES ('engine','Engine',NULL,"
+            "'owner',?,1)", (c.now_iso(),))
+        result = exporter.restore_exported_persona_reservations(
+            restored, export)
+        self.assertEqual(result["inserted"], 4)
+        self.assertEqual(
+            {row["persona"] for row in restored.execute(
+                "SELECT persona FROM agent_persona_reservations"
+                " WHERE project_id='engine'")},
+            {"gibbs", "turing", "hopper", "curie"})
+
+    def test_history_token_scan_mirrors_the_core_identity_rules(self):
+        """The export scanner and ``attacca`` must fold identically."""
+        self.assertEqual(
+            exporter._persona_actors_in_value(
+                "engine.director.codex.turing under D74", "engine"),
+            [{"actor_id": "engine.director.codex.turing",
+              "persona": "turing"}])
+        # Whitespace means free text, even with four dot-separated parts.
+        self.assertEqual(
+            exporter._persona_actors_in_value(
+                "engine.director.codex. is the runtime label", "engine"), [])
+        # Look-alike and mixed-case tokens fold to one reserved lowercase name.
+        for token in ("engine.worker.claude.curíe",
+                      "Engine.Worker.Claude.Curie",
+                      "cc engine.worker.claude.curíe please"):
+            self.assertEqual(
+                exporter._persona_actors_in_value(token, "engine"),
+                [{"actor_id": "engine.worker.claude.curie",
+                  "persona": "curie"}],
+                token)
+        # A token that cannot carry a persona is skipped, never fatal.
+        for token in ("engine.director.codex.default",
+                      "engine.director.codex.@@@",
+                      "engine.dirextor.codex.gibbs",
+                      "other.director.codex.gibbs"):
+            self.assertEqual(
+                exporter._persona_actors_in_value(token, "engine"), [], token)
+
+
 
 def latest(events):
     return events[-1]["seq"] if events else 0

@@ -840,60 +840,106 @@ _PERSONA_HISTORY_COLUMNS = (
 )
 
 
-def _persona_actors_in_value(value, project_id):
-    """Yield exact canonical persona actors embedded in structured history."""
+def _fold_history_name_token(token):
+    """Fold one legacy identity part into the ASCII reservation alphabet.
+
+    Durable history can carry mixed-case or look-alike identity strings that
+    the current wire alphabet rejects.  Folding them, rather than failing the
+    whole scan closed, keeps the safe direction: a look-alike name becomes
+    unavailable and is never released.  ``None`` means the token cannot name
+    anything at all and is skipped.
+    """
+    # Imported here because only creation/repair boundaries fold legacy names.
+    import unicodedata
+
+    decomposed = unicodedata.normalize("NFKD", str(token or "").lower())
+    folded = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    # ``slugify`` answers "project" for an empty result, so a part carrying no
+    # ASCII letter or digit is rejected before it is slugified.
+    if not re.search(r"[A-Za-z0-9]", folded, re.ASCII):
+        return None
+    value = slugify(folded)
+    if not value.isascii() or "--" in value:
+        return None
+    return value
+
+
+def _persona_actor_occurrence(token, project_id):
+    """Return ``(actor_id, kind)`` for one whitespace-free named-actor token.
+
+    ``kind`` is ``historical`` for an already canonical actor and
+    ``historical-normalized`` when a legacy token had to be folded into the
+    reservation alphabet.  ``None`` means the token cannot carry a persona;
+    that is ordinary data, never an error.
+    """
+    text = str(token or "").strip()
+    parts = text.lower().split(".")
+    if len(parts) != 4 \
+            or parts[0] != slugify(project_id) \
+            or parts[1] not in AGENT_ROLES + ("unassigned",):
+        return None
+    exact = parse_canonical_agent_id(text, project_id)
+    if exact and exact.get("persona"):
+        return (text.lower(), "historical")
+    runtime = _fold_history_name_token(parts[2])
+    persona = _fold_history_name_token(parts[3])
+    if not runtime or not persona \
+            or not _AGENT_WIRE_SLUG_RE.fullmatch(runtime) \
+            or not _AGENT_PERSONA_RE.fullmatch(persona) \
+            or persona in ("default", "none", "unassigned"):
+        return None
+    normalized = "%s.%s.%s.%s" % (parts[0], parts[1], runtime, persona)
+    if not parse_canonical_agent_id(normalized, project_id):
+        return None
+    return (normalized, "historical-normalized")
+
+
+def _persona_actors_in_value(value, project_id, with_source=False):
+    """Yield canonical persona actors embedded in structured history.
+
+    Only a single whitespace-free token can be an exact actor id.  Free text
+    that merely happens to contain dots (``"engine.director.codex.turing
+    under D74"``) is scanned for embedded actors instead.  A malformed or
+    non-normalized persona is folded and reported as a legacy occurrence
+    rather than raising: one stray history string must never block identity
+    creation, reuse, or setup for a whole workspace.  ``with_source`` returns
+    ``(actor_id, kind)`` pairs for the reservation source label.
+    """
     if value is None:
         return []
     if isinstance(value, (dict, list, tuple)):
         items = value.values() if isinstance(value, dict) else value
         result = []
         for item in items:
-            result.extend(_persona_actors_in_value(item, project_id))
+            result.extend(
+                _persona_actors_in_value(item, project_id, with_source))
         return result
     text = str(value).strip()
     if not text:
         return []
     if text[:1] in ("{", "["):
         try:
-            return _persona_actors_in_value(json.loads(text), project_id)
+            return _persona_actors_in_value(
+                json.loads(text), project_id, with_source)
         except (TypeError, ValueError):
             pass
-    lowered = text.lower()
-    parts = lowered.split(".")
-    if len(parts) == 4 \
-            and parts[0] == slugify(project_id) \
-            and parts[1] in AGENT_ROLES + ("unassigned",) \
-            and (text != lowered
-                 or not text.isascii()
-                 or not parts[2].isascii()
-                 or not _AGENT_WIRE_SLUG_RE.fullmatch(parts[2])
-                 or "--" in parts[2]
-                 or not _AGENT_PERSONA_RE.fullmatch(parts[3])
-                 or "--" in parts[3]
-                 or parts[3] in ("default", "none", "unassigned")):
-        raise AttaccaError(
-            "invalid_agent_persona_history: named actor %r does not use "
-            "the normalized ASCII persona alphabet" % text)
-    exact = parse_canonical_agent_id(text, project_id)
-    if exact and exact.get("persona"):
-        return [text.lower()]
-    prefix = re.escape(slugify(project_id))
-    pattern = re.compile(
-        r"(?<![\w.-])(" + prefix +
-        r"\.(?:director|advisor|worker|unassigned)"
-        r"\.[\w-]+\.[\w-]+)(?![\w.-])",
-        re.IGNORECASE)
-    result = []
-    for match in pattern.finditer(text):
-        actor = match.group(1).lower()
-        parsed = parse_canonical_agent_id(actor, project_id)
-        if not parsed or not parsed.get("persona"):
-            raise AttaccaError(
-                "invalid_agent_persona_history: named actor %r does not "
-                "use the normalized ASCII persona alphabet" %
-                match.group(1))
-        result.append(actor)
-    return result
+    found = []
+    if len(text.split()) == 1:
+        exact = _persona_actor_occurrence(text, project_id)
+        if exact:
+            found.append(exact)
+    if not found:
+        prefix = re.escape(slugify(project_id))
+        pattern = re.compile(
+            r"(?<![\w.-])(" + prefix +
+            r"\.(?:director|advisor|worker|unassigned)"
+            r"\.[\w-]+\.[\w-]+)(?![\w.-])",
+            re.IGNORECASE)
+        for match in pattern.finditer(text):
+            embedded = _persona_actor_occurrence(match.group(1), project_id)
+            if embedded:
+                found.append(embedded)
+    return found if with_source else [actor for actor, _ in found]
 
 
 def _persona_seed_marker(project_id):
@@ -906,7 +952,9 @@ def _project_named_actor_history(conn, project_id):
     The scan is used only at creation/repair/setup migration boundaries, never
     on ordinary request paths.  It deliberately reads immutable/audit history
     as well as current rows so deleting or aliasing an actor cannot release a
-    friendly name.  A malformed named actor fails closed.
+    friendly name.  A malformed or non-normalized named actor is folded to
+    the reservation alphabet and recorded as a legacy occurrence, so it
+    reserves that name instead of failing the whole scan closed.
     """
     found = {}
     for table, field_specs in _PERSONA_HISTORY_COLUMNS:
@@ -930,8 +978,8 @@ def _project_named_actor_history(conn, project_id):
             for field, timestamp in usable:
                 occurred_at = row[timestamp] \
                     if timestamp and timestamp in columns else None
-                for actor_id in _persona_actors_in_value(
-                        row[field], project_id):
+                for actor_id, kind in _persona_actors_in_value(
+                        row[field], project_id, with_source=True):
                     parsed = parse_canonical_agent_id(actor_id, project_id)
                     persona = parsed.get("persona") if parsed else None
                     if not persona:
@@ -939,7 +987,7 @@ def _project_named_actor_history(conn, project_id):
                     candidate = {
                         "actor_id": actor_id,
                         "occurred_at": occurred_at,
-                        "source": "historical:%s.%s" % (table, field),
+                        "source": "%s:%s.%s" % (kind, table, field),
                     }
                     previous = found.get(actor_id)
                     # A real timestamp is stronger than an unknown one; among
