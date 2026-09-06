@@ -1,15 +1,112 @@
 # Attacca
 
-**Durable project continuity for humans and AI coding tools.** Attacca keeps a
-project's operational memory on a shared hosted service so a Claude, Codex,
-Kimi, or generic MCP session can disappear without taking the project state
-with it.
+Attacca is a durable project-continuity layer for humans and AI coding tools.
+It keeps the parts of a project that outlive a chat window — an append-only
+event ledger, a shared task board, decisions, handoffs, binding rules, and one
+human+AI room — on a small server you run yourself. Claude Code, Codex CLI,
+Kimi Code, Cline, Cursor, Windsurf, other MCP clients, and the browser Control
+Panel all read and write the same workspace, so any one session can end, crash,
+or be replaced without taking the project state with it. Sessions are
+disposable; the project is not.
 
 > [!IMPORTANT]
-> Attacca is a pre-production dogfood prototype, not a finished public SaaS.
-> It demonstrates the complete continuity workflow and strong correctness
-> boundaries, but it does not provide TLS termination, SSO, MFA, encrypted
-> database storage, or hardened hostile-host isolation.
+> Attacca is a pre-production dogfood prototype, not a finished public SaaS. It
+> runs the complete continuity workflow with strong correctness boundaries, but
+> it does not terminate TLS or provide SSO, MFA, login rate limiting, encrypted
+> database storage, or hardened hostile-host isolation. Keep it on localhost, or
+> put your own TLS and network controls in front of it.
+
+## Quick start (local server)
+
+You need Python 3.8+ and Git. There is nothing else to install: Attacca is
+Python standard library only.
+
+**1. Clone the repository and start the server**
+
+```bash
+git clone https://github.com/jdevgy/attacca-ai.git && cd attacca-ai
+python3 attacca.py serve --host 127.0.0.1 --port 4173
+```
+
+All state lives in one SQLite file (`~/.attacca/attacca.db`; override with
+`ATTACCA_DB`), and `http://127.0.0.1:4173/healthz` reports the running version.
+Any free port works — `8722` is the built-in default the examples further down
+use.
+
+**2. Open the Control Panel and create the first admin account**
+
+```
+http://127.0.0.1:4173/app
+```
+
+While no account exists the panel opens on a **Create the first administrator**
+form; submitting it creates that account and signs you in.
+
+**3. Give other people their own accounts** *(optional)*
+
+An admin opens self-service sign-up — start the server with
+`--allow-self-registration`, or set `self_registration` to `open` in server
+settings (`PUT /v1/settings`) — and everyone else joins through the **Create
+account** form on the sign-in page (0.5.9 and later). The alternative: a
+signed-in admin creates one invitation per person with
+`POST /v1/auth/invitations`, and the invited person accepts it in the panel.
+
+**4. Install the Attacca plugin into your coding tools**
+
+```bash
+cd ~ && curl -fsSL http://127.0.0.1:4173/install.sh | sh
+```
+
+Run this from your home directory, not from this checkout. The server serves
+its own plugin pre-wired to the URL it came from, installs it under
+`~/.attacca/plugin/attacca`, and configures every AI coding tool it finds.
+
+**5. Link a project and register the AI**
+
+Open your own project in Claude Code and run `/attacca:setup` (Codex:
+`$attacca:setup`; Kimi: `/attacca:setup`). The guided flow picks or creates a
+workspace, registers this AI's role and identity, and writes the non-secret
+workspace link into `.attacca/project.json`.
+
+**6. Verify**
+
+Run `/attacca:status` in Claude Code or Kimi (Codex: `$attacca:update`). It
+reports the linked workspace, this AI's identity, and the current handoff.
+
+## What you get
+
+- **One shared memory** — a hash-chained, append-only event ledger plus a
+  readable activity log of what changed, why, and who ran it.
+- **Cold resume** — a Director-owned project handoff, per-AI identity handoffs,
+  shared Cloud Context, and binding role-scoped rules, injected at session start.
+- **Coordinated work** — a task board with expiring claims, declared file scope,
+  immutable plan revisions, decisions, and evidence-based completion.
+- **A room humans and AIs share** — group messages, persistent per-identity
+  inbox cursors, and explicit dispositions so addressed work is never dropped.
+- **Separate identity and authority** — the AI actor, the authenticated human
+  operator, the runtime, the role, and the Git checkout stay distinct on every write.
+- **The tools you already run** — native plugins for Claude Code, Codex CLI, and
+  Kimi Code; MCP config for Cline, Cursor, Windsurf, and any other MCP client;
+  REST and a CLI for everything else.
+- **No cloud dependency** — one Python process, one SQLite file, zero third-party
+  packages.
+
+## Documentation
+
+- [What Attacca gives a project](#what-attacca-gives-a-project) — the full feature list
+- [Architecture](#architecture) — server, clients, and installation-bound AI identity
+- [Setup and installation in detail](#setup-and-installation-in-detail) — every install path, flag, and side effect
+- [Hosted authentication](#hosted-authentication-prototype) — accounts, client API keys, enforcement
+- [How a tool connects](#how-a-tool-connects-three-shapes-one-server) — the three client shapes; two computers, one workspace
+- [REST API](#rest-api-server-mode) — every `/v1` endpoint and the shared paging contract
+- [The protocol agents follow](#the-protocol-agents-follow) — what every AI session is required to do
+- [Message dispositions](#message-dispositions) — why reading a message is not handling it
+- [MCP tools](#mcp-tools) — the tool surface and compact read projections
+- [CLI reference](#cli-reference-same-data-for-humans-and-non-mcp-tools) — the same data without MCP
+- [Demos and tests](#demos-and-tests) — cold-handoff demo, unittest suite, ledger verification
+- [Notes and limits](#notes-and-limits-honest-edges) — the honest edges
+
+## What Attacca gives a project
 
 Claude Code, Codex CLI, Kimi Code, Cline, Cursor, Windsurf, GLM-backed clients,
 other MCP tools, and the browser Control Panel can coordinate through the same
@@ -41,11 +138,6 @@ workspace:
 The runtime is Python 3.8+ standard library only. One hosted Attacca process
 serves many isolated workspaces from SQLite; projects do not receive their own
 hidden server or database.
-
-**Start here:** [Quickstart](#quickstart) ·
-[Hosted authentication](#hosted-authentication-prototype) ·
-[Agent protocol](#the-protocol-agents-follow) ·
-[MCP tools](#mcp-tools-42) · [Tests](#demos-and-tests)
 
 The broader design in [`docs/blueprint.txt`](docs/blueprint.txt) also describes
 future encryption, Project Brain/context packs, capability marketplaces, and
@@ -100,7 +192,11 @@ full export can substitute for the verified identity-scoped mirror.
   identity. Existing Red/Blue and three-part actors remain compatibility
   records; only an explicit duplicate-name repair migrates one safely.
 
-## Quickstart
+## Setup and installation in detail
+
+The [Quick start](#quick-start-local-server) above is the short path. This
+section explains what each step actually does, every supported client, and
+the flags for non-default installations.
 
 **The server is the app.** It runs standalone — its own directory, its own
 lifecycle — and owns all state. Tools are pure clients; no Attacca server or
@@ -624,7 +720,7 @@ touched. The Control Panel exposes this as **Resolve all before
 `migration_directive`, `agent_register`, `agent_list`, `list_projects`,
 `append_event`, `check_freshness`.
 
-In Claude Code they appear as `mcp__attacca__<name>`. Every tool takes an optional
+In Claude Code they appear as `mcp__plugin_attacca_attacca__<name>` (the native plugin prefix). Every tool takes an optional
 `project` argument for cross-project work.
 
 ### Compact read projections (`detail`)
