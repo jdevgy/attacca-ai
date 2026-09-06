@@ -4562,17 +4562,133 @@ def _normalize_evidence(evidence):
 
 
 _EVIDENCE_VERDICT_KEYS = {
-    "result", "status", "outcome", "passed", "success", "ok",
+    "result", "verdict", "status", "outcome", "passed", "success", "ok",
     "verified", "exit_code", "returncode", "exit_status",
 }
 _EVIDENCE_PASS_VALUES = {
     "pass", "passed", "success", "succeeded", "successful", "ok",
-    "green", "verified", "complete", "completed",
+    "green", "verified", "complete", "completed", "done", "true",
 }
 _EVIDENCE_FAIL_VALUES = {
-    "fail", "failed", "failure", "error", "errored", "red",
-    "blocked", "cancelled", "canceled", "timeout", "timed_out",
+    "fail", "failed", "failure", "error", "errored", "red", "broken",
+    "blocked", "cancelled", "canceled", "timeout", "timed_out", "false",
 }
+# Recognized verdicts that judge neither way: a skipped or waived check is a
+# legitimate report, so it must never be named back as unreadable — it simply
+# cannot verify a completion on its own.
+_EVIDENCE_NEUTRAL_VALUES = {
+    "skip", "skipped", "waived", "partial", "unknown",
+}
+_EVIDENCE_VERDICT_WORDS = dict(
+    [(word, "pass") for word in _EVIDENCE_PASS_VALUES] +
+    [(word, "fail") for word in _EVIDENCE_FAIL_VALUES] +
+    [(word, "neutral") for word in _EVIDENCE_NEUTRAL_VALUES])
+# The vocabulary promised to clients in the MCP tool description and returned
+# as accepted_results when a value is refused.  The accepted sets above stay
+# slightly wider (verified, complete, timeout, ...) so older reporters keep
+# working; this tuple is what we document.
+_EVIDENCE_ACCEPTED_RESULTS = (
+    "pass", "passed", "ok", "success", "succeeded", "green", "done",
+    "fail", "failed", "error", "red", "broken",
+    "skipped", "skip", "blocked", "waived", "partial", "unknown",
+)
+_EVIDENCE_RESULT_GUIDANCE = (
+    "use one of pass/fail/skipped/blocked/waived/partial (case-insensitive; "
+    "'PASS exit0' and '27/27 PASS' style values are accepted)")
+# Keys whose name promises a verdict.  status/outcome are classified the same
+# way but never complained about: "open", "queued" and "merged" are honest
+# values there, and inventing a complaint about them would repeat the bug
+# this vocabulary exists to fix.
+_EVIDENCE_NAMED_VERDICT_KEYS = ("result", "verdict")
+_EVIDENCE_FRACTION = re.compile(r"^([0-9]+)/([0-9]+)$")
+_EVIDENCE_ZERO_WORDS = {"0", "no", "zero"}
+_EVIDENCE_FAILURE_NOUNS = {
+    "fail", "fails", "failed", "failure", "failures",
+    "error", "errors", "errored",
+}
+
+
+def _evidence_token(text):
+    """Lowercase one token and drop the punctuation reporters wrap it in.
+
+    Wrapping punctuation goes ("pass:", "(ok)", "PASS-"), while an interior
+    hyphen is read as "_" so "timed-out" still matches "timed_out".
+    """
+    return text.strip(":;,.!?()[]{}<>\"'*-").lower().replace("-", "_")
+
+
+def _evidence_verdict(value):
+    """Classify one evidence verdict value leniently and deterministically.
+
+    Returns "pass", "fail", "neutral" (recognized, but no judgement on the
+    work — skipped, waived, partial, unknown) or None when the value cannot
+    be read at all.  Applied in order, these rules are the whole grammar:
+
+      * a boolean maps to pass/fail;
+      * the first token — case-insensitive, wrapping punctuation stripped,
+        "-" read as "_" — may be a verdict word, and whatever follows it is
+        detail: "PASS exit0", "pass: 27/27", "FAIL 2 errors";
+      * a leading n/d fraction followed by a verdict word takes that verdict,
+        except that a pass counts only when the two numbers match, so
+        "27/27 PASS" passes and "26/27 PASS" fails;
+      * "0 failures" / "no failures" passes.
+
+    Anything else returns None, so the reporter is told exactly which value
+    was not understood instead of being told nothing was attached.
+    """
+    if isinstance(value, bool):
+        return "pass" if value else "fail"
+    if value is None:
+        return None
+    tokens = [token for token in
+              (_evidence_token(part) for part in str(value).split()) if token]
+    if not tokens:
+        return None
+    verdict = _EVIDENCE_VERDICT_WORDS.get(tokens[0])
+    if verdict:
+        return verdict
+    fraction = _EVIDENCE_FRACTION.match(tokens[0])
+    if fraction and len(tokens) > 1:
+        following = _EVIDENCE_VERDICT_WORDS.get(tokens[1])
+        if following == "pass":
+            return ("pass"
+                    if int(fraction.group(1)) == int(fraction.group(2))
+                    else "fail")
+        if following:
+            return following
+    if tokens[0] in _EVIDENCE_ZERO_WORDS and len(tokens) > 1 \
+            and tokens[1] in _EVIDENCE_FAILURE_NOUNS:
+        return "pass"
+    return None
+
+
+def _evidence_result_warnings(evidence):
+    """Name every verdict value the vocabulary could not read.
+
+    Each warning quotes the exact index, key and value, so a report whose
+    verdict was merely spelled descriptively is never answered with "no
+    credible passing evidence attached".  Evidence is stored verbatim: only
+    the reading of it is lenient, the ledger keeps what the reporter wrote.
+    """
+    warnings = []
+    for index, item in enumerate(evidence):
+        keyed = {}
+        for key, value in item.items():
+            keyed.setdefault(str(key).strip().lower(), value)
+        for key in _EVIDENCE_NAMED_VERDICT_KEYS:
+            if key not in keyed or _evidence_verdict(keyed[key]) is not None:
+                continue
+            raw = keyed[key]
+            shown = "" if raw is None else str(raw)
+            if not shown.strip():
+                # An empty verdict is an absent verdict, not a wrong one.
+                continue
+            if len(shown) > 80:
+                shown = shown[:80] + "..."
+            warnings.append(
+                "evidence[%d].%s '%s' is not a recognized verdict; %s"
+                % (index, key, shown, _EVIDENCE_RESULT_GUIDANCE))
+    return warnings
 
 
 def _evidence_verification(evidence):
@@ -4604,10 +4720,10 @@ def _evidence_verification(evidence):
                 item_pass = item_pass or code == 0
                 item_failure = item_failure or code != 0
                 continue
-            verdict = str(value or "").strip().lower().replace("-", "_")
-            if verdict in _EVIDENCE_PASS_VALUES:
+            verdict = _evidence_verdict(value)
+            if verdict == "pass":
                 item_pass = True
-            elif verdict in _EVIDENCE_FAIL_VALUES:
+            elif verdict == "fail":
                 item_failure = True
         explicit_failure = explicit_failure or item_failure
         credible_pass = credible_pass or (identifying and item_pass and
@@ -9171,6 +9287,7 @@ def task_report(conn, project_id, actor_id, actor_type, task_id, summary,
     if requested_state not in ("review", "done", "blocked", "queued"):
         raise AttaccaError("requested_state must be review|done|blocked|queued")
     evidence = _normalize_evidence(evidence)
+    evidence_warnings = _evidence_result_warnings(evidence)
     requested_target = requested_state
     verification_status = _evidence_verification(evidence)
     # A bare assertion, ambiguous evidence, or an explicit failed check cannot
@@ -9240,11 +9357,16 @@ def task_report(conn, project_id, actor_id, actor_type, task_id, summary,
                 "verified passing evidence — attach identified checks with "
                 "an explicit passing result"
                 % (row["base_revision"], base_revision))
+        warnings.extend(evidence_warnings)
         if verification_status == "failed":
             warnings.append(
                 "evidence contains an explicit failed check: completion "
                 "remains in review until passing verification is reported")
-        elif verification_status != "verified":
+        elif verification_status != "verified" and not evidence_warnings:
+            # Reserved for evidence that carried no readable verdict at all.
+            # A value that WAS sent but could not be read is named above
+            # instead: telling a reporter "no evidence" about evidence it
+            # attached is the misdirection this vocabulary fixes.
             warnings.append(
                 "no credible passing evidence attached: completion remains "
                 "unverified and cannot enter done; identify the check and "
@@ -9253,6 +9375,10 @@ def task_report(conn, project_id, actor_id, actor_type, task_id, summary,
               "requested_state": requested_target,
               "verification_status": verification_status,
               "warnings": warnings, "event": event}
+    if evidence_warnings:
+        # Answer a refused verdict with the vocabulary itself, so the caller
+        # can fix the value without reading the source or guessing.
+        result["accepted_results"] = list(_EVIDENCE_ACCEPTED_RESULTS)
     if context_version:
         result["context_version"] = context_version
     return result
@@ -11881,7 +12007,19 @@ MCP_TOOLS = [
         "description": "Report the outcome of your task with evidence (tests run, commits, "
                        "outputs). requested_state: review (default), done, blocked, or "
                        "queued (give it back). Evidence-less 'done' is flagged — the "
-                       "platform distinguishes 'agent says done' from verified completion.",
+                       "platform distinguishes 'agent says done' from verified completion. "
+                       "evidence[].result (also verdict/status/outcome) accepts, "
+                       "case-insensitively: pass/passed/ok/success/succeeded/green/done, "
+                       "fail/failed/error/red/broken, and "
+                       "skipped/skip/blocked/waived/partial/unknown — plus booleans and "
+                       "descriptive values, so 'PASS exit0' and 'pass: 27/27' pass, "
+                       "'FAIL 2 errors' fails, '27/27 PASS' passes only when the counts "
+                       "match ('26/27 PASS' is a failure), and '0 failures' passes. Your "
+                       "evidence is stored exactly as written; a verdict that cannot be "
+                       "read is quoted back by index with the accepted list, never "
+                       "reported as missing evidence (status/outcome are read the "
+                       "same way but never complained about — 'open' and 'queued' "
+                       "are honest values there).",
         "inputSchema": {"type": "object", "properties": {
             "task_id": _s("Task id, e.g. T-3."),
             "summary": _s("What you did and the outcome."),
@@ -18001,6 +18139,19 @@ def _r_task_claim(h, m, q):
 
 
 def _r_task_report(h, m, q):
+    """Report task outcome with evidence.
+
+    evidence[].result (also verdict/status/outcome) accepts, case-
+    insensitively, pass/passed/ok/success/succeeded/green/done,
+    fail/failed/error/red/broken and skipped/skip/blocked/waived/partial/
+    unknown, plus booleans and descriptive values: "PASS exit0" passes,
+    "FAIL 2 errors" fails, "27/27 PASS" passes only when the counts match,
+    and "0 failures" passes.  An unreadable result/verdict is quoted back by
+    index in warnings, with the vocabulary in accepted_results, and leaves
+    verification_status unverified; the evidence is stored verbatim.  A
+    status/outcome is read the same way but never complained about, because
+    "open" and "queued" are honest values there.
+    """
     actor, atype = h._actor()
     body = h._body_json()
     h._reply_json(200, task_report(

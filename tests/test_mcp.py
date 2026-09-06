@@ -197,6 +197,72 @@ class McpTestCase(unittest.TestCase):
         self.assertTrue(is_err)
         self.assertIn("not claimable", text)
 
+    def test_task_report_evidence_verdict_vocabulary_over_mcp(self):
+        alice = self.client(actor="alice")
+        alice.initialize()
+        resp = alice.request("tools/list")
+        described = next(tool["description"] for tool in resp["result"]["tools"]
+                         if tool["name"] == "task_report")
+        # the vocabulary is documented where a reporting AI actually reads it
+        self.assertIn("pass/passed/ok/success/succeeded/green/done", described)
+        self.assertIn("fail/failed/error/red/broken", described)
+        self.assertIn("skipped/skip/blocked/waived/partial/unknown", described)
+        self.assertIn("'PASS exit0'", described)
+        self.assertIn("'27/27 PASS'", described)
+
+        def report(title, evidence):
+            _, _, task = alice.call_tool("task_create", {"title": title})
+            alice.call_tool("task_claim", {"task_id": task["task_id"]})
+            is_err, text, result = alice.call_tool("task_report", {
+                "task_id": task["task_id"], "summary": "ran the suite",
+                "evidence": evidence, "requested_state": "done"})
+            self.assertFalse(is_err, text)
+            _, _, shown = alice.call_tool(
+                "task_show", {"task_id": task["task_id"], "detail": "full"})
+            return result, shown["last_report"]["evidence"]
+
+        # the descriptive strings from #907/#908 now finish the task
+        for value in ("PASS exit0", "27/27 PASS", "27/27 passed"):
+            with self.subTest(result=value):
+                result, stored = report("descriptive pass: %s" % value, [
+                    {"kind": "test", "name": "unittest discover",
+                     "result": value}])
+                self.assertEqual(result["status"], "done")
+                self.assertEqual(result["verification_status"], "verified")
+                self.assertEqual(result["warnings"], [])
+                self.assertNotIn("accepted_results", result)
+                self.assertEqual(stored[0]["result"], value)
+
+        for value in ("26/27 PASS", "FAIL 2 errors"):
+            with self.subTest(result=value):
+                result, stored = report("descriptive failure: %s" % value, [
+                    {"kind": "test", "name": "unittest discover",
+                     "result": value}])
+                self.assertEqual(result["status"], "review")
+                self.assertEqual(result["verification_status"], "failed")
+                self.assertFalse(any("is not a recognized verdict" in w
+                                     for w in result["warnings"]))
+                self.assertEqual(stored[0]["result"], value)
+
+        result, stored = report("boolean pass", [
+            {"kind": "test", "name": "unittest discover", "result": True}])
+        self.assertEqual(result["verification_status"], "verified")
+        self.assertIs(stored[0]["result"], True)
+
+        result, stored = report("unreadable verdict", [
+            {"kind": "test", "name": "unittest discover", "result": "meh"}])
+        self.assertEqual(result["status"], "review")
+        self.assertEqual(result["verification_status"], "unverified")
+        self.assertIn(
+            "evidence[0].result 'meh' is not a recognized verdict; use one "
+            "of pass/fail/skipped/blocked/waived/partial (case-insensitive; "
+            "'PASS exit0' and '27/27 PASS' style values are accepted)",
+            result["warnings"])
+        self.assertIn("skipped", result["accepted_results"])
+        self.assertFalse(any("no credible passing evidence" in w
+                             for w in result["warnings"]))
+        self.assertEqual(stored[0]["result"], "meh")
+
     def test_stale_context_warning_via_mcp(self):
         alice = self.client(actor="alice")
         alice.initialize()

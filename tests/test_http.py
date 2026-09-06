@@ -1355,6 +1355,63 @@ class HttpTestCase(unittest.TestCase):
         _, shown, _ = self.rest("GET", "/v1/projects/hub/tasks/%s" % tid)
         self.assertEqual(shown["status"], "done")
 
+    def test_task_report_evidence_verdict_vocabulary_over_rest(self):
+        def report(title, evidence):
+            _, task, _ = self.rest("POST", "/v1/projects/hub/tasks",
+                                   {"title": title}, actor="alice")
+            tid = task["task_id"]
+            self.rest("POST", "/v1/projects/hub/tasks/%s/claim" % tid, {},
+                      actor="alice")
+            status, result, _ = self.rest(
+                "POST", "/v1/projects/hub/tasks/%s/report" % tid,
+                {"summary": "ran the suite", "evidence": evidence,
+                 "requested_state": "done"}, actor="alice")
+            self.assertEqual(status, 200, result)
+            _, shown, _ = self.rest(
+                "GET", "/v1/projects/hub/tasks/%s?detail=full" % tid)
+            return result, shown["last_report"]["evidence"]
+
+        result, stored = report("rest descriptive pass", [
+            {"kind": "test", "name": "unittest discover",
+             "result": "PASS 27/27"}])
+        self.assertEqual(result["status"], "done")
+        self.assertEqual(result["verification_status"], "verified")
+        self.assertEqual(result["warnings"], [])
+        self.assertNotIn("accepted_results", result)
+        # the ledger keeps the reporter's own wording
+        self.assertEqual(stored[0]["result"], "PASS 27/27")
+
+        result, stored = report("rest counted failure", [
+            {"kind": "test", "name": "unittest discover",
+             "result": "26/27 PASS"}])
+        self.assertEqual(result["status"], "review")
+        self.assertEqual(result["verification_status"], "failed")
+        self.assertEqual(stored[0]["result"], "26/27 PASS")
+
+        result, stored = report("rest boolean fail", [
+            {"kind": "test", "name": "unittest discover", "result": False}])
+        self.assertEqual(result["status"], "review")
+        self.assertEqual(result["verification_status"], "failed")
+        self.assertIs(stored[0]["result"], False)
+
+        result, stored = report("rest unreadable verdict", [
+            {"kind": "test", "name": "unittest discover", "result": "PASS"},
+            {"kind": "test", "name": "browser smoke", "result": "skipped"},
+            {"kind": "test", "name": "manual sweep", "result": "meh"}])
+        self.assertIn(
+            "evidence[2].result 'meh' is not a recognized verdict; use one "
+            "of pass/fail/skipped/blocked/waived/partial (case-insensitive; "
+            "'PASS exit0' and '27/27 PASS' style values are accepted)",
+            result["warnings"])
+        # the refusal answers with the vocabulary the caller needs
+        self.assertEqual(result["accepted_results"][:7], [
+            "pass", "passed", "ok", "success", "succeeded", "green", "done"])
+        self.assertIn("waived", result["accepted_results"])
+        self.assertFalse(any("no credible passing evidence" in w
+                             for w in result["warnings"]))
+        self.assertEqual([item["result"] for item in stored],
+                         ["PASS", "skipped", "meh"])
+
     def test_handoff_freshness_verify_and_sync(self):
         status, registration, _ = self.rest(
             "POST", "/v1/projects/hub/agents",

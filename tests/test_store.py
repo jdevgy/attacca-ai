@@ -109,6 +109,165 @@ class StoreTestCase(unittest.TestCase):
         report = c.task_report(self.conn, "p1", "a", "agent", tid, summary="done-ish")
         self.assertTrue(any("evidence" in w for w in report["warnings"]))
 
+    # -- evidence verdict vocabulary ----------------------------------------
+
+    UNRECOGNIZED = "is not a recognized verdict"
+    NO_EVIDENCE = "no credible passing evidence"
+    VOCABULARY = [
+        "pass", "passed", "ok", "success", "succeeded", "green", "done",
+        "fail", "failed", "error", "red", "broken",
+        "skipped", "skip", "blocked", "waived", "partial", "unknown",
+    ]
+
+    def _report_evidence(self, evidence, requested_state="done"):
+        """Claim a fresh task, report `evidence`, return (report, stored)."""
+        tid = c.task_create(self.conn, "p1", "a", "agent",
+                            "evidence vocabulary case")["task_id"]
+        c.task_claim(self.conn, "p1", "a", "agent", tid)
+        report = c.task_report(self.conn, "p1", "a", "agent", tid,
+                               summary="ran the suite", evidence=evidence,
+                               requested_state=requested_state)
+        stored = c.task_show(self.conn, "p1", tid)["last_report"]["evidence"]
+        return report, stored
+
+    def test_evidence_verdict_accepts_the_documented_vocabulary(self):
+        for spelling in ("pass", "PASS", "passed", "Passed", "ok", "OK",
+                         "success", "succeeded", "green", "Done", "true"):
+            with self.subTest(result=spelling):
+                report, stored = self._report_evidence(
+                    [{"kind": "test", "name": "pytest tests/",
+                      "result": spelling}])
+                self.assertEqual(report["verification_status"], "verified")
+                self.assertEqual(report["status"], "done")
+                self.assertEqual(report["warnings"], [])
+                self.assertEqual(stored[0]["result"], spelling)
+        for spelling in ("fail", "FAIL", "failed", "error", "ERROR", "red",
+                         "broken", "blocked", "false"):
+            with self.subTest(result=spelling):
+                report, stored = self._report_evidence(
+                    [{"kind": "test", "name": "pytest tests/",
+                      "result": spelling}])
+                self.assertEqual(report["verification_status"], "failed")
+                self.assertEqual(report["status"], "review")
+                self.assertFalse(any(self.UNRECOGNIZED in w
+                                     for w in report["warnings"]))
+                self.assertEqual(stored[0]["result"], spelling)
+        # Recognized, but no judgement on the work: never called unreadable,
+        # and never enough to finish the task either.
+        for spelling in ("skipped", "SKIP", "waived", "partial", "unknown"):
+            with self.subTest(result=spelling):
+                report, _ = self._report_evidence(
+                    [{"kind": "test", "name": "pytest tests/",
+                      "result": spelling}])
+                self.assertEqual(report["verification_status"], "unverified")
+                self.assertEqual(report["status"], "review")
+                self.assertFalse(any(self.UNRECOGNIZED in w
+                                     for w in report["warnings"]))
+                self.assertNotIn("accepted_results", report)
+
+    def test_descriptive_evidence_verdicts_are_read_leniently(self):
+        for spelling in ("PASS exit0", "pass: 27/27", "ok (3 warnings)",
+                         "SUCCESS  in 4.2s", "27/27 PASS", "27/27 passed",
+                         "0 failures", "no failures"):
+            with self.subTest(result=spelling):
+                item = {"kind": "test", "name": "unittest discover",
+                        "result": spelling}
+                report, stored = self._report_evidence([dict(item)])
+                self.assertEqual(report["verification_status"], "verified")
+                self.assertEqual(report["status"], "done")
+                self.assertEqual(report["warnings"], [])
+                # the ledger keeps exactly what the reporter wrote
+                self.assertEqual(stored, [item])
+        for spelling in ("FAIL 2 errors", "26/27 PASS", "0/27 passed",
+                         "2/27 failed", "failed: 2 of 27"):
+            with self.subTest(result=spelling):
+                report, stored = self._report_evidence(
+                    [{"kind": "test", "name": "unittest discover",
+                      "result": spelling}])
+                self.assertEqual(report["verification_status"], "failed")
+                self.assertEqual(report["status"], "review")
+                self.assertFalse(any(self.UNRECOGNIZED in w
+                                     for w in report["warnings"]))
+                self.assertEqual(stored[0]["result"], spelling)
+
+    def test_evidence_verdict_booleans_map_to_pass_and_fail(self):
+        report, stored = self._report_evidence(
+            [{"kind": "test", "name": "unittest", "result": True}])
+        self.assertEqual(report["verification_status"], "verified")
+        self.assertEqual(report["status"], "done")
+        self.assertIs(stored[0]["result"], True)
+        report, stored = self._report_evidence(
+            [{"kind": "test", "name": "unittest", "result": False}])
+        self.assertEqual(report["verification_status"], "failed")
+        self.assertEqual(report["status"], "review")
+        self.assertIs(stored[0]["result"], False)
+
+    def test_unrecognized_evidence_verdict_is_named_exactly(self):
+        report, stored = self._report_evidence([
+            {"kind": "test", "name": "unittest discover",
+             "result": "PASS exit0"},
+            {"kind": "test", "name": "browser smoke", "result": "skipped"},
+            {"kind": "test", "name": "manual sweep", "result": "meh"}])
+        # the passing entry still counts, and the unreadable one is named by
+        # its exact index and value rather than dismissed as missing evidence
+        self.assertEqual(report["verification_status"], "verified")
+        self.assertEqual(report["status"], "done")
+        self.assertIn(
+            "evidence[2].result 'meh' is not a recognized verdict; use one "
+            "of pass/fail/skipped/blocked/waived/partial (case-insensitive; "
+            "'PASS exit0' and '27/27 PASS' style values are accepted)",
+            report["warnings"])
+        self.assertEqual(report["accepted_results"], self.VOCABULARY)
+        self.assertFalse(any(self.NO_EVIDENCE in w for w in report["warnings"]))
+        self.assertEqual([item["result"] for item in stored],
+                         ["PASS exit0", "skipped", "meh"])
+
+    def test_unreadable_verdict_is_never_reported_as_missing_evidence(self):
+        report, stored = self._report_evidence(
+            [{"kind": "test", "name": "unittest", "result": "mostly fine"}])
+        self.assertEqual(report["verification_status"], "unverified")
+        self.assertEqual(report["status"], "review")
+        self.assertTrue(any(
+            w.startswith("evidence[0].result 'mostly fine' " +
+                         self.UNRECOGNIZED)
+            for w in report["warnings"]), report["warnings"])
+        self.assertFalse(any(self.NO_EVIDENCE in w for w in report["warnings"]))
+        self.assertEqual(stored[0]["result"], "mostly fine")
+        # an oversized value is still named, but bounded before it is echoed
+        report, _ = self._report_evidence(
+            [{"kind": "test", "name": "unittest", "result": "z" * 300}])
+        named = [w for w in report["warnings"] if self.UNRECOGNIZED in w]
+        self.assertEqual(len(named), 1)
+        self.assertIn("'" + "z" * 80 + "...'", named[0])
+        # the classic wording is reserved for evidence carrying no verdict
+        bare, _ = self._report_evidence(None)
+        self.assertTrue(any(self.NO_EVIDENCE in w for w in bare["warnings"]))
+        self.assertFalse(any(self.UNRECOGNIZED in w for w in bare["warnings"]))
+        self.assertNotIn("accepted_results", bare)
+
+    def test_single_evidence_object_is_indexed_from_zero(self):
+        report, _ = self._report_evidence(
+            {"kind": "test", "name": "unittest", "result": "unclear"})
+        self.assertTrue(any(w.startswith("evidence[0].result 'unclear' ")
+                            for w in report["warnings"]), report["warnings"])
+
+    def test_verdict_key_is_read_while_pipeline_status_is_left_alone(self):
+        report, _ = self._report_evidence(
+            [{"kind": "test", "name": "unittest", "verdict": "PASS exit0"}])
+        self.assertEqual(report["verification_status"], "verified")
+        self.assertEqual(report["status"], "done")
+        report, _ = self._report_evidence(
+            [{"kind": "test", "name": "unittest", "verdict": "nope"}])
+        self.assertTrue(any(w.startswith("evidence[0].verdict 'nope' ")
+                            for w in report["warnings"]), report["warnings"])
+        # "open"/"queued" are honest pipeline states, not broken verdicts:
+        # they are not named back, and the classic wording still applies
+        report, _ = self._report_evidence(
+            [{"kind": "pull_request", "name": "#907", "status": "open"}])
+        self.assertEqual(report["verification_status"], "unverified")
+        self.assertFalse(any(self.UNRECOGNIZED in w for w in report["warnings"]))
+        self.assertTrue(any(self.NO_EVIDENCE in w for w in report["warnings"]))
+
     def test_release_and_set_status(self):
         tid = c.task_create(self.conn, "p1", "a", "agent", "t")["task_id"]
         c.task_claim(self.conn, "p1", "a", "agent", tid)
