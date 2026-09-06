@@ -1,0 +1,81 @@
+name: CI
+
+# Attacca is standard-library-only (Python 3.8+), so there is nothing to build
+# and nothing to install. CI just runs the unit suite on the supported
+# interpreter range.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Supersede in-progress PR runs, but never cancel a run on main: this project
+  # lands small commits directly on main, and a cancelled run there would hide
+  # the pass/fail signal for that commit.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  tests:
+    name: unit tests (python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Python 3.8 is the supported floor, but actions/python-versions does
+          # not publish a 3.8 build for ubuntu-24.04 (= current ubuntu-latest),
+          # so the floor leg pins the last image that has it.
+          - os: ubuntu-22.04
+            python-version: "3.8"
+          - os: ubuntu-latest
+            python-version: "3.10"
+          - os: ubuntu-latest
+            python-version: "3.12"
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # NOTE: no `working-directory` is set anywhere in this workflow.
+      # The Git repository root IS the attacca package -- attacca.py, tests/
+      # and .github/ all sit at the top level of the checkout. There is no
+      # nested `attacca/` directory, so adding `working-directory: attacca`
+      # would fail every step with "directory does not exist".
+
+      - name: Show the interpreter
+        run: python3 -VV
+
+      # Attacca has no third-party runtime dependencies; requirements.txt is
+      # conventional scaffolding and installs nothing. Deliberately no pip step.
+
+      - name: Smoke test the CLI
+        run: python3 attacca.py --version
+
+      # Plain `python3 -m unittest discover` finds NOTHING here: tests/ has no
+      # __init__.py and Python 3.11+ no longer discovers namespace packages, so
+      # it exits 5 with "NO TESTS RAN" and would look like a pass. Several test
+      # modules also import siblings as `tests.test_http`, so the modules must
+      # be named explicitly as members of the `tests` package.
+      - name: Run the unit suite
+        run: |
+          modules="$(cd tests && ls test_*.py | sed 's/\.py$//; s/^/tests./')"
+          if [ -z "$modules" ]; then
+            echo "::error::no test modules found under tests/"
+            exit 1
+          fi
+          echo "Running $(printf '%s\n' $modules | wc -l) test modules on $(python3 -V)"
+          python3 -m unittest $modules

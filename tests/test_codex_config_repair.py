@@ -8,7 +8,10 @@ import subprocess
 import sys
 import tempfile
 import threading
-import tomllib
+try:
+    import tomllib
+except ImportError:  # Python < 3.11
+    tomllib = None
 import unittest
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -65,6 +68,7 @@ class StandaloneCodexRepairTests(unittest.TestCase):
         self.config = self.root / "codex" / "config.toml"
         self.config.parent.mkdir()
 
+    @unittest.skipUnless(tomllib is not None, "tomllib requires Python 3.11+")
     def test_exact_line_14_duplicate_env_is_repaired_and_idempotent(self):
         self.assertEqual(
             LINE_14_DUPLICATE_ENV.splitlines()[13],
@@ -109,6 +113,7 @@ class StandaloneCodexRepairTests(unittest.TestCase):
         self.assertEqual(self.config.read_bytes(), first_bytes)
         self.assertEqual(Path(first["backup"]).read_bytes(), backup_bytes)
 
+    @unittest.skipUnless(tomllib is not None, "tomllib requires Python 3.11+")
     def test_all_root_descendant_quoted_and_partial_tables_are_removed(self):
         fixture = """# preserved preamble
 [mcp_servers.attacca.env]
@@ -152,6 +157,9 @@ command = "duplicate"
             parsed["mcp_servers"]["attacca"]["env"]["ATTACCA_URL"],
             "https://sync.example.test/base")
 
+    # The "original left untouched" message comes from the tomllib
+    # validation branch; the structural fallback raises a different error.
+    @unittest.skipUnless(tomllib is not None, "tomllib requires Python 3.11+")
     def test_invalid_unrelated_toml_is_never_backed_up_or_replaced(self):
         fixture = """[mcp_servers.attacca]
 command = "stale"
@@ -190,6 +198,7 @@ broken = [
         self.assertEqual(self.config.read_text(), LINE_14_DUPLICATE_ENV)
         self.assertEqual(protected.read_text(), "do not overwrite")
 
+    @unittest.skipUnless(tomllib is not None, "tomllib requires Python 3.11+")
     def test_standalone_cli_repairs_private_new_config_and_reports_noop(self):
         self.config.unlink(missing_ok=True)
         command = [
@@ -213,6 +222,7 @@ broken = [
             tomllib.loads(first_bytes.decode())["mcp_servers"]["attacca"]
             ["env"]["ATTACCA_URL"], "http://host:4173")
 
+    @unittest.skipUnless(tomllib is not None, "tomllib requires Python 3.11+")
     def test_parallel_identical_repairs_leave_one_entry_and_exact_backup(self):
         self.config.write_text(LINE_14_DUPLICATE_ENV)
 
@@ -234,6 +244,7 @@ broken = [
 
 
 class InstallerCodexRepairIntegrationTests(unittest.TestCase):
+    @unittest.skipUnless(tomllib is not None, "tomllib requires Python 3.11+")
     def test_real_served_installer_is_warning_clean_and_idempotent_three_times(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -317,6 +328,7 @@ class InstallerCodexRepairIntegrationTests(unittest.TestCase):
             self.assertFalse(any("plugins/cache" in command
                                  for command in hook_commands))
 
+    @unittest.skipUnless(tomllib is not None, "tomllib requires Python 3.11+")
     def test_configure_codex_repairs_then_survives_three_identical_reruns(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary) / "home"
@@ -353,6 +365,7 @@ class InstallerCodexRepairIntegrationTests(unittest.TestCase):
             self.assertEqual(updated["mcp_servers"]["attacca"]["env"]
                              ["ATTACCA_URL"], "http://new-host:4173")
 
+    @unittest.skipUnless(tomllib is not None, "tomllib requires Python 3.11+")
     def test_configure_codex_repairs_descendant_only_partial_block(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary) / "home"

@@ -13,7 +13,10 @@ import subprocess
 import sys
 import tempfile
 import threading
-import tomllib
+try:
+    import tomllib
+except ImportError:  # Python < 3.11
+    tomllib = None
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -209,6 +212,7 @@ class MachineServerSwitchTests(unittest.TestCase):
             "watcher": watcher, "old_key": old_key, "records": records,
         }
 
+    @unittest.skipUnless(tomllib is not None, "tomllib requires Python 3.11+")
     def test_switch_repairs_all_clients_preserves_identity_and_is_3x_idempotent(self):
         paths = self.build_installed_machine()
         identity_before = paths["identity"].read_bytes()
@@ -310,6 +314,7 @@ class MachineServerSwitchTests(unittest.TestCase):
         self.assertFalse((paths["codex"].with_name(
             "config.toml.attacca-backup")).exists())
 
+    @unittest.skipUnless(tomllib is not None, "tomllib requires Python 3.11+")
     def test_cli_process_concurrency_keeps_one_consistent_final_url(self):
         paths = self.build_installed_machine()
         urls = ["http://one.test:4173", "http://two.test:4173"] * 3
@@ -346,6 +351,7 @@ class MachineServerSwitchTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual({path: path.read_bytes() for path in before}, before)
 
+    @unittest.skipUnless(tomllib is not None, "tomllib requires Python 3.11+")
     def test_effective_codex_home_override_is_repaired_by_real_cli_path(self):
         custom_codex = Path(self.temporary.name) / "custom-codex"
         custom_codex.mkdir()

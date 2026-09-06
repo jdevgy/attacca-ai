@@ -9,7 +9,10 @@ import sys
 import tempfile
 import threading
 import time
-import tomllib
+try:
+    import tomllib
+except ImportError:  # Python < 3.11
+    tomllib = None
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -96,6 +99,7 @@ else:
 """
 
 
+@unittest.skipUnless(tomllib is not None, "tomllib requires Python 3.11+")
 class CodexTomlConcurrencyRegressionTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
