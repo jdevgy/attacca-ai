@@ -1,6 +1,6 @@
 {
   "name": "attacca",
-  "version": "0.5.9+codex.20260906",
+  "version": "0.5.10+codex.20260906",
   "description": "Shared project memory and workspace continuity across AI coding tools.",
   "author": {
     "name": "agentg"

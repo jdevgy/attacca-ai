@@ -18,6 +18,18 @@ Git tags in this repository, so versions are dated by their bump commit.
 - No `LICENSE` file yet. One must be chosen before publication.
 - `SECURITY.md` needs a private security contact address before publication.
 
+## [0.5.10] - 2026-09-06
+
+### Fixed
+
+- The background watcher daemon no longer exits when another session
+  atomically replaces `watcher-state.json` while it is being opened
+  (`WatcherStateSecurityError: watcher path changed while it was opened`). A
+  replacement that is still one of our own private files is re-opened with a
+  bounded retry; a foreign owner, a readable mode, a symlink, a non-regular
+  file or a swapped parent directory still fails closed. Retry exhaustion is
+  logged once and the daemon continues on the next tick (T-96).
+
 ## [0.5.9] - 2026-09-06
 
 ### Added
