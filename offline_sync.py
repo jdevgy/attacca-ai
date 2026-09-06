@@ -22,6 +22,7 @@ HTTP implementation lives in :mod:`sync_client`.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -112,6 +113,10 @@ _SYNC_MODES = {
     "syncing", "online", "conflict",
 }
 
+# How many times an oversized delta is re-chunked when a concurrent writer
+# moves the ledger head between the small drain and the large resources.
+CHUNKED_PULL_ATTEMPTS = 3
+
 _MUTATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{7,199}$")
 _RECORD_NAME_RE = re.compile(r"^(\d{20})\.json$")
 _RESERVED_ATTRIBUTION_KEYS = {
@@ -188,6 +193,21 @@ class OfflineIdentityChangedError(OfflineSyncError):
 
 class OfflineVisibilityChangedError(OfflineSyncError):
     """The same identity has a newer visibility/projection generation."""
+
+
+class OfflineResponseTooLargeError(OfflineSyncError):
+    """The host answered, but the answer does not fit the sync envelope.
+
+    This is never a transport outage and never a revoked identity: the
+    verified mirror stays usable and the exact protocol code is carried so a
+    watcher, a hook, and a human all see the same reason.  ``resource`` names
+    the single projection resource that could not be narrowed any further.
+    """
+
+    def __init__(self, message, *, code=None, resource=None):
+        super().__init__(message)
+        self.code = code or "envelope_too_large"
+        self.resource = resource
 
 
 class RemoteUnavailableError(ConnectionError):
@@ -2052,6 +2072,28 @@ class OfflineProjectSync:
         })
         return self._sync_report("offline", report)
 
+    def _response_too_large_report(self, error, report):
+        """A reachable host whose answer does not fit is not an outage.
+
+        The verified mirror stays usable and the exact protocol code (or
+        ``sync_resource_too_large:<resource>``) is reported, so the watcher
+        backs off in a bounded way instead of latching an offline state.
+        """
+        usable = self.has_mirror()
+        self._set_state(
+            mode="pending" if usable else "offline_uninitialized",
+            pending_sync=True, mirror_stale=True, last_error=str(error))
+        report.update({
+            "error": str(error),
+            "failure_kind": "sync_response_too_large",
+            "error_code": error.code,
+            "oversized_resource": error.resource,
+            "authentication_required": False,
+            "host_reachable": True,
+            "offline_usable": usable,
+        })
+        return self._sync_report("pending" if usable else "offline", report)
+
     def _remote_snapshot(self, remote, allow_scope_change=False):
         method = getattr(remote, "fetch_snapshot", None)
         if not callable(method):
@@ -2062,14 +2104,64 @@ class OfflineProjectSync:
             allow_visibility_change=allow_scope_change
             or self.visibility_fingerprint is None)
 
-    def _remote_pull(self, remote, cursor):
+    @staticmethod
+    def _oversized_response_code(error):
+        """Protocol code when the host answered but the answer is too big."""
+        for name in ("protocol_code", "code"):
+            code = getattr(error, name, None)
+            if isinstance(code, str) \
+                    and code in protocol.OVERSIZED_RESPONSE_CODES:
+                return code
+        return None
+
+    @staticmethod
+    def _response_too_large(code, resources=None):
+        """One precise, non-outage error for an oversized sync response."""
+        wanted = list(resources or ())
+        if len(wanted) == 1:
+            precise = "sync_resource_too_large:%s" % wanted[0]
+            return OfflineResponseTooLargeError(
+                "%s: the hosted %s resource alone does not fit one sync "
+                "response (%s)" % (precise, wanted[0], code),
+                code=precise, resource=wanted[0])
+        return OfflineResponseTooLargeError(
+            "%s: the hosted sync response exceeds its protocol ceiling"
+            % code, code=code)
+
+    @staticmethod
+    def _remote_accepts_resources(remote):
+        """True when this remote adapter can narrow one pull request."""
+        method = getattr(remote, "pull", None)
+        try:
+            parameters = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            return False
+        return "resources" in parameters or any(
+            item.kind is inspect.Parameter.VAR_KEYWORD
+            for item in parameters.values())
+
+    def _remote_pull(self, remote, cursor, resources=None):
         method = getattr(remote, "pull", None)
         if not callable(method):
             raise OfflineSyncError("remote adapter has no pull()")
-        result = method(
-            cursor=_json_copy(cursor),
-            visibility_fingerprint=self.visibility_fingerprint,
-            limit=protocol.MAX_PULL_RECORDS)
+        arguments = {
+            "cursor": _json_copy(cursor),
+            "visibility_fingerprint": self.visibility_fingerprint,
+            "limit": protocol.MAX_PULL_RECORDS,
+        }
+        if resources is not None:
+            if not self._remote_accepts_resources(remote):
+                raise OfflineResponseTooLargeError(
+                    "this sync client cannot narrow an oversized pull",
+                    code="envelope_too_large")
+            arguments["resources"] = list(resources)
+        try:
+            result = method(**arguments)
+        except Exception as error:
+            code = self._oversized_response_code(error)
+            if code is None:
+                raise
+            raise self._response_too_large(code, resources) from error
         try:
             checked = protocol.validate_pull_result(result)
             if checked["status"] == "ok":
@@ -2077,6 +2169,9 @@ class OfflineProjectSync:
                     checked["changes"], checked["scope"],
                     self.projection_capabilities, partial=True)
         except protocol.SyncProtocolError as error:
+            code = self._oversized_response_code(error)
+            if code is not None:
+                raise self._response_too_large(code, resources) from error
             error_class = OfflineSchemaCompatibilityError \
                 if protocol.is_schema_compatibility_error(error) \
                 else OfflineMirrorError
@@ -2114,6 +2209,62 @@ class OfflineProjectSync:
                 else OfflineSyncError
             raise error_class(
                 "remote push response failed validation: %s" % error) from error
+
+    def _pull_chunked(self, remote, cursor):
+        """Converge one oversized delta window resource by resource.
+
+        A delta replaces whole resources, so the small resources are drained
+        first - advancing the cursor through the window - and each large
+        resource is then fetched at the resulting cursor, where its window is
+        empty and the server returns that resource complete without moving
+        the cursor again.  Every negotiated resource belongs to exactly one
+        of the two groups, so no resource can silently stay stale.
+        """
+        negotiated = list(self.projection_capabilities["resources"])
+        large = [name for name in protocol.LARGE_PROJECTION_RESOURCES
+                 if name in negotiated]
+        small = [name for name in negotiated if name not in large]
+        if not large or not small:
+            raise self._response_too_large("envelope_too_large")
+        if set(small) | set(large) != set(negotiated):
+            raise OfflineSyncError(
+                "resource-chunked pull would omit a negotiated resource")
+        changed = False
+        for _attempt in range(CHUNKED_PULL_ATTEMPTS):
+            result = None
+            while True:
+                result = self._remote_pull(remote, cursor, resources=small)
+                if result["status"] != "ok":
+                    return changed, result
+                changed = self._install_pull_result(result) or changed
+                if not result["has_more"]:
+                    break
+                with self._locked():
+                    cursor = self._cursor_locked()
+            stable = True
+            for name in large:
+                with self._locked():
+                    at = self._cursor_locked()
+                single = self._remote_pull(remote, at, resources=[name])
+                if single["status"] != "ok":
+                    return changed, single
+                if single["records"] or single["next_cursor"] != at:
+                    # Another writer appended while this sequence was
+                    # running, so this answer is NOT complete as of the
+                    # mirror cursor.  Installing it would advance the cursor
+                    # past an event whose resource nobody refreshes.  Drop it
+                    # and drain the new window first.
+                    stable = False
+                    break
+                changed = self._install_pull_result(single) or changed
+            if stable:
+                return changed, result
+            with self._locked():
+                cursor = self._cursor_locked()
+        # Only complete-as-of-cursor resources were installed, and this
+        # report leaves the mirror stale/pending rather than claiming a
+        # convergence the chunk sequence never reached.
+        raise self._response_too_large("envelope_too_large")
 
     def _pull_until_current(self, remote, allow_initialize=True):
         changed = False
@@ -2155,7 +2306,18 @@ class OfflineProjectSync:
                     binder(self.scope, self.visibility_fingerprint)
                 changed = True
                 continue
-            result = self._remote_pull(remote, cursor)
+            installed = False
+            try:
+                result = self._remote_pull(remote, cursor)
+            except OfflineResponseTooLargeError as error:
+                if error.resource is not None:
+                    # One resource alone exceeds the ceiling. Narrowing
+                    # further is impossible, so surface the exact reason
+                    # rather than pretending the host is unreachable.
+                    raise
+                chunk_changed, result = self._pull_chunked(remote, cursor)
+                changed = chunk_changed or changed
+                installed = True
             if result["status"] == "reset_required":
                 snapshot = self._remote_snapshot(remote, allow_scope_change=True)
                 self.install_snapshot(
@@ -2167,7 +2329,8 @@ class OfflineProjectSync:
                     binder(self.scope, self.visibility_fingerprint)
                 changed = True
                 continue
-            changed = self._install_pull_result(result) or changed
+            if not installed:
+                changed = self._install_pull_result(result) or changed
             if not result["has_more"]:
                 if result["next_cursor"] != result["head_cursor"]:
                     # ``has_more`` is sequence-based, so a server can announce
@@ -2241,6 +2404,8 @@ class OfflineProjectSync:
                 self._pull_until_current(remote)
             report["converged"].extend(first_converged)
         except Exception as error:
+            if isinstance(error, OfflineResponseTooLargeError):
+                return self._response_too_large_report(error, report)
             contract_failure = self._remote_contract_failure_kind(error)
             if contract_failure:
                 return self._remote_contract_report(
@@ -2267,6 +2432,8 @@ class OfflineProjectSync:
         try:
             reconciled = self.reconcile_ambiguous(remote)
         except Exception as error:
+            if isinstance(error, OfflineResponseTooLargeError):
+                return self._response_too_large_report(error, report)
             contract_failure = self._remote_contract_failure_kind(error)
             if contract_failure:
                 return self._remote_contract_report(
@@ -2303,6 +2470,8 @@ class OfflineProjectSync:
             try:
                 pushed = self._remote_push(remote, ready, known_receipts)
             except Exception as error:
+                if isinstance(error, OfflineResponseTooLargeError):
+                    return self._response_too_large_report(error, report)
                 contract_failure = self._remote_contract_failure_kind(error)
                 if contract_failure:
                     return self._remote_contract_report(
@@ -2363,6 +2532,8 @@ class OfflineProjectSync:
                 item for item in final_converged
                 if item not in report["converged"])
         except Exception as error:
+            if isinstance(error, OfflineResponseTooLargeError):
+                return self._response_too_large_report(error, report)
             contract_failure = self._remote_contract_failure_kind(error)
             if contract_failure:
                 return self._remote_contract_report(
@@ -2661,7 +2832,7 @@ __all__ = [
     "OfflineSyncError", "OfflineMirrorError",
     "OfflineSchemaCompatibilityError", "OfflineJournalError",
     "OfflineConflictError", "OfflineIdentityChangedError",
-    "OfflineVisibilityChangedError",
+    "OfflineVisibilityChangedError", "OfflineResponseTooLargeError",
     "RemoteUnavailableError", "ConvergenceProof", "normalize_server_url",
     "mirror_storage_key", "validate_convergence_proof", "OfflineProjectSync",
     "JOURNAL_RECORD_KINDS", "JOURNAL_ROOT_KINDS", "AMBIGUOUS_PHASES",

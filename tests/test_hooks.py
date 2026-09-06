@@ -1924,5 +1924,109 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
         self.assertIn("[master-directive]", summary)
 
 
+class SyncResponseTooLargeNoticeTest(unittest.TestCase):
+    """T-94 · a reachable host whose reply is too large is not an outage.
+
+    All state is one temporary watcher directory; no configured host, no
+    network, and no ~/.attacca path is touched.
+    """
+
+    KEY = "k" * 64
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.previous = os.environ.get("ATTACCA_WATCHER_DIR")
+        os.environ["ATTACCA_WATCHER_DIR"] = str(
+            Path(self.temp.name) / "watcher")
+        self.addCleanup(self.restore_environment)
+
+    def restore_environment(self):
+        if self.previous is None:
+            os.environ.pop("ATTACCA_WATCHER_DIR", None)
+        else:
+            os.environ["ATTACCA_WATCHER_DIR"] = self.previous
+
+    def seed(self, code):
+        def mutate(state):
+            entry = state.setdefault("subscriptions", {}).setdefault(
+                self.KEY, {"project_id": "proj"})
+            if code is None:
+                for name in hook_module.SYNC_TOO_LARGE_STATE_KEYS:
+                    entry.pop(name, None)
+            else:
+                entry["sync_too_large_code"] = code
+
+        hook_module._mutate_state(hook_module._watcher_state_path(), mutate)
+
+    def entry(self):
+        state = json.loads(hook_module._watcher_state_path().read_text())
+        return state["subscriptions"][self.KEY]
+
+    def notices(self, event_name="SessionStart"):
+        return hook_module._offline_continuity_notices(
+            self.KEY, "proj", event_name, {"mode": "pending"})
+
+    def test_notice_renders_once_per_state_with_the_exact_code(self):
+        self.seed("sync_resource_too_large:tasks")
+        first = self.notices()
+        self.assertEqual(len(first), 1)
+        context = first[0]["context"]
+        self.assertIn(
+            "ATTACCA SYNC RESPONSE TOO LARGE (sync_resource_too_large:tasks)",
+            context)
+        self.assertIn("REACHABLE", context)
+        self.assertIn("not a hosted outage", context.lower())
+        self.assertNotIn("AUTOMATIC INBOX CHECK FAILED", context)
+        self.assertEqual(
+            self.entry()["sync_too_large_notice_signature"],
+            "sync_resource_too_large:tasks")
+
+        # Unchanged state: reported once, exactly like the outage notice.
+        self.assertEqual(self.notices(), ())
+
+        self.seed("envelope_too_large")
+        repeated = self.notices()
+        self.assertEqual(len(repeated), 1)
+        self.assertIn("(envelope_too_large)", repeated[0]["context"])
+
+        # Stop drops status notices, so it must not consume the latch.
+        self.seed("sync_resource_too_large:room_messages")
+        self.assertEqual(self.notices(event_name="Stop"), ())
+        self.assertIn("ATTACCA SYNC RESPONSE TOO LARGE",
+                      self.notices()[0]["context"])
+
+        # A normal sync clears the state and the notice goes silent.
+        self.seed(None)
+        self.assertEqual(self.notices(), ())
+
+    def test_oversized_sync_is_classified_apart_from_an_outage(self):
+        self.assertEqual(
+            hook_module._sync_response_too_large_code({
+                "status": "pending",
+                "failure_kind": "sync_response_too_large",
+                "error_code": "sync_resource_too_large:tasks"}),
+            "sync_resource_too_large:tasks")
+        self.assertEqual(
+            hook_module._sync_response_too_large_code({
+                "status": "pending",
+                "failure_kind": "sync_response_too_large"}),
+            "envelope_too_large")
+        for other in ({"status": "offline", "error": "connection refused"},
+                      {"status": "online"},
+                      {"failure_kind": "schema_incompatible"}, None):
+            self.assertIsNone(hook_module._sync_response_too_large_code(other))
+        # Bounded back-off, never the unbounded outage ladder.
+        self.assertEqual(
+            hook_module._sync_too_large_backoff_seconds(1),
+            hook_module.SYNC_TOO_LARGE_BACKOFF_START_SECONDS)
+        self.assertGreater(
+            hook_module._sync_too_large_backoff_seconds(3),
+            hook_module._sync_too_large_backoff_seconds(1))
+        self.assertEqual(
+            hook_module._sync_too_large_backoff_seconds(99),
+            hook_module.SYNC_TOO_LARGE_BACKOFF_MAX_SECONDS)
+
+
 if __name__ == "__main__":
     unittest.main()

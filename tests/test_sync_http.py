@@ -15,6 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -173,6 +174,183 @@ class SyncHttpFixture:
             "client_a", device, mutations)
 
 
+class SyncProjectionShapeTest(unittest.TestCase):
+    """T-94 · the mirror projection carries each plan revision exactly once.
+
+    Measured on a live workspace before this change: one identity projection
+    was 51.4 MB, of which 23.7 MB were tasks (23.5 MB of that being
+    ``tasks[].plan_revisions``) and another 23.5 MB were the SAME revisions
+    repeated under ``task_plans``.  Everything here is one temporary
+    database; no server and no configured host is involved.
+    """
+
+    SECTION_BODY = "immutable plan section body. " * 900  # ~25 KB
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.db = Path(self.temp.name) / "projection.db"
+        checkout = Path(self.temp.name) / "repo"
+        checkout.mkdir()
+        self.conn = attacca.connect(self.db)
+        self.addCleanup(self.conn.close)
+        attacca.set_current_owner(None)
+        attacca.project_init(
+            self.conn, "setup", "human", path=str(checkout),
+            project_id="proj", name="Projection")
+        attacca.agent_register(
+            self.conn, "proj", "setup", "human",
+            agent_id="proj.director.codex", role="director", runtime="codex")
+        self.task_ids = []
+        for index in range(2):
+            task_id = attacca.task_create(
+                self.conn, "proj", "proj.director.codex", "agent",
+                "Plan heavy task %d" % index)["task_id"]
+            self.task_ids.append(task_id)
+            for version in range(3):
+                attacca.task_plan_set(
+                    self.conn, "proj", task_id, "proj.director.codex",
+                    "agent", "Plan v%d" % (version + 1),
+                    "overview revision %d" % version,
+                    [{"section_id": "s%d" % number,
+                      "title": "Section %d" % number,
+                      "body": self.SECTION_BODY} for number in range(6)],
+                    expected_version=None if version == 0 else version)
+        self.scope = {
+            "server_id": "srv_projection", "project_id": "proj",
+            "principal_id": "usr_owner", "actor_id": "proj.director.codex",
+            "actor_type": "agent", "role": "director",
+        }
+
+    def test_projection_carries_each_plan_revision_once(self):
+        projection = attacca._sync_projection(self.conn, self.scope)
+        for task in projection["tasks"]:
+            self.assertNotIn("plan_revisions", task)
+        self.assertEqual(len(projection["task_plans"]), 6)
+
+        exporter = attacca._project_export_module()
+        export = exporter.build_project_export(
+            self.conn, "proj", log_renderer=attacca.render_log_line)
+        # The administrative export deliberately keeps both shapes.
+        self.assertEqual(
+            len(export["tasks"][0]["plan_revisions"]), 3)
+        before = dict(projection)
+        before["tasks"] = export["tasks"]
+        before["task_plans"] = [
+            plan for task in export["tasks"]
+            for plan in task.get("plan_revisions", [])]
+        before_bytes = len(protocol.canonical_json_bytes(before))
+        after_bytes = len(protocol.canonical_json_bytes(projection))
+        print("MEASURED · T-94 sync projection · before %d B · after %d B"
+              % (before_bytes, after_bytes))
+        self.assertLess(after_bytes * 4, before_bytes)
+
+    def test_only_the_latest_plan_revision_carries_its_sections(self):
+        projection = attacca._sync_projection(self.conn, self.scope)
+        for task_id in self.task_ids:
+            revisions = sorted(
+                (plan for plan in projection["task_plans"]
+                 if plan["task_id"] == task_id),
+                key=lambda item: item["version"])
+            self.assertEqual([item["version"] for item in revisions],
+                             [1, 2, 3])
+            latest = revisions[-1]
+            self.assertEqual(len(latest["sections"]), 6)
+            self.assertNotIn("sections_omitted", latest)
+            for older in revisions[:-1]:
+                self.assertNotIn("sections", older)
+                self.assertTrue(older["sections_omitted"])
+                self.assertEqual(older["section_count"], 6)
+                for field in ("task_id", "version", "title", "status",
+                              "content_sha256", "authored_by", "authored_at",
+                              "updated_at", "overview"):
+                    self.assertIn(field, older)
+
+    def test_offline_plan_read_reports_an_omitted_body_instead_of_crashing(self):
+        projection = attacca._sync_projection(self.conn, self.scope)
+        snapshot = {"scope": self.scope, "projection": projection,
+                    "records": []}
+        task_id = self.task_ids[0]
+        latest = attacca._offline_proxy_plan(snapshot, task_id)
+        self.assertEqual(latest["plan"]["version"], 3)
+        self.assertEqual(len(latest["plan"]["sections"]), 6)
+        older = attacca._offline_proxy_plan(snapshot, task_id, version=1)
+        self.assertEqual(older["plan"]["version"], 1)
+        self.assertEqual(older["plan"]["sections"], [])
+        self.assertTrue(older["plan"]["sections_omitted"])
+        self.assertIn("hosted", older["plan"]["sections_hint"])
+        counts = {item["version"]: item["section_count"]
+                  for item in older["revisions"]}
+        self.assertEqual(counts, {1: 6, 2: 6, 3: 6})
+
+    def test_a_narrowed_projection_returns_only_those_resources(self):
+        narrowed = attacca._sync_projection(
+            self.conn, self.scope, resources=["tasks"])
+        self.assertEqual(set(narrowed), {"tasks"})
+        self.assertEqual(len(narrowed["tasks"]), 2)
+        self.assertEqual(
+            attacca._sync_projection(self.conn, self.scope, resources=[]), {})
+
+
+class SyncDeltaResourceSelectionTest(unittest.TestCase):
+    """T-94 · a delta carries only what its window can change."""
+
+    @staticmethod
+    def window(*event_types):
+        return [{"seq": index + 1, "event_type": name}
+                for index, name in enumerate(event_types)]
+
+    def test_each_event_type_selects_its_own_resources(self):
+        always = set(attacca.SYNC_ALWAYS_DELTA_RESOURCES)
+        cases = {
+            "task.created": {"tasks", "task_plans"},
+            "task.plan.submitted": {"tasks", "task_plans"},
+            "decision.resolved": {"decisions"},
+            "room.message": {"room_messages"},
+            "room.message_disposition": {"room_messages"},
+            "handoff.updated": {"project_handoffs", "identity_handoffs",
+                                "handoffs"},
+            "identity_handoff.updated": {"identity_handoffs", "handoffs",
+                                         "project_handoffs"},
+            "rule.updated": {"rules"},
+            "cloud_context.updated": {"cloud_context"},
+            "agent.registered": {"agents", "persona_reservations",
+                                 "actor_aliases"},
+            "bridge.created": {"bridges"},
+            "role_scope.updated": {"role_scopes", "project"},
+            "project.lead_changed": {"project", "agents", "role_scopes"},
+        }
+        for event_type, expected in cases.items():
+            self.assertEqual(
+                attacca._sync_delta_resources(self.window(event_type)),
+                expected | always, event_type)
+        self.assertEqual(
+            attacca._sync_delta_resources(
+                self.window("task.created", "decision.proposed")),
+            {"tasks", "task_plans", "decisions"} | always)
+
+    def test_unknown_or_empty_windows_fall_back_to_the_whole_projection(self):
+        # A custom append_event type, an identity migration that rewrites
+        # already projected attribution, and a context-version-only advance
+        # are all unbounded: the safe answer is the complete projection.
+        for window in ([],
+                       self.window("note.custom"),
+                       self.window("git.commit"),
+                       self.window("task.created", "note.custom"),
+                       self.window("agent.identity_migrated"),
+                       self.window("bridge.access_identity_migrated")):
+            self.assertIsNone(attacca._sync_delta_resources(window))
+
+    def test_every_mapped_resource_is_a_negotiable_projection_resource(self):
+        known = set(protocol.current_projection_capabilities()["resources"])
+        mapped = set(attacca.SYNC_ALWAYS_DELTA_RESOURCES)
+        for _prefix, resources in attacca.SYNC_EVENT_TYPE_RESOURCES:
+            mapped.update(resources)
+        self.assertLessEqual(mapped, known)
+        # Nothing a client mirrors may be unreachable through the map.
+        self.assertEqual(known - mapped, set())
+
+
 class SyncHttpTestCase(unittest.TestCase):
     def setUp(self):
         self.fx = SyncHttpFixture()
@@ -308,6 +486,119 @@ class SyncHttpTestCase(unittest.TestCase):
         self.assertEqual(reset["status"], "reset_required")
         self.assertEqual(reset["reason_code"], "visibility_changed")
         protocol.validate_pull_result(reset)
+
+    def negotiated_snapshot(self, token=None):
+        query = urllib.parse.urlencode(
+            protocol.projection_capabilities_query())
+        status, snapshot, _ = self.fx.request(
+            "GET", "/v1/projects/proj/sync/snapshot?" + query,
+            token=token or self.fx.director_token)
+        self.assertEqual(status, 200)
+        return snapshot
+
+    def pull_query(self, cursor, fingerprint, resources=None,
+                   capabilities=True, limit=50):
+        query = {
+            "after_seq": cursor["event_seq"],
+            "after_hash": cursor["event_hash"],
+            "context_version": cursor["context_version"],
+            "visibility_fingerprint": fingerprint,
+            "limit": limit,
+        }
+        if capabilities:
+            query.update(protocol.projection_capabilities_query())
+        if resources is not None:
+            query["projection_pull_resources"] = ",".join(resources)
+        return "/v1/projects/proj/sync/pull?" + urllib.parse.urlencode(query)
+
+    def write(self, action):
+        conn = attacca.connect(self.fx.db)
+        attacca.set_current_owner("owner1")
+        try:
+            return action(conn)
+        finally:
+            conn.close()
+
+    def test_delta_pull_carries_only_resources_the_window_can_change(self):
+        # T-94 · before this change every pull answered with the COMPLETE
+        # identity projection, so one 51 MB workspace could never advance its
+        # cursor through a 16 MB ceiling.
+        snapshot = self.negotiated_snapshot()
+        self.write(lambda conn: attacca.task_create(
+            conn, "proj", "proj.director.codex", "agent", "Delta task"))
+        status, pulled, _ = self.fx.request(
+            "GET", self.pull_query(
+                snapshot["cursor"], snapshot["visibility_fingerprint"]),
+            token=self.fx.director_token)
+        self.assertEqual(status, 200)
+        protocol.validate_pull_result(pulled)
+        self.assertEqual(pulled["status"], "ok")
+        self.assertEqual(
+            set(pulled["changes"]),
+            {"tasks", "task_plans", "full_log", "inbox_cursor",
+             "message_dispositions"})
+        self.assertIn(
+            "Delta task",
+            [item["title"] for item in pulled["changes"]["tasks"]])
+        # A narrowed delta must not look like a new projection generation.
+        self.assertEqual(pulled["visibility_fingerprint"],
+                         snapshot["visibility_fingerprint"])
+
+        self.write(lambda conn: attacca.room_send(
+            conn, "proj", "proj.director.codex", "agent", "delta chat"))
+        status, second, _ = self.fx.request(
+            "GET", self.pull_query(
+                pulled["next_cursor"], pulled["visibility_fingerprint"]),
+            token=self.fx.director_token)
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            set(second["changes"]),
+            {"room_messages", "full_log", "inbox_cursor",
+             "message_dispositions"})
+        self.assertIn(
+            "delta chat",
+            [item["body"] for item in second["changes"]["room_messages"]])
+
+    def test_pull_honours_a_requested_projection_resource_subset(self):
+        snapshot = self.negotiated_snapshot()
+        # A pull whose cursor is already the head is valid: its window is
+        # empty, so the requested resources come back complete.
+        for wanted in (["tasks"], ["rules", "agents"]):
+            status, pulled, _ = self.fx.request(
+                "GET", self.pull_query(
+                    snapshot["cursor"], snapshot["visibility_fingerprint"],
+                    resources=wanted),
+                token=self.fx.director_token)
+            self.assertEqual(status, 200)
+            protocol.validate_pull_result(pulled)
+            self.assertEqual(pulled["status"], "ok")
+            self.assertEqual(set(pulled["changes"]), set(wanted))
+            self.assertEqual(pulled["next_cursor"], pulled["from_cursor"])
+            # The capability offer, and therefore the negotiated shape and
+            # its fingerprint, is unchanged by a narrowed request.
+            self.assertEqual(pulled["visibility_fingerprint"],
+                             snapshot["visibility_fingerprint"])
+        self.assertEqual(
+            {rule["scope"] for rule in pulled["changes"]["rules"]},
+            {"everyone", "director"})
+
+        status, body, _ = self.fx.request(
+            "GET", self.pull_query(
+                snapshot["cursor"], snapshot["visibility_fingerprint"],
+                resources=["not_a_resource"]),
+            token=self.fx.director_token)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["code"], "unsupported_projection_resource")
+
+        # A legacy (unnegotiated) client cannot request a schema-v2 resource.
+        _, legacy, _ = self.fx.snapshot()
+        status, body, _ = self.fx.request(
+            "GET", self.pull_query(
+                legacy["cursor"], legacy["visibility_fingerprint"],
+                resources=["cloud_context"], capabilities=False),
+            token=self.fx.director_token)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["code"], "unnegotiated_projection_resource")
 
     def test_push_is_exactly_once_and_preserves_trusted_attribution(self):
         _, snapshot, _ = self.fx.snapshot()
@@ -469,6 +760,65 @@ class SyncHttpTestCase(unittest.TestCase):
         proof = offline.validate_convergence_proof(
             synchronized["convergence_proof"], require_online=True)
         self.assertEqual(proof["scope"], snapshot["scope"])
+
+    def test_an_oversized_delta_converges_through_resource_chunked_pulls(self):
+        """T-94 · the whole loop: real client, real routes, lowered ceiling."""
+        _, snapshot, _ = self.fx.snapshot()
+        cache = Path(self.fx.temp.name) / "chunked-cache"
+        engine = offline.OfflineProjectSync(
+            cache, self.fx.base, snapshot["scope"], "client_chunk",
+            "device_chunk", visibility_fingerprint=None)
+        client = sync_client.AuthenticatedSyncHttpClient(
+            self.fx.base, "proj", snapshot["scope"], None,
+            "client_chunk", "device_chunk", lambda: self.fx.director_token)
+        self.assertEqual(engine.synchronize(client)["status"], "online")
+
+        filler = "wide task description. " * 900
+        self.write(lambda conn: [
+            attacca.task_create(
+                conn, "proj", "proj.director.codex", "agent",
+                "Wide task %d" % index, description=filler)
+            for index in range(3)])
+        self.write(lambda conn: attacca.room_send(
+            conn, "proj", "proj.director.codex", "agent",
+            "wide chat " + filler))
+
+        # Measure the real envelopes, then put the ceiling between one chunk
+        # and the whole delta, so the RECOVERY PATH is what is under test.
+        cursor = engine.status()["mirror_cursor"]
+        fingerprint = engine.visibility_fingerprint
+
+        def size(resources=None):
+            return len(protocol.canonical_json_bytes(client.pull(
+                cursor=cursor, visibility_fingerprint=fingerprint,
+                resources=resources)))
+
+        negotiated = engine.projection_capabilities["resources"]
+        large = [name for name in protocol.LARGE_PROJECTION_RESOURCES
+                 if name in negotiated]
+        small = [name for name in negotiated if name not in large]
+        chunks = [size(small)] + [size([name]) for name in large]
+        ceiling = max(chunks) + 1024
+        whole = size()
+        self.assertLess(ceiling, whole)
+
+        with mock.patch.object(protocol, "MAX_PULL_BYTES", ceiling):
+            report = engine.synchronize(client)
+
+        self.assertEqual(report["status"], "online")
+        self.assertIsNone(report["error"])
+        _, current, _ = self.fx.snapshot()
+        self.assertEqual(engine.status()["mirror_cursor"], current["cursor"])
+        self.assertFalse(engine.status()["mirror_stale"])
+        projection = engine.local_projection()
+        self.assertEqual(
+            len([item for item in projection["tasks"]
+                 if str(item.get("title", "")).startswith("Wide task")]), 3)
+        self.assertTrue(any(
+            str(item.get("body", "")).startswith("wide chat")
+            for item in projection["room_messages"]))
+        # A narrowed request is not a visibility change: no reset happened.
+        self.assertEqual(engine.visibility_fingerprint, fingerprint)
 
     def test_two_devices_disconnect_queue_and_reconnect_exactly_once(self):
         """Two computers retain separate outboxes and converge through HTTP."""

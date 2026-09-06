@@ -495,8 +495,13 @@ class AuthenticatedSyncHttpClient:
             raise SyncResponseError(
                 "sync transport returned malformed response fields")
         if len(response.body) > int(max_response_bytes):
+            # The host answered; the answer does not fit the bounded
+            # envelope.  Carry the protocol code so a caller can narrow the
+            # request instead of treating it as an outage.
             raise SyncResponseError(
-                "sync response exceeded its bounded size")
+                "sync response exceeded its bounded size",
+                http_status=response.status,
+                protocol_code="envelope_too_large")
         if response.status in {401, 403}:
             # Compatibility is a live server state, never a sticky downgrade.
             self._compatibility_optional_auth = False
@@ -580,11 +585,25 @@ class AuthenticatedSyncHttpClient:
                 visibility_fingerprint=checked["visibility_fingerprint"])
         return checked
 
-    def pull(self, *, cursor, visibility_fingerprint, limit=200):
+    def pull(self, *, cursor, visibility_fingerprint, limit=200,
+             resources=None):
+        """Fetch one delta, optionally narrowed to ``resources``.
+
+        ``resources`` restricts only what THIS response delivers.  The
+        capability offer - and therefore the negotiated shape and the
+        visibility fingerprint - is unchanged, so a narrowed pull returns a
+        smaller partial ``changes`` instead of ``reset_required``.
+        """
         visibility = protocol.validate_visibility_fingerprint(
             visibility_fingerprint)
         request = protocol.make_pull_request(
             self.scope, cursor, visibility, limit=limit)
+        try:
+            subset = protocol.validate_projection_subset(
+                resources, capabilities=self.projection_capabilities)
+        except protocol.SyncProtocolError as error:
+            raise SyncClientError(
+                "pull resource subset is invalid: %s" % error) from error
         value = self._request(
             "GET", "/pull",
             query={
@@ -595,7 +614,8 @@ class AuthenticatedSyncHttpClient:
                     "visibility_fingerprint"],
                 "limit": request["limit"],
             } | protocol.projection_capabilities_query(
-                self.projection_capabilities),
+                self.projection_capabilities)
+            | protocol.projection_subset_query(subset),
             max_response_bytes=protocol.MAX_PULL_BYTES)
         try:
             checked = protocol.validate_pull_result(value)

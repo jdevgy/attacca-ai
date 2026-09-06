@@ -310,6 +310,74 @@ class SyncHttpClientTest(unittest.TestCase):
         with self.assertRaises(client_module.SyncResponseError):
             client.fetch_snapshot()
 
+    def test_pull_narrows_one_request_without_changing_the_offer(self):
+        """T-94 · a delivered-resource subset is not a capability change."""
+        snapshot = self.remote.fetch_snapshot()
+        narrowed = protocol.make_pull_result(
+            self.scope, self.visibility, snapshot["cursor"],
+            snapshot["cursor"], self.remote.head(), [],
+            {"tasks": list(self.remote.tasks)})
+        transport = RecordingTransport([narrowed])
+        client = client_module.AuthenticatedSyncHttpClient(
+            "https://example.test", "agentg", self.scope, self.visibility,
+            "client_home", "device_home", lambda: "token",
+            transport=transport)
+        result = client.pull(
+            cursor=snapshot["cursor"], visibility_fingerprint=self.visibility,
+            resources=["tasks"])
+        self.assertEqual(set(result["changes"]), {"tasks"})
+        query = parse_qs(urlsplit(transport.calls[0]["url"]).query)
+        self.assertEqual(query["projection_pull_resources"], ["tasks"])
+        # The capability offer - and therefore the negotiated shape and the
+        # visibility fingerprint - is deliberately unchanged.
+        self.assertEqual(
+            query["projection_resources"],
+            [",".join(client.projection_capabilities["resources"])])
+        self.assertEqual(
+            query["projection_schema_version"],
+            [str(client.projection_capabilities["schema_version"])])
+        self.assertEqual(result["visibility_fingerprint"], self.visibility)
+
+        plain = RecordingTransport([narrowed])
+        client._transport = plain
+        client.pull(cursor=snapshot["cursor"],
+                    visibility_fingerprint=self.visibility)
+        self.assertNotIn(
+            "projection_pull_resources",
+            parse_qs(urlsplit(plain.calls[0]["url"]).query))
+        for unsafe in (["../etc"], ["not_a_resource"], []):
+            with self.assertRaises(client_module.SyncClientError):
+                client.pull(cursor=snapshot["cursor"],
+                            visibility_fingerprint=self.visibility,
+                            resources=unsafe)
+
+    def test_a_refused_or_oversized_response_carries_the_envelope_code(self):
+        """T-94 · 'answer too big' must be recoverable, not an outage."""
+        refused = RecordingTransport([
+            ({"error": "pull result exceeds bounds",
+              "code": "envelope_too_large"}, 400)])
+        client = client_module.AuthenticatedSyncHttpClient(
+            "https://example.test", "agentg", self.scope, self.visibility,
+            "client_home", "device_home", lambda: "token",
+            transport=refused)
+        with self.assertRaises(client_module.SyncResponseError) as raised:
+            client.pull(cursor=self.remote.head(),
+                        visibility_fingerprint=self.visibility)
+        self.assertEqual(raised.exception.protocol_code, "envelope_too_large")
+        self.assertNotIsInstance(
+            raised.exception, client_module.SyncSchemaCompatibilityError)
+        self.assertIn(
+            raised.exception.protocol_code, protocol.OVERSIZED_RESPONSE_CODES)
+
+        oversized = client_module.JsonHttpResponse(
+            200, {"content-type": "application/json"},
+            b" " * (protocol.MAX_PULL_BYTES + 1))
+        client._transport.request = lambda *args, **kwargs: oversized
+        with self.assertRaises(client_module.SyncResponseError) as raised:
+            client.pull(cursor=self.remote.head(),
+                        visibility_fingerprint=self.visibility)
+        self.assertEqual(raised.exception.protocol_code, "envelope_too_large")
+
     def test_role_change_requires_valid_snapshot_then_explicit_binding(self):
         changed = FakeRemote(identity(role="advisor", runtime="claude"))
         changed.policy_generation = 4

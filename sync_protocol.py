@@ -46,7 +46,12 @@ LIVE_RECEIPT_FORMAT = "attacca.sync.live-receipt"
 GENESIS_HASH = "0" * 64
 
 MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
-MAX_PULL_BYTES = 16 * 1024 * 1024
+# A delta may legitimately carry any resource the snapshot it feeds carries
+# (a pull replaces whole resources), so a pull must never be bounded more
+# strictly than the snapshot: a stricter pull ceiling made every pull fail
+# with ``envelope_too_large`` on a workspace whose verified snapshot is
+# accepted, and the client cursor could never advance.
+MAX_PULL_BYTES = MAX_SNAPSHOT_BYTES
 MAX_PUSH_BYTES = 4 * 1024 * 1024
 MAX_MUTATION_BYTES = 256 * 1024
 MAX_MUTATIONS = 100
@@ -435,6 +440,85 @@ def projection_capabilities_from_query(schema_version=None, resources=None):
         "resources": rows,
     }
     return negotiate_projection_capabilities(offered)
+
+
+# Resources whose complete content dominates one identity projection.  A
+# recovering client fetches these one at a time when a whole delta exceeds the
+# protocol ceiling; everything else fits in a single narrowed request.
+LARGE_PROJECTION_RESOURCES = (
+    "tasks", "task_plans", "room_messages", "full_log", "decisions",
+    "project_handoffs",
+)
+# Protocol codes that mean "the hosted host answered, but the response does
+# not fit the bounded envelope".  They are recoverable by narrowing the
+# request; they are never a transport outage.
+OVERSIZED_RESPONSE_CODES = frozenset({
+    "envelope_too_large", "json_too_many_items", "string_too_large",
+})
+
+
+def validate_projection_subset(resources, capabilities=None):
+    """Validate one pull-only *delivered* resource subset.
+
+    This is deliberately NOT a capability offer.  A capability offer defines
+    the negotiated projection shape, may never omit a required schema-v1
+    resource, and is bound into the visibility fingerprint.  A pull result is
+    an explicitly partial projection, so one request may ask for fewer
+    resources than the negotiated set without changing the negotiated shape,
+    the fingerprint, or the mirror identity.  ``None`` means "the whole delta
+    the server would send anyway".
+    """
+    if resources is None:
+        return None
+    if isinstance(resources, str) or not isinstance(
+            resources, (list, tuple, set, frozenset)):
+        _error("invalid_projection_subset",
+               "projection pull subset must be a bounded array")
+    rows = list(resources)
+    if not rows or len(rows) > _MAX_PROJECTION_RESOURCES:
+        _error("invalid_projection_subset",
+               "projection pull subset must be a bounded non-empty array")
+    selected = []
+    for resource in rows:
+        if not isinstance(resource, str) \
+                or not _PROJECTION_RESOURCE_RE.fullmatch(resource):
+            _error("invalid_projection_subset",
+                   "projection pull subset has unsafe syntax")
+        if resource not in _PROJECTION_RESOURCES:
+            _error("unsupported_projection_resource",
+                   "projection resource %s is unsupported" % resource)
+        if resource not in selected:
+            selected.append(resource)
+    if capabilities is not None:
+        negotiated = set(
+            negotiate_projection_capabilities(capabilities)["resources"])
+        unexpected = sorted(set(selected) - negotiated)
+        if unexpected:
+            _error(
+                "unnegotiated_projection_resource",
+                "projection pull subset requests unnegotiated resource(s): %s"
+                % ", ".join(unexpected))
+    return sorted(selected)
+
+
+def projection_subset_query(resources=None):
+    """Encode one pull-only delivered-resource subset for a query string."""
+    checked = validate_projection_subset(resources)
+    if checked is None:
+        return {}
+    return {"projection_pull_resources": ",".join(checked)}
+
+
+def projection_subset_from_query(resources=None):
+    """Parse a pull-only delivered-resource subset; absence means all."""
+    if resources is None:
+        return None
+    if not isinstance(resources, str) \
+            or len(resources.encode("utf-8")) > 4096:
+        _error("invalid_projection_subset",
+               "projection pull subset query is invalid")
+    return validate_projection_subset(
+        [item.strip() for item in resources.split(",") if item.strip()])
 
 
 def projection_visibility_policy(visibility_policy, capabilities=None):
@@ -1832,6 +1916,9 @@ __all__ = [
     "validate_chain", "validate_projection_capabilities",
     "make_projection_capabilities", "legacy_projection_capabilities",
     "current_projection_capabilities", "negotiate_projection_capabilities",
+    "LARGE_PROJECTION_RESOURCES", "OVERSIZED_RESPONSE_CODES",
+    "validate_projection_subset", "projection_subset_query",
+    "projection_subset_from_query",
     "projection_capabilities_query", "projection_capabilities_from_query",
     "projection_visibility_policy", "validate_identity_projection",
     "validate_projection_for_capabilities",

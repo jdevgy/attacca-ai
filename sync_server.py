@@ -161,6 +161,11 @@ class SyncServerAdapters:
           "result": {...}, "server_cursor": cursor
       }
 
+    A projector may declare ``supports_projection_resources = True`` to be
+    called with one extra argument in ``pull`` mode: the exact list of
+    resources that response may deliver.  Any other projector is called
+    unchanged and its projection is narrowed afterwards.
+
     ``check_precondition`` has the same first two arguments as
     ``apply_mutation`` and returns ``None`` or a conflict mapping containing
     code/reason/current/retryable.  ``transaction`` optionally returns a
@@ -479,13 +484,21 @@ class SyncServerEngine:
                 for item in events]
 
     def _project_view(self, scope, mode, start, through, events,
-                      projection_capabilities=None):
-        raw = self.adapters.visibility_projector(
+                      projection_capabilities=None,
+                      projection_resources=None):
+        projector = self.adapters.visibility_projector
+        arguments = [
             self.connection, _json_copy(scope), mode,
             _json_copy(start) if start is not None else None,
             _json_copy(through) if through is not None else None,
             _json_copy(events),
-        )
+        ]
+        if projection_resources is not None and getattr(
+                projector, "supports_projection_resources", False):
+            # A projector that understands the narrowed request builds only
+            # those resources; every other projector is narrowed below.
+            arguments.append(list(projection_resources))
+        raw = projector(*arguments)
         if not isinstance(raw, dict) or "visibility_policy" not in raw:
             raise SyncServerStateError(
                 "visibility_projector must return visibility_policy")
@@ -504,6 +517,14 @@ class SyncServerEngine:
             _json_copy(
                 raw["projection"], max_bytes=protocol.MAX_SNAPSHOT_BYTES),
             scope, selected_capabilities, partial=mode == "pull")
+        if projection_resources is not None:
+            # A pull-only delivered subset.  Validation above still ran
+            # against everything the projector returned, so narrowing here
+            # can only remove already validated resources - it can never let
+            # an unvalidated or cross-project resource through.
+            requested = set(projection_resources)
+            projection = {key: value for key, value in projection.items()
+                          if key in requested}
         visible_raw = raw["visible_event_seqs"]
         if not isinstance(visible_raw, (list, tuple, set)):
             raise SyncServerStateError("visible_event_seqs must be a collection")
@@ -569,12 +590,23 @@ class SyncServerEngine:
             and event_cursor["context_version"] <= cursor["context_version"]
 
     def pull(self, authenticated_scope, envelope, *,
-             projection_capabilities=None):
-        """Return a bounded delta or ``reset_required`` for a stale/forked view."""
+             projection_capabilities=None, projection_resources=None):
+        """Return a bounded delta or ``reset_required`` for a stale/forked view.
+
+        ``projection_resources`` narrows only the resources THIS response
+        delivers.  It is not a capability offer: the negotiated shape, and
+        therefore the visibility fingerprint, is unchanged, so a client
+        recovering from an oversized response can fetch one resource at a
+        time without forcing a full reset.
+        """
         scope = self._trusted_scope(authenticated_scope)
         self._require_authorized(scope, "sync.read")
         request = protocol.validate_pull_request(
             envelope, expected_scope=scope)
+        subset = protocol.validate_projection_subset(
+            projection_resources,
+            capabilities=protocol.negotiate_projection_capabilities(
+                projection_capabilities))
         with self._lock, self._transaction():
             head = self._head(scope)
             fingerprint, _, _ = self._project_view(
@@ -603,7 +635,8 @@ class SyncServerEngine:
                 end = head
             fingerprint_after, changes, visible = self._project_view(
                 scope, "pull", start, end, events,
-                projection_capabilities=projection_capabilities)
+                projection_capabilities=projection_capabilities,
+                projection_resources=subset)
             if fingerprint_after != fingerprint:
                 return protocol.make_reset_required(
                     scope, fingerprint_after, "visibility_changed",

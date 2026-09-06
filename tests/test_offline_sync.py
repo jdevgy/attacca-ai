@@ -1049,6 +1049,203 @@ class OfflineIdentitySyncTest(unittest.TestCase):
         self.assertEqual(persisted["live_cursor"], ahead)
 
 
+class OversizedResponse(RuntimeError):
+    """Mirrors ``sync_client.SyncResponseError`` for an over-ceiling reply.
+
+    The real HTTP client raises that class with ``protocol_code`` set from
+    the hosted 400 body (or from its own bounded-size guard); this fake keeps
+    the exact attribute the recovery path classifies on.
+    """
+
+    def __init__(self, message, protocol_code="envelope_too_large"):
+        super().__init__(message)
+        self.protocol_code = protocol_code
+
+
+class ChunkingRemote(FakeRemote):
+    """A remote that refuses any pull response above a small ceiling.
+
+    It also implements the hosted rule the recovery path depends on: a
+    narrowed pull answers with those resources COMPLETE, because a window
+    with no events is unbounded.
+    """
+
+    def __init__(self, scope=None, max_pull_bytes=20000):
+        super().__init__(scope)
+        self.max_pull_bytes = max_pull_bytes
+        self.pull_requests = []
+        self.tasks = [dict(self.tasks[0], description="task body " * 1200)]
+        self.room = [dict(self.room[0], body="room body " * 1200)]
+        # Simulate another writer landing an event just before this exact
+        # single-resource request is answered.
+        self.append_before_resource = None
+        self.interleaved_body = "interleaved hosted line"
+
+    def pull(self, *, cursor, visibility_fingerprint, limit, resources=None):
+        self.pull_requests.append(
+            None if resources is None else list(resources))
+        if resources is not None and list(resources) == [
+                self.append_before_resource]:
+            self.append_before_resource = None
+            self.land_live_write(
+                "cm_interleaved_01", "room_send",
+                {"body": self.interleaved_body}, operation="room.send")
+        result = FakeRemote.pull(
+            self, cursor=cursor,
+            visibility_fingerprint=visibility_fingerprint, limit=limit)
+        if result.get("status") == "ok" and resources is not None:
+            source = self.projection()
+            result = protocol.make_pull_result(
+                self.scope, self.visibility(), result["from_cursor"],
+                result["next_cursor"], result["head_cursor"],
+                result["records"],
+                {name: source[name] for name in resources if name in source})
+        size = len(protocol.canonical_json_bytes(result))
+        if size > self.max_pull_bytes:
+            raise OversizedResponse(
+                "pull response is %d bytes, ceiling is %d"
+                % (size, self.max_pull_bytes))
+        return result
+
+
+class OversizedPullRecoveryTest(unittest.TestCase):
+    """T-94 · a reply that does not fit is recovered, never an outage."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    def engine(self, remote, name="home"):
+        return offline.OfflineProjectSync(
+            self.root / "cache", "HTTPS://EXAMPLE.test:443/", remote.scope,
+            "client_%s" % name, "device_%s" % name,
+            visibility_fingerprint=remote.visibility())
+
+    def test_oversized_pull_converges_through_resource_chunks(self):
+        remote = ChunkingRemote(max_pull_bytes=20000)
+        engine = self.engine(remote)
+        engine.install_snapshot(remote.fetch_snapshot())
+        remote.land_live_write(
+            "cm_seed_000000001", "room_send",
+            {"body": "hosted room line after the snapshot"},
+            operation="room.send")
+
+        report = engine.synchronize(remote)
+
+        self.assertIn(report["status"], ("online", "pending"))
+        self.assertIsNone(report["error"])
+        self.assertNotIn("failure_kind", report)
+        self.assertIsNone(remote.pull_requests[0])
+        chunks = [item for item in remote.pull_requests if item is not None]
+        self.assertNotIn("tasks", chunks[0])
+        self.assertNotIn("room_messages", chunks[0])
+        self.assertEqual(
+            [item for item in chunks[1:] if len(item) == 1],
+            [[name] for name in protocol.LARGE_PROJECTION_RESOURCES])
+        # Every negotiated resource belongs to exactly one chunk, so nothing
+        # can silently stay stale behind an advancing cursor.
+        covered = set(chunks[0])
+        for item in chunks[1:]:
+            covered.update(item)
+        self.assertEqual(
+            covered, set(engine.projection_capabilities["resources"]))
+
+        status = engine.status()
+        self.assertEqual(status["mirror_cursor"], remote.head())
+        self.assertFalse(status["mirror_stale"])
+        self.assertNotIn(status["mode"], ("offline", "offline_uninitialized"))
+        projection = engine.local_projection()
+        self.assertIn(
+            "hosted room line after the snapshot",
+            [item.get("body") for item in projection["room_messages"]])
+        self.assertEqual(projection["tasks"], remote.tasks)
+
+    def test_a_writer_during_chunking_never_converges_a_partial_mirror(self):
+        """A resource fetched after the window moved is never installed.
+
+        The chunk sequence is sound only while each single-resource answer is
+        complete AS OF the mirror cursor.  If another writer lands an event
+        after ``room_messages`` was fetched, installing the later chunk would
+        advance the cursor past a room message nobody ever re-projects.
+        """
+        remote = ChunkingRemote(max_pull_bytes=20000)
+        remote.append_before_resource = "project_handoffs"
+        engine = self.engine(remote, name="racing")
+        engine.install_snapshot(remote.fetch_snapshot())
+        remote.land_live_write(
+            "cm_seed_000000004", "room_send", {"body": "first hosted line"},
+            operation="room.send")
+
+        report = engine.synchronize(remote)
+
+        bodies = [item.get("body")
+                  for item in engine.local_projection()["room_messages"]]
+        seqs = {record["event"]["seq"]
+                for record in engine.local_snapshot()["records"]
+                if record.get("kind") == "event"}
+        if report.get("failure_kind"):
+            # Fail-safe: the mirror is labelled stale, never "converged".
+            self.assertEqual(report["failure_kind"], "sync_response_too_large")
+            self.assertTrue(engine.status()["mirror_stale"])
+        else:
+            self.assertIn(remote.interleaved_body, bodies)
+            self.assertFalse(engine.status()["mirror_stale"])
+            self.assertEqual(engine.status()["mirror_cursor"], remote.head())
+        # Never the broken state: an event in the chain whose room message is
+        # missing from the projection while the mirror claims to be current.
+        if remote.head()["event_seq"] in seqs:
+            self.assertIn(remote.interleaved_body, bodies)
+
+    def test_a_single_oversized_resource_reports_a_precise_code(self):
+        remote = ChunkingRemote(max_pull_bytes=9000)
+        engine = self.engine(remote, name="tight")
+        engine.install_snapshot(remote.fetch_snapshot())
+        remote.land_live_write(
+            "cm_seed_000000002", "room_send", {"body": "another line"},
+            operation="room.send")
+
+        report = engine.synchronize(remote)
+
+        self.assertEqual(report["status"], "pending")
+        self.assertEqual(report["failure_kind"], "sync_response_too_large")
+        self.assertEqual(report["error_code"],
+                         "sync_resource_too_large:tasks")
+        self.assertEqual(report["oversized_resource"], "tasks")
+        self.assertTrue(report["host_reachable"])
+        self.assertTrue(report["offline_usable"])
+        self.assertFalse(report["authentication_required"])
+        # The mirror is never marked unreachable or reset for this.
+        status = engine.status()
+        self.assertTrue(status["mirror_valid"])
+        self.assertNotIn(status["mode"], ("offline", "offline_uninitialized"))
+        self.assertIn("sync_resource_too_large:tasks", status["last_error"])
+        self.assertTrue(engine.local_projection()["rules"])
+
+    def test_a_remote_that_cannot_narrow_is_still_not_an_outage(self):
+        remote = FakeRemote()
+
+        class Refusing:
+            scope = remote.scope
+
+            def fetch_snapshot(self, allow_scope_change=False):
+                return remote.fetch_snapshot()
+
+            def pull(self, *, cursor, visibility_fingerprint, limit):
+                raise OversizedResponse("delta does not fit")
+
+        engine = self.engine(remote, name="legacy")
+        engine.install_snapshot(remote.fetch_snapshot())
+        remote.land_live_write(
+            "cm_seed_000000003", "room_send", {"body": "line"},
+            operation="room.send")
+        report = engine.synchronize(Refusing())
+        self.assertEqual(report["failure_kind"], "sync_response_too_large")
+        self.assertEqual(report["error_code"], "envelope_too_large")
+        self.assertIsNone(report["oversized_resource"])
+        self.assertTrue(report["offline_usable"])
+
+
 class OfflineDispositionParityTest(unittest.TestCase):
     """T-80: the mirror and the hosted store agree on what is still pending."""
 

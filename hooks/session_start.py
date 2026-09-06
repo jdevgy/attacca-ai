@@ -4084,6 +4084,11 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
     last_full_sync = float(entry.get("last_full_sync_at_epoch") or 0)
     safety_sync_due = now - last_full_sync >= WATCHER_FULL_SYNC_SAFETY_SECONDS
     retry_sync_due = (int(entry.get("offline_failure_count") or 0) > 0 or
+                      # A reachable host whose reply was too large keeps its
+                      # own bounded back-off (next_poll_at_epoch); when that
+                      # poll comes due it must actually retry the sync even
+                      # though no new event arrived.
+                      bool(entry.get("sync_too_large_code")) or
                       str((adapter_status or {}).get("mode") or "") ==
                       "offline")
     perform_full_sync = bool(force or write_woke or relevant or
@@ -4239,6 +4244,22 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
                 "sync_projection_capabilities": entry[
                     "sync_projection_capabilities"],
             })
+            too_large = _sync_response_too_large_code(sync_result)
+            if too_large:
+                # Reachable host, unusable response. Never the outage path:
+                # offline_failure_count stays 0 and no outage notice is
+                # queued; only this state's own bounded back-off applies.
+                failures = max(0, int(
+                    live.get("sync_too_large_failures") or 0)) + 1
+                live["sync_too_large_code"] = too_large
+                live["sync_too_large_failures"] = failures
+                live["sync_too_large_retry_seconds"] = \
+                    _sync_too_large_backoff_seconds(failures)
+                live["sync_too_large_at"] = datetime.now(
+                    timezone.utc).isoformat()
+            else:
+                for name in SYNC_TOO_LARGE_STATE_KEYS:
+                    live.pop(name, None)
             if sync_state in ("online", "pending", "conflict"):
                 live.pop("auth_required", None)
                 live.pop("auth_required_at", None)
@@ -4323,6 +4344,17 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
             "last_error_fingerprint": None,
             "offline_failure_count": 0,
         })
+        # The event feed succeeded, so this is not an outage. When the sync
+        # response itself was too large, poll on that state's own bounded
+        # back-off instead of repeating the same oversized response every
+        # minute; a normal sync clears the field and restores the interval.
+        too_large_retry = live.get("sync_too_large_retry_seconds")
+        if live.get("sync_too_large_code") and too_large_retry:
+            try:
+                live["next_poll_at_epoch"] = now + max(
+                    float(interval), float(too_large_retry))
+            except (TypeError, ValueError):
+                pass
         # Discard the legacy materialized view after the first successful
         # delta request. Only cursors and concise pending summaries persist.
         live.pop("snapshot", None)
@@ -4706,6 +4738,7 @@ def _offline_continuity_notices(key, project_id, event_name, adapter_status):
     return tuple(notice for notice in (
         _reconnect_summary_notice(key, project_id, adapter_status),
         _ambiguous_unjournaled_notice(key, adapter_status),
+        _sync_response_too_large_notice(key),
     ) if notice)
 
 
@@ -4769,6 +4802,86 @@ def _disposition_reconciled_notice(key, snapshot):
             "still shows each row with its implied outcome, and anything "
             "still open remains in pending_dispositions. Reported once."
             % (count, "" if count == 1 else "s")),
+    }
+
+
+# A reachable, authenticated host whose sync answer does not fit the protocol
+# envelope is NOT an outage: the verified mirror stays readable, queued writes
+# stay durable, and the exact protocol code is reported. Retrying every minute
+# would only repeat the same oversized response, so this state has its own
+# bounded back-off, separate from the outage back-off.
+SYNC_TOO_LARGE_BACKOFF_START_SECONDS = 5 * 60
+SYNC_TOO_LARGE_BACKOFF_MAX_SECONDS = 30 * 60
+SYNC_TOO_LARGE_STATE_KEYS = (
+    "sync_too_large_code", "sync_too_large_failures",
+    "sync_too_large_retry_seconds", "sync_too_large_at",
+    "sync_too_large_notice_signature",
+)
+
+
+def _sync_response_too_large_code(result):
+    """The exact protocol code when a sync result was refused for its size.
+
+    ``envelope_too_large`` means the whole response did not fit;
+    ``sync_resource_too_large:<resource>`` means one single resource could not
+    be narrowed any further. Both mean "host reachable, response too large".
+    """
+    if not isinstance(result, dict):
+        return None
+    if str(result.get("failure_kind") or "") != "sync_response_too_large":
+        return None
+    code = result.get("error_code")
+    if isinstance(code, str) and code.strip():
+        return code.strip()[:128]
+    return "envelope_too_large"
+
+
+def _sync_too_large_backoff_seconds(failures):
+    steps = max(0, int(failures or 0) - 1)
+    return min(
+        SYNC_TOO_LARGE_BACKOFF_START_SECONDS * (2 ** min(steps, 8)),
+        SYNC_TOO_LARGE_BACKOFF_MAX_SECONDS)
+
+
+def _sync_response_too_large_notice(key):
+    """One line per distinct oversized-sync state; never an outage claim.
+
+    Latched exactly like the hosted-outage notice (A9): the same code is
+    reported once, a different code reports again, and a normal sync clears
+    the latch in ``persist_sync``.
+    """
+    code = None
+    seen = False
+
+    def mutate(state):
+        nonlocal code, seen
+        entry = (state.get("subscriptions") or {}).get(key)
+        if not entry:
+            return
+        value = entry.get("sync_too_large_code")
+        if not isinstance(value, str) or not value.strip():
+            return
+        code = value.strip()[:128]
+        seen = entry.get("sync_too_large_notice_signature") == code
+        if not seen:
+            entry["sync_too_large_notice_signature"] = code
+
+    try:
+        _mutate_state(_watcher_state_path(), mutate)
+    except Exception:
+        return None
+    if not code or seen:
+        return None
+    return {
+        "system_message": "Attacca sync response too large",
+        "context": (
+            "ATTACCA SYNC RESPONSE TOO LARGE (%s): the hosted workspace is "
+            "REACHABLE and authenticated, but its sync response does not fit "
+            "the protocol envelope, so the verified mirror could not advance "
+            "this time. This is NOT a hosted outage and NOT an authentication "
+            "failure: cached reads stay valid, local writes still queue "
+            "durably, and the watcher retries with a bounded back-off. "
+            "Reported once until this state changes." % code),
     }
 
 

@@ -450,6 +450,80 @@ class SnapshotPullTests(SyncServerTestCase):
         self.assertEqual(raised.exception.code, "secret_in_projection")
 
 
+class PullResourceSubsetTests(SyncServerTestCase):
+    """T-94 · one pull may deliver fewer resources without a reset."""
+
+    def pull_request(self):
+        return p.make_pull_request(
+            self.scope, p.make_cursor(0, p.GENESIS_HASH, 0),
+            self.fingerprint(), limit=5)
+
+    def test_a_narrowed_pull_filters_a_projector_that_cannot_narrow(self):
+        full = self.engine.pull(self.scope, self.pull_request())
+        self.assertEqual(set(full["changes"]), {"tasks"})
+
+        narrowed = self.engine.pull(
+            self.scope, self.pull_request(), projection_resources=["rules"])
+        self.assertEqual(narrowed["status"], "ok")
+        self.assertEqual(narrowed["changes"], {})
+        # The negotiated shape - and therefore the visibility fingerprint -
+        # is deliberately untouched, so a narrowed request never resets a
+        # verified mirror.
+        self.assertEqual(narrowed["visibility_fingerprint"],
+                         full["visibility_fingerprint"])
+        self.assertEqual(narrowed["records"], full["records"])
+        self.assertEqual(narrowed["next_cursor"], full["next_cursor"])
+
+        kept = self.engine.pull(
+            self.scope, self.pull_request(),
+            projection_resources=["tasks", "rules"])
+        self.assertEqual(kept["changes"], full["changes"])
+
+    def test_a_capable_projector_receives_the_pull_subset_only(self):
+        seen = []
+        original = self.harness.visibility_projector
+
+        def projector(conn, trusted_scope, mode, start, through, events,
+                      resources=None):
+            seen.append((mode, None if resources is None else list(resources)))
+            return original(conn, trusted_scope, mode, start, through, events)
+
+        projector.supports_projection_resources = True
+        engine = s.SyncServerEngine(
+            self.conn,
+            s.SyncServerAdapters(
+                authorize=self.harness.authorize,
+                head_cursor=self.harness.head_cursor,
+                read_events=self.harness.read_events,
+                visibility_projector=projector,
+                apply_mutation=self.harness.apply_mutation,
+                check_precondition=self.harness.check_precondition),
+            busy_timeout_ms=5000)
+        result = engine.pull(
+            self.scope, self.pull_request(), projection_resources=["tasks"])
+        self.assertEqual(set(result["changes"]), {"tasks"})
+        # The policy call decides the fingerprint and must never be narrowed.
+        self.assertIn(("policy", None), seen)
+        self.assertIn(("pull", ["tasks"]), seen)
+        self.assertEqual(engine.snapshot(self.scope)["scope"], self.scope)
+        self.assertIn(("snapshot", None), seen)
+
+    def test_an_unsupported_or_unnegotiated_subset_is_refused(self):
+        with self.assertRaises(p.SyncProtocolError) as raised:
+            self.engine.pull(
+                self.scope, self.pull_request(),
+                projection_resources=["not_a_resource"])
+        self.assertEqual(
+            raised.exception.code, "unsupported_projection_resource")
+        # A legacy schema-v1 client never negotiated cloud_context.
+        with self.assertRaises(p.SyncProtocolError) as raised:
+            self.engine.pull(
+                self.scope, self.pull_request(),
+                projection_resources=["cloud_context"])
+        self.assertEqual(
+            raised.exception.code, "unnegotiated_projection_resource")
+
+
 class IdempotencyAndAttributionTests(SyncServerTestCase):
     def test_exact_retry_is_duplicate_and_reused_id_body_is_conflict(self):
         mutation = self.mutation()

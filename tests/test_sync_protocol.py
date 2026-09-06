@@ -619,5 +619,67 @@ class HumanScopeTests(ProtocolFixture):
         self.assertEqual(raised.exception.code, "cross_actor_inbox")
 
 
+class PullBoundsAndSubsetTests(ProtocolFixture):
+    """T-94 · a pull is never bounded more strictly than its own snapshot."""
+
+    def test_pull_ceiling_matches_the_snapshot_ceiling(self):
+        # A delta may carry any resource the snapshot carries, so a stricter
+        # pull ceiling made every pull fail on a workspace whose snapshot is
+        # accepted, and the client cursor could never advance.
+        self.assertEqual(p.MAX_PULL_BYTES, p.MAX_SNAPSHOT_BYTES)
+        oversized = p.make_pull_result(
+            self.scope, self.visibility, self.cursor, self.cursor,
+            self.cursor, [], {"full_log": ["line"]}, has_more=False)
+        with mock.patch.object(p, "MAX_PULL_BYTES", 64):
+            with self.assertRaises(p.EnvelopeTooLarge) as raised:
+                p.validate_pull_result(oversized)
+        self.assertEqual(raised.exception.code, "envelope_too_large")
+        self.assertIn("envelope_too_large", p.OVERSIZED_RESPONSE_CODES)
+
+    def test_projection_subset_is_pull_only_bounded_and_negotiated(self):
+        # A capability offer may never omit a required schema-v1 resource; a
+        # pull-only delivered subset may, because pull changes are partial.
+        with self.assertRaises(p.SyncProtocolError):
+            p.make_projection_capabilities(
+                p.PROJECTION_SCHEMA_VERSION, ["rules", "agents"])
+        subset = p.validate_projection_subset(["tasks", "rules", "tasks"])
+        self.assertEqual(subset, ["rules", "tasks"])
+        self.assertEqual(
+            p.projection_subset_query(subset),
+            {"projection_pull_resources": "rules,tasks"})
+        self.assertEqual(
+            p.projection_subset_from_query("tasks,rules"), ["rules", "tasks"])
+        self.assertIsNone(p.projection_subset_from_query(None))
+        self.assertIsNone(p.validate_projection_subset(None))
+        self.assertEqual(p.projection_subset_query(None), {})
+
+        for unsafe in (["Tasks"], ["../etc"], ["tasks", ""], "tasks", []):
+            with self.assertRaises(p.SyncProtocolError):
+                p.validate_projection_subset(unsafe)
+        with self.assertRaises(p.SyncProtocolError) as raised:
+            p.validate_projection_subset(["not_a_resource"])
+        self.assertEqual(
+            raised.exception.code, "unsupported_projection_resource")
+
+        legacy = p.legacy_projection_capabilities()
+        with self.assertRaises(p.SyncProtocolError) as raised:
+            p.validate_projection_subset(
+                ["cloud_context"], capabilities=legacy)
+        self.assertEqual(
+            raised.exception.code, "unnegotiated_projection_resource")
+
+    def test_a_narrowed_delta_still_validates_as_a_partial_projection(self):
+        value = projection(self.scope)
+        narrowed = {"tasks": value["tasks"]}
+        checked = p.validate_projection_for_capabilities(
+            narrowed, self.scope, p.current_projection_capabilities(),
+            partial=True)
+        self.assertEqual(set(checked), {"tasks"})
+        for resource in p.LARGE_PROJECTION_RESOURCES:
+            self.assertIn(
+                resource,
+                p.current_projection_capabilities()["resources"])
+
+
 if __name__ == "__main__":
     unittest.main()

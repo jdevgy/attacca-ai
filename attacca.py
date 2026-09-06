@@ -13992,160 +13992,289 @@ def _sync_visibility_policy(conn, scope):
     }
 
 
-def _sync_projection(conn, scope):
+def _sync_projection(conn, scope, resources=None):
+    """Build this identity's mirror projection.
+
+    ``resources`` narrows WHICH resources are returned; every returned
+    resource is still built complete from the store, because a mirror merges
+    a delta by replacing whole resources rather than patching rows.  ``None``
+    means the complete projection (snapshot mode).
+    """
+    wanted = None if resources is None else set(resources)
+
+    def want(name):
+        return wanted is None or name in wanted
+
     exporter = _project_export_module()
     snapshot = exporter.build_project_export(
         conn, scope["project_id"], log_renderer=render_log_line)
     events = snapshot["ledger"]["events"]
-    room_events = [event for event in events
-                   if event.get("event_type") == "room.message"]
-    enriched_room_payloads = _room_policy_payloads(
-        conn, scope["project_id"], room_events,
-        payloads=[event.get("payload") or {} for event in room_events])
-    room_payload_by_id = {
-        event.get("event_id"): payload
-        for event, payload in zip(room_events, enriched_room_payloads)}
-    visible_events = [
-        event for event in events
-        if _sync_event_visible(
-            conn, scope, event,
-            room_payload=room_payload_by_id.get(event.get("event_id"))
-            if event.get("event_type") == "room.message" else None)]
-    visible_seqs = {event["seq"] for event in visible_events}
-
     room_messages = []
-    for event in events:
-        if event.get("event_type") != "room.message" \
-                or event.get("seq") not in visible_seqs:
-            continue
-        payload = room_payload_by_id[event.get("event_id")]
-        message = _room_message_dict(event, payload)
-        message["project_id"] = scope["project_id"]
-        if message.get("mirrored_to"):
-            message["mirrored_to"] = _visible_bridge_peers(
-                conn, scope["project_id"], message,
-                scope["actor_id"], scope["actor_type"])
-        identity_project = message.get("origin_project") or scope["project_id"]
-        attribution = immutable_event_attribution(
-            conn, identity_project, message["actor"], message["actor_type"],
-            message.get("owner"))
-        message["ledger_actor"] = message["actor"]
-        message["actor"] = attribution["actor_id"]
-        message["identity"] = attribution["identity"]
-        message["attribution"] = attribution
-        room_messages.append(message)
-    # Retraction lives in the ledger, which a mirror never replays.  Project
-    # the derived fact onto the exact message so the offline rules can reach
-    # the same conclusion as the hosted store.
-    retracted_ids = _retracted_room_message_ids(
-        conn, scope["project_id"],
-        {message["event_id"]: (message.get("ledger_actor")
-                               or message.get("actor"))
-         for message in room_messages if message.get("event_id")})
-    for message in room_messages:
-        if message.get("event_id") in retracted_ids:
-            message["retracted"] = True
+    visible_events = []
+    if want("room_messages") or want("full_log"):
+        room_events = [event for event in events
+                       if event.get("event_type") == "room.message"]
+        enriched_room_payloads = _room_policy_payloads(
+            conn, scope["project_id"], room_events,
+            payloads=[event.get("payload") or {} for event in room_events])
+        room_payload_by_id = {
+            event.get("event_id"): payload
+            for event, payload in zip(room_events, enriched_room_payloads)}
+        visible_events = [
+            event for event in events
+            if _sync_event_visible(
+                conn, scope, event,
+                room_payload=room_payload_by_id.get(event.get("event_id"))
+                if event.get("event_type") == "room.message" else None)]
+        visible_seqs = {event["seq"] for event in visible_events}
 
-    listed_bridges = bridge_list(
-        conn, scope["project_id"], actor_id=scope["actor_id"],
-        actor_type=scope["actor_type"])["bridges"]
+        if want("room_messages"):
+            for event in events:
+                if event.get("event_type") != "room.message" \
+                        or event.get("seq") not in visible_seqs:
+                    continue
+                payload = room_payload_by_id[event.get("event_id")]
+                message = _room_message_dict(event, payload)
+                message["project_id"] = scope["project_id"]
+                if message.get("mirrored_to"):
+                    message["mirrored_to"] = _visible_bridge_peers(
+                        conn, scope["project_id"], message,
+                        scope["actor_id"], scope["actor_type"])
+                identity_project = message.get("origin_project") \
+                    or scope["project_id"]
+                attribution = immutable_event_attribution(
+                    conn, identity_project, message["actor"],
+                    message["actor_type"], message.get("owner"))
+                message["ledger_actor"] = message["actor"]
+                message["actor"] = attribution["actor_id"]
+                message["identity"] = attribution["identity"]
+                message["attribution"] = attribution
+                room_messages.append(message)
+            # Retraction lives in the ledger, which a mirror never replays.
+            # Project the derived fact onto the exact message so the offline
+            # rules can reach the same conclusion as the hosted store.
+            retracted_ids = _retracted_room_message_ids(
+                conn, scope["project_id"],
+                {message["event_id"]: (message.get("ledger_actor")
+                                       or message.get("actor"))
+                 for message in room_messages if message.get("event_id")})
+            for message in room_messages:
+                if message.get("event_id") in retracted_ids:
+                    message["retracted"] = True
+
+    tasks = []
+    task_plans = []
+    for task in snapshot["tasks"]:
+        revisions = list(task.get("plan_revisions") or [])
+        # A mirror carries plan bodies exactly once, under ``task_plans``.
+        # Repeating every immutable revision inside its own task row
+        # duplicated 23.5 MB of section bodies in one measured hosted
+        # workspace.  The administrative export keeps both shapes.
+        tasks.append({key: value for key, value in task.items()
+                      if key != "plan_revisions"})
+        if not revisions:
+            continue
+        latest = max(int(item.get("version") or 0) for item in revisions)
+        for plan in revisions:
+            if int(plan.get("version") or 0) == latest:
+                task_plans.append(plan)
+                continue
+            # Older immutable revisions stay individually addressable
+            # (version, status, digest, authorship, overview, section count)
+            # while their full section bodies remain a hosted read: one
+            # measured task carried 29 revisions of repeated section text.
+            sections = plan.get("sections")
+            stub = {key: value for key, value in plan.items()
+                    if key != "sections"}
+            stub["section_count"] = len(sections) \
+                if isinstance(sections, (list, tuple)) else 0
+            stub["sections_omitted"] = True
+            task_plans.append(stub)
+
     accessible_bridges = []
-    for bridge in listed_bridges:
-        if bridge.get("can_participate") is False:
-            continue
-        item = dict(bridge)
-        item["project_id"] = scope["project_id"]
-        accessible_bridges.append(item)
+    if want("bridges"):
+        listed_bridges = bridge_list(
+            conn, scope["project_id"], actor_id=scope["actor_id"],
+            actor_type=scope["actor_type"])["bridges"]
+        for bridge in listed_bridges:
+            if bridge.get("can_participate") is False:
+                continue
+            item = dict(bridge)
+            item["project_id"] = scope["project_id"]
+            accessible_bridges.append(item)
 
-    cursor = conn.execute(
-        "SELECT * FROM inbox_cursors WHERE project_id=? AND actor_id=?",
-        (scope["project_id"], scope["actor_id"])).fetchone()
-    inbox_cursor = dict(cursor) if cursor else None
-    # The reconciliation baseline rides on this actor's own cursor record.
-    # It is identity-scoped state the offline rules need, and it keeps the
-    # negotiated projection resource list unchanged for older mirrors.
-    baseline_row = _message_disposition_baseline_row(
-        conn, scope["project_id"], scope["actor_id"])
-    if baseline_row is not None:
-        if inbox_cursor is None:
-            inbox_cursor = {"project_id": scope["project_id"],
-                            "actor_id": scope["actor_id"],
-                            "last_read_seq": 0,
-                            "updated_at": baseline_row["at"]}
-        inbox_cursor["disposition_baseline_seq"] = int(
-            baseline_row["baseline_seq"] or 0)
-        inbox_cursor["disposition_baseline_source"] = baseline_row["source"]
+    inbox_cursor = None
+    if want("inbox_cursor"):
+        cursor = conn.execute(
+            "SELECT * FROM inbox_cursors WHERE project_id=? AND actor_id=?",
+            (scope["project_id"], scope["actor_id"])).fetchone()
+        inbox_cursor = dict(cursor) if cursor else None
+        # The reconciliation baseline rides on this actor's own cursor
+        # record.  It is identity-scoped state the offline rules need, and it
+        # keeps the negotiated projection resource list unchanged for older
+        # mirrors.
+        baseline_row = _message_disposition_baseline_row(
+            conn, scope["project_id"], scope["actor_id"])
+        if baseline_row is not None:
+            if inbox_cursor is None:
+                inbox_cursor = {"project_id": scope["project_id"],
+                                "actor_id": scope["actor_id"],
+                                "last_read_seq": 0,
+                                "updated_at": baseline_row["at"]}
+            inbox_cursor["disposition_baseline_seq"] = int(
+                baseline_row["baseline_seq"] or 0)
+            inbox_cursor["disposition_baseline_source"] = baseline_row["source"]
     dispositions = [dict(row) for row in conn.execute(
         "SELECT * FROM message_dispositions"
         " WHERE project_id=? AND actor_id=?"
         " ORDER BY updated_at, message_event_id",
-        (scope["project_id"], scope["actor_id"])).fetchall()]
-    rules = rule_list(
-        conn, scope["project_id"], actor_id=scope["actor_id"],
-        actor_type=scope["actor_type"])["rules"]
-    identity_handoffs = [
-        _identity_handoff_dict(row) for row in conn.execute(
-            "SELECT * FROM identity_handoffs WHERE project_id=?"
-            " AND actor_id=? ORDER BY version",
-            (scope["project_id"], scope["actor_id"])).fetchall()
-    ]
-    # Negotiated schema-v3 resource: the Director-governed shared project
-    # handoff is readable by every role, so it is not actor-filtered.
-    project_handoffs = [
-        _handoff_dict(row) for row in conn.execute(
-            "SELECT * FROM handoffs WHERE project_id=? ORDER BY version",
-            (scope["project_id"],)).fetchall()
-    ]
-    role_scopes = role_scope_get(
-        conn, scope["project_id"], actor_id=scope["actor_id"],
-        actor_type=scope["actor_type"],
-        include_all=scope["actor_type"] == "human")["scopes"]
-    persona_reservations = [dict(row) for row in conn.execute(
-        "SELECT project_id,persona,persona_name,reserved_at"
-        " FROM agent_persona_reservations WHERE project_id=?"
-        " ORDER BY reserved_at,persona", (scope["project_id"],)).fetchall()]
-    projection = {
-        "project": snapshot["project"],
-        # ``handoffs`` remains the schema-v1 compatibility resource name, but
-        # an offline mirror always binds it to this exact actor.  The retired
-        # project-global archive exists only in administrative exports.
-        "handoffs": identity_handoffs,
-        "identity_handoffs": identity_handoffs,
-        # Negotiated schema-v3 resource. The shared project handoff has no
-        # owning identity; every role mirrors the same project-bound history.
-        "project_handoffs": project_handoffs,
-        "role_scopes": role_scopes,
-        # Negotiated schema-v2 resource. The originating actor/source are
-        # administrative audit details and are deliberately not mirrored.
-        "persona_reservations": persona_reservations,
-        "rules": rules,
-        "cloud_context": cloud_context_get(
-            conn, scope["project_id"])["cloud_context"],
-        "tasks": snapshot["tasks"],
-        "decisions": snapshot["decisions"],
-        "room_messages": room_messages,
-        "agents": snapshot["agents"],
-        "bridges": accessible_bridges,
-        "inbox_cursor": inbox_cursor,
-        "task_plans": [plan for task in snapshot["tasks"]
-                       for plan in task.get("plan_revisions", [])],
-        "full_log": [
+        (scope["project_id"], scope["actor_id"])).fetchall()] \
+        if want("message_dispositions") else []
+    identity_handoffs = []
+    if want("handoffs") or want("identity_handoffs"):
+        identity_handoffs = [
+            _identity_handoff_dict(row) for row in conn.execute(
+                "SELECT * FROM identity_handoffs WHERE project_id=?"
+                " AND actor_id=? ORDER BY version",
+                (scope["project_id"], scope["actor_id"])).fetchall()
+        ]
+    projection = {}
+    if want("project"):
+        projection["project"] = snapshot["project"]
+    # ``handoffs`` remains the schema-v1 compatibility resource name, but
+    # an offline mirror always binds it to this exact actor.  The retired
+    # project-global archive exists only in administrative exports.
+    if want("handoffs"):
+        projection["handoffs"] = identity_handoffs
+    if want("identity_handoffs"):
+        projection["identity_handoffs"] = identity_handoffs
+    # Negotiated schema-v3 resource. The shared project handoff has no
+    # owning identity; every role mirrors the same project-bound history.
+    if want("project_handoffs"):
+        projection["project_handoffs"] = [
+            _handoff_dict(row) for row in conn.execute(
+                "SELECT * FROM handoffs WHERE project_id=? ORDER BY version",
+                (scope["project_id"],)).fetchall()
+        ]
+    if want("role_scopes"):
+        projection["role_scopes"] = role_scope_get(
+            conn, scope["project_id"], actor_id=scope["actor_id"],
+            actor_type=scope["actor_type"],
+            include_all=scope["actor_type"] == "human")["scopes"]
+    # Negotiated schema-v2 resource. The originating actor/source are
+    # administrative audit details and are deliberately not mirrored.
+    if want("persona_reservations"):
+        projection["persona_reservations"] = [dict(row) for row in conn.execute(
+            "SELECT project_id,persona,persona_name,reserved_at"
+            " FROM agent_persona_reservations WHERE project_id=?"
+            " ORDER BY reserved_at,persona", (scope["project_id"],)).fetchall()]
+    if want("rules"):
+        projection["rules"] = rule_list(
+            conn, scope["project_id"], actor_id=scope["actor_id"],
+            actor_type=scope["actor_type"])["rules"]
+    if want("cloud_context"):
+        projection["cloud_context"] = cloud_context_get(
+            conn, scope["project_id"])["cloud_context"]
+    if want("tasks"):
+        projection["tasks"] = tasks
+    if want("decisions"):
+        projection["decisions"] = snapshot["decisions"]
+    if want("room_messages"):
+        projection["room_messages"] = room_messages
+    if want("agents"):
+        projection["agents"] = snapshot["agents"]
+    if want("bridges"):
+        projection["bridges"] = accessible_bridges
+    if want("inbox_cursor"):
+        projection["inbox_cursor"] = inbox_cursor
+    if want("task_plans"):
+        projection["task_plans"] = task_plans
+    if want("full_log"):
+        projection["full_log"] = [
             (render_log_line(dict(event, payload=event.get("payload_json")))
              or "%s %s" % (event.get("created_at"), event.get("event_type")))
             for event in visible_events
-        ],
-        "actor_aliases": snapshot["actor_aliases"],
-        "message_dispositions": dispositions,
-    }
+        ]
+    if want("actor_aliases"):
+        projection["actor_aliases"] = snapshot["actor_aliases"]
+    if want("message_dispositions"):
+        projection["message_dispositions"] = dispositions
     return _sync_scrub_secrets(projection)
 
 
+# Resources every non-empty delta window carries: the rendered activity log
+# and this identity's own inbox/disposition state are cheap and are derived
+# from the whole visible ledger rather than from one event type.
+SYNC_ALWAYS_DELTA_RESOURCES = ("full_log", "inbox_cursor",
+                               "message_dispositions")
+# Which mirror resources one ledger event type can change.  Prefixes are
+# tested in order; ``task.plan.*`` is covered by ``task.``.
+SYNC_EVENT_TYPE_RESOURCES = (
+    ("task.", ("tasks", "task_plans")),
+    ("decision.", ("decisions",)),
+    ("room.", ("room_messages",)),
+    ("identity_handoff.", ("identity_handoffs", "handoffs",
+                           "project_handoffs")),
+    ("handoff.", ("project_handoffs", "identity_handoffs", "handoffs")),
+    ("rule.", ("rules",)),
+    ("cloud_context.", ("cloud_context",)),
+    ("agent.", ("agents", "persona_reservations", "actor_aliases")),
+    ("persona.", ("agents", "persona_reservations", "actor_aliases")),
+    ("bridge.", ("bridges",)),
+    # Which role scopes are applicable to this identity depends on the
+    # project's lead director, so the two travel together.
+    ("role_scope.", ("role_scopes", "project")),
+    ("project.", ("project", "agents", "role_scopes")),
+)
+# Event types that rewrite content already projected under another resource
+# (historical attribution embedded in room messages, tasks, and the log).
+SYNC_FULL_PROJECTION_EVENT_TYPES = frozenset({
+    "agent.identity_migrated",
+    "bridge.access_identity_migrated",
+})
+
+
+def _sync_delta_resources(events):
+    """Resources the events in one pull window can change (``None`` = all).
+
+    A delta replaces whole resources, so this map must fail safe: an event
+    type that is not mapped - a custom ``append_event`` type, or one that
+    rewrites already projected attribution - returns the complete projection,
+    and so does a window with no events at all (a context-version-only
+    advance, or a client that is already at the head).
+    """
+    if not events:
+        return None
+    selected = set(SYNC_ALWAYS_DELTA_RESOURCES)
+    for event in events:
+        event_type = str(event.get("event_type") or "")
+        if event_type in SYNC_FULL_PROJECTION_EVENT_TYPES:
+            return None
+        for prefix, mapped in SYNC_EVENT_TYPE_RESOURCES:
+            if event_type.startswith(prefix):
+                selected.update(mapped)
+                break
+        else:
+            return None
+    return selected
+
+
 def _sync_visibility_projector(conn, scope, mode, from_cursor,
-                               through_cursor, events):
+                               through_cursor, events, resources=None):
     result = {"visibility_policy": _sync_visibility_policy(conn, scope)}
     if mode == "policy":
         return result
-    result["projection"] = _sync_projection(conn, scope)
+    wanted = None
+    if mode == "pull":
+        # Only a snapshot is a complete projection.  A delta carries the
+        # resources this window's events can change; ``resources`` narrows
+        # that further for one request when a client is recovering from an
+        # oversized response.
+        wanted = _sync_delta_resources(events)
+        if resources is not None:
+            requested = set(resources)
+            wanted = requested if wanted is None else wanted & requested
+    result["projection"] = _sync_projection(conn, scope, resources=wanted)
     room_events = [event for event in events
                    if event.get("event_type") == "room.message"]
     room_payloads = _room_policy_payloads(
@@ -14161,6 +14290,11 @@ def _sync_visibility_projector(conn, scope, mode, from_cursor,
             room_payload=room_payload_by_id.get(event.get("event_id"))
             if event.get("event_type") == "room.message" else None)]
     return result
+
+
+# The hosted projector can build one narrowed delta directly instead of
+# building the complete projection and discarding most of it.
+_sync_visibility_projector.supports_projection_resources = True
 
 
 def _sync_authorize(conn, scope, action, operation=None):
@@ -17719,8 +17853,15 @@ def _r_sync_pull(h, m, q):
         capabilities = protocol.projection_capabilities_from_query(
             q.get("projection_schema_version"),
             q.get("projection_resources"))
+        # Pull-only: which of the negotiated resources this one response
+        # delivers.  It never changes the negotiated projection shape or the
+        # visibility fingerprint, so a client recovering from an oversized
+        # delta can converge one resource at a time instead of resetting.
+        subset = protocol.projection_subset_from_query(
+            q.get("projection_pull_resources"))
         result = _sync_engine(h, scope).pull(
-            scope, request, projection_capabilities=capabilities)
+            scope, request, projection_capabilities=capabilities,
+            projection_resources=subset)
         protocol.validate_pull_result(result)
     except protocol.SyncProtocolError as error:
         _sync_protocol_error(h, error)
@@ -19119,6 +19260,16 @@ def _offline_proxy_plan(snapshot, task_id, version=None,
     plans = [dict(item) for item in projection.get("task_plans", [])
              if item.get("task_id") == task_id]
     plans.sort(key=lambda item: int(item.get("version") or 0), reverse=True)
+    for item in plans:
+        # A mirror carries the latest plan revision in full; every older
+        # immutable revision keeps its metadata while its section bodies stay
+        # a hosted read.  Say so instead of rendering an empty plan.
+        if item.get("sections_omitted") and "sections" not in item:
+            item["sections"] = []
+            item["sections_hint"] = (
+                "Section bodies for this older plan revision are a hosted "
+                "read; the verified offline mirror carries the complete "
+                "sections of the latest revision only.")
     if version is None:
         selected = plans[0] if plans else None
     else:
@@ -19131,8 +19282,13 @@ def _offline_proxy_plan(snapshot, task_id, version=None,
         if selected is None:
             raise AttaccaError(
                 "task %s has no cached plan version %s" % (task_id, wanted))
-    revisions = [_task_plan_summary(item, include_search=True)
-                 for item in plans]
+    revisions = []
+    for item in plans:
+        summary = _task_plan_summary(item, include_search=True)
+        if item.get("sections_omitted"):
+            summary["section_count"] = int(item.get("section_count") or 0)
+            summary["sections_omitted"] = True
+        revisions.append(summary)
     revision_page = _task_plan_page(
         revisions, "revisions", query=revision_query,
         filter_value=revision_filter, filter_kind="revision",
