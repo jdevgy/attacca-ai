@@ -9,13 +9,6 @@ Panel all read and write the same workspace, so any one session can end, crash,
 or be replaced without taking the project state with it. Sessions are
 disposable; the project is not.
 
-> [!IMPORTANT]
-> Attacca is a pre-production dogfood prototype, not a finished public SaaS. It
-> runs the complete continuity workflow with strong correctness boundaries, but
-> it does not terminate TLS or provide SSO, MFA, login rate limiting, encrypted
-> database storage, or hardened hostile-host isolation. Keep it on localhost, or
-> put your own TLS and network controls in front of it.
-
 ## Quick start (local server)
 
 You need Python 3.8+ and Git. There is nothing else to install: Attacca is
@@ -98,7 +91,7 @@ reports the linked workspace, this AI's identity, and the current handoff.
 - [What Attacca gives a project](#what-attacca-gives-a-project) — the full feature list
 - [Architecture](#architecture) — server, clients, and installation-bound AI identity
 - [Setup and installation in detail](#setup-and-installation-in-detail) — every install path, flag, and side effect
-- [Hosted authentication](#hosted-authentication-prototype) — accounts, client API keys, enforcement
+- [Hosted authentication](#hosted-authentication) — accounts, client API keys, enforcement
 - [How a tool connects](#how-a-tool-connects-three-shapes-one-server) — the three client shapes; two computers, one workspace
 - [REST API](#rest-api-server-mode) — every `/v1` endpoint and the shared paging contract
 - [The protocol agents follow](#the-protocol-agents-follow) — what every AI session is required to do
@@ -158,7 +151,7 @@ attacca server — it owns the state and exposes two client surfaces:
   the canonical actor and workspace with `X-Attacca-Actor` and
   `X-Attacca-Project`; authentication separately identifies the human-owned
   client installation.
-- **REST API** under `/v1/…` (blueprint §22.1 shape) — for curl, scripts, dashboards
+- **REST API** under `/v1/…` — for curl, scripts, dashboards
   and anything that isn't an MCP client.
 
 The installed **`connect` stdio client** normally forwards MCP to the configured
@@ -209,7 +202,7 @@ database is installed inside a user's project.
 ```bash
 python3 attacca.py serve                   # http://127.0.0.1:8722
 # bootstrap the owner, create per-install client keys, and enable auth in /app Settings
-# remote prototype: --host 0.0.0.0 (put TLS in front of it)
+# LAN or remote access: --host 0.0.0.0 behind your own TLS/network controls
 ```
 
 **2. Users install the plugin from the server — one line, every tool:**
@@ -243,7 +236,7 @@ Prefer a native in-tool install? The same zip carries Claude, Kimi, and Codex
 plugin manifests:
 
 - **Claude Code:** after the one-liner adds the local marketplace, run
-  `/plugin install attacca@agentg` if needed
+  `/plugin install attacca@<marketplace name>` if needed
 - **Kimi Code:** `/plugins install http://127.0.0.1:8722/plugin.zip`
 - **Codex CLI:** the one-liner installs `attacca@attacca-local`; open
   `/plugins` in a new session, or run
@@ -279,7 +272,7 @@ name, take over another existing named identity, create the next permanent
 name, or use a freshly generated name only in the current MCP process. The
 temporary path is deliberately performed by `agent_register` through that
 already-running, already-bound proxy; it is not offered to a first/unbound
-client because D-17 authentication requires an exact actor first. A setup shell
+client because authentication requires an exact actor first. A setup shell
 subprocess cannot claim to change its parent MCP process. Reuse is
 selection-only: it shares that exact actor's identity handoff, inbox cursor,
 and task leases without merging, deleting, or renaming the currently active
@@ -350,7 +343,7 @@ only through that current MCP connection. Direct CLI `temporary` is rejected
 because a child process cannot alter its parent,
 `--skip-tools codex,cline` / `--skip-tools all`, and `--no-server`.
 
-## Hosted authentication (prototype)
+## Hosted authentication
 
 The Control Panel at `/app` is the first-run entry point. Before it loads
 workspace data, it checks public authentication status and asks for the first
@@ -421,10 +414,9 @@ changes the actor binding.
 
 The landing page, `/install.sh`, plugin zip/marketplace, health check, auth
 status, bootstrap, and login remain public so a new machine can install and
-connect. This is prototype account security, not a claim of production
-hardening: Attacca does not terminate TLS, provide SSO/MFA, rate-limit login,
-or encrypt the database. Put TLS and appropriate network controls in front of
-any remotely reachable instance.
+connect. Attacca does not terminate TLS, provide SSO/MFA, rate-limit login, or
+encrypt the database. Put TLS and appropriate network controls in front of any
+remotely reachable instance.
 
 The native plugins bundle lifecycle continuity. Claude/Codex use `SessionStart`,
 `UserPromptSubmit`, and `Stop`; Kimi uses its manifest startup skill plus native
@@ -820,7 +812,7 @@ install-instructions [--files CLAUDE.md,AGENTS.md]
 ## Demos and tests
 
 ```bash
-./demo/demo_cold_handoff.sh        # blueprint north-star: fresh worker resumes cold
+./demo/demo_cold_handoff.sh        # fresh worker resumes cold
 python3 demo/demo_two_agents_mcp.py  # two real MCP sessions coordinating via the ledger
 python3 -m unittest discover -s tests -v   # storage, hooks, MCP, REST, UI, concurrency
 python3 attacca.py event verify  # hash-chain + sequence integrity of a real ledger
@@ -828,16 +820,13 @@ python3 attacca.py event verify  # hash-chain + sequence integrity of a real led
 
 ## Notes and limits (honest edges)
 
-- **Prototype authentication, not production identity infrastructure.** Account
+- **Authentication is account sign-in plus per-installation API keys.** Account
   sessions, CSRF, hash-only per-install client keys, exact project/actor request
   selection, human attribution, Director-governed shared project handoff,
   exact-AI-identity handoff ownership, Director-managed Role Scope/directive
-  rules, and stale versions are enforced.
-  SSO/MFA, login rate
-  limits, centralized key rotation, TLS termination, and hostile-host isolation
-  remain later layers (blueprint §12.3, §28 "policy bypass").
-- **No encryption.** Everything is plaintext on your machine. The E2E key hierarchy
-  (§17) is the next milestone and slots in at the sync boundary.
+  rules, and stale versions are enforced. TLS, SSO, MFA and login rate limiting
+  are provided by what you put in front of the server.
+- **No encryption.** Everything is plaintext on your machine.
 - **Offline mode is identity-scoped, not a second database.** It activates only
   after an authenticated snapshot has bound server, project, human principal,
   canonical AI actor/role, visibility policy and client installation. Bridge/agent/lead-policy
@@ -846,7 +835,7 @@ python3 attacca.py event verify  # hash-chain + sequence integrity of a real led
   connection refusal can be queued safely.
 - **Leases are soft locks** for coordination, not Git locking. Use branches/worktrees
   as usual; `base_revision` is recorded at claim/report for later comparison.
-- **Hash chain is tamper-*evident*, not tamper-*proof*** (no signatures yet — §23.3).
+- **Hash chain is tamper-*evident*, not tamper-*proof*** (no signatures).
 - **One exact actor = one workspace/role/runtime/persona continuity owner.**
   Two simultaneous sessions that reuse the same named actor intentionally
   share its identity handoff, inbox cursor, and task leases. Separate permanent
@@ -858,4 +847,4 @@ python3 attacca.py event verify  # hash-chain + sequence integrity of a real led
   always receive a server-unique friendly name and `@ShortName`. Owner remains
   separately visible on every new event.
 - The room is a projection of `room.message` events in the ledger — chat is not the
-  database (blueprint principle, §2.3).
+  database.

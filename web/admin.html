@@ -1630,7 +1630,7 @@
           : bootstrapRequired
             ? "Creating the administrator does not enable enforcement. The owner can first create client-install API keys, then use the explicit Settings toggle."
             : creatingAccount
-            ? "Registration creates a human account only: no administrator authority, no workspace membership, and no AI actor identity. This prototype server applies no sign-up rate limiting, so restrict network access before exposing it publicly."
+            ? "Registration creates a human account only: no administrator authority, no workspace membership, and no AI actor identity. Sign-up is not rate limited, so restrict network access before exposing the server publicly."
             : "Sign-in identifies the human operator. AI actor identities remain separate and are never replaced by this account.";
         content.innerHTML = `${pageHead("Hosted access", title, description)}<div class="grid two"><section class="card" style="grid-column:1/-1;max-width:760px"><div class="card-head"><h2>${h(title)}</h2><span class="badge ${bootstrapRequired || acceptingInvitation || creatingAccount ? "pending" : "accepted"}">${acceptingInvitation ? "one-time invitation" : bootstrapRequired ? "first run" : creatingAccount ? "new account" : "account sign-in"}</span></div><div class="card-body">${state.invitationAcceptanceError ? `<div class="notice error"><span>!</span><div><strong>Invitation could not be accepted.</strong><br>${h(state.invitationAcceptanceError)}</div></div>` : ""}${form}<div class="notice section-gap"><span>i</span><div>${context}</div></div></div></section></div>`;
         content.setAttribute("aria-busy", "false");
@@ -2351,7 +2351,7 @@
                 <div class="field section-gap"><label for="workspace-fingerprint">Git fingerprint <span class="faint">optional</span></label><input id="workspace-fingerprint" name="repository_fingerprint" placeholder="sha256:…"><span class="help">Use the canonical remote fingerprint when connecting clones.</span></div>
                 <div class="form-actions"><button class="button primary" type="submit">Create workspace</button></div>
               </form>
-              <div class="notice section-gap"><span>i</span><div><strong>Prototype boundary</strong><br>The current REST API creates and selects workspaces. Rename, archive, delete, and remote-path attachment are not exposed yet.</div></div>
+              <div class="notice section-gap"><span>i</span><div><strong>Workspace management</strong><br>The REST API creates and selects workspaces. Rename, archive, delete, and remote-path attachment are not exposed yet.</div></div>
             </div></aside>
           </div>` +
           renderWorkspaceMembers();

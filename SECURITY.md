@@ -1,10 +1,7 @@
 # Security Policy
 
-Attacca is a **pre-production dogfood/prototype**. It is built to demonstrate a
-complete continuity workflow with strong correctness boundaries, and it is
-deliberately *not* described as production-ready security or operations
-infrastructure. Please read "Prototype status and known limits" before you
-deploy it anywhere other people can reach.
+Please read "What the server does not provide" before you deploy Attacca
+anywhere other people can reach.
 
 ## Supported versions
 
@@ -27,21 +24,15 @@ python3 attacca.py --version
 
 **Please do not open a public GitHub issue for a security problem.**
 
-1. Preferred: use **GitHub private vulnerability reporting** on the repository —
-   <https://github.com/jdevgy/attacca-ai> → **Security** tab → **Report a
-   vulnerability**. This keeps the report private until a fix is published.
-2. Alternative: a private security contact address: to be set by the
-   maintainer before publishing. Until that line names a real address,
-   use GitHub private vulnerability reporting above.
+Use **GitHub private vulnerability reporting** on the repository —
+<https://github.com/jdevgy/attacca-ai> → **Security** tab → **Report a
+vulnerability**. This keeps the report private until a fix is published.
 
 Useful things to include: the Attacca version (`python3 attacca.py --version`),
 whether the server was running with authentication enforcement on or off, how
 the server was exposed (loopback, LAN, reverse proxy), and the smallest
 reproduction you have. Please do not include real API keys, session cookies, or
 a copy of a live database — describe them instead.
-
-Because this is a prototype maintained without a support rotation, responses are
-best-effort and there is no committed response or fix SLA.
 
 ### In scope
 
@@ -64,17 +55,17 @@ Anything that breaks a boundary Attacca claims to enforce, for example:
 
 ### Out of scope (already documented limits, not vulnerabilities)
 
-The items in the next section are known and intentional for a prototype. Reports
-that only restate them will be closed as documented limits — though a report
-showing they are *worse than documented* is very welcome.
+The items under "What the server does not provide" are documented behaviour.
+Reports that only restate them will be closed as documented limits — though a
+report showing they are *worse than documented* is very welcome.
 
-## Prototype status and known limits
+## What the server does not provide
 
 Attacca does **not** currently provide:
 
 - **TLS termination.** The server speaks plain HTTP. Anything in front of it
   must supply TLS.
-- **SSO or MFA.** Authentication is a first-owner account plus per-installation
+- **SSO or MFA.** Authentication is an account sign-in plus per-installation
   API keys, nothing more.
 - **Login rate limiting.** Account sign-in is not throttled. (Browser lookups of
   an unknown client-pairing code *are* rate-limited.)

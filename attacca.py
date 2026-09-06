@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-attacca.py — Local Project Attacca Layer (blueprint Phase 0 dogfood build).
+attacca.py — Attacca project continuity layer.
 
 One zero-dependency file (Python 3.8+, stdlib only) implementing the
 "Project Attacca Layer" from the Multi-Agent Developer SaaS blueprint:
@@ -2208,7 +2208,7 @@ def connect(db_path):
 
 
 # ---------------------------------------------------------------------------
-# Hosted authentication (prototype accounts + browser sessions + API tokens)
+# Hosted authentication (accounts + browser sessions + API tokens)
 # ---------------------------------------------------------------------------
 
 PASSWORD_ITERATIONS = 210000
@@ -2620,7 +2620,7 @@ def _auth_reject_username_alias_collision(conn, username):
 def auth_claim_single_user_legacy_owner_aliases(conn, principal):
     """Preserve legacy actor rows while attaching their labels to one owner.
 
-    Prototype databases often recorded a shell username, display name, or
+    Earlier databases often recorded a shell username, display name, or
     placeholder in ``agents.owner`` before account authentication existed.
     If and only if the server has one active human account, activation may
     claim those exact labels for that immutable server owner. No actor row is
@@ -2667,7 +2667,7 @@ def auth_claim_single_user_legacy_owner_aliases(conn, principal):
 
 
 def auth_grant_single_user_legacy_project_memberships(conn, principal):
-    """Attach a prototype single-owner account to every existing workspace.
+    """Attach a single-owner account to every existing workspace.
 
     Pre-auth Attacca databases had projects and actors but no human membership
     rows. During the one-account owner cutover, preserve those projects without
@@ -16895,7 +16895,7 @@ def _r_plugin_git(h, m, q):
 
 
 def _auth_cookie_headers(session=None, clear=False, secure=False):
-    """Return the two same-site browser cookies used by the prototype UI."""
+    """Return the two same-site browser cookies used by the Control Panel."""
     secure_flag = "; Secure" if secure else ""
     if clear:
         expired = "Path=/; Max-Age=0; SameSite=Strict%s" % secure_flag
@@ -17067,7 +17067,7 @@ def _r_auth_register(h, m, q):
 
     Attacca applies no rate limit to this route.  A publicly reachable
     deployment must place real network controls (reverse proxy, firewall,
-    TLS) in front of it; the prototype server provides none.
+    TLS) in front of it; the server itself provides none.
     """
     conn = h._conn()
     # Order matters: a server with no accounts at all satisfies both gates, and

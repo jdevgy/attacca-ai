@@ -3,9 +3,8 @@
 Attacca is a hosted project-continuity layer for humans and AI coding tools.
 This file covers what you need to build, run, and test it locally.
 
-Attacca is a **pre-production dogfood/prototype**. Please read
-[`SECURITY.md`](SECURITY.md) before running a server anywhere other people can
-reach, and do not describe prototype behaviour as production-ready.
+Please read [`SECURITY.md`](SECURITY.md) before running a server anywhere other
+people can reach.
 
 ## Ground rules
 
@@ -68,7 +67,7 @@ Surfaces on a running server:
 
 - Point the development server at a **scratch database**:
   `ATTACCA_DB=/tmp/attacca-dev.db python3 attacca.py serve --port 8799`.
-- Use a **port other than the default** if a shared or dogfood instance is
+- Use a **port other than the default** if a shared instance is
   already running on this machine, and never point development work, tests, or
   a migration at a shared instance.
 - Stay on loopback. `--host 0.0.0.0` publishes an unencrypted, unthrottled
@@ -237,11 +236,10 @@ Human contributors do not need an Attacca account to send a patch.
 
 ## Commits and pull requests
 
-- **Small, focused commits on `main`.** This is a fast-moving prototype with a
-  short history; keep each commit to one coherent change with a subject line
-  that says what changed. The existing log is the style guide — release commits
-  read `Release 0.5.8: <summary>`, work commits often reference the task or
-  decision they close (`T-88: ...`, `D-29: ...`).
+- **Small, focused commits on `main`.** Keep each commit to one coherent change
+  with a subject line that says what changed. The existing log is the style
+  guide — release commits read `Release 0.5.8: <summary>`, and a work commit
+  references the issue or change it closes in the subject.
 - **Tests green before you commit.** Run the full suite above. If a change is
   risk-specific (concurrency, auth, hooks, sync, export), run and mention the
   matching module.
@@ -261,15 +259,9 @@ Human contributors do not need an Attacca account to send a patch.
 | File | What it is |
 | --- | --- |
 | [`README.md`](README.md) | **The maintained user and developer guide.** Current architecture and usage. Start here, and keep it true when shipped behaviour changes. |
-| [`SECURITY.md`](SECURITY.md) | Reporting process, prototype status, and the known-limits list. |
+| [`SECURITY.md`](SECURITY.md) | Vulnerability reporting process, scope, and what the server does not provide. |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release history, Keep a Changelog format. |
 | `AGENTS.md` / `CLAUDE.md` | Managed protocol block plus the synced Cloud Context copy. Machine-owned inside the markers. |
-| `docs/LOG.archive.md` | **Historical only.** The archived build narrative from before Attacca became its own source of truth. Evidence of what happened, not a description of current behaviour. |
 | `docs/blueprint.txt` | **Vision, not implemented.** The broader SaaS direction — end-to-end encryption, Project Brain, capability marketplaces, billing, production identity. Nothing here is implemented merely because the blueprint describes it. Do not cite it as shipped behaviour. |
 
 When these disagree, current source and tests are the implementation truth.
-
-## Licence
-
-This repository does not yet carry a `LICENSE` file. One still has to be chosen
-before publication; until then, no open-source licence grant is in effect.

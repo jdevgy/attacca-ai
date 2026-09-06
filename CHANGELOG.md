@@ -3,8 +3,8 @@
 All notable changes to Attacca are recorded here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Attacca is a pre-production prototype: the `0.x` series makes no semantic
-versioning promise, and only the latest `0.5.x` receives fixes.
+The `0.x` series makes no semantic versioning promise, and only the latest
+`0.5.x` receives fixes.
 
 Entries below are reconstructed from the Git history. Releases are marked in
 history by a `Release x.y.z` commit that also bumps `VERSION` in `attacca.py`;
@@ -13,10 +13,7 @@ Git tags in this repository, so versions are dated by their bump commit.
 
 ## [Unreleased]
 
-### Pending
-
-- No `LICENSE` file yet. One must be chosen before publication.
-- `SECURITY.md` needs a private security contact address before publication.
+Nothing yet.
 
 ## [0.5.10] - 2026-09-06
 
@@ -28,13 +25,13 @@ Git tags in this repository, so versions are dated by their bump commit.
   replacement that is still one of our own private files is re-opened with a
   bounded retry; a foreign owner, a readable mode, a symlink, a non-regular
   file or a swapped parent directory still fails closed. Retry exhaustion is
-  logged once and the daemon continues on the next tick (T-96).
+  logged once and the daemon continues on the next tick.
 
 ## [0.5.9] - 2026-09-06
 
 ### Added
 
-- Self-service **Create account** flow for local servers (T-90): the
+- Self-service **Create account** flow for local servers: the
   `self_registration` server setting (`off` | `open`, default `off`), exposed in
   the auth status and settings payloads and editable by an admin through
   `PUT /v1/settings`; `serve --allow-self-registration` opens it at start;
@@ -43,7 +40,7 @@ Git tags in this repository, so versions are dated by their bump commit.
   bootstrap or while registration is off, 409 on a username collision, 400 on
   invalid credentials, client API keys denied); the Control Panel sign-in card
   offers **Create account** only while registration is open.
-- Workspace membership administration (T-97): `GET /v1/projects/{id}/members`,
+- Workspace membership administration: `GET /v1/projects/{id}/members`,
   `POST /v1/projects/{id}/members` and
   `DELETE /v1/projects/{id}/members/{username}` for a server admin or workspace
   owner (404 unknown account, 409 already a member or last workspace admin,
@@ -52,17 +49,17 @@ Git tags in this repository, so versions are dated by their bump commit.
   Control Panel Workspaces view; an account without a workspace is told to ask
   an administrator or create one.
 - `CONTRIBUTING.md`, `CHANGELOG.md` (this file), `SECURITY.md` and
-  `.github/workflows/ci.yml` (unit suite on Python 3.8, 3.10 and 3.12) (T-93).
+  `.github/workflows/ci.yml` (unit suite on Python 3.8, 3.10 and 3.12).
 - README opens with a plain-language description and a six-step local-server
-  quick start; the detailed sections follow unchanged (T-91).
+  quick start; the detailed sections follow unchanged.
 
 ### Changed
 
 - `task_report` reads descriptive evidence verdicts leniently and
   deterministically (`PASS exit0`, `27/27 PASS`, `FAIL 2 errors`, `0 failures`)
   and names an unrecognized value exactly, with the accepted vocabulary in the
-  reply, instead of reporting "no credible passing evidence attached" (T-92).
-- Sync projections are compact and pulls are deltas (T-94): task rows no longer
+  reply, instead of reporting "no credible passing evidence attached".
+- Sync projections are compact and pulls are deltas: task rows no longer
   embed `plan_revisions`; `task_plans` carries only the latest revision's
   sections (older revisions keep metadata with `sections_omitted`, and the
   offline plan read says the body is a hosted read); a pull carries only the
@@ -77,22 +74,22 @@ Git tags in this repository, so versions are dated by their bump commit.
 ### Fixed
 
 - Setup discovery and `agent_register` were rejected for a whole workspace by
-  one free-text history string such as `workspace.director.codex.turing under
-  D74` (`invalid_agent_persona_history`). The persona-history scan now treats
-  only a single whitespace-free token as an exact actor id, scans free text for
-  embedded actors, and folds malformed or look-alike tokens into a reserved
-  normalized name instead of raising; the export module mirrors the same rules
-  (T-95).
+  one free-text history string that embedded an actor id inside a longer
+  sentence (`invalid_agent_persona_history`). The persona-history scan now
+  treats only a single whitespace-free token as an exact actor id, scans free
+  text for embedded actors, and folds malformed or look-alike tokens into a
+  reserved normalized name instead of raising; the export module mirrors the
+  same rules.
 - `tests/test_codex_config_repair.py`, `tests/test_server_switch.py`, and
   `tests/test_codex_toml_concurrency_regression.py` imported `tomllib`
   (Python 3.11+) at top level, so they failed to import on 3.8/3.10. The
-  import is now guarded and the dependent tests skip there (T-93).
+  import is now guarded and the dependent tests skip there.
 
 ## [0.5.8] - 2026-09-06
 
 ### Removed
 
-- Retired the per-minute managed inbox cron (D-29). `SessionStart` no longer
+- Retired the per-minute managed inbox cron. `SessionStart` no longer
   offers to create it, and a surviving legacy job is retired once.
 
 ## [0.5.7] - 2026-09-03
@@ -101,13 +98,13 @@ Git tags in this repository, so versions are dated by their bump commit.
 
 - The lifecycle hook renders the reconnect outage summary, the unjournaled-write
   count, and the stale-mirror refusal **once per state** rather than repeating
-  them every turn (T-84 A9 / T-85 E).
+  them every turn.
 
 ## [0.5.6] - 2026-09-03
 
 ### Changed
 
-- Live-receipt retention: receipts are tombstoned, never deleted (T-88, D-28).
+- Live-receipt retention: receipts are tombstoned, never deleted.
 - Apply and receipt are written atomically, with recovery for stranded
   reservations.
 
@@ -123,23 +120,23 @@ Git tags in this repository, so versions are dated by their bump commit.
 
 ### Added
 
-- Proven-failure queueing and ambiguous-write reconciliation (T-85, D-27): a
+- Proven-failure queueing and ambiguous-write reconciliation: a
   proven connection refusal may queue; an ambiguous timeout must not create a
   duplicate side effect.
 - Export carries `message_disposition_baselines`, and the `cloud_context`
-  record is validated on export (T-87).
+  record is validated on export.
 
 ### Changed
 
-- Compact default read projections (T-86, T-84 B2/B3).
+- Compact default read projections.
 
 ## [0.5.4] - 2026-09-03
 
 ### Added
 
 - The session brief renders both the shared project handoff and the caller's
-  own identity handoff (T-75).
-- Historical disposition reconciliation (T-80, D-26): implicit resolution
+  own identity handoff.
+- Historical disposition reconciliation: implicit resolution
   rules, a per-identity upgrade baseline, and bounded bulk disposition.
 
 ## [0.5.3] - 2026-09-03
@@ -147,10 +144,9 @@ Git tags in this repository, so versions are dated by their bump commit.
 ### Added
 
 - Split handoffs: one shared project handoff plus a per-identity handoff owned
-  by each registered actor, with independent optimistic versions
-  (T-81/T-83/T-75).
+  by each registered actor, with independent optimistic versions.
 - Persona repair and guided setup for duplicate or legacy identities.
-- Hook injection contract (T-82/T-84, D-23/D-24): auth gate, show-once render
+- Hook injection contract: auth gate, show-once render
   ledger, silent `Stop`, show-once count lines, no self-echo, coalesced entity
   updates, outage reported once, pulse-as-ping with back-off, compact rules
   banner, and compaction parity.
@@ -240,7 +236,7 @@ hosted continuity layer end to end.
   release metadata validated.
 - Offline sync projections with forward-compatible negotiation, plus sync
   initialization and push capability binding.
-- D-17 client install keys replacing terminal enrollment, with security
+- Client install keys replacing terminal enrollment, with security
   regression coverage and client auth/workflow integrity enforcement.
 - Rooms as true group conversations, and autonomous inbox delivery.
 - `/v1/projects/{id}/poll-status` returning per-request update and new-mail
@@ -255,5 +251,3 @@ hosted continuity layer end to end.
 - Hooks detached from stale plugin caches and kept out of auth flows.
 - Codex TOML rewrites serialized across clients; watcher state kept private and
   abandoned subscriptions pruned safely.
-- `docs/LOG.md` archived to `docs/LOG.archive.md` — Attacca itself is now the
-  project's source of truth.
