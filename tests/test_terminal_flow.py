@@ -391,7 +391,8 @@ class ClientAuthorizationFlowTest(unittest.TestCase):
             credentials_path=self.credentials, transport=retry,
             open_browser=False)
         self.assertTrue(ready["authorized"])
-        self.assertTrue(retry.calls[0]["payload"]["acknowledged"])
+        self.assertTrue(retry.calls[0]["url"].endswith("/v1/auth/status"))
+        self.assertTrue(retry.calls[1]["payload"]["acknowledged"])
         self.assertIsNone(flow._pairing_record(
             flow.read_credentials_store(self.credentials),
             self.server, self.instance))
@@ -438,6 +439,7 @@ class ClientAuthorizationFlowTest(unittest.TestCase):
         result = flow.authorize_client(
             self.server, client_instance=self.instance,
             credentials_path=self.credentials,
+            transport=FakeTransport(),
             browser_open=lambda url: opened.append(url) or True)
         self.assertEqual(result["status"], "ready")
         self.assertEqual(opened, [])

@@ -27,6 +27,8 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -82,6 +84,10 @@ class TerminalFlowProtocolError(TerminalFlowError):
 
 class TerminalFlowTransportError(TerminalFlowError):
     """The authorization server could not be reached safely."""
+
+
+class ClientCredentialRejected(TerminalFlowProtocolError):
+    """The server explicitly rejected the stored client credential."""
 
 
 class ControllingTerminalUnavailable(TerminalFlowError):
@@ -830,9 +836,13 @@ def verify_client_api_key(server_url, token, *, client_instance=None,
     if response.status not in {200, 401, 403}:
         raise TerminalFlowProtocolError(
             "Attacca returned an unexpected authorization response")
-    if response.status != 200 or response.value.get("authenticated") is not True:
-        raise TerminalFlowProtocolError(
+    if response.status == 401 or (response.status == 200 and
+                                 response.value.get("authenticated") is not True):
+        raise ClientCredentialRejected(
             "Attacca rejected this client API key")
+    if response.status != 200:
+        raise TerminalFlowProtocolError(
+            "Attacca denied this client request; check workspace access")
     principal = response.value.get("principal")
     if not isinstance(principal, dict) or principal.get("token_kind") != "client":
         raise TerminalFlowProtocolError(
@@ -915,14 +925,123 @@ def _store_pairing(server_url, instance, pairing, credentials_path=None):
     update_credentials_store(credentials_path, install)
 
 
-def _forget_pairing(server_url, instance, credentials_path=None):
+def _forget_pairing(server_url, instance, credentials_path=None,
+                    expected_request=None):
     def remove(data):
         server = server_record_for_url(data, server_url)
         if isinstance(server, dict) and isinstance(
                 server.get("client_authorizations"), dict):
-            server["client_authorizations"].pop(instance, None)
+            current = server["client_authorizations"].get(instance)
+            if expected_request is None or (isinstance(current, dict) and
+                    current.get("authorization_request") == expected_request):
+                server["client_authorizations"].pop(instance, None)
         return data
     update_credentials_store(credentials_path, remove)
+
+
+@contextlib.contextmanager
+def _client_authorization_lock(server_url, instance, credentials_path=None):
+    """Serialize one installation's pairing steps across hooks and processes.
+
+    Use a separate lock from the credential store: HTTP runs between private
+    store transactions, while other processes can still load credentials.
+    """
+    path = _absolute_private_path(credentials_path or default_credentials_path())
+    scope = canonical_server_url(server_url) + "\n" + instance
+    suffix = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:32]
+    with _private_file_lock(path.with_name(path.name + ".pairing-" + suffix)):
+        yield
+
+
+def _verified_cached_client_status(server_url, instance, credentials_path,
+                                   transport, timeout, project_id=None,
+                                   actor_id=None, device_id=None):
+    """Local readiness is not proof that a key is still accepted remotely."""
+    status = client_api_key_status(
+        server_url, client_instance=instance, project_id=project_id,
+        credentials_path=credentials_path)
+    if not status.get("authorized"):
+        return None
+    token = load_client_api_key(
+        server_url, client_instance=instance, project_id=project_id,
+        credentials_path=credentials_path)
+    if not token:
+        return None
+    try:
+        checked = verify_client_api_key(
+            server_url, token, client_instance=instance,
+            project_id=project_id, actor_id=actor_id, device_id=device_id,
+            verify_registered_actor=bool(project_id and actor_id),
+            transport=transport, timeout=timeout)
+    except ClientCredentialRejected:
+        # Keep the rejected record until a replacement is safely delivered.
+        return None
+    return save_client_api_key(
+        server_url, checked, client_instance=instance,
+        credentials_path=credentials_path)
+
+
+def _pairing_delivery_matches(data, server_url, instance, pairing):
+    """An ACK requires a receipt for this request and the stored exact key."""
+    current = _pairing_record(data, server_url, instance)
+    record = _client_key_record(data, server_url, instance)
+    if not isinstance(current, dict) or not isinstance(record, dict) or \
+            current.get("authorization_request") != pairing.get("authorization_request"):
+        return False
+    digest = current.get("delivered_token_sha256")
+    try:
+        token = _validate_client_credential(record, instance)["token"]
+    except TerminalFlowProtocolError:
+        return False
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        return False
+    return hmac.compare_digest(
+        digest, hashlib.sha256(token.encode("utf-8")).hexdigest())
+
+
+def _record_pairing_delivery(server_url, instance, pairing, token,
+                             credentials_path):
+    """Bind cleanup to the received key only after it was durably installed."""
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def record_receipt(data):
+        current = _pairing_record(data, server_url, instance)
+        stored = _client_key_record(data, server_url, instance)
+        if not isinstance(current, dict) or not isinstance(stored, dict) or \
+                current.get("authorization_request") != pairing.get("authorization_request"):
+            return data
+        installed = _validate_client_credential(stored, instance)["token"]
+        if hmac.compare_digest(
+                hashlib.sha256(installed.encode("utf-8")).hexdigest(), digest):
+            current["delivered_token_sha256"] = digest
+        return data
+
+    update_credentials_store(credentials_path, record_receipt)
+
+
+def _acknowledge_pairing_delivery(server_url, instance, pairing,
+                                  credentials_path, transport, timeout):
+    if not _pairing_delivery_matches(
+            read_credentials_store(credentials_path), server_url, instance, pairing):
+        return False
+    try:
+        response = (transport or UrllibJsonTransport()).request(
+            "POST", _endpoint(server_url, CLIENT_AUTHORIZATIONS_PATH + "/poll"),
+            headers={"Accept": "application/json"}, payload={
+                "poll_secret": pairing.get("poll_secret"),
+                "client_instance": instance,
+                "device_id": pairing.get("device_id"),
+                "acknowledged": True,
+            }, timeout=timeout)
+    except TerminalFlowError:
+        return False
+    acknowledged = response.status == 200 and (
+        response.value.get("acknowledged") is True or
+        str(response.value.get("status") or "").lower() == "ready")
+    if acknowledged:
+        _forget_pairing(server_url, instance, credentials_path,
+                        expected_request=pairing.get("authorization_request"))
+    return acknowledged
 
 
 def start_client_pairing(server_url, *, client_instance=None, runtime=None,
@@ -933,6 +1052,20 @@ def start_client_pairing(server_url, *, client_instance=None, runtime=None,
     """Start one install-only browser pairing and persist its secret privately."""
     instance = _resolved_client_instance_id(
         client_instance, runtime=runtime, storage_path=storage_path)
+    with _client_authorization_lock(server_url, instance, credentials_path):
+        existing = _pairing_record(
+            read_credentials_store(credentials_path), server_url, instance)
+        if isinstance(existing, dict):
+            return _poll_client_pairing(
+                server_url, instance, credentials_path, transport, timeout)
+        return _start_client_pairing(
+            server_url, instance, client_label, device_id, credentials_path,
+            transport, timeout, open_browser, browser_open)
+
+
+def _start_client_pairing(server_url, instance, client_label, device_id,
+                          credentials_path, transport, timeout, open_browser,
+                          browser_open):
     response = (transport or UrllibJsonTransport()).request(
         "POST", _endpoint(server_url, CLIENT_AUTHORIZATIONS_PATH),
         headers={"Accept": "application/json"}, payload={
@@ -983,11 +1116,31 @@ def poll_client_pairing(server_url, *, client_instance=None, runtime=None,
     """Poll silently; consume and persist an approved one-time credential."""
     instance = _resolved_client_instance_id(
         client_instance, runtime=runtime, storage_path=storage_path)
+    with _client_authorization_lock(server_url, instance, credentials_path):
+        return _poll_client_pairing(
+            server_url, instance, credentials_path, transport, timeout)
+
+
+def _poll_client_pairing(server_url, instance, credentials_path, transport, timeout):
     pairing = _pairing_record(
         read_credentials_store(credentials_path), server_url, instance)
     if not isinstance(pairing, dict):
+        verified = _verified_cached_client_status(
+            server_url, instance, credentials_path, transport, timeout)
+        if verified:
+            return verified
         return {"status": "authorization_required", "authorized": False,
                 "client_instance": instance, "hot_reload": True}
+    if _pairing_delivery_matches(
+            read_credentials_store(credentials_path), server_url, instance, pairing):
+        # The previous ACK response may have been lost after the server
+        # consumed it. Retry only with the matching durable delivery receipt.
+        verified = _verified_cached_client_status(
+            server_url, instance, credentials_path, transport, timeout)
+        if verified:
+            _acknowledge_pairing_delivery(
+                server_url, instance, pairing, credentials_path, transport, timeout)
+            return verified
     response = (transport or UrllibJsonTransport()).request(
         "POST", _endpoint(server_url, CLIENT_AUTHORIZATIONS_PATH + "/poll"),
         headers={"Accept": "application/json"}, payload={
@@ -997,6 +1150,9 @@ def poll_client_pairing(server_url, *, client_instance=None, runtime=None,
         }, timeout=timeout)
     value = response.value
     state = str(value.get("status") or "").lower()
+    if response.status in {400, 410} and value.get("error") == \
+            "client pairing code expired":
+        state = "expired"
     if response.status in {202, 428} or state in {"pending", "slow_down"}:
         return {"status": "pending", "authorized": False,
                 "client_instance": instance,
@@ -1004,7 +1160,8 @@ def poll_client_pairing(server_url, *, client_instance=None, runtime=None,
                 "interval": pairing.get("interval", 5), "hot_reload": True}
     if response.status != 200 or state not in {"approved", "ready"}:
         if state in {"denied", "expired"} or response.status in {404, 410}:
-            _forget_pairing(server_url, instance, credentials_path)
+            _forget_pairing(server_url, instance, credentials_path,
+                            expected_request=pairing.get("authorization_request"))
         return {"status": state or "authorization_required",
                 "authorized": False, "client_instance": instance,
                 "hot_reload": True}
@@ -1021,29 +1178,11 @@ def poll_client_pairing(server_url, *, client_instance=None, runtime=None,
     result = save_client_api_key(
         server_url, credential, client_instance=instance,
         credentials_path=credentials_path)
-    # Receipt acknowledgement happens only after the normalized credential is
-    # durably installed.  A lost response or validation failure therefore
-    # remains replayable without minting another browser request.
-    acknowledged = False
-    try:
-        acknowledgement = (transport or UrllibJsonTransport()).request(
-            "POST", _endpoint(server_url,
-                              CLIENT_AUTHORIZATIONS_PATH + "/poll"),
-            headers={"Accept": "application/json"}, payload={
-                "poll_secret": pairing.get("poll_secret"),
-                "client_instance": instance,
-                "device_id": pairing.get("device_id"),
-                "acknowledged": True,
-            }, timeout=timeout)
-        acknowledged = acknowledgement.status == 200 and (
-            acknowledgement.value.get("acknowledged") is True or
-            str(acknowledgement.value.get("status") or "").lower() == "ready")
-    except TerminalFlowError:
-        # The installed credential is authoritative; ACK is a cleanup signal
-        # and a later retry can safely repeat it.
-        acknowledged = False
-    if acknowledged:
-        _forget_pairing(server_url, instance, credentials_path)
+    token = credential.get("token")
+    _record_pairing_delivery(
+        server_url, instance, pairing, token, credentials_path)
+    _acknowledge_pairing_delivery(
+        server_url, instance, pairing, credentials_path, transport, timeout)
     return result
 
 
@@ -1165,44 +1304,22 @@ def authorize_client(server_url, *, client_instance=None, runtime=None,
     """AI-initiated one-click browser pairing with silent hot reload."""
     instance = _resolved_client_instance_id(
         client_instance, runtime=runtime, storage_path=storage_path)
-    status = client_api_key_status(
-        server_url, client_instance=instance, project_id=project_id,
-        credentials_path=credentials_path)
-    existing = _pairing_record(
-        read_credentials_store(credentials_path), server_url, instance)
-    if status.get("authorized"):
+    with _client_authorization_lock(server_url, instance, credentials_path):
+        existing = _pairing_record(
+            read_credentials_store(credentials_path), server_url, instance)
         if isinstance(existing, dict):
-            try:
-                acknowledgement = (transport or UrllibJsonTransport()).request(
-                    "POST", _endpoint(
-                        server_url, CLIENT_AUTHORIZATIONS_PATH + "/poll"),
-                    headers={"Accept": "application/json"}, payload={
-                        "poll_secret": existing.get("poll_secret"),
-                        "client_instance": instance,
-                        "device_id": existing.get("device_id"),
-                        "acknowledged": True,
-                    }, timeout=timeout)
-                if acknowledgement.status == 200 and (
-                        acknowledgement.value.get("acknowledged") is True or
-                        str(acknowledgement.value.get("status") or "").lower()
-                        == "ready"):
-                    _forget_pairing(server_url, instance, credentials_path)
-            except TerminalFlowError:
-                pass
-        return status
-    if isinstance(existing, dict):
-        polled = poll_client_pairing(
-            server_url, client_instance=instance,
-            credentials_path=credentials_path, transport=transport,
-            timeout=timeout)
-        if polled.get("status") not in {"expired", "denied",
-                                         "authorization_required"}:
-            return polled
-    started = start_client_pairing(
-        server_url, client_instance=instance, client_label=client_label,
-        device_id=device_id, credentials_path=credentials_path,
-        transport=transport, timeout=timeout, open_browser=open_browser,
-        browser_open=browser_open)
+            # A stored key can be obsolete while a new approval is pending.
+            # Always receive that delivery before considering ACK or readiness.
+            started = _poll_client_pairing(
+                server_url, instance, credentials_path, transport, timeout)
+        else:
+            started = _verified_cached_client_status(
+                server_url, instance, credentials_path, transport, timeout,
+                project_id=project_id, actor_id=actor_id, device_id=device_id)
+            if started is None:
+                started = _start_client_pairing(
+                    server_url, instance, client_label, device_id,
+                    credentials_path, transport, timeout, open_browser, browser_open)
     if not wait or started.get("authorized") \
             or str(started.get("status") or "").lower() != "pending":
         return started
