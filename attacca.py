@@ -22748,7 +22748,9 @@ def _ensure_client_setup_auth(url, actor_id, interactive=False,
     # ATTACCA_API_TOKEN instead of the private registry.  Treat that exact
     # process-local secret as a first-class hot-load source; verify the signed
     # client instance with the server before setup uses it and never copy the
-    # value into another file or response.
+    # value into another file or response. Receiving a browser approval is not
+    # revocation of other valid keys: on later operations without a pending
+    # delivery, an explicit environment override keeps its normal precedence.
     environment_token = str(os.environ.get(ENV_API_TOKEN) or "").strip()
     if environment_token and not replacement_received:
         try:

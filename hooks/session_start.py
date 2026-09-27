@@ -2585,6 +2585,8 @@ def _watcher_status_payload(session_id=None):
                 "offline_mirror_verified_at", "offline_directory",
                 "sync_schema_version", "sync_activated_at",
                 "sync_bootstrap_error", "local_path_missing_reason",
+                "pending_approval_status", "pending_approval_checked_at_epoch",
+                "pending_approval_error",
                 "local_path_missing_since_epoch",
                 "local_path_missing_observations")
         } | {"pending_count": len(entry.get("pending") or []),
@@ -2644,6 +2646,96 @@ def _watcher_api_token(entry):
         raise RuntimeError(
             "local client API key state is invalid: %s" %
             _trim(error, 160)) from None
+
+
+def _watcher_collect_pending_approval(key, entry, now):
+    """Collect an existing browser approval without creating another request.
+
+    Pairing status is independent of the currently installed credential. A
+    denied, expired, or temporarily unavailable replacement must not revoke a
+    working key or latch its verified project authority off. Never retain the
+    returned authorization link, credential, or exception text in watcher state.
+    The caller reloads the key even after failure: receipt acknowledgement can
+    fail after the approved credential was already persisted safely.
+    """
+    result = None
+    error = None
+    failure_message = (
+        "An existing approval could not finish collection. Credentials still "
+        "undergo normal verification; automatic retries continue. Do not reapprove.")
+    try:
+        result = _terminal_flow_module().collect_pending_client_pairing(
+            entry["server_url"],
+            client_instance=entry.get("client_instance") or
+                _client_instance_id(entry.get("runtime")),
+            runtime=entry.get("runtime"),
+            timeout=AUXILIARY_HTTP_TIMEOUT_SECONDS)
+    except Exception:
+        error = failure_message
+    if result is None and error is None and not any(
+            name in entry for name in (
+                "pending_approval_status", "pending_approval_error")):
+        return
+    status = result.get("status") if isinstance(result, dict) else None
+    if result is not None and (not isinstance(status, str) or status not in {
+            "pending", "approved", "ready", "denied", "expired"}):
+        # A rejected poll secret or HTTP error can be returned as a public
+        # authorization_required result rather than an exception. It still
+        # says nothing about the currently installed credential's authority.
+        error = failure_message
+    if error:
+        status = "poll_failed"
+
+    def record(state):
+        current = (state.get("subscriptions") or {}).get(key)
+        if not current:
+            return
+        was_error = bool(current.get("pending_approval_error"))
+        current["pending_approval_checked_at_epoch"] = now
+        if status is None:
+            current.pop("pending_approval_status", None)
+        else:
+            current["pending_approval_status"] = status
+        if error:
+            current["pending_approval_error"] = error
+        else:
+            current.pop("pending_approval_error", None)
+        if bool(error) == was_error:
+            return
+        incident = max(0, int(current.get("pending_approval_incident") or 0))
+        if error:
+            incident += 1
+            current["pending_approval_incident"] = incident
+            kind = "sync_error"
+            summary = "ATTACCA APPROVAL COLLECTION NEEDS ATTENTION · %s\n- %s" % (
+                current["project_id"], failure_message)
+        else:
+            kind = "sync_recovered"
+            detail = {
+                "approved": "The approved credential was received and saved; normal project identity and scope verification is still required.",
+                "ready": "The approved credential was received and saved; normal project identity and scope verification is still required.",
+                "pending": "Approval polling resumed; the request is still pending. This poll did not confirm a replacement credential.",
+                "denied": "Approval polling resumed; the request was denied. This poll did not confirm a replacement credential.",
+                "expired": "Approval polling resumed; the request expired. This poll did not confirm a replacement credential.",
+                None: "No outstanding approval remains in this installation; this alone does not confirm a replacement credential.",
+            }[status]
+            summary = (
+                "ATTACCA APPROVAL COLLECTION UPDATE · %s\n- %s\n"
+                "- This does not prove current identity authorization, watcher "
+                "sync, or receiver delivery health." % (current["project_id"], detail))
+        # Both the episode transition and its notice commit together. The
+        # monotonic incident keeps recurring failures observable after a real
+        # recovery, without re-announcing every retry after FIFO consumption.
+        fingerprint = hashlib.sha256(json.dumps([
+            "client_approval_collection", key, incident, kind,
+        ], separators=(",", ":")).encode("utf-8")).hexdigest()
+        current.setdefault("pending", []).append({
+            "source": "client_approval_collection", "kind": kind,
+            "fingerprint": fingerprint, "summary": summary,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+    _mutate_state(_watcher_state_path(), record)
 
 
 def _watcher_request_actor(entry):
@@ -4402,6 +4494,27 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
                         "due": True, "disabled": True,
                         "authentication_required": bool(entry.get("auth_required")),
                         "offline": False, "key": key}
+            if preflight_interval != 0:
+                # A still-valid old key must not strand an approved replacement.
+                # Only inspect existing pairing state on the normal due cadence;
+                # paused subscriptions never poll approvals, even when forced.
+                _watcher_collect_pending_approval(key, entry, now)
+                credential = _watcher_api_token(entry)
+                fingerprint = hashlib.sha256(
+                    credential.encode("utf-8")).hexdigest() if credential else None
+                if fingerprint != entry.get(
+                        "observed_credential_fingerprint",
+                        entry.get("verified_credential_fingerprint")):
+                    credential_changed = True
+
+                    def observe_collected_credential(state_value):
+                        current = (state_value.get("subscriptions") or {}).get(key)
+                        if current:
+                            current["observed_credential_fingerprint"] = fingerprint
+                            current["identity_refresh_required"] = True
+
+                    _mutate_state(_watcher_state_path(), observe_collected_credential)
+                    entry["identity_refresh_required"] = True
         if native_sync and due and (credential_changed or
                                     _watcher_identity_refresh_needed(entry)):
             entry, adapter = _watcher_recover_identity(key, entry)
