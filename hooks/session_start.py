@@ -11,6 +11,7 @@ at the next supported turn boundary, so the user never has to type
 """
 
 import argparse
+import copy
 import hashlib
 import importlib.util
 import json
@@ -2747,24 +2748,37 @@ def _watcher_fetch_sync_snapshot(entry, transport=None):
             timeout=AUXILIARY_HTTP_TIMEOUT_SECONDS,
             max_response_bytes=client.MAX_ERROR_BODY_BYTES)
         if not isinstance(status_response, client.JsonHttpResponse) \
-                or status_response.status != 200 \
+                or not isinstance(status_response.status, int) \
+                or isinstance(status_response.status, bool) \
                 or not isinstance(status_response.headers, dict) \
                 or not isinstance(status_response.body, bytes) \
-                or len(status_response.body) > client.MAX_ERROR_BODY_BYTES \
-                or "application/json" not in str(
-                    status_response.headers.get("content-type") or "").lower():
-            auth_status = None
-        else:
-            try:
-                auth_status = json.loads(status_response.body.decode("utf-8"))
-            except Exception:
-                auth_status = None
-        if not isinstance(auth_status, dict) \
-                or auth_status.get("authentication_required") is not False \
-                or auth_status.get("effective_authentication") != "optional" \
-                or auth_status.get("compatibility_active") is not True:
+                or len(status_response.body) > client.MAX_ERROR_BODY_BYTES:
+            raise RuntimeError("authentication status transport returned malformed fields")
+        if status_response.status in {401, 403}:
             raise HostedAuthenticationRequired(
-                "Attacca requires terminal enrollment for sync", http_status=401)
+                "No client credential was sent; the authentication status endpoint "
+                "denied anonymous access", http_status=status_response.status)
+        if status_response.status != 200:
+            raise RuntimeError("authentication status endpoint returned HTTP %d" %
+                               status_response.status)
+        if "application/json" not in str(
+                status_response.headers.get("content-type") or "").lower():
+            raise RuntimeError("authentication status response is not JSON")
+        try:
+            auth_status = json.loads(status_response.body.decode("utf-8"))
+        except Exception as error:
+            raise RuntimeError("authentication status response is malformed JSON") from error
+        if not isinstance(auth_status, dict) or not isinstance(
+                auth_status.get("authentication_required"), bool):
+            raise RuntimeError("authentication status response lacks an explicit auth mode")
+        if auth_status["authentication_required"]:
+            raise HostedAuthenticationRequired(
+                "No client credential was sent; client authorization is required "
+                "because the server requires authentication", http_status=401)
+        if auth_status.get("effective_authentication") != "optional" \
+                or auth_status.get("compatibility_active") is not True:
+            raise RuntimeError(
+                "anonymous compatibility sync policy could not be verified")
     capabilities = protocol.validate_projection_capabilities(
         entry.get("sync_projection_capabilities") or
         protocol.current_projection_capabilities())
@@ -2784,7 +2798,9 @@ def _watcher_fetch_sync_snapshot(entry, transport=None):
         raise RuntimeError("sync snapshot transport returned malformed fields")
     if response.status in {401, 403}:
         raise HostedAuthenticationRequired(
-            "Attacca rejected the current terminal credential or AI scope",
+            "Attacca rejected the supplied terminal credential or selected AI scope"
+            if token else
+            "No client credential was sent; Attacca denied the selected anonymous AI scope",
             http_status=response.status)
     if not 200 <= response.status < 300:
         raise RuntimeError(
@@ -3596,7 +3612,8 @@ def _watcher_fresh_first_page(plan, size=WATCHER_ATTENTION_PAGE_SIZE):
 
 
 def _watcher_attention_notice(status, config, runtime=None, consume=True,
-                              fresh_only=False, delta_label=None, page_size=None):
+                              fresh_only=False, delta_label=None, page_size=None,
+                              _state=None):
     """Pin unresolved assignments and staged unread mail at every boundary.
 
     Delivery is show-once-per-session: a row is injected in full the first
@@ -3682,7 +3699,9 @@ def _watcher_attention_notice(status, config, runtime=None, consume=True,
                         row.get("message_key") in paged_keys:
                     row["delivered_at"] = rendered_at
 
-    if consume:
+    if _state is not None:
+        mutate(_state)
+    elif consume:
         _mutate_state(_watcher_state_path(), mutate)
     else:
         mutate(_read_state(_watcher_state_path()))
@@ -5348,7 +5367,7 @@ WATCHER_OUTAGE_KINDS = frozenset({
 
 
 def _watcher_pending_notice(status, config, runtime=None, consume=True,
-                            event_name=None, max_rows=None):
+                            event_name=None, max_rows=None, _state=None):
     """Deliver the durable watcher FIFO for one lifecycle boundary.
 
     A8: supersedable entity rows (task/decision/rule/handoff/plan/bridge) are
@@ -5411,7 +5430,9 @@ def _watcher_pending_notice(status, config, runtime=None, consume=True,
                 entry["last_delivered_at"] = datetime.now(
                     timezone.utc).isoformat()
 
-    if consume:
+    if _state is not None:
+        mutate(_state)
+    elif consume:
         _mutate_state(_watcher_state_path(), mutate)
     else:
         mutate(_read_state(_watcher_state_path()))
@@ -8721,63 +8742,79 @@ def _post_tool_output(status, payload):
         state = _read_state(_watcher_state_path())
         daemon = state.get("daemon") or {}
         alive = _watcher_process_matches(daemon.get("pid"), daemon.get("nonce"))
-        transport = _watcher_transport_health(entry, alive)
-        health_state = transport["state"]
-        notices = []
-        prior = entry.get("post_tool_health_state")
-        if health_state != prior and health_state not in {"ready", "paused"}:
-            notices.append("ATTACCA DELIVERY HEALTH: watcher transport=%s. "
-                           "This is not proof of idle receiver delivery. "
-                           "Use the local watcher/receiver diagnostics; do not "
-                           "repeat browser approval unless a fresh authenticated "
-                           "probe actually rejects the credential." % health_state)
-        if health_state != prior:
-            def record_health(state_value):
-                current = (state_value.get("subscriptions") or {}).get(key)
-                if current is not None:
-                    current["post_tool_health_state"] = health_state
-            _mutate_state(_watcher_state_path(), record_health)
-        if health_state not in {"authentication_required", "identity_verification_required"} \
-                and entry.get("canonical_actor_id"):
-            rows = list(entry.get("pending_dispositions") or []) + list(entry.get("attention") or [])
-            ledger = _watcher_render_ledger(entry)
-            fresh = any(mode == "full" for _, mode, _ in
-                        _watcher_render_plan(ledger, rows, False, ""))
-            if fresh:
-                attention = _watcher_attention_notice(
-                    status, config, consume=False, fresh_only=True,
-                    delta_label="ACTIVE TURN UPDATE", page_size=10)
-                if attention and len(("\n\n".join(notices) + attention["context"]).encode()) < 30000:
-                    attention = _watcher_attention_notice(
-                        status, config, fresh_only=True,
-                        delta_label="ACTIVE TURN UPDATE", page_size=10)
-                    if attention:
-                        notices.append(attention["context"])
-            if entry.get("pending"):
-                pending = _watcher_pending_notice(
-                    status, config, event_name="PostToolUse", consume=False,
-                    max_rows=WATCHER_NOTICE_BATCH_SIZE)
-                if pending and len(("\n\n".join(notices) + pending["context"]).encode()) < 30000:
-                    pending = _watcher_pending_notice(
-                        status, config, event_name="PostToolUse",
-                        max_rows=WATCHER_NOTICE_BATCH_SIZE)
-                    if pending:
-                        notices.append(pending["context"])
-        recovery = _post_tool_local_diagnostic(status, False)
-        if recovery:
-            notices.append(recovery["hookSpecificOutput"]["additionalContext"])
-        if not notices:
-            return None
-        def record_emission(state_value):
+        health_state = _watcher_transport_health(entry, alive)["state"]
+        rows = list(entry.get("pending_dispositions") or []) + list(entry.get("attention") or [])
+        fresh = any(mode == "full" for _, mode, _ in
+                    _watcher_render_plan(_watcher_render_ledger(entry), rows, False, ""))
+        allowed = health_state not in {
+            "authentication_required", "identity_verification_required"} \
+            and entry.get("canonical_actor_id")
+        if health_state == entry.get("post_tool_health_state") and not (
+                allowed and (fresh or entry.get("pending"))):
+            return _post_tool_local_diagnostic(status, False)
+        captured = {"output": None}
+
+        def drain(state_value):
             current = (state_value.get("subscriptions") or {}).get(key)
-            if current is not None:
-                current["active_turn_delivery"] = {
-                    "hook_event": "PostToolUse",
-                    "last_context_emitted_at": datetime.now(timezone.utc).isoformat(),
-                    "ai_processing": "unverified"}
-        _mutate_state(_watcher_state_path(), record_emission)
-        return {"hookSpecificOutput": {"hookEventName": "PostToolUse",
-                "additionalContext": _bound_injected_context("\n\n".join(notices))}}
+            if current is None:
+                return
+            current_daemon = state_value.get("daemon") or {}
+            current_alive = _watcher_process_matches(
+                current_daemon.get("pid"), current_daemon.get("nonce"))
+            current_health = _watcher_transport_health(
+                current, current_alive)["state"]
+            notices = []
+            prior = current.get("post_tool_health_state")
+            if current_health != prior and current_health not in {"ready", "paused"}:
+                notices.append("ATTACCA DELIVERY HEALTH: watcher transport=%s. "
+                               "This is not proof of idle receiver delivery. "
+                               "Use the local watcher/receiver diagnostics; do not "
+                               "repeat browser approval unless a fresh authenticated "
+                               "probe actually rejects the credential." % current_health)
+            current["post_tool_health_state"] = current_health
+            if current_health not in {
+                    "authentication_required", "identity_verification_required"} \
+                    and current.get("canonical_actor_id"):
+                # Render and mark the exact same state under one lock. A
+                # concurrent auth latch or actor change is checked above; a
+                # renderer/write failure leaves every delivery marker intact.
+                for render in (
+                        lambda candidate: _watcher_attention_notice(
+                            status, config, fresh_only=True,
+                            delta_label="ACTIVE TURN UPDATE", page_size=10,
+                            _state=candidate),
+                        lambda candidate: _watcher_pending_notice(
+                            status, config, event_name="PostToolUse",
+                            max_rows=WATCHER_NOTICE_BATCH_SIZE, _state=candidate)):
+                    candidate = copy.deepcopy(state_value)
+                    notice = render(candidate)
+                    if notice and len("\n\n".join(
+                            notices + [notice["context"]]).encode()) < 30000:
+                        state_value.clear()
+                        state_value.update(candidate)
+                        notices.append(notice["context"])
+            if not notices:
+                return
+            # Prepare bounded, serializable output before the transaction can
+            # commit. No later bookkeeping failure may discard this output.
+            output = {"hookSpecificOutput": {"hookEventName": "PostToolUse",
+                      "additionalContext": _bound_injected_context("\n\n".join(notices))}}
+            json.dumps(output)
+            state_value["subscriptions"][key]["active_turn_delivery"] = {
+                "hook_event": "PostToolUse",
+                "last_context_emitted_at": datetime.now(timezone.utc).isoformat(),
+                "ai_processing": "unverified"}
+            captured["output"] = output
+
+        _mutate_state(_watcher_state_path(), drain)
+        # Clear a prior independent diagnostic only after successful commit.
+        # Persistent write failures must not clear/re-add it every tool; this
+        # optional cleanup can never suppress already committed delivery.
+        try:
+            recovery = _post_tool_local_diagnostic(status, False)
+        except Exception:
+            recovery = None
+        return captured["output"] or recovery
     except Exception:
         # Auxiliary local state must never replace or reject the tool result.
         # The normal lifecycle/diagnostics path surfaces persistent failures.

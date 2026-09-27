@@ -213,6 +213,70 @@ class WatcherIdentityRecoveryTest(unittest.TestCase):
         self.assertEqual(self.entry()["last_identity_recovery_error"], result["error"])
         auth_failure.assert_not_called()
 
+    def test_missing_credential_status_failures_are_not_fabricated_auth_rejections(self):
+        _, _, client = hook._watcher_sync_modules()
+        responses = [
+            client.JsonHttpResponse(503, {"content-type": "application/json"}, b'{}'),
+            client.JsonHttpResponse(200, {"content-type": "text/html"}, b'<html>proxy</html>'),
+            client.JsonHttpResponse(200, {"content-type": "application/json"}, b'{bad'),
+            client.JsonHttpResponse(200, {"content-type": "application/json"}, b'[]'),
+            client.JsonHttpResponse(200, {"content-type": "application/json"}, b'{}'),
+            client.JsonHttpResponse(200, {"content-type": "application/json"},
+                                    b'{"authentication_required":false}'),
+            client.JsonHttpResponse(200, {"content-type": "application/json"},
+                                    b'{"authentication_required":false,"effective_authentication":'
+                                    b'"optional","compatibility_active":false}'),
+            client.JsonHttpResponse(True, {"content-type": "application/json"}, b'{}'),
+        ]
+        for response in responses:
+            with self.subTest(status=response.status, body=response.body):
+                transport = mock.Mock()
+                transport.request.return_value = response
+                with mock.patch.object(hook, "_watcher_api_token", return_value=None):
+                    with self.assertRaises(RuntimeError) as raised:
+                        hook._watcher_fetch_sync_snapshot(self.entry(), transport=transport)
+                self.assertFalse(hook._authentication_required_error(raised.exception))
+                self.assertEqual(transport.request.call_count, 1)
+
+    def test_missing_credential_auth_rejection_says_no_credential_was_sent(self):
+        _, _, client = hook._watcher_sync_modules()
+        responses = [
+            client.JsonHttpResponse(401, {"content-type": "application/json"}, b'{}'),
+            client.JsonHttpResponse(200, {"content-type": "application/json"},
+                                    b'{"authentication_required":true}'),
+        ]
+        for response in responses:
+            transport = mock.Mock()
+            transport.request.return_value = response
+            with self.subTest(status=response.status), \
+                    mock.patch.object(hook, "_watcher_api_token", return_value=None):
+                with self.assertRaisesRegex(hook.HostedAuthenticationRequired,
+                                            "No client credential was sent"):
+                    hook._watcher_fetch_sync_snapshot(self.entry(), transport=transport)
+            self.assertEqual(transport.request.call_count, 1)
+
+    def test_sync_denial_distinguishes_missing_and_supplied_credentials(self):
+        _, _, client = hook._watcher_sync_modules()
+        compatibility = client.JsonHttpResponse(
+            200, {"content-type": "application/json"},
+            b'{"authentication_required":false,"effective_authentication":"optional",'
+            b'"compatibility_active":true}')
+        for token in (None, "isolated-test-credential"):
+            for status in (401, 403):
+                with self.subTest(credential_present=bool(token), status=status):
+                    transport = mock.Mock()
+                    denied = client.JsonHttpResponse(
+                        status, {"content-type": "application/json"}, b'{}')
+                    transport.request.side_effect = [denied] if token else [compatibility, denied]
+                    with mock.patch.object(hook, "_watcher_api_token", return_value=token):
+                        with self.assertRaises(hook.HostedAuthenticationRequired) as raised:
+                            hook._watcher_fetch_sync_snapshot(self.entry(), transport=transport)
+                    self.assertEqual(raised.exception.http_status, status)
+                    self.assertIn("supplied terminal credential" if token else
+                                  "No client credential was sent", str(raised.exception))
+                    sent = transport.request.call_args.kwargs["headers"]
+                    self.assertEqual("Authorization" in sent, bool(token))
+
     def test_stale_visibility_during_backoff_does_not_postpone_retry_forever(self):
         self.assertTrue(self.tick()["ok"])
         protocol, _, _ = hook._watcher_sync_modules()

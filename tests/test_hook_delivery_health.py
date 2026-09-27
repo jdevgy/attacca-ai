@@ -136,6 +136,89 @@ class HookDeliveryHealthTests(unittest.TestCase):
         self.assertNotIn("rendered", entry)
         self.assertEqual(len(entry["attention"]), 1)
 
+    def test_post_tool_rechecks_concurrent_auth_and_identity_latches_under_lock(self):
+        for latch in ("auth_required", "identity_refresh_required"):
+            with self.subTest(latch=latch):
+                key = self.stage(auth_required=False, identity_refresh_required=False,
+                                 post_tool_health_state="ready", pending=[], rendered={},
+                                 attention=[{"event_id": "raced", "message_key": "event:raced",
+                                             "body": "PRIVATE RACE SENTINEL"}])
+                original = hook._mutate_state
+                def raced(path, callback):
+                    if callback.__name__ == "drain":
+                        def latch_before_lock(state):
+                            state["subscriptions"][key][latch] = True
+                        original(path, latch_before_lock)
+                    return original(path, callback)
+                with mock.patch.object(hook, "_mutate_state", side_effect=raced):
+                    output = self.post_tool()
+                self.assertNotIn("PRIVATE RACE SENTINEL", json.dumps(output))
+                entry = hook._read_state(hook._watcher_state_path())["subscriptions"][key]
+                self.assertNotIn("raced", entry.get("rendered", {}))
+                self.assertNotIn("delivered_at", entry["attention"][0])
+
+    def test_post_tool_failed_transaction_does_not_consume_mail_or_entity_deltas(self):
+        key = self.stage(post_tool_health_state="ready", attention=[{
+            "event_id": "retry", "message_key": "event:retry", "body": "DELIVERY RETRY"}],
+            pending=[{"kind": "project_entity_delta", "entity_key": "task:retry",
+                      "summary": "ENTITY RETRY", "fingerprint": "retry"}])
+        original = hook._write_state
+        def failed_write(path, state):
+            if path == hook._watcher_state_path():
+                raise OSError("isolated transaction write failure")
+            return original(path, state)
+        with mock.patch.object(hook, "_write_state", side_effect=failed_write):
+            failed = self.post_tool()
+            self.assertIsNone(self.post_tool())
+        self.assertNotIn("DELIVERY RETRY", json.dumps(failed))
+        entry = hook._read_state(hook._watcher_state_path())["subscriptions"][key]
+        self.assertNotIn("retry", entry.get("rendered", {}))
+        self.assertNotIn("delivered_at", entry["attention"][0])
+        self.assertEqual(len(entry["pending"]), 1)
+        success = self.post_tool()
+        self.assertIn("DELIVERY RETRY", json.dumps(success))
+        self.assertIn("ENTITY RETRY", json.dumps(success))
+        self.assertIsNone(self.post_tool())
+
+    def test_post_tool_renderer_failure_rolls_back_earlier_mail_consumption(self):
+        key = self.stage(post_tool_health_state="ready", attention=[{
+            "event_id": "retry", "message_key": "event:retry", "body": "DELIVERY RETRY"}],
+            pending=[{"kind": "project_entity_delta", "entity_key": "task:retry",
+                      "summary": "ENTITY RETRY", "fingerprint": "retry"}])
+        with mock.patch.object(hook, "_watcher_pending_notice", side_effect=ValueError(
+                "isolated later renderer failure")):
+            failed = self.post_tool()
+        self.assertNotIn("DELIVERY RETRY", json.dumps(failed))
+        entry = hook._read_state(hook._watcher_state_path())["subscriptions"][key]
+        self.assertNotIn("retry", entry.get("rendered", {}))
+        self.assertEqual(len(entry["pending"]), 1)
+        self.assertIn("DELIVERY RETRY", json.dumps(self.post_tool()))
+
+    def test_post_tool_has_no_metadata_write_after_consuming_delivery(self):
+        self.stage(post_tool_health_state="ready", attention=[{
+            "event_id": "one", "message_key": "event:one", "body": "ONLY TRANSACTION"}])
+        original = hook._mutate_state
+        transactions = []
+        def tracked(path, callback):
+            if path == hook._watcher_state_path():
+                transactions.append(callback.__name__)
+                if len(transactions) > 1:
+                    raise OSError("forbidden post-delivery bookkeeping")
+            return original(path, callback)
+        with mock.patch.object(hook, "_mutate_state", side_effect=tracked):
+            output = self.post_tool()
+        self.assertIn("ONLY TRANSACTION", json.dumps(output))
+        self.assertEqual(transactions, ["drain"])
+
+    def test_post_tool_diagnostic_cleanup_cannot_hide_committed_delivery(self):
+        self.stage(post_tool_health_state="ready", attention=[{
+            "event_id": "one", "message_key": "event:one", "body": "COMMITTED DELIVERY"}])
+        with mock.patch.object(hook, "_post_tool_local_diagnostic", side_effect=OSError(
+                "isolated nonessential diagnostic cleanup failure")):
+            output = self.post_tool()
+        self.assertIn("COMMITTED DELIVERY", json.dumps(output))
+        self.assertIsNone(self.post_tool())
+
     def test_oversized_post_tool_context_stays_queued_instead_of_being_lost(self):
         key = self.stage(pending=[{"kind": "project_entity_delta", "entity_key": "large",
                                   "summary": "x" * 40000, "fingerprint": "large"}])

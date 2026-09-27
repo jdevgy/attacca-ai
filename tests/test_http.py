@@ -322,6 +322,8 @@ class HttpTestCase(unittest.TestCase):
                          "skills/msg/SKILL.md", "skills/update/SKILL.md",
                          "kimi-skills/session/SKILL.md",
                          "hooks/hooks.json", "hooks/session_start.py",
+                         "hooks/wait_for_change.py", "hooks/codex_wake.py",
+                         "monitors/monitors.json",
                          "web/admin.html",
                          "docs/assets/attacca-architecture.svg",
                          "plugin-mcp.json", "kimi.plugin.json",
@@ -364,7 +366,10 @@ class HttpTestCase(unittest.TestCase):
         self.assertIn("CronCreate", packaged_hook)
         hook_manifest = json.loads(archive.read("hooks/hooks.json"))
         self.assertEqual(set(hook_manifest["hooks"]),
-                         {"SessionStart", "UserPromptSubmit", "Stop"})
+                         {"SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"})
+        monitors = json.loads(archive.read("monitors/monitors.json"))
+        self.assertEqual(monitors[0]["when"], "always")
+        self.assertIn("wait_for_change.py", monitors[0]["command"])
         # the downloaded plugin is pre-wired to the server it came from
         cfg = json.loads(archive.read("plugin-mcp.json"))
         self.assertEqual(cfg["mcpServers"]["attacca"]["env"]["ATTACCA_URL"],
