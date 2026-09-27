@@ -248,7 +248,7 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
         manifest = json.loads((ROOT / "hooks" / "hooks.json").read_text())
         hooks = manifest["hooks"]
         self.assertEqual(set(hooks),
-                         {"SessionStart", "UserPromptSubmit", "Stop"})
+                         {"SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"})
         self.assertEqual(hooks["SessionStart"][0]["matcher"],
                          "startup|resume|clear|compact|fork")
         commands = []
@@ -1386,7 +1386,7 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
             self.assertIn("AGENTS.md", notice["context"])
 
     def test_previous_managed_law_auto_refreshes_to_latest_without_touching_user_bytes(self):
-        self.assertEqual(c.MANAGED_BLOCK_VERSION, 15)
+        self.assertEqual(c.MANAGED_BLOCK_VERSION, 16)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             checkout = root / "repo"

@@ -549,12 +549,70 @@ queues a concise local notification. The next
 supported lifecycle boundary injects that queue into the AI's context. The user
 never has to type “check messages,” and there is no second project database.
 
-Attacca does not create a recurring model prompt or session cron job. Claude
-setup retires only legacy jobs carrying the Attacca-managed inbox marker and
-preserves unrelated jobs. The machine-global watcher keeps continuity current
-while clients are idle; lifecycle hooks deliver staged changes at the next
-supported turn. A running watcher does not by itself prove that an idle coding
-client can start a new AI turn automatically.
+Interactive Claude hosts with plugin Monitor support can start the plugin's
+`attacca-events` receiver automatically. Startup, resume, and setup must verify
+the current session's receiver rather than assume an earlier session's Monitor
+survived. If it is missing and the host exposes Monitor, Attacca's setup
+instructions require arming exactly one persistent receiver from the stable
+installed plugin. The receiver observes local watcher state and emits only
+new actionable changes or changed connection problems. Unchanged checks
+produce no output and no model turns.
+
+On Codex CLI installations exposing `codex queue --thread`, SessionStart can
+start a receiver bound to that exact live session. New actionable events queue
+one notification; busy or interrupted turns may delay delivery. Submitted
+events are deduplicated across receiver restarts. An ambiguous queue result
+is retained rather than blindly retried. Other Codex hosts and Kimi retain
+next-turn delivery unless the host supplies a verified event channel. Hosts
+without such a channel report **idle wake unsupported**; they must not report
+automatic delivery as healthy just because MCP works.
+
+During a long-running task or goal, hosts supporting `PostToolUse` hooks can
+deliver bounded, already-staged changes into the active turn after a tool
+finishes. This local event drain does not start another prompt, fetch a full
+startup brief, or poll the server. Unchanged tool boundaries emit nothing.
+
+Automatic delivery has four separate checks:
+
+| Check | What proves it |
+|---|---|
+| Server connection | A fresh hosted response under the exact workspace and identity. |
+| Watcher and mirror | A live, current-generation watcher, a recent successful subscription check, and a verified identity-scoped mirror without unresolved sync errors. |
+| Session wake | A live receiver attached to this exact session and a supported host delivery channel. |
+| Delivery receipt | Evidence that the session received the staged notification; printing or queueing it is not proof the agent read or handled the work. |
+
+Setup reports missing or unverified layers explicitly. The same verification
+applies after startup, resume, reconnect, and a reported delivery failure.
+Safe recovery can restart a missing managed receiver or reconcile its exact
+subscription using the existing installation binding. It never disables login,
+deletes credentials, changes an identity, or creates a second project store.
+If a bounded recovery cycle and recheck do not restore the missing layer, the
+failure stays visible instead of entering a prompt/restart loop.
+
+`attacca watch status` shows watcher and subscription diagnostics. A local
+`.attacca/mirror/ROOM.md` is a read-only projection, not a second inbox: stale
+projection content or an old file timestamp alone cannot prove that no new
+mail exists. Mirror freshness and delivered-message receipts are distinct
+from hosted read cursors and task dispositions.
+
+For receiver diagnostics, use `hooks/wait_for_change.py --status` from the
+stable installed plugin, with the current runtime, checkout, and exact session
+arguments. Its `running` field is distinct from `configured`;
+`last_delivery_state` can report `stdout_emitted`, `queued`, or `pending_unknown`,
+while `ai_processing` remains `unverified`. These are transport receipts, not
+message dispositions.
+
+The receiver's optional `--jsonl` mode exposes the same change-only stdout
+stream as newline-delimited `attacca.event` objects (`schema_version: 1`), with
+an event ID, scope, sequence, kind, actionable count, and message. Sequences
+are scoped to the receiver session and identity context. Integrations consume
+this stream through their supported event channel; it is not a growing event
+file, a `ROOM.md` tail, or an instruction to send periodic AI prompts.
+
+Attacca creates no recurring model prompt, cron, or `/loop` inbox job. Setup
+retires only legacy jobs carrying the Attacca-managed marker. Real event
+notifications can consume model credits when the AI handles them; silent
+local checks do not.
 
 Lifecycle startup compares the installed Attacca executable `VERSION` and the
 checkout's managed-law version/hash with the configured server. Only a newer

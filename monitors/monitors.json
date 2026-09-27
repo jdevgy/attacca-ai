@@ -1,0 +1,8 @@
+[
+  {
+    "name": "attacca-events",
+    "command": "python3 \"$HOME/.attacca/plugin/attacca/hooks/wait_for_change.py\" --runtime claude",
+    "description": "Attacca: change-only events and receiver health",
+    "when": "always"
+  }
+]

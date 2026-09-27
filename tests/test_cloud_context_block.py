@@ -528,7 +528,7 @@ class CloudContextBlockTestCase(unittest.TestCase):
 
     def test_managed_law_describes_identity_handoffs_and_auto_sync(self):
         block = c.managed_instruction_block("p1", None)
-        self.assertEqual(c.MANAGED_BLOCK_VERSION, 15)
+        self.assertEqual(c.MANAGED_BLOCK_VERSION, 16)
         self.assertIn("workspace.role.runtime.persona", block)
         self.assertIn("legacy three-part", block)
         self.assertIn("exact identity handoff", block)

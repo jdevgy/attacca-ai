@@ -171,10 +171,14 @@ def _runtime_name():
     explicit = str(os.environ.get("ATTACCA_RUNTIME") or "").strip().lower()
     if explicit:
         return explicit
-    if os.environ.get("PLUGIN_ROOT"):
+    if os.environ.get("PLUGIN_ROOT") or os.environ.get("CODEX_PLUGIN_ROOT"):
         return "codex"
     if os.environ.get("KIMI_PLUGIN_ROOT"):
         return "kimi"
+    if os.environ.get("CLAUDE_PLUGIN_ROOT"):
+        return "claude"
+    if os.environ.get("CODEX_THREAD_ID") or os.environ.get("CODEX_SESSION_ID"):
+        return "codex"
     # Codex deliberately also exports CLAUDE_PLUGIN_ROOT for hook
     # compatibility, so the Codex-specific PLUGIN_ROOT check must stay first.
     # A real Claude plugin has CLAUDE_PLUGIN_ROOT without PLUGIN_ROOT.
@@ -1735,6 +1739,7 @@ def _connection_config(plugin_root):
                   {"codex": "codex", "claude": "claude",
                    "kimi": "kimi"}[runtime]),
         "owner": os.environ.get("ATTACCA_OWNER") or "",
+        "runtime": runtime,
     }
 
 
@@ -1774,7 +1779,7 @@ def _settings_interval(config, entry=None):
         if isinstance(entry, dict):
             device_id = str(
                 entry.get("device_id") or _local_device_id()).strip()
-            actor_id = str(entry.get("canonical_actor_id") or "").strip()
+            actor_id = str(_watcher_request_actor(entry) or "").strip()
             project_id = str(entry.get("project_id") or "").strip()
             if device_id:
                 headers["X-Attacca-Device-ID"] = device_id
@@ -1802,6 +1807,10 @@ def _settings_interval(config, entry=None):
             return interval
     except Exception:
         pass
+    # A failed Settings read cannot silently turn a saved pause back on.
+    # Successful reads above still detect an owner resuming the watcher.
+    if isinstance(entry, dict) and entry.get("interval_seconds") == 0:
+        return 0
     return DEFAULT_UPDATE_INTERVAL_SECONDS
 
 
@@ -1975,6 +1984,29 @@ def _prune_missing_watcher_subscriptions(now=None):
                 str(item[1].get("last_registered_at") or ""), item[0]))
             survivor_key, survivor = rows[-1]
             for duplicate_key, duplicate in rows[:-1]:
+                archives = duplicate.get("identity_delivery_archives") or {}
+                if isinstance(archives, dict):
+                    target_archives = survivor.setdefault(
+                        "identity_delivery_archives", {})
+                    for archived_actor, deliveries in archives.items():
+                        if isinstance(deliveries, list):
+                            target_archives.setdefault(
+                                archived_actor, []).extend(deliveries)
+                previous_actor = duplicate.get("canonical_actor_id")
+                if previous_actor and survivor.get("canonical_actor_id") \
+                        and previous_actor != survivor["canonical_actor_id"]:
+                    # Same installation does not make two actors' private
+                    # delivery cursors interchangeable after explicit setup.
+                    survivor.setdefault("identity_delivery_archives", {}).setdefault(
+                        previous_actor, []).append({
+                            field: duplicate.get(field) for field in (
+                                "attention", "pending_dispositions", "pending",
+                                "event_cursor", "attention_ack_cursor",
+                                "pending_disposition_total", "rendered")})
+                    subscriptions.pop(duplicate_key, None)
+                    result["deduplicated"].append({
+                        "removed": duplicate_key, "survivor": survivor_key})
+                    continue
                 for field, identity_field in (
                         ("pending", "fingerprint"),
                         ("attention", "message_key"),
@@ -2457,7 +2489,60 @@ def _offline_write_marker(adapter_status):
     ).hexdigest()
 
 
-def _watcher_status_payload():
+def _session_receiver_module():
+    script = _stable_plugin_root() / "hooks" / "wait_for_change.py"
+    if not script.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("attacca_session_wake", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _session_receiver_health(cwd, runtime, session_id=None):
+    try:
+        module = _session_receiver_module()
+        if module is not None and callable(getattr(module, "receiver_status", None)):
+            return module.receiver_status(cwd, runtime, session_id)
+    except Exception:
+        return {"configured": False, "running": False,
+                "state": "diagnostic_failed"}
+    return {"configured": False, "running": False, "state": "not_installed"}
+
+
+def _watcher_transport_health(entry, daemon_alive, now=None):
+    """Local observations only: server reachability is not delivery health."""
+    now = time.time() if now is None else now
+    interval = entry.get("interval_seconds", DEFAULT_UPDATE_INTERVAL_SECONDS)
+    last_success = entry.get("last_poll_at_epoch")
+    bound_actor = _watcher_bound_actor(entry)
+    if entry.get("auth_required"):
+        state = "authentication_required"
+    elif entry.get("identity_refresh_required") or (
+            bound_actor and bound_actor != entry.get("canonical_actor_id")):
+        state = "identity_verification_required"
+    elif interval == 0:
+        state = "paused"
+    elif not daemon_alive:
+        state = "daemon_stopped"
+    elif entry.get("last_error") or entry.get("sync_bootstrap_error"):
+        state = "sync_error"
+    elif entry.get("offline_mirror_stale"):
+        state = "mirror_stale"
+    elif not entry.get("canonical_actor_id") or not isinstance(last_success, (int, float)):
+        state = "not_verified"
+    elif now - last_success > max(180, 3 * int(interval or 60)):
+        state = "stale"
+    else:
+        state = "ready"
+    return {"state": state, "daemon_alive": bool(daemon_alive),
+            "last_success_at_epoch": last_success,
+            "last_retry_or_poll_attempt_at": entry.get("last_attempt_at"),
+            "last_recovery_error": entry.get("last_identity_recovery_error"),
+            "interval_seconds": interval}
+
+
+def _watcher_status_payload(session_id=None):
     state = _read_state(_watcher_state_path())
     daemon = dict(state.get("daemon") or {})
     daemon["alive"] = _watcher_process_matches(
@@ -2485,6 +2570,9 @@ def _watcher_status_payload():
         subscriptions.append({
             key: entry.get(key) for key in (
                 "key", "server_url", "project_id", "runtime", "actor",
+                "canonical_actor_id", "actor_role", "client_instance",
+                "auth_required", "auth_required_at", "identity_refresh_required",
+                "last_attempt_at", "active_turn_delivery",
                 "device_id", "root", "interval_seconds", "last_poll_at",
                 "next_poll_at_epoch", "last_error", "event_cursor",
                 "event_cursor_initialized", "offline_mode",
@@ -2499,7 +2587,11 @@ def _watcher_status_payload():
                 "local_path_missing_since_epoch",
                 "local_path_missing_observations")
         } | {"pending_count": len(entry.get("pending") or []),
-             "queued_notice_count": len(entry.get("pending") or [])})
+             "queued_notice_count": len(entry.get("pending") or []),
+             "transport_health": _watcher_transport_health(entry, daemon["alive"]),
+             "receiver_health": _session_receiver_health(
+                 entry.get("root"), entry.get("runtime"), session_id),
+             "delivery_scope": "Receiver liveness and queue acceptance do not prove AI processing."})
     return {"daemon": daemon, "daemon_launch": launch,
             "current_launch": dict(current or {}),
             "subscriptions": subscriptions,
@@ -2555,8 +2647,70 @@ def _watcher_api_token(entry):
 
 def _watcher_request_actor(entry):
     """Use canonical identity when known, otherwise the runtime bootstrap hint."""
-    return (entry.get("canonical_actor_id") or entry.get("actor") or
+    return (_watcher_bound_actor(entry) or entry.get("canonical_actor_id") or
+            entry.get("actor") or
             entry.get("runtime") or "watcher")
+
+
+def _watcher_bound_actor(entry):
+    """Read the same exact installation binding used by the MCP proxy.
+
+    This is a request selection, never proof of authority. A saved identity
+    must still be authenticated by the server before its mirror or mail is
+    used. In particular, never search other URLs, projects or installations
+    for a plausible actor when the exact binding is absent.
+    """
+    if not isinstance(entry, dict) or not all(entry.get(field) for field in (
+            "server_url", "project_id", "runtime", "client_instance")):
+        return None
+    path = Path.home() / ".attacca" / "config.json"
+    if not path.exists():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError("machine Attacca config is not a safe regular file")
+    try:
+        machine = json.loads(path.read_text())
+        if not isinstance(machine, dict):
+            raise ValueError("expected object")
+        bindings = machine.get("actor_bindings") or {}
+        if not isinstance(bindings, dict):
+            raise ValueError("actor_bindings must be an object")
+    except (OSError, ValueError) as error:
+        raise RuntimeError("machine Attacca config is invalid: %s" % error)
+    values = [_normalized_server_url(entry["server_url"]),
+              str(entry["project_id"]).strip(),
+              str(entry["runtime"]).strip().lower(),
+              str(entry["client_instance"]).strip()]
+    key = hashlib.sha256(json.dumps(
+        values, separators=(",", ":"), ensure_ascii=False).encode(
+            "utf-8")).hexdigest()
+    binding = bindings.get(key)
+    if binding is None:
+        return None
+    if not isinstance(binding, dict) or any(
+            binding.get(field) != value for field, value in zip(
+                ("server_url", "project_id", "runtime", "client_instance"),
+                values)):
+        raise RuntimeError("machine actor binding scope differs from its key")
+    actor = str(binding.get("actor_id") or "").strip()
+    prefix = values[1] + "."
+    parts = actor[len(prefix):].split(".") if actor.startswith(prefix) else []
+    if len(parts) not in (2, 3) or parts[0] not in CONFIGURED_AI_ROLES \
+            or parts[1] != values[2] or (len(parts) == 3 and not re.fullmatch(
+                r"[a-z0-9]+(?:-[a-z0-9]+)*", parts[2])):
+        raise RuntimeError("machine actor binding selects an invalid AI identity")
+    return actor
+
+
+def _watcher_identity_refresh_needed(entry):
+    """Whether transport must prove the selected actor before using a cache."""
+    bound = _watcher_bound_actor(entry)
+    return bool(not entry.get("canonical_actor_id") or
+                not entry.get("actor_role") or not entry.get("sync_scope") or
+                entry.get("auth_required") or
+                entry.get("identity_refresh_required") or
+                entry.get("sync_bootstrap_error") or
+                (bound and bound != entry.get("canonical_actor_id")))
 
 
 def _watcher_fetch_sync_snapshot(entry, transport=None):
@@ -2649,12 +2803,23 @@ def _watcher_fetch_sync_snapshot(entry, transport=None):
         raise RuntimeError(
             "sync snapshot failed schema-v1 validation: %s" % error) from error
     scope = snapshot["scope"]
+    selected = _watcher_request_actor(entry)
+    # An exact saved actor takes precedence over a stale watcher identity.
+    # Without a saved actor, the runtime bootstrap hint is resolved ONLY by
+    # this authenticated response, never inferred from a local cache.
+    exact_selection = selected != entry.get("runtime")
+    expected_prefix = str(entry.get("project_id")) + "."
+    actor_parts = scope["actor_id"][len(expected_prefix):].split(".") \
+        if scope["actor_id"].startswith(expected_prefix) else []
     if scope["project_id"] != entry.get("project_id") \
-            or scope["actor_id"] != entry.get("canonical_actor_id") \
-            or scope["role"] != entry.get("actor_role") \
+            or (exact_selection and scope["actor_id"] != selected) \
+            or len(actor_parts) not in (2, 3) \
+            or actor_parts[0] != scope["role"] \
+            or actor_parts[1] != entry.get("runtime") \
+            or scope["role"] not in CONFIGURED_AI_ROLES \
             or scope["actor_type"] != "agent":
         raise HostedAuthenticationRequired(
-            "sync snapshot differs from the authenticated MCP workspace/AI",
+            "sync snapshot differs from the selected workspace/AI",
             http_status=403)
     previous = entry.get("sync_scope")
     if isinstance(previous, dict):
@@ -2667,7 +2832,74 @@ def _watcher_fetch_sync_snapshot(entry, transport=None):
     return snapshot
 
 
-def _watcher_install_sync_snapshot(key, entry, snapshot):
+def _watcher_recover_identity(key, entry, transport=None):
+    """Recover identity and visibility using one fresh authenticated snapshot.
+
+    The old outbox remains bound to its original scope. Snapshot installation
+    refuses an actor/role reset while that outbox contains unresolved writes.
+    A failed fetch/install leaves the authentication latch and old queues
+    intact, so no stale bytes can become a successful recovery report.
+    """
+    snapshot = _watcher_fetch_sync_snapshot(entry, transport=transport)
+    scope = snapshot["scope"]
+    selected = dict(entry)
+    selected.update({"canonical_actor_id": scope["actor_id"],
+                     "actor_role": scope["role"]})
+    adapter = _watcher_install_sync_snapshot(
+        key, selected, snapshot, previous_identity=entry.get("canonical_actor_id"))
+    current = ((_read_state(_watcher_state_path()).get("subscriptions") or {})
+               .get(key)) or selected
+    return dict(current), adapter
+
+
+def _watcher_rebind_delivery_identity(entry, actor_id):
+    """Keep one actor's staged mail separate when setup changes the default."""
+    old_actor = entry.get("canonical_actor_id")
+    if old_actor and old_actor != actor_id:
+        archive = entry.setdefault("identity_delivery_archives", {})
+        archive.setdefault(old_actor, []).append({
+            field: entry.get(field) for field in (
+                "attention", "pending_dispositions", "pending", "event_cursor",
+                "attention_ack_cursor", "pending_disposition_total", "rendered")})
+        entry.update({"attention": [], "pending_dispositions": [],
+                      "pending": [], "attention_ack_cursor": 0,
+                      "pending_disposition_total": 0, "event_cursor": 0,
+                      "event_cursor_initialized": False, "rendered": {}})
+
+
+def _watcher_reclassify_staged_attention(entry, snapshot):
+    """Correct old runtime-only classifications after hosted identity proof."""
+    projection = snapshot.get("projection") or {}
+    messages = projection.get("room_messages") or []
+    by_id = {row.get("event_id"): row for row in messages
+             if isinstance(row, dict)}
+    actor_id = entry.get("canonical_actor_id")
+    aliases = {actor_id}
+    aliases.update(row.get("legacy_actor_id") for row in
+                   projection.get("actor_aliases") or []
+                   if isinstance(row, dict) and
+                   row.get("canonical_actor_id") == actor_id)
+    for field in ("attention", "pending_dispositions"):
+        for row in entry.get(field) or []:
+            if not isinstance(row, dict):
+                continue
+            reply = by_id.get(row.get("reply_to")) or {}
+            direct = bool(aliases.intersection(row.get("mentions") or []) or
+                          (row.get("reply_to") and
+                           (reply.get("actor") or reply.get("actor_id")) in aliases))
+            if direct:
+                was_direct = row.get("directed_to_you")
+                row.update({"directed_to_you": True, "group_context": False,
+                            "priority_attention": True})
+                if not was_direct:
+                    # A previous group-context rendering did not fulfil a
+                    # newly verified direct assignment. Deliver it once more.
+                    row.pop("delivered_at", None)
+                    (entry.get("rendered") or {}).pop(
+                        _watcher_rendered_key(row), None)
+
+
+def _watcher_install_sync_snapshot(key, entry, snapshot, previous_identity=None):
     """Atomically seed/rebind the real mirror, then persist its exact scope."""
     protocol, offline, _ = _watcher_sync_modules()
     checked = protocol.validate_snapshot(snapshot)
@@ -2714,11 +2946,18 @@ def _watcher_install_sync_snapshot(key, entry, snapshot):
         current = (state.get("subscriptions") or {}).get(key)
         if not current:
             return
-        if current.get("canonical_actor_id") != scope["actor_id"] \
-                or current.get("actor_role") != scope["role"]:
+        if current.get("canonical_actor_id") not in (
+                previous_identity, scope["actor_id"]):
             raise RuntimeError(
                 "live-verified identity changed during sync bootstrap")
+        bound = _watcher_bound_actor(current)
+        if bound and bound != scope["actor_id"]:
+            raise RuntimeError("installation binding changed during sync bootstrap")
+        _watcher_rebind_delivery_identity(current, scope["actor_id"])
         current.update({
+            "canonical_actor_id": scope["actor_id"],
+            "actor_role": scope["role"],
+            "identity_verified_at": datetime.now(timezone.utc).isoformat(),
             "sync_schema_version": protocol.SCHEMA_VERSION,
             "sync_scope": scope,
             "sync_visibility_fingerprint": visibility,
@@ -2740,6 +2979,13 @@ def _watcher_install_sync_snapshot(key, entry, snapshot):
         current.pop("auth_required_at", None)
         current.pop("last_auth_error_fingerprint", None)
         current.pop("auth_login_surfaced_at", None)
+        current.pop("identity_refresh_required", None)
+        current.pop("sync_bootstrap_error", None)
+        current.pop("sync_bootstrap_failed_at", None)
+        current.pop("last_error", None)
+        current.pop("last_inbox_error", None)
+        current.pop("last_inbox_error_at", None)
+        _watcher_reclassify_staged_attention(current, checked)
         current["pending"] = [
             row for row in current.get("pending") or []
             if row.get("kind") not in {
@@ -3023,7 +3269,8 @@ def _watcher_attention_projection(value, entry):
     # durable FIFO itself would make a transient watcher cache the only place
     # where an unread room message was silently destroyed.
     body = str(payload.get("body") or "")
-    directed = bool(payload.get("directed_to_you") or
+    directed = bool(canonical and canonical in (payload.get("mentions") or []) or
+                    payload.get("directed_to_you") or
                     payload.get("addressed_to_you") and
                     not payload.get("broadcast_to_everyone"))
     everyone = bool(payload.get("broadcast_to_everyone"))
@@ -3047,8 +3294,7 @@ def _watcher_attention_projection(value, entry):
         "authority": payload.get("authority"),
         "directed_to_you": directed,
         "broadcast_to_everyone": everyone,
-        "group_context": bool(payload.get("group_context")) or
-                         not (directed or everyone),
+        "group_context": not (directed or everyone),
         "priority_attention": bool(directed or everyone or bridge),
     }
 
@@ -3350,7 +3596,7 @@ def _watcher_fresh_first_page(plan, size=WATCHER_ATTENTION_PAGE_SIZE):
 
 
 def _watcher_attention_notice(status, config, runtime=None, consume=True,
-                              fresh_only=False, delta_label=None):
+                              fresh_only=False, delta_label=None, page_size=None):
     """Pin unresolved assignments and staged unread mail at every boundary.
 
     Delivery is show-once-per-session: a row is injected in full the first
@@ -3390,7 +3636,9 @@ def _watcher_attention_notice(status, config, runtime=None, consume=True,
         # already-delivered rows while the count line reported "0 new".
         disposition_all = _watcher_render_plan(
             ledger, all_dispositions, False, rendered_at)
-        disposition_page = _watcher_fresh_first_page(disposition_all)
+        disposition_page = (_watcher_fresh_first_page(disposition_all, page_size)
+                            if page_size is not None else
+                            _watcher_fresh_first_page(disposition_all))
         captured["dispositions"] = [row for row, _, _ in disposition_page]
         captured["disposition_total"] = max(
             len(all_dispositions),
@@ -3405,7 +3653,9 @@ def _watcher_attention_notice(status, config, runtime=None, consume=True,
         mail_rows = [row for row in pending
                      if row.get("message_key") not in disposition_keys]
         mail_all = _watcher_render_plan(ledger, mail_rows, False, rendered_at)
-        mail_page = _watcher_fresh_first_page(mail_all)
+        mail_page = (_watcher_fresh_first_page(mail_all, page_size)
+                     if page_size is not None else
+                     _watcher_fresh_first_page(mail_all))
         captured["rows"] = [row for row, _, _ in mail_page]
         captured["mail_new"] = sum(
             1 for _, mode, _ in mail_all if mode == "full")
@@ -3698,7 +3948,10 @@ def _watcher_subscription_status(entry):
 
 def _watcher_subscription_config(entry):
     return {"url": entry["server_url"], "actor": entry.get("actor"),
-            "owner": entry.get("owner") or ""}
+            "owner": entry.get("owner") or "",
+            "runtime": entry.get("runtime"),
+            "client_instance": entry.get("client_instance"),
+            "device_id": entry.get("device_id")}
 
 
 def _watcher_queue_auth_required(key, entry, error, now):
@@ -4065,19 +4318,93 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
         return {"ok": False, "missing": True, "key": key}
     adapter = None
     adapter_status = None
+    preflight_interval = None
+    native_sync = (delta_loader is None and offline_adapter is None and
+                   offline_factory is None)
     try:
-        adapter = offline_adapter or _watcher_build_offline_adapter(
-            entry, factory=offline_factory)
-        adapter_status = _watcher_adapter_status(adapter)
+        credential_changed = False
+        if native_sync:
+            credential = _watcher_api_token(entry)
+            fingerprint = hashlib.sha256(credential.encode("utf-8")).hexdigest() \
+                if credential else None
+            credential_changed = (fingerprint != entry.get(
+                "observed_credential_fingerprint",
+                entry.get("verified_credential_fingerprint")))
+            if credential_changed:
+                def observe_credential(state_value):
+                    current = (state_value.get("subscriptions") or {}).get(key)
+                    if current:
+                        current["observed_credential_fingerprint"] = fingerprint
+                        current["identity_refresh_required"] = True
+                _mutate_state(_watcher_state_path(), observe_credential)
+                entry["identity_refresh_required"] = True
+        due = force or credential_changed or now >= float(
+            entry.get("next_poll_at_epoch") or 0)
+        if native_sync and due:
+            preflight_interval = _settings_interval(
+                _watcher_subscription_config(entry), entry=entry)
+            if preflight_interval == 0 and not force:
+                def pause(state_value):
+                    current = (state_value.get("subscriptions") or {}).get(key)
+                    if current:
+                        current.update({"interval_seconds": 0,
+                                        "next_poll_at_epoch": now + 60})
+                _mutate_state(_watcher_state_path(), pause)
+                return {"ok": not bool(entry.get("auth_required")),
+                        "due": True, "disabled": True,
+                        "authentication_required": bool(entry.get("auth_required")),
+                        "offline": False, "key": key}
+        if native_sync and due and (credential_changed or
+                                    _watcher_identity_refresh_needed(entry)):
+            entry, adapter = _watcher_recover_identity(key, entry)
+
+            def record_credential(state_value):
+                current = (state_value.get("subscriptions") or {}).get(key)
+                if current:
+                    current["verified_credential_fingerprint"] = fingerprint
+                    current["next_poll_at_epoch"] = 0
+                    current.pop("last_identity_recovery_error", None)
+
+            _mutate_state(_watcher_state_path(), record_credential)
+            entry["next_poll_at_epoch"] = 0
+        try:
+            adapter = adapter or offline_adapter or _watcher_build_offline_adapter(
+                entry, factory=offline_factory)
+            adapter_status = _watcher_adapter_status(adapter)
+        except Exception as error:
+            if native_sync and not due:
+                # A stale pin must not move its own retry deadline forward on
+                # every daemon iteration; otherwise the recovery is never due.
+                return {"ok": False, "due": False, "key": key,
+                        "error": _trim(error, 240),
+                        "authentication_required": bool(entry.get("auth_required"))}
+            if not native_sync:
+                raise
+            # Another authenticated client can replace the shared mirror's
+            # visibility generation. Reopening the old adapter then fails
+            # before synchronize() gets a chance to repair it. Fetch and
+            # validate the new snapshot instead of retrying that open forever.
+            entry, adapter = _watcher_recover_identity(key, entry)
+            adapter_status = _watcher_adapter_status(adapter)
     except Exception as err:
-        if _authentication_required_error(err) or entry.get("auth_required"):
-            auth_error = err if _authentication_required_error(err) else \
-                HostedAuthenticationRequired(
-                    entry.get("last_error") or "credential repair required")
-            _watcher_queue_auth_required(key, entry, auth_error, now)
+        if _authentication_required_error(err):
+            _watcher_queue_auth_required(key, entry, err, now)
             return {"ok": False, "due": True,
                     "authentication_required": True, "offline": False,
-                    "error": str(auth_error), "key": key}
+                    "error": str(err), "key": key}
+        if entry.get("auth_required"):
+            # The old rejection still blocks cached authority, but a local
+            # mirror error or transport failure is NOT another hosted 401.
+            def record_recovery_failure(state_value):
+                current = (state_value.get("subscriptions") or {}).get(key)
+                if current:
+                    current["last_identity_recovery_error"] = _trim(err, 240)
+                    current["identity_recovery_attempted_at_epoch"] = now
+            _mutate_state(_watcher_state_path(), record_recovery_failure)
+            _watcher_queue_error(key, entry, err, now, offline_adapter=adapter)
+            return {"ok": False, "due": True, "authentication_required": True,
+                    "offline": False, "error": _trim(err, 240),
+                    "failure_kind": "identity_recovery_failed", "key": key}
         _watcher_queue_error(key, entry, err, now, offline_adapter=adapter)
         return {"ok": False, "due": True,
                 "offline_uninitialized": True,
@@ -4095,7 +4422,8 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
                     "credential/AI scope repair is required", "key": key}
         return {"ok": True, "due": False, "key": key}
     config = _watcher_subscription_config(entry)
-    interval = _settings_interval(config, entry=entry)
+    interval = preflight_interval if preflight_interval is not None else \
+        _settings_interval(config, entry=entry)
     if interval == 0:
         def disable(state_value):
             current = (state_value.get("subscriptions") or {}).get(key)
@@ -5020,7 +5348,7 @@ WATCHER_OUTAGE_KINDS = frozenset({
 
 
 def _watcher_pending_notice(status, config, runtime=None, consume=True,
-                            event_name=None):
+                            event_name=None, max_rows=None):
     """Deliver the durable watcher FIFO for one lifecycle boundary.
 
     A8: supersedable entity rows (task/decision/rule/handoff/plan/bridge) are
@@ -5058,6 +5386,8 @@ def _watcher_pending_notice(status, config, runtime=None, consume=True,
         for row in pending:
             if not selectable(row):
                 continue
+            if max_rows is not None and len(coalesced) >= max_rows:
+                break
             if row.get("kind") in WATCHER_ENTITY_KINDS or \
                     row.get("kind") in WATCHER_OUTAGE_KINDS:
                 coalesced.append(row)
@@ -6515,8 +6845,15 @@ def _mcp_snapshot(status, plugin_root, config, mark_inbox_read=True):
          "params": {"name": "attacca_status", "arguments": {}}},
     ]
     env = dict(os.environ)
+    runtime = config.get("runtime") or _runtime_name()
     env.update({"ATTACCA_URL": config["url"],
                 "ATTACCA_ACTOR": config["actor"],
+                "ATTACCA_ACTOR_TYPE": "agent",
+                "ATTACCA_RUNTIME": runtime,
+                "ATTACCA_CLIENT_INSTANCE": (config.get("client_instance") or
+                                            _client_instance_id(runtime)),
+                "ATTACCA_DEVICE_ID": (config.get("device_id") or
+                                      _local_device_id()),
                 "ATTACCA_AUTOSTART": "0",
                 "CLAUDE_PROJECT_DIR": status["root"]})
     if config["owner"]:
@@ -6758,6 +7095,7 @@ def _watcher_record_verified_identity(status, config, snapshot, runtime=None):
     def mutate(state):
         entry = (state.get("subscriptions") or {}).get(key)
         if entry:
+            _watcher_rebind_delivery_identity(entry, actor_id)
             entry.update({
                 "canonical_actor_id": actor_id,
                 "actor_role": role,
@@ -7153,6 +7491,21 @@ def _offline_failure_output(status, config, event_name, err, adapter,
             key = None
         return _authentication_gate_output(
             status, config, event_name, latched, key=key, entry=entry)
+    text = str(err).lower()
+    if any(marker in text for marker in (
+            "verified offline mirror is unavailable or invalid",
+            "stored mirror visibility differs", "cached sync scope differs")):
+        # The MCP proxy rejected its current identity projection. Another
+        # hook-owned mirror cannot contradict that rejection by claiming the
+        # session is authorized offline. Reauthenticate the exact scope first.
+        return _event_context_output(
+            event_name, "Attacca identity sync needs repair",
+            "ATTACCA IDENTITY SYNC REQUIRED — CACHE BLOCKED\n"
+            "The current client's identity-scoped projection could not be "
+            "verified: %s. No older mirror is being supplied as authority. "
+            "The watcher must complete a fresh authenticated identity sync "
+            "before cached project work or queued writes may continue." %
+            _trim(err, 260))
     try:
         brief = _offline_session_payload(
             status, adapter, entry=entry, failure=err)
@@ -7407,6 +7760,26 @@ def _is_managed_pulse(payload):
     """
     prompt = (payload or {}).get("prompt")
     return bool(prompt) and MANAGED_PULSE_MARKER in str(prompt)
+
+
+def _retired_managed_pulse_output(payload):
+    """Stop only the exact obsolete machine-ping syntax before model work.
+
+    Both supported hosts document UserPromptSubmit decision:block. Text that
+    merely discusses the marker is an ordinary human prompt and is untouched.
+    Retiring the cron itself remains a host-owned CronDelete operation.
+    """
+    if (payload or {}).get("hook_event_name") != "UserPromptSubmit" or \
+            _runtime_name() not in {"claude", "codex"}:
+        return None
+    prompt = (payload or {}).get("prompt")
+    if not isinstance(prompt, str) or not re.fullmatch(
+            r"\s*(?:/attacca:inbox\s+)?\[ATTACCA_MANAGED_INBOX_LOOP_V1:"
+            r"[A-Za-z0-9][A-Za-z0-9._-]*\]\s*", prompt):
+        return None
+    return {"decision": "block", "reason": (
+        "Retired Attacca timer suppressed; no model turn is needed. "
+        "Remove its managed cron and use the event receiver.")}
 
 
 def _pulse_marker_line(new_count):
@@ -8214,6 +8587,203 @@ def _periodic_output(status, event_name, offline_adapter=None,
         return deliver(output)
 
 
+def _session_wake_notice(status, payload):
+    """Arm host-native event delivery only at an actual session boundary."""
+    if os.environ.get("ATTACCA_DISABLE_SESSION_WAKE") == "1":
+        return None
+    runtime = _runtime_name()
+    if runtime not in {"claude", "codex"}:
+        return {"system_message": "Attacca idle delivery unavailable",
+                "context": "ATTACCA EVENT RECEIVER: idle delivery is unsupported on this host; staged changes require a supported lifecycle boundary."}
+    script = _stable_plugin_root() / "hooks" / "wait_for_change.py"
+    if not script.is_file():
+        return {"system_message": "Attacca event receiver missing",
+                "context": "ATTACCA EVENT RECEIVER: the installed receiver is missing. Repair the client installation before claiming idle delivery works; server reachability alone is insufficient."}
+    # Session identity must come from this actual lifecycle payload. An outer
+    # Codex session variable can be inherited by tests or a nested CLI and is
+    # not authorization to queue work into that other session.
+    session_id = payload.get("session_id")
+    module = None
+    try:
+        module = _session_receiver_module()
+        if session_id and callable(getattr(module, "register_session", None)):
+            module.register_session(status["root"], runtime, session_id)
+    except Exception:
+        pass
+    if runtime == "claude":
+        command = "%s %s --runtime claude --cwd %s%s" % (
+            shlex.quote(sys.executable), shlex.quote(str(script)),
+            shlex.quote(str(status["root"])),
+            " --session-id %s" % shlex.quote(str(session_id)) if session_id else "")
+        health = _session_receiver_health(status["root"], runtime, session_id)
+        return {
+            "system_message": "Attacca event monitor",
+            "context": (
+                "ATTACCA EVENT MONITOR — SESSION START/RESUME CHECK REQUIRED: "
+                "the native plugin requests the attacca-events monitor on supported "
+                "Claude hosts; that configuration alone is not proof it is running. "
+                "Verify exactly one receiver for this session before claiming idle "
+                "delivery is ready. Current-generation fresh receiver heartbeat: %s. "
+                "If absent and Monitor is available, start exactly one Monitor "
+                "with persistent=true, description "
+                "'Attacca: new assignments', command: %s. Keep it running while "
+                "idle, then confirm a fresh receiver heartbeat; re-arm it after "
+                "resume if it exited. It prints only actionable changes or changed connection "
+                "problems; do not create a recurring prompt/cron. If Monitor is "
+                "unavailable, say idle wake is unsupported on this host; staged "
+                "mail still arrives at a supported lifecycle boundary. A healthy "
+                "server or watcher alone does not prove agent delivery.%s" % (
+                    "observed" if health.get("running") and health.get("current_generation")
+                    else "not observed", command,
+                    " An older receiver generation is still running: stop that Monitor and start the current receiver; do not stack duplicate monitors."
+                    if health.get("diagnostic") == "receiver_generation_stale" else "")),
+        }
+    try:
+        armed = bool(session_id and module and
+                     module.start_codex_receiver(status["root"], session_id))
+    except Exception:
+        armed = False
+    health = (_session_receiver_health(status["root"], runtime, session_id)
+              if session_id else {"running": False, "state": "missing_session"})
+    return {
+        "system_message": "Attacca event receiver",
+        "context": (
+            "ATTACCA EVENT RECEIVER: fresh targeted Codex receiver heartbeat "
+            "observed for this session. Only changed actionable events are queued; "
+            "queue acceptance does not prove AI processing."
+            if health.get("running") and health.get("current_generation") else
+            "ATTACCA EVENT RECEIVER: an older receiver generation is still running. "
+            "Current idle delivery is not verified; restart this session's receiver "
+            "or its coding session, not the Attacca server. Do not launch duplicate receivers."
+            if health.get("diagnostic") == "receiver_generation_stale" else
+            "ATTACCA EVENT RECEIVER: targeted Codex launch requested; waiting for "
+            "a fresh receiver heartbeat. Idle delivery is not verified yet. Quiet "
+            "polls create no prompts; delivery may wait until the active turn ends."
+            if armed else
+            "ATTACCA EVENT RECEIVER: automatic idle wake is unavailable on "
+            "this Codex host (requires native queue and an exact live CLI "
+            "session). The watcher still stages mail for the next turn; do "
+            "not create a recurring prompt as a substitute."),
+    }
+
+
+def _post_tool_local_diagnostic(status, failed):
+    """Deduplicate state failures outside the potentially corrupt watcher file."""
+    path = Path.home() / ".attacca" / "hook-health" / "post-tool.json"
+    key = hashlib.sha256(json.dumps([
+        status.get("root"), status.get("project_id"), _runtime_name()
+    ], separators=(",", ":")).encode()).hexdigest()
+    changed = {"value": False}
+    try:
+        if not failed and not path.exists():
+            return None
+        existing = _read_state(path).get("failures") or {}
+        if (key in existing) == bool(failed):
+            return None
+        def mutate(state):
+            failures = state.setdefault("failures", {})
+            if failed:
+                failures[key] = time.time()
+            else:
+                failures.pop(key, None)
+            for old in sorted(failures, key=failures.get)[:-128]:
+                failures.pop(old, None)
+            changed["value"] = True
+        _mutate_state(path, mutate)
+    except Exception:
+        # Unsafe/unwritable diagnostic storage cannot justify another write
+        # location or unbounded per-tool warnings. Explicit status still fails.
+        return None
+    if not changed["value"]:
+        return None
+    message = ("ATTACCA DELIVERY HEALTH: local watcher state could not be read "
+               "or validated. Active-turn delivery is unverified; the tool result "
+               "is unchanged. Inspect `attacca watch status` and repair local "
+               "state safely; do not re-authorize merely for a local state error."
+               if failed else
+               "ATTACCA DELIVERY HEALTH: local watcher-state access recovered. "
+               "This does not by itself verify idle receiver delivery.")
+    return {"hookSpecificOutput": {"hookEventName": "PostToolUse",
+                                   "additionalContext": message}}
+
+
+def _post_tool_output(status, payload):
+    """Drain already-authorized local deltas during a long model turn.
+
+    Never fetch hosted data, run setup, poll authorization, or block a tool.
+    A repeated quiet tool boundary writes nothing and emits nothing.
+    """
+    try:
+        _, config = _plugin_and_config()
+        key, entry = _watcher_subscription_entry(status, config)
+        if not entry:
+            return None
+        state = _read_state(_watcher_state_path())
+        daemon = state.get("daemon") or {}
+        alive = _watcher_process_matches(daemon.get("pid"), daemon.get("nonce"))
+        transport = _watcher_transport_health(entry, alive)
+        health_state = transport["state"]
+        notices = []
+        prior = entry.get("post_tool_health_state")
+        if health_state != prior and health_state not in {"ready", "paused"}:
+            notices.append("ATTACCA DELIVERY HEALTH: watcher transport=%s. "
+                           "This is not proof of idle receiver delivery. "
+                           "Use the local watcher/receiver diagnostics; do not "
+                           "repeat browser approval unless a fresh authenticated "
+                           "probe actually rejects the credential." % health_state)
+        if health_state != prior:
+            def record_health(state_value):
+                current = (state_value.get("subscriptions") or {}).get(key)
+                if current is not None:
+                    current["post_tool_health_state"] = health_state
+            _mutate_state(_watcher_state_path(), record_health)
+        if health_state not in {"authentication_required", "identity_verification_required"} \
+                and entry.get("canonical_actor_id"):
+            rows = list(entry.get("pending_dispositions") or []) + list(entry.get("attention") or [])
+            ledger = _watcher_render_ledger(entry)
+            fresh = any(mode == "full" for _, mode, _ in
+                        _watcher_render_plan(ledger, rows, False, ""))
+            if fresh:
+                attention = _watcher_attention_notice(
+                    status, config, consume=False, fresh_only=True,
+                    delta_label="ACTIVE TURN UPDATE", page_size=10)
+                if attention and len(("\n\n".join(notices) + attention["context"]).encode()) < 30000:
+                    attention = _watcher_attention_notice(
+                        status, config, fresh_only=True,
+                        delta_label="ACTIVE TURN UPDATE", page_size=10)
+                    if attention:
+                        notices.append(attention["context"])
+            if entry.get("pending"):
+                pending = _watcher_pending_notice(
+                    status, config, event_name="PostToolUse", consume=False,
+                    max_rows=WATCHER_NOTICE_BATCH_SIZE)
+                if pending and len(("\n\n".join(notices) + pending["context"]).encode()) < 30000:
+                    pending = _watcher_pending_notice(
+                        status, config, event_name="PostToolUse",
+                        max_rows=WATCHER_NOTICE_BATCH_SIZE)
+                    if pending:
+                        notices.append(pending["context"])
+        recovery = _post_tool_local_diagnostic(status, False)
+        if recovery:
+            notices.append(recovery["hookSpecificOutput"]["additionalContext"])
+        if not notices:
+            return None
+        def record_emission(state_value):
+            current = (state_value.get("subscriptions") or {}).get(key)
+            if current is not None:
+                current["active_turn_delivery"] = {
+                    "hook_event": "PostToolUse",
+                    "last_context_emitted_at": datetime.now(timezone.utc).isoformat(),
+                    "ai_processing": "unverified"}
+        _mutate_state(_watcher_state_path(), record_emission)
+        return {"hookSpecificOutput": {"hookEventName": "PostToolUse",
+                "additionalContext": _bound_injected_context("\n\n".join(notices))}}
+    except Exception:
+        # Auxiliary local state must never replace or reject the tool result.
+        # The normal lifecycle/diagnostics path surfaces persistent failures.
+        return _post_tool_local_diagnostic(status, True)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--cwd", default=None)
@@ -8226,6 +8796,7 @@ def main(argv=None):
     parser.add_argument("--server-version")
     parser.add_argument("--setup-cwd")
     parser.add_argument("--runtime")
+    parser.add_argument("--session-id")
     parser.add_argument("--watcher-daemon", action="store_true")
     parser.add_argument("--watcher-nonce")
     parser.add_argument("--watcher-launch-version")
@@ -8266,7 +8837,7 @@ def main(argv=None):
         print(json.dumps(result))
         return 0
     if args.watcher_status:
-        print(json.dumps(_watcher_status_payload(), indent=2))
+        print(json.dumps(_watcher_status_payload(args.session_id), indent=2))
         return 0
     if args.watcher_stop:
         print(json.dumps(_stop_background_watcher(), indent=2))
@@ -8298,6 +8869,10 @@ def main(argv=None):
         else _hook_input()
     cwd = args.cwd or payload.get("cwd") or os.getcwd()
     event_name = payload.get("hook_event_name") or "SessionStart"
+    retired_pulse = _retired_managed_pulse_output(payload)
+    if retired_pulse:
+        print(json.dumps(retired_pulse))
+        return 0
     # A changed Stop poll blocks once so the model can process the update.
     # Claude marks the resulting second Stop event active; skipping it is what
     # makes the continuation strictly one-shot instead of recursive.
@@ -8308,6 +8883,12 @@ def main(argv=None):
         print(json.dumps(result, indent=2))
         return 0
     result = prompt_status(cwd, args.data_dir)
+    if event_name == "PostToolUse":
+        if result.get("status") == "linked":
+            output = _post_tool_output(result, payload)
+            if output:
+                print(json.dumps(output))
+        return 0
     is_first_run_boundary = (
         event_name == "SessionStart" or
         (_runtime_name() == "kimi" and event_name == "UserPromptSubmit"))
@@ -8366,6 +8947,11 @@ def main(argv=None):
                 rebrief = False
         if event_name == "SessionStart":
             output = _active_output(result, hook_payload=payload)
+            if payload.get("hook_event_name") == "SessionStart":
+                wake_notice = _session_wake_notice(result, payload)
+                # Receiver verification is required even while auth is gated:
+                # it can report recovery without granting cached authority.
+                output = _append_notices(output, event_name, (wake_notice,))
         elif rebrief:
             # Same assembly as SessionStart, emitted at the boundary the
             # compacted client actually supports.

@@ -43,8 +43,9 @@ On invocation, do exactly this:
 3. Apply the confirmed choices once. A first/unbound installation uses one
    `setup …` command. An explicitly requested switch in an already-running MCP
    process uses the **current Attacca MCP proxy** `agent_register` path described in
-   §3 so the active proxy actually adopts the selection. Then give one short
-   confirmation line.
+   §3 so the active proxy actually adopts the selection. Verify the separate
+   delivery layers in §5, then give one concise confirmation with any missing
+   or unsupported layer clearly identified.
 
 Normal flow after runtime resolution: ~2 commands + 1 picker (plus one
 conditional identity follow-up only when required). If discovery confirms
@@ -351,14 +352,74 @@ If the current MCP host cannot hot-reload the new connection, report the exact
 unverified checks and let its native reconnect mechanism run; never infer
 success from configuration files and never make restart the default recovery.
 
-In Claude Code only, finish verification by using CronList once to retire the
-managed inbox pulse. Attacca no longer uses a per-minute session job: never
-create one, and use CronDelete only for surviving jobs whose prompt contains
-the `ATTACCA_MANAGED_INBOX_LOOP_V1:` marker. Preserve every unrelated job. New
-mail arrives through the lifecycle hooks at the next turn and the background
-watcher keeps the mirror current between turns. This is a host-tool
-verification step, not another shell command or user decision. Skip it when the
-host's cron tools are unavailable.
+### Verify automatic delivery separately from MCP
+
+This check is part of setup, not an optional audit. Repeat it at startup/resume,
+reconnect, or a delivery-failure notice without repeating workspace or identity
+choices. A successful MCP call proves only the connection; it does not prove
+that the watcher, local mirror, or idle-session receiver is working.
+
+Report four separate results, retaining `unverified`, `failed`, `paused`, or
+`unsupported` where appropriate rather than collapsing them into "connected":
+
+1. **Hosted connection:** a fresh successful response for the exact selected
+   workspace, installation, and identity.
+2. **Watcher and mirror:** inspect the resolved runtime's `watch status` result
+   for a live current-generation daemon and the exact subscription's recent
+   successful check, sync error, and verified mirror freshness. A live PID or
+   unchanged `ROOM.md` alone is insufficient. Respect an intentionally paused
+   watcher; do not silently re-enable it.
+3. **Session wake:** prove the receiver belongs to this current host session
+   and has an available event channel. A receiver from a previous conversation,
+   a successful process spawn, or a queued command is not that proof.
+4. **Delivery receipt:** distinguish staged, emitted/queued, received, and
+   handled. Use the available session receipt; never claim agent consumption
+   from a hosted inbox read cursor or a receiver's stdout write. If no event
+   has yet been received, report delivery as unverified without sending a test
+   message or creating an empty model turn.
+
+For Claude or Codex, use the stable `hooks/wait_for_change.py --status --runtime
+RUNTIME --cwd CHECKOUT` helper with the exact current `--session-id` when
+available; never guess one or pass an unsupported runtime. Treat `configured`
+separately from `running`, and
+`last_delivery_state=stdout_emitted|queued|pending_unknown` as transport evidence
+only. `ai_processing=unverified` must remain unverified in the setup summary.
+The optional `--jsonl` stream carries change-only `attacca.event` schema-v1
+objects through stdout for a host-supported consumer; it is not a local
+append-only file or a substitute for host wake capability.
+
+In Claude, when CronList/CronDelete are available, retire only jobs containing
+`ATTACCA_MANAGED_INBOX_LOOP_V1:`. Preserve every unrelated job. This legacy-job
+cleanup and receiver verification are independent: missing cron tools is not
+a reason to skip Monitor verification. Never create a per-minute session cron,
+`/loop`, timed model prompt, or full briefing turn for an unchanged check.
+
+On Claude hosts with plugin Monitor support, verify the automatic
+`attacca-events` receiver. When it is absent and Monitor is available, use
+`persistent=true` to arm exactly one receiver running Python against the stable
+installed `hooks/wait_for_change.py --runtime claude --cwd CHECKOUT` command.
+Resolve and shell-quote the executable and checkout paths; do not use a native
+cache path or assume a previous session's Monitor survived. Recheck its actual
+state. If no supported channel exists, clearly report **idle wake unsupported;
+mail is staged for the next turn**. Do not substitute a recurring prompt.
+
+For Codex, check the actual SessionStart receiver result. The native queue path
+requires `codex queue --thread` support and the exact live CLI session; never
+guess a thread or send to another session. Busy/interrupted turns may delay a
+queued event. A successful queue submission is not an agent-consumption receipt.
+Report unsupported hosts explicitly and retain next-turn delivery.
+
+For a missing or unhealthy managed watcher/receiver, make one bounded safe
+repair using the already-selected installation, workspace, and actor: ensure
+the managed watcher, reconcile that exact subscription, re-arm the supported
+session receiver, then recheck. Do not delete credentials or queues, disable
+authentication, take over an identity, reset hosted cursors, or create another
+store. A 401/403 or changed authority stops authority-dependent work until
+authorization is repaired; a receiver may still observe recovery, but offline
+state is not proof of access. If the recheck still fails,
+show the failed layer and required action instead of repeatedly restarting or
+prompting. A stale mirror, including `ROOM.md`, remains marked stale until a
+verified sync succeeds; never interpret it as an empty inbox.
 
 ## 6. Offer project migration into Attacca
 

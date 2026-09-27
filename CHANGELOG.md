@@ -15,6 +15,26 @@ Git tags in this repository, so versions are dated by their bump commit.
 
 Nothing yet.
 
+## [0.5.14] - 2026-09-27
+
+### Added
+
+- Change-only session receivers for supported Claude Monitor and Codex queue
+  hosts, with local health diagnostics and an optional versioned JSONL stream.
+- Quiet active-tool delivery of newly staged changes on supported hook hosts.
+- Distributed agent guidance requiring separate connection, watcher, receiver,
+  and delivery verification, plus bounded safe recovery and explicit failures.
+
+### Fixed
+
+- Recover identity-scoped watcher state from fresh authenticated evidence when
+  an obsolete mirror or saved error previously kept valid clients blocked.
+- Select runtime-specific client credentials consistently across hooks and
+  per-subscription watcher requests without replacing registered identities.
+- Re-check session receivers on startup and resume and suppress obsolete
+  marked polling prompts before they create empty model turns.
+- Label Markdown room mirrors as sync snapshots rather than live event feeds.
+
 ## [0.5.13] - 2026-09-27
 
 ### Fixed

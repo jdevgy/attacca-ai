@@ -29,6 +29,19 @@
         ]
       }
     ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.attacca/plugin/attacca/hooks/session_start.py\"",
+            "timeout": 3,
+            "additionalContextLimit": 32768
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "matcher": "",

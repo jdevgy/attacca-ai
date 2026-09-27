@@ -66,7 +66,7 @@ try:
 except ImportError:  # pragma: no cover - Windows keeps thread serialization
     fcntl = None
 
-VERSION = "0.5.13"
+VERSION = "0.5.14"
 MCP_SUPPORTED_PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18")
 MCP_DEFAULT_PROTOCOL = "2025-06-18"
 DEFAULT_UPDATE_INTERVAL_SECONDS = 60
@@ -157,7 +157,7 @@ LOG_EXCLUDED_MSG_TYPES = {"chat", "status"}
 
 MANAGED_BEGIN = "<!-- MANAGED_ATTACCA:BEGIN"
 MANAGED_END = "<!-- MANAGED_ATTACCA:END -->"
-MANAGED_BLOCK_VERSION = 15
+MANAGED_BLOCK_VERSION = 16
 _CLOUD_CONTEXT_UNSET = object()
 _INSTRUCTION_FILE_ABSENT = object()
 _INSTRUCTION_WRITE_THREAD_LOCK = threading.RLock()
@@ -2230,6 +2230,9 @@ AUTH_ARTIFACT_FILES = (
     "hooks/hooks.json",
     "hooks/session_start.py",
     "web/admin.html",
+    "hooks/wait_for_change.py",
+    "hooks/codex_wake.py",
+    "monitors/monitors.json",
     "plugin-mcp.json",
     "kimi.plugin.json",
     ".codex-plugin/plugin.json",
@@ -14781,6 +14784,9 @@ PLUGIN_FILES = [
     "kimi-skills/session/SKILL.md",
     "hooks/hooks.json",
     "hooks/session_start.py",
+    "hooks/wait_for_change.py",
+    "hooks/codex_wake.py",
+    "monitors/monitors.json",
     "web/admin.html",
     "commands/status.md",
     "commands/brief.md",
@@ -25163,6 +25169,27 @@ def managed_instruction_block(project_id, db_path):
     lines.append("hosted workspace immediately when it is reachable; otherwise the verified")
     lines.append("identity-scoped outbox fsyncs allowlisted writes for exact-once replay. The")
     lines.append("interval is only the pull cadence for changes made elsewhere.")
+    lines.append("**Automatic delivery is a verified capability, not a connection claim.**")
+    lines.append("At every startup/resume and after a delivery warning, verify separately:")
+    lines.append("hosted access for this exact identity, a recent successful watcher poll,")
+    lines.append("the current session's receiver, and actual delivery at a supported boundary.")
+    lines.append("A successful MCP call, running PID, configured Monitor, or accepted queue")
+    lines.append("submission alone never proves that the AI received or acted on new mail.")
+    lines.append("Re-arm and verify the event receiver on every new/resumed session; do not")
+    lines.append("assume a pre-reboot Monitor survived. Supported active-tool hooks deliver")
+    lines.append("staged deltas during ongoing work; idle wake requires a supported host")
+    lines.append("receiver. Report unsupported or unverified delivery explicitly.")
+    lines.append("When delivery fails, attempt bounded repair of owned local watcher/receiver")
+    lines.append("processes and reload the saved credential and exact identity binding. Verify")
+    lines.append("recovery against the host before clearing authentication or scope failures.")
+    lines.append("Never disable server authentication, delete credentials, change identity,")
+    lines.append("restart the shared server, or relabel an old mirror to make health look good.")
+    lines.append("If safe repair cannot recover it, promptly tell the human which layer failed")
+    lines.append("and what requires their action; never silently assume an empty inbox.")
+    lines.append("Unchanged local checks must not create model turns. Retire only Attacca's")
+    lines.append("legacy marked polling jobs; never replace them with another periodic prompt.")
+    lines.append("Markdown mirrors, including ROOM.md, are sync snapshots, not live feeds;")
+    lines.append("use the installed event receiver, not file tailing, for automatic wake-up.")
     lines.append("Setup is one-time; do not rerun it unless adding a client, switching, or")
     lines.append("repairing the workspace.")
     lines.append("The lifecycle hook also compares both the installed plugin version and this")
@@ -26088,7 +26115,11 @@ def render_state_markdown(projection):
         "files does not change project state.\n\n"
         "- `HANDOFF.md` — current handoff\n- `CLOUD_CONTEXT.md` — project summary\n"
         "- `RULES.md` — mandatory Project Rules\n- `TASKS.md` — task board\n"
-        "- `DECISIONS.md` — decision records\n- `ROOM.md` — recent room/inbox\n"
+        "- `DECISIONS.md` — decision records\n- `ROOM.md` — recent room/inbox snapshot\n"
+        "\nThese files may lag the watcher's staged changes between full syncs. "
+        "Do not tail ROOM.md as a live feed or interpret an unchanged file as "
+        "an empty inbox. Use the installed event receiver for wake-up and "
+        "hosted reads for current messages.\n\n"
         "- `LOG.md` — project event log\n" % name)
 
     handoffs = p.get("handoffs") or []
@@ -26147,7 +26178,11 @@ def render_state_markdown(projection):
     out["DECISIONS.md"] = "\n".join(dlines)
 
     room = p.get("room_messages") or []
-    mlines = ["# Room / Inbox — %s" % name, ""]
+    mlines = ["# Room / Inbox — %s" % name, "",
+              "> SYNC SNAPSHOT — not a live message feed. New messages may "
+              "already be staged by the watcher but absent here until the "
+              "next full sync. Use the installed event receiver and hosted "
+              "inbox; an unchanged file does not mean no new mail.", ""]
     for m in room[-200:]:
         mlines.append("- **%s** · %s · _%s_: %s" % (
             m.get("actor"), m.get("msg_type") or "chat",
