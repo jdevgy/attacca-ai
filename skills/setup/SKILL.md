@@ -21,34 +21,40 @@ such as **Gibbs · @Gibbs · Director · Codex**.
 ## FAST PATH — this is a DECISION flow, NOT a thinking job
 
 Setup is: pick a workspace, pick a role and installation identity, apply. Do it
-fast. Do NOT investigate, audit, narrate reasoning, weigh trade-offs, or run
-extra commands. The single `setup --discover` call already returns everything
-you need. Ordinary startup/resume is not setup: it silently reuses the saved
-installation binding and must never ask an identity question.
+fast. After resolving the installed runtime, do NOT investigate, audit, narrate
+reasoning, or run redundant commands. One successful `setup --discover` call
+returns the choices you need. Ordinary startup/resume is not setup: it silently
+reuses the saved installation binding and must never ask an identity question.
 
 On invocation, do exactly this:
-1. Run `setup --discover` **once** (one command). Nothing before it.
-2. **Immediately** present the decisions in a **single** native choice-UI call
-   (Claude Code AskUserQuestion): put workspace, role, and the applicable
+
+1. Resolve and verify the bundled runtime as described in §0, then run
+   `setup --discover` **once** as the first remote preflight. If it reports
+   pending server setup or authorization, follow §0 before choosing a workspace.
+2. Once discovery succeeds, **immediately** present its decisions in a **single**
+   native choice-UI call (Claude Code AskUserQuestion): put workspace, role, and the applicable
    friendly identity choice in the **same** call (add the relationship question
    only if a bridge decision is actually pending). When the client cannot make
    the identity choices conditional on the selected role, ask the identity as
    one immediate follow-up using the already-discovered per-role options; do
-   not run discovery again. Do not write prose between discovery and the
-   picker — go straight to the choices.
+   not repeat successful discovery unless a different workspace needs the
+   governance lookup described in §1. Do not write prose between discovery and
+   the picker — go straight to the choices.
 3. Apply the confirmed choices once. A first/unbound installation uses one
    `setup …` command. An explicitly requested switch in an already-running MCP
    process uses the **current Attacca MCP proxy** `agent_register` path described in
    §3 so the active proxy actually adopts the selection. Then give one short
    confirmation line.
 
-Budget: ~2 commands + 1 picker (plus one conditional identity follow-up only
-when required). If discovery shows a valid credential and an already-linked/
-obvious workspace, skip straight to role + identity (never silently skip the
+Normal flow after runtime resolution: ~2 commands + 1 picker (plus one
+conditional identity follow-up only when required). If discovery confirms
+usable server access and reports `already_linked`, skip straight to
+role + identity (never silently skip the
 identity decision when the human explicitly invoked setup to switch or create
-an identity). If auth is needed, surface the one link
-from the CLI and stop — do not loop or advise. Never spend a turn "thinking"
-about setup; if you catch yourself investigating, stop and show the popup.
+an identity). If setup or authorization is needed, follow §0's access-mode
+branches and packaged helper; do not substitute a separate prompt loop. Never
+spend a turn "thinking" about setup; if you catch yourself investigating, stop
+and show the choices.
 
 The sections below are REFERENCE for the exact CLI arguments and edge cases —
 consult them only as needed to fill in a choice; they are not a script to
@@ -78,14 +84,46 @@ python3 "ATTACCA_RUNTIME" \
   --json setup --discover
 ```
 
-The CLI checks the public `/v1/auth/status` before workspace discovery. If it
-succeeds, call MCP `list_projects` and keep `you.actor_id` / `you.actor_type`
-internally as `CURRENT_AI_ACTOR` / `CURRENT_AI_TYPE`; pass them to every later
-CLI call so actions belong to this AI, not the shell user.
+The CLI checks the public `/v1/auth/status` before workspace discovery. Use its
+returned workspace and network data for the choices in Steps 1-4; do not call
+MCP `list_projects` before first/unbound setup has registered the exact AI
+identity. Keep `CURRENT_AI_ACTOR=RUNTIME_HINT` and `CURRENT_AI_TYPE=agent` until
+the CLI applies the confirmed identity choice. When discovery reports a valid
+`network.machine_actor_binding` with its matching `network.current_actor_record`,
+you may instead use that exact bound actor internally for the same workspace.
+Never substitute the shell user or invent an actor id. After apply, use the
+returned exact registered identity for MCP verification.
 
-If the server needs its first owner, the AI opens the displayed `/app` URL and
-asks the human only to create or sign in to that account in the browser. If a
-401/403 says this installation needs a credential, the AI itself starts the
+Handle the server's access choice before account authorization:
+
+- `server_setup_required` or `setup_required=true`: open the displayed console
+  URL and ask the human to choose **Local use without login** or **Protect with
+  login**. First-run setup must be completed from the server's localhost browser
+  or an SSH tunnel. Strongly recommend protection when the server is exposed
+  beyond localhost; the human must explicitly acknowledge the risk of choosing
+  no login there. Do not choose, activate, disable, or otherwise change the
+  server's access policy for them. Pause workspace setup until they finish,
+  then retry discovery.
+- A fresh verified `access_mode=local`, `anonymous_access=true`, and
+  `authentication_required=false` (CLI `kind=local`) means the human has already
+  completed no-login setup. Skip account creation and browser authorization;
+  continue workspace, role, and exact AI identity setup. Keep `authenticated=false`:
+  this mode does not establish an authenticated human. Do not rename an existing
+  actor or change its role because login is optional.
+- A rejected credential or 401/403 is not evidence of local access. Never
+  purge credentials, bypass rejection by retrying anonymously, or disable login
+  protection to recover. Use the authorization flow below only when an
+  account-based installation explicitly requests client authorization. Otherwise
+  report that the credential or scope needs repair and stop; do not create an
+  account or change a no-login server's policy to work around the rejection.
+  Verify repaired access against the live server before proceeding.
+
+For a protected or legacy account-based installation that still needs its first
+owner, the AI opens the displayed `/app` URL and asks the human to create or
+sign in to that account in the browser. This account step does not apply to
+completed local no-login mode. If that account-based installation returns
+`client_authorization_required` or a 401/403 explicitly requiring client
+authorization, the AI itself starts the
 packaged `terminal_flow.py authorize` flow in its active terminal. Never tell
 the human to run a command. The helper opens a short-lived, non-secret Attacca
 Settings link for this exact `client_instance`. The human signs in, reviews the
@@ -117,21 +155,19 @@ identity during ordinary start/resume.
 The private key persists across the separate discovery and apply processes, so
 the AI can list or create an allowed workspace, register the explicitly chosen
 actor and role, and then retry as that actor. Browser cookies remain browser
-only. On success, hot-reload the credential in the current client, run a fresh
-hosted status/sync check, and clear the authentication latch; do not force a
-restart or ask the human to rerun setup. Cached offline data is never proof of
+only. After authorization, hot-reload the credential and retry discovery. An
+already-bound client can verify hosted status/sync immediately; a first/unbound
+client must finish the confirmed CLI apply before MCP verification. Clear the
+authentication latch only after verified hosted sync; do not force a restart
+or ask the human to rerun setup. Cached offline data is never proof of
 authentication. Do not repeat Steps 1-5 after setup is already complete;
 continue at verification and Step 6.
 
 ## 1. Select the workspace
 
-Start with read-only discovery:
-
-```bash
-python3 "ATTACCA_RUNTIME" \
-  --actor "CURRENT_AI_ACTOR" --actor-type "CURRENT_AI_TYPE" \
-  --json setup --discover
-```
+Use the successful read-only discovery result from §0; this is not another
+discovery call. Retry only after the human completes pending server setup or
+authorization, or for the different-workspace governance lookup below.
 
 Report the detected Git remote or local folder and whether a stale link needs
 repair; keep the stale link's raw ID internal. Then:

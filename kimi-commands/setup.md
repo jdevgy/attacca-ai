@@ -28,7 +28,8 @@ and report the missing plugin runtime instead of searching for or starting a
 second Attacca copy. Set the private runtime hint to `claude` in Claude Code or
 `kimi` in Kimi Code, with actor type `agent`.
 
-Run the setup CLI discovery yourself as the first remote preflight. It calls
+After verifying the bundled runtime, run the setup CLI discovery once as the
+first remote preflight. It calls
 the public authentication status before any protected workspace request; never
 delegate a recovery command to the human:
 
@@ -39,14 +40,47 @@ python3 "$ATTACCA_PLUGIN_ROOT/attacca.py" \
   --actor "RUNTIME_HINT" --actor-type agent --json setup --discover
 ```
 
-When that succeeds, call MCP `list_projects`; keep `you.actor_id` and
-`you.actor_type` internally as `CURRENT_AI_ACTOR` and `CURRENT_AI_TYPE` and
-pass both to later setup CLI calls. They identify the actual Claude/Kimi AI,
-not the shell account such as `vscode`.
+Use the returned workspace and network data for the choices in Steps 1-4;
+do not call MCP `list_projects` before first/unbound setup has registered the
+exact AI identity. Keep `CURRENT_AI_ACTOR=RUNTIME_HINT` and
+`CURRENT_AI_TYPE=agent` until the CLI applies the confirmed identity choice.
+When discovery reports a valid `network.machine_actor_binding` with its
+matching `network.current_actor_record`, you may instead use that exact bound
+actor internally for the same workspace. Never substitute the shell user or
+invent an actor id. After apply, use the returned exact registered identity
+for MCP verification.
 
-If the server needs its first owner, open the displayed `/app` URL and ask the
-human only to create or sign in to that account in the browser. On a 401/403,
-Kimi itself starts the packaged `terminal_flow.py authorize` helper in the
+Handle the server's access choice before account authorization:
+
+- `server_setup_required` or `setup_required=true`: open the displayed console
+  URL and ask the human to choose **Local use without login** or **Protect with
+  login**. First-run setup must be completed from the server's localhost browser
+  or an SSH tunnel. Strongly recommend protection when the server is exposed
+  beyond localhost; the human must explicitly acknowledge the risk of choosing
+  no login there. Do not choose, activate, disable, or otherwise change the
+  server's access policy for them. Pause workspace setup until they finish,
+  then retry discovery.
+- A fresh verified `access_mode=local`, `anonymous_access=true`, and
+  `authentication_required=false` (CLI `kind=local`) means the human has already
+  completed no-login setup. Skip account creation and browser authorization;
+  continue workspace, role, and exact AI identity setup. Keep `authenticated=false`:
+  this mode does not establish an authenticated human. Do not rename an existing
+  actor or change its role because login is optional.
+- A rejected credential or 401/403 is not evidence of local access. Never
+  purge credentials, bypass rejection by retrying anonymously, or disable login
+  protection to recover. Use the authorization flow below only when an
+  account-based installation explicitly requests client authorization. Otherwise
+  report that the credential or scope needs repair and stop; do not create an
+  account or change a no-login server's policy to work around the rejection.
+  Verify repaired access against the live server before proceeding.
+
+For a protected or legacy account-based installation that still needs its first
+owner, open the displayed `/app` URL and ask the human to create or sign in to
+that account in the browser. This account step does not apply to completed local
+no-login mode. If that account-based installation returns
+`client_authorization_required` or a 401/403 explicitly requiring client
+authorization, Kimi itself starts the packaged
+`terminal_flow.py authorize` helper in the
 active terminal; never give the human a recovery command. The helper opens a
 short-lived, non-secret Attacca Settings link for the exact client-install ID.
 The human signs in, reviews the installation and optional workspace scope, and
@@ -71,25 +105,18 @@ separate home/container gets a separate installation and makes a one-time setup
 choice; mounting the same home deliberately shares it. Never use a Kimi, Claude,
 or Codex conversation/session ID as any part of durable identity.
 
-After authorization, hot-reload and retry MCP/watcher sync in this same client.
+After authorization, hot-reload the credential and retry discovery. An
+already-bound client can verify hosted status/sync immediately; a first/unbound
+client must finish the confirmed CLI apply before MCP verification.
 Clear the latch only after verified hosted sync; do not force a restart, alter
 the established actor identity, or repeat completed Steps 1-5. Cached offline
 data never authorizes recovery.
 
 ## 1. Select the workspace
 
-Run read-only discovery first:
-
-```bash
-ATTACCA_PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-${KIMI_PLUGIN_ROOT:-${KIMI_CODE_HOME:-$HOME/.kimi-code}/plugins/managed/attacca}}"
-test -f "$ATTACCA_PLUGIN_ROOT/attacca.py" || {
-  printf '%s\n' "Attacca plugin runtime not found: $ATTACCA_PLUGIN_ROOT/attacca.py" >&2
-  exit 1
-}
-python3 "$ATTACCA_PLUGIN_ROOT/attacca.py" \
-  --actor "CURRENT_AI_ACTOR" --actor-type "CURRENT_AI_TYPE" \
-  --json setup --discover
-```
+Use the successful read-only discovery result from §0; this is not another
+discovery call. Retry only after the human completes pending server setup or
+authorization, or for the different-workspace governance lookup below.
 
 Report the detected Git remote or local folder and whether a stale project link
 needs repair; keep its raw ID internal. Then resolve `action` conversationally:

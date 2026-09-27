@@ -485,18 +485,12 @@ queues a concise local notification. The next
 supported lifecycle boundary injects that queue into the AI's context. The user
 never has to type “check messages,” and there is no second project database.
 
-Claude additionally maintains one native session job equivalent to
-`/loop 1m /attacca:inbox`. Every Claude SessionStart asks the host's Cron tools
-to list existing jobs, create the job when absent, and remove only duplicate
-Attacca inbox jobs. This check repeats on startup, resume, clear, and compact
-because Claude loop jobs are session-scoped and recurring jobs expire after
-seven days; it never replaces the
-machine-global watcher, which continues transport and staging while no Claude
-generation is active. The native pulse runs only while Claude is open and idle,
-and each firing is a model turn that can consume credits even when prompt
-caching reduces its cost. Codex and Kimi do not receive the Claude-only Cron
-instruction. If the user has disabled Claude cron jobs, Attacca preserves that
-choice and continues with the watcher alone.
+Attacca does not create a recurring model prompt or session cron job. Claude
+setup retires only legacy jobs carrying the Attacca-managed inbox marker and
+preserves unrelated jobs. The machine-global watcher keeps continuity current
+while clients are idle; lifecycle hooks deliver staged changes at the next
+supported turn. A running watcher does not by itself prove that an idle coding
+client can start a new AI turn automatically.
 
 Lifecycle startup compares the installed Attacca executable `VERSION` and the
 checkout's managed-law version/hash with the configured server. Only a newer
