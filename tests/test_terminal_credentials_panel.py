@@ -118,7 +118,7 @@ process.stdout.write(JSON.stringify({
         actions_end = self.script.index(
             'if (action === "select-project")', actions_start)
         actions = self.script[actions_start:actions_end]
-        self.assertIn('body: { enabled, confirmed: true }', actions)
+        self.assertIn('body: loginProtectionRequest(enabled)', actions)
         self.assertNotIn("readiness", actions.lower())
         self.assertNotIn("qa", actions.lower())
         self.assertNotIn("armed", actions.lower())

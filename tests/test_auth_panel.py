@@ -104,7 +104,7 @@ class AuthPanelTestCase(unittest.TestCase):
         self.assertIn('/v1/auth/client-authorizations/${authorize ?', actions)
         self.assertIn("authorization_request: authorizationRequest", actions)
         self.assertIn(
-            'body: { enabled, confirmed: true }', actions)
+            'body: loginProtectionRequest(enabled)', actions)
         self.assertNotIn("expected_readiness_version", actions)
         bootstrap_start = self.script.index("async function bootstrap()")
         bootstrap_end = self.script.index("async function loadProjects()", bootstrap_start)

@@ -1308,6 +1308,17 @@
           (auth?.authenticated === true || localConsoleAccess(auth));
       }
 
+      function loginProtectionConfirmation(enabled, auth = state.auth) {
+        return enabled
+          ? "Enable login protection now? Browser users must sign in and agent installations need valid credentials. Existing accounts and AI identities are preserved."
+          : `${auth?.network_exposed ? "WARNING: this server is listening beyond localhost. " : ""}Disable login protection now? Anyone who can reach this server will be able to read and change its data without signing in. Existing accounts, passwords, client keys, and AI identities are preserved so you can enable protection again. For no-login access, use localhost or the server's actual IP address, not a reverse-proxy hostname.`;
+      }
+
+      function loginProtectionRequest(enabled, auth = state.auth) {
+        return { enabled, confirmed: true,
+          ...(!enabled && auth?.network_exposed === true ? { acknowledge_network_risk: true } : {}) };
+      }
+
       function setupChoice(auth = state.auth, chosen = state.setupMode) {
         if (chosen === "local" || chosen === "protected") return chosen;
         return auth?.network_exposed === true || auth?.login_recommended === true
@@ -1396,14 +1407,16 @@
       function activationEligibility(access, account) {
         const isOwner = account?.is_owner === true;
         const activationSupported = access?.capabilities?.activation === true;
-        const enabled = state.auth?.authentication_required === true ||
+        const enforcementEnabled = state.auth?.authentication_required === true ||
           state.auth?.authentication_activated === true;
+        const enabled = enforcementEnabled ||
+          (state.auth?.bootstrapped === true && !localConsoleAccess());
         const reasons = [];
         if (!isOwner) reasons.push("Only the server owner can change authentication enforcement.");
         if (!activationSupported) reasons.push("This server does not expose the authentication toggle.");
         return {
           allowed: isOwner && activationSupported,
-          isOwner, activationSupported, enabled, reasons
+          isOwner, activationSupported, enabled, enforcementEnabled, reasons
         };
       }
 
@@ -1492,7 +1505,12 @@
               user: null, csrf_token: null };
           }
           updateChrome();
-          renderAuth();
+          if (localConsoleAccess()) {
+            state.prefs = { ...state.prefs, actor: "web.local", actorType: "human", owner: "" };
+            render({ force: true });
+          } else {
+            renderAuth();
+          }
         })();
         try { return await state.authRecovery; }
         finally { state.authRecovery = null; }
@@ -1683,15 +1701,19 @@
         const registrationOpen = !acceptingInvitation && !bootstrapRequired &&
           state.auth?.self_registration === "open";
         const creatingAccount = registrationOpen && state.authMode === "register";
+        const optional = localConsoleAccess() && !acceptingInvitation && !bootstrapRequired;
         const title = acceptingInvitation ? "Accept your Attacca invitation"
           : bootstrapRequired ? "Create the first administrator"
-          : creatingAccount ? "Create your Attacca account" : "Sign in to Attacca";
+          : creatingAccount ? "Create your Attacca account"
+          : optional ? "Optional account sign-in" : "Sign in to Attacca";
         const description = acceptingInvitation
           ? "Create your own human account from this one-time invitation. Its workspace and administrator scope cannot be widened here."
           : bootstrapRequired
           ? "Create the human control account for this existing installation. Its current authentication settings are preserved."
           : creatingAccount
           ? "Create your own human account on this server. A new account starts with no workspace access: an administrator grants it, or you create your own workspace."
+          : optional
+          ? "Login protection is off. Sign in as the existing server owner to enable protection or manage account credentials; using the console does not require sign-in."
           : "Use your Attacca account to open the hosted control room.";
         const form = acceptingInvitation
           ? `<form data-form="accept-human-invitation"><div class="form-grid"><div class="field"><label for="invite-accept-username">Account name</label><input id="invite-accept-username" name="username" autocomplete="username" minlength="2" maxlength="64" pattern="[a-z0-9][a-z0-9._-]+" required autofocus><span class="help">This immutable name is used for login and audit attribution.</span></div><div class="field"><label for="invite-accept-password">Create password</label><input id="invite-accept-password" name="password" type="password" autocomplete="new-password" minlength="8" required><span class="help">The invitation token remains only in this page's memory and is submitted once over the same-origin API.</span></div></div><div class="form-actions"><button class="button quiet" type="button" data-action="dismiss-invitation-acceptance">Cancel</button><button class="button primary" type="submit">Accept invitation and sign in</button></div></form>`
@@ -1707,7 +1729,7 @@
             : creatingAccount
             ? "Registration creates a human account only: no administrator authority, no workspace membership, and no AI actor identity. Sign-up is not rate limited, so restrict network access before exposing the server publicly."
             : "Sign-in identifies the human operator. AI actor identities remain separate and are never replaced by this account.";
-        content.innerHTML = `${pageHead("Hosted access", title, description)}<div class="grid two"><section class="card" style="grid-column:1/-1;max-width:760px"><div class="card-head"><h2>${h(title)}</h2><span class="badge ${bootstrapRequired || acceptingInvitation || creatingAccount ? "pending" : "accepted"}">${acceptingInvitation ? "one-time invitation" : bootstrapRequired ? "first run" : creatingAccount ? "new account" : "account sign-in"}</span></div><div class="card-body">${state.invitationAcceptanceError ? `<div class="notice error"><span>!</span><div><strong>Invitation could not be accepted.</strong><br>${h(state.invitationAcceptanceError)}</div></div>` : ""}${form}<div class="notice section-gap"><span>i</span><div>${context}</div></div></div></section></div>`;
+        content.innerHTML = `${pageHead("Hosted access", title, description)}<div class="grid two"><section class="card" style="grid-column:1/-1;max-width:760px"><div class="card-head"><h2>${h(title)}</h2><span class="badge ${bootstrapRequired || acceptingInvitation || creatingAccount ? "pending" : "accepted"}">${acceptingInvitation ? "one-time invitation" : bootstrapRequired ? "first run" : creatingAccount ? "new account" : optional ? "optional" : "account sign-in"}</span></div><div class="card-body">${state.invitationAcceptanceError ? `<div class="notice error"><span>!</span><div><strong>Invitation could not be accepted.</strong><br>${h(state.invitationAcceptanceError)}</div></div>` : ""}${form}${optional ? `<div class="form-actions"><button class="button quiet" type="button" data-action="dismiss-optional-sign-in">Continue without signing in</button></div>` : ""}<div class="notice section-gap"><span>i</span><div>${context}</div></div></div></section></div>`;
         content.setAttribute("aria-busy", "false");
       }
 
@@ -1733,7 +1755,7 @@
           busy(false);
           return;
         }
-        if (state.pendingInvitationToken || !consoleAccessAllowed() || (!localConsoleAccess() && (state.auth.bootstrap_required ||
+        if (state.pendingInvitationToken || (state.setupWizard === "sign-in" && !state.auth.authenticated) || !consoleAccessAllowed() || (!localConsoleAccess() && (state.auth.bootstrap_required ||
             (state.auth.bootstrapped && !state.auth.authenticated) ||
             (state.auth.authentication_required && !state.auth.authenticated)))) {
           state.projects = [];
@@ -2294,7 +2316,7 @@
           state.renderContext = null;
           return true;
         }
-        if (!consoleAccessAllowed()) {
+        if (!consoleAccessAllowed() || (state.setupWizard === "sign-in" && !state.auth?.authenticated)) {
           renderAuth();
           state.renderContext = null;
           return true;
@@ -2940,19 +2962,21 @@
           ? keys.map(key => renderClientKeyRow(key, account)).join("")
           : `<div class="muted">No client API keys yet.</div>`;
         const activationText = eligibility.enabled
-          ? "Authentication is enforced. Browser sessions or a valid client-install API key are required."
-          : "Authentication enforcement is off. Create keys for active client installations before enabling it.";
+          ? eligibility.enforcementEnabled
+            ? "Login protection is on. Browser sessions or a valid client-install API key are required."
+            : "Console sign-in is required; API authentication enforcement is not enabled. Choose Disable login to allow no-login console access as well."
+          : "Login protection is off. The console and project API are available without signing in. Existing accounts and client keys are preserved. Ensure active client installations have valid keys before enabling protection.";
         const activationButton = eligibility.enabled
-          ? "Disable authentication enforcement"
-          : "Enable authentication enforcement";
+          ? "Disable login"
+          : "Enable login protection";
         const local = localConsoleAccess() && !state.auth?.authenticated;
         return pageHead("Account and access", "Settings", "Manage access protection, client installation, and server behavior. AI identities remain separate.", `<button class="button" type="button" data-action="show-client-install">Install clients</button>`) +
           `${local ? `<div class="notice"><span>i</span><div><strong>Local mode · no sign-in required</strong><br>Project actions are attributed to a local operator, not an authenticated account. AI identities and roles remain separately registered.</div></div>` : `<div class="notice"><span>✓</span><div><strong>Signed in as @${h(account.username)}</strong><br>This immutable account name is used for login and audit attribution. It authorizes clients but never renames or replaces an AI identity.</div></div>`}
           <div class="grid two section-gap">
-            ${local ? `<section class="card" style="grid-column:1/-1"><div class="card-head"><h2>Login protection</h2><span class="badge pending">off</span></div><div class="card-body"><p class="muted">${state.auth?.network_exposed ? "This server is listening beyond localhost. Login protection is strongly recommended: anyone who can reach it currently has access." : "No login is required on this private server. You can enable protection without changing existing project or AI identities."}</p>${state.auth?.setup_allowed ? `<div class="form-actions"><button class="button primary" type="button" data-action="protect-local-server">Set up login protection</button></div>` : `<p class="help">To add protection, open this console on the server's computer using its loopback address or an SSH loopback tunnel.</p>`}</div></section>` : `
+            ${local ? `<section class="card" style="grid-column:1/-1"><div class="card-head"><h2>Login protection</h2><span class="badge pending">off</span></div><div class="card-body"><p class="muted">${state.auth?.network_exposed ? "This server is listening beyond localhost. Login protection is strongly recommended: anyone who can reach it currently has access." : "No login is required on this private server. You can enable protection without changing existing project or AI identities."}</p>${state.auth?.bootstrapped ? `<p class="help">Your existing accounts and passwords are unchanged. The server owner can sign in optionally, then enable login protection.</p><div class="form-actions"><button class="button primary" type="button" data-action="show-optional-sign-in">Sign in to manage protection</button></div>` : state.auth?.setup_allowed ? `<div class="form-actions"><button class="button primary" type="button" data-action="protect-local-server">Set up login protection</button></div>` : `<p class="help">To add protection, open this console on the server's computer using its loopback address or an SSH loopback tunnel.</p>`}</div></section>` : `
             ${renderPendingClientAuthorization()}
             <section class="card"><div class="card-head"><h2>Human account</h2><span class="badge accepted">${account.is_owner ? "server owner" : account.is_admin ? "admin" : "user"}</span></div><div class="card-body"><div class="list"><div class="list-row"><span class="muted">Account name</span><strong>@${h(account.username)}</strong></div><div class="list-row"><span class="muted">Authentication authority</span><strong>${account.is_owner ? "Owner toggle available" : "Read only · server owner required"}</strong></div></div><div class="form-actions"><button class="button danger" type="button" data-action="auth-logout">Sign out</button></div></div></section>
-            <section class="card"><div class="card-head"><h2>Authentication enforcement</h2>${statusBadge(eligibility.enabled ? "enabled" : "off")}</div><div class="card-body"><p class="muted">${h(activationText)}</p>${eligibility.reasons.length ? `<div class="notice section-gap"><span>i</span><div>${h(eligibility.reasons.join(" "))}</div></div>` : ""}<div class="form-actions"><button class="button ${eligibility.enabled ? "danger" : "primary"}" type="button" data-action="toggle-authentication" ${eligibility.allowed ? "" : "disabled"} data-enabled="${eligibility.enabled ? "false" : "true"}">${h(activationButton)}</button></div></div></section>
+            <section class="card"><div class="card-head"><h2>Login protection</h2>${statusBadge(eligibility.enabled ? "enabled" : "off")}</div><div class="card-body"><p class="muted">${h(activationText)}</p>${eligibility.reasons.length ? `<div class="notice section-gap"><span>i</span><div>${h(eligibility.reasons.join(" "))}</div></div>` : ""}<div class="form-actions"><button class="button ${eligibility.enabled ? "danger" : "primary"}" type="button" data-action="toggle-authentication" ${eligibility.allowed ? "" : "disabled"} data-enabled="${eligibility.enabled ? "false" : "true"}">${h(activationButton)}</button></div></div></section>
             <section class="card" style="grid-column:1/-1"><div class="card-head"><div><h2>Client API keys</h2><span class="faint small">one human-owned key per authorized client</span></div><span class="badge">${h(keyPage.unfilteredTotal)} key${keyPage.unfilteredTotal === 1 ? "" : "s"}</span></div><div class="card-body"><div class="notice"><span>i</span><div><strong>Client authorization and AI identity are separate.</strong><br>New installations open a short-lived authorization request here. Review the client and scope, then explicitly authorize or deny it. The browser never displays or asks you to copy an API key.</div></div>${access.supported ? "" : `<div class="notice error section-gap"><span>!</span><div><strong>Client API key management is unavailable.</strong><br>Upgrade the hosted Attacca service before enabling authentication.</div></div>`}${state.errors.clientKeys ? errorNotice(state.errors.clientKeys) : ""}<div class="filterbar section-gap"><input id="client-key-search" type="search" value="${h(state.clientKeySearch)}" placeholder="Search all client keys by label, installation, owner, status, or scope…" aria-label="Search client API keys">${sortControl("clientKeys")}</div><div class="list section-gap">${keyRows}</div>${pageToolbar("clientKeys", access, "client_keys", "client API keys")}</div></section>
             `}
             <section class="card"><div class="card-head"><h2>Browser refresh</h2></div><div class="card-body"><form data-form="save-panel-behavior"><div class="form-grid"><div class="field"><label for="settings-refresh">Refresh interval</label><input id="settings-refresh" name="refreshSeconds" type="number" min="5" max="300" value="${h(state.prefs.refreshSeconds)}"></div><div class="field"><label for="settings-auto">Live refresh</label><select id="settings-auto" name="autoRefresh"><option value="true" ${state.prefs.autoRefresh ? "selected" : ""}>On</option><option value="false" ${!state.prefs.autoRefresh ? "selected" : ""}>Off</option></select></div></div><div class="form-actions"><button class="button primary" type="submit">Save browser settings</button></div></form></div></section>
@@ -3100,9 +3124,21 @@
           }
           if (action === "protect-local-server") {
             if (!localConsoleAccess() || state.auth?.setup_allowed !== true) throw new Error("Login protection must be set up through a local connection.");
+            if (state.auth?.bootstrapped) throw new Error("Sign in as the existing server owner to enable login protection.");
             state.setupMode = "protected";
             state.setupWizard = "security";
             render({ force: true });
+          }
+          if (action === "show-optional-sign-in") {
+            if (!localConsoleAccess() || !state.auth?.bootstrapped) throw new Error("No existing account is available for optional sign-in.");
+            state.authMode = "sign-in";
+            state.setupWizard = "sign-in";
+            render({ force: true });
+          }
+          if (action === "dismiss-optional-sign-in") {
+            state.authMode = "sign-in";
+            state.setupWizard = "";
+            await bootstrap();
           }
           if (action === "list-previous") {
             await navigateList(button.dataset.listPage, -1);
@@ -3112,6 +3148,7 @@
           }
           if (action === "auth-logout") {
             await api("/v1/auth/logout", { method: "POST", body: {} });
+            state.setupWizard = "";
             state.auth = null;
             state.credentialAccess = null;
             state.oneTimeCredential = null;
@@ -3191,12 +3228,11 @@
             const eligibility = activationEligibility(state.credentialAccess || emptyCredentialAccess(), state.auth?.user || {});
             if (!eligibility.allowed) throw new Error(eligibility.reasons[0] || "Only the server owner can change authentication enforcement.");
             const enabled = button.dataset.enabled === "true";
-            const verb = enabled ? "enable" : "disable";
-            if (!confirm(`${identityPart(verb)} authentication enforcement now? Existing client keys and AI identities are not changed.`)) return;
-            await api("/v1/auth/activation", { method: "POST", body: { enabled, confirmed: true } });
+            if (!confirm(loginProtectionConfirmation(enabled))) return;
+            await api("/v1/auth/activation", { method: "POST", body: loginProtectionRequest(enabled) });
             state.auth = await api("/v1/auth/status");
             await reloadCredentialAccess({ throwOnError: true });
-            toast(`Authentication enforcement ${enabled ? "enabled" : "disabled"}`);
+            toast(`Login protection ${enabled ? "enabled" : "disabled — sign-in is no longer required"}`);
           }
           if (action === "select-project") await selectProject(button.dataset.project);
           if (action === "revoke-workspace-member") {
@@ -3547,6 +3583,7 @@
             state.auth = await api("/v1/auth/login", { method: "POST", body: { username: values.username.trim(), password: values.password } });
             state.invitationAcceptanceError = "";
             state.authMode = "sign-in";
+            state.setupWizard = "";
             form.reset();
             await bootstrap();
             toast("Signed in");

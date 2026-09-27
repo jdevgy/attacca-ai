@@ -15,6 +15,16 @@ Git tags in this repository, so versions are dated by their bump commit.
 
 Nothing yet.
 
+## [0.5.13] - 2026-09-27
+
+### Fixed
+
+- Disabling login protection now opens the console as well as the API, even
+  when administrator accounts already exist. The saved choice is honored
+  after reload and restart without deleting accounts or client credentials.
+- No-login installations with existing accounts offer optional sign-in so the
+  server owner can enable protection again without recreating the account.
+
 ## [0.5.12] - 2026-09-27
 
 ### Added

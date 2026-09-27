@@ -66,7 +66,7 @@ try:
 except ImportError:  # pragma: no cover - Windows keeps thread serialization
     fcntl = None
 
-VERSION = "0.5.12"
+VERSION = "0.5.13"
 MCP_SUPPORTED_PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18")
 MCP_DEFAULT_PROTOCOL = "2025-06-18"
 DEFAULT_UPDATE_INTERVAL_SECONDS = 60
@@ -2307,6 +2307,13 @@ def server_access_mode(conn):
     """Explicit onboarding policy, never an inferred authentication bypass."""
     if _auth_setting(conn, "auth.activated", False):
         return "protected"
+    # Older releases saved an owner-confirmed disable without changing the
+    # console's separate onboarding mode. Honor that recorded choice, but do
+    # not interpret an absent activation bit as consent to anonymous access.
+    if (_auth_setting(conn, "auth.activated") is False and
+            _auth_setting(conn, "auth.deactivated_by") and
+            _auth_setting(conn, "auth.deactivated_at")):
+        return "local"
     mode = _auth_setting(conn, "server.setup_mode")
     return mode if mode in ("pending", "local", "protected") else "legacy"
 
@@ -4608,8 +4615,10 @@ def auth_activate(conn, principal, confirmed, expected_readiness_version=None,
         raise AuthorizationError("server_owner_required: activation denied")
     if confirmed is not True:
         raise AttaccaError("authentication toggle requires confirmed=true")
-    if enabled not in (True, False):
+    if not isinstance(enabled, bool):
         raise AttaccaError("enabled must be true or false")
+    if enabled and getattr(server, "auth_mode", "auto") != "auto":
+        raise AttaccaError("restart with --auth-mode auto before enabling protection")
     with write_tx(conn):
         claimed_owner_aliases = auth_claim_single_user_legacy_owner_aliases(
             conn, principal) if enabled else []
@@ -4623,6 +4632,7 @@ def auth_activate(conn, principal, confirmed, expected_readiness_version=None,
                 "authentication cannot activate before account bootstrap")
         nowi = now_iso()
         for key, value in {
+                "server.setup_mode": "protected" if enabled else "local",
                 "auth.activation_requested": bool(enabled),
                 "auth.activated": bool(enabled),
                 "auth.activated_by": principal["username"] if enabled else None,
@@ -17750,6 +17760,13 @@ def _r_auth_migration_scope(h, m, q):
 def _r_auth_activation(h, m, q):
     principal = _require_owner_session(h)
     body = h._body_json()
+    if (body.get("enabled", True) is False and
+            _local_access_runtime().network_exposed(h.server.server_address) and
+            body.get("acknowledge_network_risk") is not True):
+        raise AttaccaError(
+            "network_exposure_confirmation_required: disabling login allows"
+            " anyone who can reach this server to access its console and API;"
+            " confirm acknowledge_network_risk=true to continue")
     result = auth_activate(
         h._conn(), principal, body.get("confirmed"),
         body.get("expected_readiness_version"), server=h.server,

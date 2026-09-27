@@ -54,6 +54,22 @@ that identity. Check it with `/attacca:status` (Codex: `$attacca:update`).
 
 ## Everyday commands
 
+### Turn login protection off or on
+
+In the console, open **Settings → Login protection → Disable login** and
+confirm. The console then opens without signing in, including after a reload
+or server restart. Existing accounts, passwords, client keys, and project
+identities are kept.
+
+To turn protection back on, choose **Sign in to manage protection** with your
+existing server owner account, then enable login protection in
+Settings. If you have never created an account, Settings guides you through
+creating the first administrator instead.
+
+Without login protection, anyone who can reach the server can read and change
+its project data. Keep protection enabled for network access; see
+[deployment guidance](SECURITY.md#deployment-guidance).
+
 ### Reset a forgotten password
 
 On the **server's computer**, from its source directory and using the same OS
@@ -425,11 +441,15 @@ an SSH tunnel to the server. A non-loopback bind strongly recommends protection
 and requires a separate acknowledgement before accepting no-login use.
 
 First-run setup is not repeated on normal restart or upgrade. Existing account
-and enforcement settings are preserved. On a no-login server, a local browser
-can later use **Settings** to create the administrator and enable protection.
-On a protected server, the signed-in server owner manages the explicit
-protection toggle in Settings. Merely registering an agent or running project
-setup never changes that server setting.
+and enforcement settings are preserved, including an explicitly disabled login
+requirement. In **Settings → Login protection**, the signed-in server
+owner can disable login for both the console and API without deleting
+accounts or client keys. No-login access does not silently sign visitors in as
+that owner. An optional sign-in with the existing owner account
+allows protection to be enabled again. If there are no accounts yet, a local
+browser can use Settings to create the first administrator and enable protection.
+Merely registering an agent or running project setup never changes that server
+setting.
 
 **Identity is still required; account login is optional.** In local mode,
 agents retain their registered workspace, role, generated name, identity

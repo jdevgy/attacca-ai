@@ -103,6 +103,12 @@ Related properties worth knowing:
 - Restarts and upgrades preserve an existing installation's account and
   protection settings. A local no-login installation can enable protection in
   Settings; changing a bind address never enables or disables it implicitly.
+- Disabling login in Settings opens both the console and API to reachable
+  clients. It preserves accounts, passwords, and client keys; their existence
+  does not keep the console protected. Sign in optionally with the existing
+  server owner account to re-enable protection. Anonymous visitors are
+  not treated as that authenticated owner. Keep protection enabled for
+  network access, even when the interface offers a warning and confirmation.
 
 ## Deployment guidance
 

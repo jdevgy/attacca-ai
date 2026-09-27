@@ -67,6 +67,41 @@ class LocalFirstPanelTests(unittest.TestCase):
           assert.throws(() => setupRequest({mode:'invalid'}, auth), /Choose/);
         """)
 
+    def test_disable_login_warns_and_acknowledges_network_access_only_when_needed(self):
+        self.node(self.helpers + """
+          const exposed={network_exposed:true};
+          assert.match(loginProtectionConfirmation(false,exposed), /WARNING.*beyond localhost/);
+          assert.match(loginProtectionConfirmation(false,exposed), /Anyone who can reach/);
+          assert.match(loginProtectionConfirmation(false,exposed), /accounts, passwords, client keys, and AI identities are preserved/);
+          assert.match(loginProtectionConfirmation(false,exposed), /actual IP address/);
+          assert.deepEqual(loginProtectionRequest(false,exposed),
+            {enabled:false,confirmed:true,acknowledge_network_risk:true});
+          assert.deepEqual(loginProtectionRequest(false,{}),{enabled:false,confirmed:true});
+          assert.deepEqual(loginProtectionRequest(true,exposed),{enabled:true,confirmed:true});
+          assert.match(loginProtectionConfirmation(true,exposed), /must sign in/);
+        """)
+
+    def test_legacy_console_gate_offers_explicit_disable_without_claiming_api_enforcement(self):
+        credential_helpers = self.between("function activationEligibility(",
+                                          "function credentialMemberships(")
+        self.node(self.helpers + credential_helpers + """
+          const state={auth:{access_mode:'legacy',bootstrapped:true,
+            authentication_required:false,authentication_activated:false}};
+          const access={capabilities:{activation:true}};
+          const owner={is_owner:true};
+          let eligibility=activationEligibility(access,owner);
+          assert.equal(eligibility.enabled,true);
+          assert.equal(eligibility.enforcementEnabled,false);
+          assert.equal(eligibility.allowed,true);
+          state.auth={...state.auth,access_mode:'local',anonymous_access:true};
+          eligibility=activationEligibility(access,owner);
+          assert.equal(eligibility.enabled,false);
+          state.auth={...state.auth,access_mode:'protected',authentication_required:true};
+          eligibility=activationEligibility(access,owner);
+          assert.equal(eligibility.enabled,true);
+          assert.equal(eligibility.enforcementEnabled,true);
+        """)
+
     def test_local_setup_excludes_credentials_and_protected_validates_confirmation(self):
         self.node(self.helpers + """
           const auth = {setup_allowed:true, network_exposed:false};
@@ -152,6 +187,42 @@ class LocalFirstPanelTests(unittest.TestCase):
           })().catch(error => { process.stderr.write(error.stack); process.exitCode=1; });
         """)
 
+    def test_disabled_login_does_not_gate_existing_accounts_unless_sign_in_chosen(self):
+        self.node(self.bootstrap_program() + """
+          (async () => {
+            const auth={access_mode:'local',anonymous_access:true,
+              authentication_required:false,bootstrapped:true,authenticated:false};
+            await boot(auth);
+            assert.equal(rendered,'console');
+            assert.equal(calls.includes('keys'),false);
+            await boot(auth,{setupWizard:'sign-in'});
+            assert.equal(rendered,'auth');
+            assert.deepEqual(calls,['/v1/auth/status']);
+            await boot(auth,{setupWizard:''});
+            assert.equal(rendered,'console');
+          })().catch(error => { process.stderr.write(error.stack); process.exitCode=1; });
+        """)
+
+    def test_optional_sign_in_has_escape_but_protected_login_does_not(self):
+        render = self.between("function renderAuth()", "async function bootstrap()")
+        self.node(self.helpers + render + """
+          const state={auth:{access_mode:'local',anonymous_access:true,bootstrapped:true}};
+          const content={innerHTML:'',setAttribute(){}};
+          const h=value=>String(value ?? '');
+          const pageHead=(eyebrow,title,description)=>title+' '+description;
+          const renderServerSetup=()=>{throw Error('must not bootstrap existing account');};
+          renderAuth();
+          assert.match(content.innerHTML,/Optional account sign-in/);
+          assert.match(content.innerHTML,/existing server owner/);
+          assert.match(content.innerHTML,/Continue without signing in/);
+          assert.match(content.innerHTML,/data-form="auth-login"/);
+          assert.doesNotMatch(content.innerHTML,/data-form="auth-bootstrap"/);
+          state.auth={access_mode:'protected',authentication_required:true,bootstrapped:true};
+          renderAuth();
+          assert.doesNotMatch(content.innerHTML,/dismiss-optional-sign-in/);
+          assert.match(content.innerHTML,/Sign in to Attacca/);
+        """)
+
     def test_protected_account_bootstrap_remains_authenticated(self):
         self.node(self.bootstrap_program() + """
           (async () => {
@@ -233,6 +304,147 @@ class LocalFirstPanelTests(unittest.TestCase):
           assert.doesNotMatch(html,/auth-logout/);
           state.auth.setup_allowed=false;
           assert.doesNotMatch(renderAuthenticatedSettings(),/data-action="protect-local-server"/);
+          state.auth.bootstrapped=true;
+          const existing=renderAuthenticatedSettings();
+          assert.match(existing,/data-action="show-optional-sign-in"/);
+          assert.match(existing,/existing accounts and passwords are unchanged/);
+          assert.doesNotMatch(existing,/data-action="protect-local-server"/);
+        """)
+
+    def test_toggle_runs_only_after_confirmation_with_explicit_network_ack(self):
+        action = self.between('if (action === "toggle-authentication")',
+                              'if (action === "select-project")')
+        self.node(self.helpers + """
+          const state={auth:{network_exposed:true,user:{is_owner:true}}};
+          let allow=true,confirmed=false,requests=[],notifications=[];
+          const activationEligibility=()=>({allowed:allow,reasons:[]});
+          const emptyCredentialAccess=()=>({});
+          const confirm=message=>{ assert.match(message,/read and change/); return confirmed; };
+          const api=async(path,options)=>{
+            requests.push([path,options]);
+            return {access_mode:'local',anonymous_access:true,network_exposed:true};
+          };
+          const reloadCredentialAccess=async()=>{};
+          const toast=text=>notifications.push(text);
+          async function act() {
+            const action='toggle-authentication';
+            const button={dataset:{enabled:'false'}};
+        """ + action + """
+          }
+          (async()=>{
+            await act(); assert.equal(requests.length,0);
+            confirmed=true; await act();
+            assert.equal(requests[0][0],'/v1/auth/activation');
+            assert.deepEqual(requests[0][1],{method:'POST',body:{
+              enabled:false,confirmed:true,acknowledge_network_risk:true}});
+            assert.equal(requests[1][0],'/v1/auth/status');
+            assert.match(notifications[0],/sign-in is no longer required/);
+            allow=false; await assert.rejects(act,/Only the server owner/);
+            assert.equal(requests.length,2);
+          })().catch(error=>{process.stderr.write(error.stack);process.exitCode=1;});
+        """)
+
+    def test_optional_sign_in_cancel_and_logout_return_to_anonymous_console(self):
+        optional_actions = self.between('if (action === "show-optional-sign-in")',
+                                       'if (action === "list-previous")')
+        logout = self.between('if (action === "auth-logout")',
+                              'if (action === "revoke-auth-token")')
+        self.node(self.bootstrap_program() + """
+          const render=()=>{rendered='auth';};
+          const toast=()=>{};
+          async function act(action) {
+        """ + optional_actions + logout + """
+          }
+          (async()=>{
+            const auth={access_mode:'local',anonymous_access:true,bootstrapped:true};
+            await boot(auth);
+            await act('show-optional-sign-in');
+            assert.equal(state.setupWizard,'sign-in');
+            assert.equal(rendered,'auth');
+            await act('dismiss-optional-sign-in');
+            assert.equal(state.setupWizard,'');
+            assert.equal(rendered,'console');
+            state.auth={...auth,authenticated:true,user:{username:'owner'}};
+            await act('auth-logout');
+            assert.equal(rendered,'console');
+            assert.equal(state.prefs.actor,'web.local');
+            assert.equal(calls.includes('/v1/auth/logout'),true);
+          })().catch(error=>{process.stderr.write(error.stack);process.exitCode=1;});
+        """)
+
+    def test_settings_offer_disable_for_legacy_and_enable_after_explicit_off(self):
+        render = self.between("function renderAuthenticatedSettings()", "async function reloadTaskPlan(")
+        eligibility = self.between("function activationEligibility(", "function credentialMemberships(")
+        self.node(self.helpers + eligibility + render + """
+          const state={auth:{access_mode:'legacy',bootstrapped:true,authenticated:true,
+            user:{username:'owner',is_owner:true}},projects:[],prefs:{},errors:{},
+            credentialAccess:{capabilities:{activation:true},client_keys:[],supported:true}};
+          const h=value=>String(value ?? '');
+          const pageHead=()=>'';
+          const listPage=()=>({offset:0});
+          const responsePage=()=>({unfilteredTotal:0});
+          const statusBadge=value=>String(value);
+          const renderPendingClientAuthorization=()=>'';
+          const sortControl=()=>'';
+          const pageToolbar=()=>'';
+          let html=renderAuthenticatedSettings();
+          assert.match(html,/Console sign-in is required; API authentication enforcement is not enabled/);
+          assert.match(html,/data-enabled="false">Disable login/);
+          state.auth={...state.auth,access_mode:'local',anonymous_access:true};
+          html=renderAuthenticatedSettings();
+          assert.match(html,/console and project API are available without signing in/);
+          assert.match(html,/data-enabled="true">Enable login protection/);
+          state.auth={...state.auth,access_mode:'protected',authentication_required:true};
+          html=renderAuthenticatedSettings();
+          assert.match(html,/Browser sessions or a valid client-install API key are required/);
+          assert.match(html,/data-enabled="false">Disable login/);
+        """)
+
+    def test_expired_auth_recovery_keeps_explicit_local_access_open(self):
+        recovery = self.between("async function recoverExpiredAuthentication()",
+                                "async function downloadProjectExport(")
+        self.node(self.helpers + recovery + """
+          const state={prefs:{actor:'web.stale',owner:'stale'}};
+          let status,rendered;
+          const fetch=async()=>({ok:true,json:async()=>status});
+          const updateChrome=()=>{};
+          const render=()=>{rendered='console';};
+          const renderAuth=()=>{rendered='auth';};
+          (async()=>{
+            status={access_mode:'local',anonymous_access:true,bootstrapped:true};
+            await recoverExpiredAuthentication();
+            assert.equal(rendered,'console');
+            assert.equal(state.prefs.actor,'web.local');
+            assert.equal(state.prefs.owner,'');
+            assert.equal(state.authRecovery,null);
+            status={access_mode:'protected',authentication_required:true};
+            await recoverExpiredAuthentication();
+            assert.equal(rendered,'auth');
+          })().catch(error=>{process.stderr.write(error.stack);process.exitCode=1;});
+        """)
+
+    def test_optional_owner_login_never_enables_protection_implicitly(self):
+        login = self.between('if (kind === "auth-login")', 'if (kind === "auth-register")')
+        self.node("""
+          const state={setupWizard:'sign-in',authMode:'sign-in'};
+          const kind='auth-login';
+          const values={username:' owner ',password:'example-password'};
+          let reset=false,booted=false,calls=[];
+          const form={reset:()=>{reset=true;}};
+          const api=async(path,options)=>{
+            calls.push([path,options]);
+            return {authenticated:true,user:{username:'owner'}};
+          };
+          const bootstrap=async()=>{booted=true;assert.equal(state.setupWizard,'');};
+          const toast=()=>{};
+          (async()=>{
+        """ + login + """
+            assert.equal(reset,true);
+            assert.equal(booted,true);
+            assert.equal(state.auth.user.username,'owner');
+            assert.deepEqual(calls,[['/v1/auth/login',{method:'POST',
+              body:{username:'owner',password:'example-password'}}]]);
+          })().catch(error=>{process.stderr.write(error.stack);process.exitCode=1;});
         """)
 
     def test_setup_submission_verifies_server_response_and_does_not_persist_secrets(self):
