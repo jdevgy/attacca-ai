@@ -3346,6 +3346,13 @@ def _watcher_merge_attention(entry, rows, acknowledged=False):
             existing["acknowledged"] = bool(
                 existing.get("acknowledged") or acked)
             continue
+        if row.get("event_type") == "room.message" and projected["seq"] <= ack_cursor:
+            # The raw ledger is history, not an unread inbox. A recovered
+            # event cursor may lag the authenticated actor's hosted read
+            # cursor by years; never resurrect absent acknowledged history.
+            # Existing staged rows above remain lossless until delivered,
+            # and explicit hosted-inbox rows are not filtered by this rule.
+            continue
         projected["acknowledged"] = acked
         projected["staged_at"] = datetime.now(timezone.utc).isoformat()
         pending.append(projected)
@@ -3460,9 +3467,20 @@ def _watcher_refresh_inbox_entry(key, entry, opener=None):
         peek = _watcher_inbox_page(
             entry, mark_read=False, limit=WATCHER_ATTENTION_PAGE_SIZE,
             opener=opener)
+        read_cursor = peek.get("read_cursor")
+        if read_cursor is not None:
+            if isinstance(read_cursor, bool) or not isinstance(read_cursor, (int, str)) \
+                    or not re.fullmatch(r"[0-9]+", str(read_cursor)):
+                raise RuntimeError("inbox peek returned an invalid read cursor")
+            read_cursor = int(read_cursor)
         messages = peek.get("messages") or []
         _watcher_replace_pending_dispositions(key, peek)
         staged += _watcher_stage_attention(key, messages)
+        if read_cursor is not None:
+            # Even an empty page proves the existing hosted read baseline.
+            # Recording it acknowledges no new hosted messages and removes
+            # no locally staged, not-yet-rendered delivery.
+            _watcher_ack_attention_through(key, read_cursor)
         # The common idle case is deliberately one lightweight request. There
         # is no hosted read cursor to advance when no visible unread row was
         # returned; unresolved dispositions were still refreshed above.
@@ -4483,9 +4501,10 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
     # perform the lightweight signal request.
     priority_sync = bool(
         force or write_woke or int(entry.get("offline_failure_count") or 0))
+    event_feed_read = not (priority_sync and delta_loader is None)
     loader = (lambda after: {
         "events": [], "next_after": after, "may_have_more": False,
-    }) if priority_sync and delta_loader is None else (delta_loader or (
+    }) if not event_feed_read else (delta_loader or (
         lambda after: _watcher_event_delta(entry, after)))
     try:
         delta = loader(cursor)
@@ -4772,7 +4791,8 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
             return
         live.update({
             "event_cursor": next_cursor,
-            "event_cursor_initialized": initialized or not may_have_more,
+            "event_cursor_initialized": initialized or (
+                event_feed_read and not may_have_more),
             "interval_seconds": interval,
             "last_poll_at": datetime.now(timezone.utc).isoformat(),
             "last_poll_at_epoch": now,
@@ -4798,7 +4818,6 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
         # Room traffic has its own durable FIFO and is never coalesced. This
         # merge is in the same fsynced state transaction as the event cursor,
         # so advancing the cursor cannot lose a message.
-        attention_added = _watcher_merge_attention(live, room_events)
         inbox_cursor = delta.get("inbox_read_cursor")
         if inbox_cursor is not None:
             try:
@@ -4811,6 +4830,9 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
             for row in live.get("attention") or []:
                 if int(row.get("seq") or 0) <= inbox_cursor:
                     row["acknowledged"] = True
+        # Apply every known hosted acknowledgement before merging raw room
+        # history, atomically with the event cursor and delivery queue.
+        attention_added = _watcher_merge_attention(live, room_events)
 
         if live.get("last_queued_fingerprint") == fingerprint:
             queued = bool(attention_added)
@@ -4918,7 +4940,7 @@ def _watcher_tick(key, now=None, delta_loader=None, notifier=None,
             "inbox_staged": int((inbox_result or {}).get("staged") or 0),
             "inbox_error": inbox_error,
             "event_cursor": next_cursor,
-            "cursor_initialized": initialized or not may_have_more}
+            "cursor_initialized": initialized or (event_feed_read and not may_have_more)}
 
 
 def _outage_signature(err, stale_reads_refused=False):

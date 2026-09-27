@@ -34,6 +34,8 @@ Nothing yet.
 - Re-check session receivers on startup and resume and suppress obsolete
   marked polling prompts before they create empty model turns.
 - Label Markdown room mirrors as sync snapshots rather than live event feeds.
+- Preserve the unread baseline during watcher recovery so old room messages
+  are not replayed as new, without dropping queued mail or unresolved work.
 
 ## [0.5.13] - 2026-09-27
 

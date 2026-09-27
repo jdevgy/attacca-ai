@@ -261,6 +261,117 @@ class WatcherIdentityRecoveryTest(unittest.TestCase):
         self.assertEqual(changed.mirror_path.read_bytes(), before)
         self.assertTrue(self.entry()["auth_required"])
 
+    def test_priority_sync_does_not_initialize_unread_event_history(self):
+        self.update(event_cursor=0, event_cursor_initialized=False,
+                    cursor_registered_at_epoch=100)
+        with mock.patch.object(hook, "_watcher_event_delta") as events:
+            result = hook._watcher_tick(self.key, now=100, force=True,
+                                       notifier=lambda *_: None)
+        self.assertTrue(result["ok"], result)
+        events.assert_not_called()
+        self.assertFalse(result["cursor_initialized"])
+        self.assertFalse(self.entry()["event_cursor_initialized"])
+        rows = [{"event_id": "epoch-%s" % seq, "seq": seq,
+                 "event_type": "room.message", "actor_id": "shared.director.claude",
+                 "created_at": timestamp, "payload": {"body": "row-%s" % seq}}
+                for seq, timestamp in ((1, "1970-01-01T00:00:50+00:00"),
+                                       (2, "1970-01-01T00:02:30+00:00"))]
+        with mock.patch.object(hook, "_watcher_event_delta", return_value={
+                "events": rows, "next_after": 2, "may_have_more": False}):
+            result = self.tick(now=200)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["cursor_initialized"])
+        self.assertTrue(self.entry()["event_cursor_initialized"])
+        self.assertEqual([row["seq"] for row in self.entry()["attention"]], [2])
+
+    def test_empty_hosted_inbox_prevents_raw_history_replay_but_preserves_staged_mail(self):
+        self.assertTrue(self.tick()["ok"])
+        hook._watcher_stage_attention(self.key, [{
+            "event_id": "staged-1020", "seq": 1020, "actor": "shared.director.claude",
+            "body": "GENUINE PREVIOUSLY STAGED MAIL"}])
+        self.update(event_cursor=0, event_cursor_initialized=True,
+                    attention_ack_cursor=0, next_poll_at_epoch=0)
+        events = [{"event_id": "historical-%s" % seq, "seq": seq,
+                   "event_type": "room.message", "actor_id": "shared.director.claude",
+                   "payload": {"body": "OLD HISTORY"}} for seq in range(8, 138)]
+        events.append({"event_id": "new-1035", "seq": 1035,
+                       "event_type": "room.message", "actor_id": "shared.director.claude",
+                       "payload": {"body": "GENUINE NEW MESSAGE"}})
+        with mock.patch.object(hook, "_watcher_event_delta", return_value={
+                "events": events, "next_after": 1035, "may_have_more": False}), \
+                mock.patch.object(hook, "_watcher_inbox_page", return_value={
+                    "messages": [], "read_cursor": 1034, "may_have_more": False,
+                    "pending_dispositions": [], "pending_disposition_total": 0}):
+            result = self.tick(now=200)
+        self.assertTrue(result["ok"], result)
+        entry = self.entry()
+        self.assertEqual(entry["attention_ack_cursor"], 1034)
+        self.assertEqual([row["seq"] for row in entry["attention"]], [1020, 1035])
+        self.assertNotIn("delivered_at", entry["attention"][0])
+        self.assertEqual(entry["attention"][0]["body"], "GENUINE PREVIOUSLY STAGED MAIL")
+
+    def test_delta_ack_floor_applies_before_staging_and_does_not_filter_inbox_rows(self):
+        self.assertTrue(self.tick()["ok"])
+        self.update(event_cursor=0, event_cursor_initialized=True, next_poll_at_epoch=0)
+        events = [{"event_id": "event-%s" % seq, "seq": seq,
+                   "event_type": "room.message", "actor_id": "shared.director.claude",
+                   "payload": {"body": "row-%s" % seq}} for seq in (12, 54)]
+        result = hook._watcher_tick(self.key, now=200, force=True,
+            delta_loader=lambda _: {"events": events, "next_after": 54,
+                                    "may_have_more": False, "inbox_read_cursor": 53},
+            notifier=lambda *_: None)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual([row["seq"] for row in self.entry()["attention"]], [54])
+        hook._watcher_stage_attention(self.key, [{
+            "event_id": "explicit-inbox-12", "seq": 12,
+            "actor": "shared.director.claude", "body": "Explicit hosted unread"}])
+        self.assertEqual([row["seq"] for row in self.entry()["attention"]], [12, 54])
+
+    def test_empty_inbox_cursor_keeps_older_pending_disposition(self):
+        self.assertTrue(self.tick()["ok"])
+        with mock.patch.object(hook, "_watcher_inbox_page", return_value={
+                "messages": [], "read_cursor": 1034, "may_have_more": False,
+                "pending_dispositions": [{"event_id": "unresolved-8", "seq": 8,
+                    "actor": "shared.director.claude", "body": "UNRESOLVED ASSIGNMENT"}],
+                "pending_disposition_total": 1}):
+            hook._watcher_refresh_inbox_entry(self.key, self.entry())
+        self.assertEqual(self.entry()["attention_ack_cursor"], 1034)
+        self.assertEqual(self.entry()["pending_dispositions"][0]["seq"], 8)
+
+    def test_invalid_or_failed_inbox_peek_does_not_invent_read_baseline(self):
+        self.assertTrue(self.tick()["ok"])
+        self.update(attention_ack_cursor=73)
+        for cursor in (True, -1, 2.5, "invalid"):
+            with self.subTest(cursor=cursor), \
+                    mock.patch.object(hook, "_watcher_inbox_page", return_value={
+                        "messages": [], "read_cursor": cursor, "may_have_more": False}):
+                with self.assertRaisesRegex(RuntimeError, "invalid read cursor"):
+                    hook._watcher_refresh_inbox_entry(self.key, self.entry())
+            self.assertEqual(self.entry()["attention_ack_cursor"], 73)
+        with mock.patch.object(hook, "_watcher_inbox_page", side_effect=RuntimeError("offline")):
+            with self.assertRaisesRegex(RuntimeError, "offline"):
+                hook._watcher_refresh_inbox_entry(self.key, self.entry())
+        self.assertEqual(self.entry()["attention_ack_cursor"], 73)
+        with mock.patch.object(hook, "_watcher_inbox_page", return_value={
+                "messages": [], "may_have_more": False}):
+            hook._watcher_refresh_inbox_entry(self.key, self.entry())
+        self.assertEqual(self.entry()["attention_ack_cursor"], 73)
+
+    def test_raw_history_floor_preserves_existing_unrendered_same_id(self):
+        entry = {"canonical_actor_id": self.actor, "attention_ack_cursor": 73,
+                 "attention": [{"event_id": "retained", "message_key": "event:retained",
+                                "seq": 12, "actor": "shared.director.claude",
+                                "body": "Already staged", "acknowledged": False}]}
+        rows = [{"event_id": event_id, "seq": seq, "event_type": "room.message",
+                 "actor_id": "shared.director.claude", "payload": {"body": body}}
+                for event_id, seq, body in (("retained", 12, "Already staged"),
+                                            ("old-absent", 13, "History"),
+                                            ("new", 74, "New mail"))]
+        self.assertEqual(hook._watcher_merge_attention(entry, rows), 1)
+        self.assertEqual([row["seq"] for row in entry["attention"]], [12, 74])
+        self.assertTrue(entry["attention"][0]["acknowledged"])
+        self.assertNotIn("delivered_at", entry["attention"][0])
+
     def test_local_recovery_failure_is_not_reported_as_another_hosted_401(self):
         self.assertTrue(self.tick()["ok"])
         self.update(next_poll_at_epoch=0, auth_required=True,
