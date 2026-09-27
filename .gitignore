@@ -11,10 +11,22 @@ vnev/
 *.db-shm
 *.attacca-backup
 .attacca/*
-!.attacca/project.json
-server.log
+*.log
+*.jsonl
+logs/
+AGENTS.md
+CLAUDE.md
+.mcp.json
+.env
+.env.*
+!.env.example
+.devcontainer/
+docs/LOG.md
+docs/LOG.archive.md
+docs/blueprint.txt
+docs/multi_agent_developer_saas_blueprint.docx
 
-# Claude Code local settings; project instructions stay committed
+# Claude Code local settings; public plugin instructions live under skills/
 .claude/settings.local.json
 
 # Office lock files

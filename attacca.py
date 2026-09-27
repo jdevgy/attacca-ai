@@ -65,7 +65,7 @@ try:
 except ImportError:  # pragma: no cover - Windows keeps thread serialization
     fcntl = None
 
-VERSION = "0.5.10"
+VERSION = "0.5.11"
 MCP_SUPPORTED_PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18")
 MCP_DEFAULT_PROTOCOL = "2025-06-18"
 DEFAULT_UPDATE_INTERVAL_SECONDS = 60
@@ -2218,6 +2218,7 @@ DEVICE_ENROLLMENT_INTERVAL_SECONDS = 5
 AUTH_MODES = ("auto", "compatibility")
 AUTH_ARTIFACT_FILES = (
     "attacca.py",
+    "local_access.py",
     "terminal_flow.py",
     "sync_client.py",
     "sync_protocol.py",
@@ -2228,7 +2229,6 @@ AUTH_ARTIFACT_FILES = (
     "hooks/session_start.py",
     "web/admin.html",
     "plugin-mcp.json",
-    ".mcp.json",
     "kimi.plugin.json",
     ".codex-plugin/plugin.json",
     ".claude-plugin/plugin.json",
@@ -2299,6 +2299,31 @@ def _auth_setting(conn, key, default=None):
         return json.loads(row["value"])
     except (TypeError, ValueError):
         return default
+
+
+def server_access_mode(conn):
+    """Explicit onboarding policy, never an inferred authentication bypass."""
+    if _auth_setting(conn, "auth.activated", False):
+        return "protected"
+    mode = _auth_setting(conn, "server.setup_mode")
+    return mode if mode in ("pending", "local", "protected") else "legacy"
+
+
+_LOCAL_ACCESS_RUNTIME = None
+
+
+def _local_access_runtime():
+    global _LOCAL_ACCESS_RUNTIME
+    if _LOCAL_ACCESS_RUNTIME is None:
+        path = Path(script_path()).resolve().parent / "local_access.py"
+        spec = importlib.util.spec_from_file_location(
+            "attacca_local_access_runtime", path)
+        if spec is None or spec.loader is None:
+            raise AttaccaError("local access support is missing from this install")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _LOCAL_ACCESS_RUNTIME = module
+    return _LOCAL_ACCESS_RUNTIME
 
 
 SELF_REGISTRATION_MODES = ("off", "open")
@@ -14644,6 +14669,7 @@ def save_project_export_artifact(path, data, force=False):
 # install payload.
 PLUGIN_FILES = [
     "attacca.py",
+    "local_access.py",
     "codex_hook_compat.py",
     "offline_sync.py",
     "project_export.py",
@@ -14657,7 +14683,6 @@ PLUGIN_FILES = [
     "docs/assets/attacca-architecture.svg",
     "plugin-mcp.json",
     "kimi.plugin.json",
-    ".mcp.json",
     ".claude-plugin/plugin.json",
     ".claude-plugin/marketplace.json",
     ".codex-plugin/plugin.json",
@@ -14689,7 +14714,7 @@ PLUGIN_FILES = [
 # every request and could route one Git clone across inconsistent commits.
 _PLUGIN_ZIP_DATE_TIME = (1980, 1, 1, 0, 0, 0)
 _PLUGIN_MCP_CONFIG_FILES = frozenset((
-    "plugin-mcp.json", "kimi.plugin.json", ".mcp.json",
+    "plugin-mcp.json", "kimi.plugin.json", ".codex-plugin/plugin.json",
 ))
 
 
@@ -14812,7 +14837,6 @@ def _capture_distribution_snapshot():
         "plugin_mcp_config_files": tuple(sorted(_PLUGIN_MCP_CONFIG_FILES)),
         "plugin_zip_date_time": tuple(_PLUGIN_ZIP_DATE_TIME),
         "app_template": by_name["web/admin.html"],
-        "landing_template": LANDING_TEMPLATE.encode("utf-8"),
         "install_template": str(INSTALL_SH_TEMPLATE),
         "managed_instructions_version": laws["version"],
         "managed_instructions_sha256": laws["law_sha256"],
@@ -15221,190 +15245,6 @@ echo "  python3 $DEST/attacca.py setup --details"
 """
 
 
-LANDING_TEMPLATE = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Attacca — One universal setup for every AI coding tool</title>
-  <style>
-    :root { --paper:#f4f0e7; --ink:#161b18; --muted:#667069; --lime:#caff55; --blue:#3659e3; --line:#babcb2; }
-    * { box-sizing:border-box; }
-    html { scroll-behavior:smooth; }
-    body { margin:0; color:var(--ink); background:var(--paper); font:16px/1.5 Inter,ui-sans-serif,system-ui,sans-serif; }
-    a { color:inherit; }
-    .wrap { width:min(1120px,calc(100% - 36px)); margin:auto; }
-    header { height:78px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--line); }
-    .brand { display:flex; align-items:center; gap:10px; font:800 14px/1 ui-monospace,monospace; letter-spacing:.14em; text-decoration:none; }
-    .mark { display:grid; place-items:center; width:34px; height:34px; border:2px solid var(--ink); border-radius:50% 50% 50% 8px; background:var(--lime); font:700 20px Georgia,serif; transform:rotate(-7deg); }
-    .head-actions { display:flex; align-items:center; gap:10px; }
-    .panel-link { padding:9px 12px; border:1px solid var(--ink); border-radius:99px; font:700 11px/1 ui-monospace,monospace; text-decoration:none; text-transform:uppercase; }
-    .online { display:flex; align-items:center; gap:8px; padding:8px 11px; border:1px solid var(--ink); border-radius:99px; font:700 11px/1 ui-monospace,monospace; text-transform:uppercase; }
-    .dot { width:8px; height:8px; border-radius:50%; background:#32a852; }
-    .hero { min-height:610px; display:grid; grid-template-columns:1.2fr .8fr; gap:70px; align-items:center; padding:76px 0; }
-    .eyebrow { margin:0 0 18px; font:800 12px/1 ui-monospace,monospace; letter-spacing:.12em; text-transform:uppercase; }
-    .eyebrow::before { content:""; display:inline-block; width:32px; height:3px; margin:0 10px 3px 0; background:#ef5b35; }
-    h1 { max-width:720px; margin:0 0 25px; font:500 clamp(58px,7.4vw,94px)/.9 Georgia,serif; letter-spacing:-.055em; }
-    h1 em { color:var(--blue); font-weight:inherit; }
-    .lede { max-width:650px; margin:0 0 32px; color:#3e4942; font-size:19px; }
-    .actions { display:flex; gap:12px; flex-wrap:wrap; }
-    .button { min-height:48px; display:inline-flex; align-items:center; padding:11px 17px; border:2px solid var(--ink); border-radius:8px; font:800 13px/1 ui-monospace,monospace; text-decoration:none; }
-    .primary { background:var(--lime); box-shadow:4px 4px 0 var(--ink); }
-    .memory { border:2px solid var(--ink); border-radius:16px; overflow:hidden; color:white; background:var(--ink); box-shadow:8px 8px 0 var(--blue); transform:rotate(1.5deg); }
-    .memory-head { display:flex; justify-content:space-between; padding:14px 17px; border-bottom:1px solid #46504a; font:700 10px/1 ui-monospace,monospace; letter-spacing:.1em; text-transform:uppercase; }
-    .memory-head span:last-child { color:var(--lime); }
-    .memory-body { padding:26px 22px; }
-    .memory-label { color:#9ba69f; font:700 10px/1 ui-monospace,monospace; text-transform:uppercase; }
-    .memory h2 { margin:8px 0 22px; font:500 32px/1.05 Georgia,serif; }
-    .event { display:grid; grid-template-columns:68px 1fr; gap:10px; padding:12px 0; border-top:1px solid #3c4540; font-size:13px; }
-    .agent { color:var(--lime); font:700 10px/1.7 ui-monospace,monospace; }
-    .install { padding:95px 0; color:white; background:var(--blue); }
-    .install-grid { display:grid; grid-template-columns:.7fr 1.3fr; gap:60px; align-items:start; }
-    .install h2 { margin:8px 0 18px; font:500 clamp(42px,6vw,72px)/.95 Georgia,serif; letter-spacing:-.04em; }
-    .install-copy { color:#dfe4ff; }
-    .terminal { border:2px solid var(--ink); border-radius:14px; overflow:hidden; background:var(--ink); box-shadow:7px 7px 0 var(--lime); }
-    .terminal-top { padding:12px 16px; border-bottom:1px solid #46504a; color:#aeb8b2; font:700 10px/1 ui-monospace,monospace; text-transform:uppercase; }
-    .command { padding:27px 22px; overflow-x:auto; }
-    code { font:700 14px/1.5 ui-monospace,monospace; white-space:nowrap; }
-    .prompt { color:var(--lime); }
-    .copy { width:100%; min-height:50px; border:0; border-top:1px solid #46504a; color:var(--ink); background:var(--lime); font:800 12px/1 ui-monospace,monospace; cursor:pointer; }
-    .fine { margin:18px 0 0; color:#dfe4ff; font-size:13px; }
-    .tools { display:flex; flex-wrap:wrap; gap:8px; margin-top:24px; }
-    .tool { padding:7px 10px; border:1px solid rgba(255,255,255,.5); border-radius:99px; font-size:12px; }
-    .steps { padding:100px 0; }
-    .steps h2 { max-width:680px; margin:0 0 46px; font:500 clamp(42px,5vw,68px)/.98 Georgia,serif; letter-spacing:-.04em; }
-    .step-grid { display:grid; grid-template-columns:repeat(3,1fr); border-top:1px solid var(--ink); }
-    .step { min-height:220px; padding:24px 24px 20px 0; border-right:1px solid var(--ink); }
-    .step + .step { padding-left:24px; }
-    .step:last-child { border-right:0; }
-    .num { display:block; margin-bottom:42px; color:var(--blue); font:800 12px/1 ui-monospace,monospace; }
-    .step h3 { margin:0 0 10px; font:600 27px/1 Georgia,serif; }
-    .step p { margin:0; color:var(--muted); }
-    .alt { padding:28px 0 70px; border-top:1px solid var(--line); }
-    .alt-row { display:flex; gap:30px; justify-content:space-between; align-items:center; }
-    .alt h2 { margin:0 0 5px; font:600 26px/1.1 Georgia,serif; }
-    .alt p { margin:0; color:var(--muted); }
-    .mini { max-width:100%; padding:14px 16px; border-radius:8px; color:white; background:var(--ink); overflow-x:auto; }
-    .setup-guide { padding:28px 0 82px; border-top:1px solid var(--line); }
-    .setup-guide h2 { margin:0 0 12px; font:600 34px/1.05 Georgia,serif; }
-    .setup-guide > p { max-width:760px; margin:0 0 24px; color:var(--muted); }
-    .setup-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
-    .setup-card { padding:18px; border:1px solid var(--ink); border-radius:10px; background:#fffdf7; }
-    .setup-card h3 { margin:0 0 12px; font:800 11px/1 ui-monospace,monospace; text-transform:uppercase; }
-    .setup-card code { display:block; overflow-x:auto; font-size:12px; }
-    footer { padding:30px 0; color:#bec7c1; background:var(--ink); font-size:12px; }
-    .foot { display:flex; justify-content:space-between; gap:20px; }
-    :focus-visible { outline:3px solid var(--lime); outline-offset:3px; }
-    @media (max-width:780px) {
-      .hero,.install-grid { grid-template-columns:1fr; gap:42px; }
-      .hero { padding:58px 0 70px; }
-      .memory { max-width:520px; }
-      .step-grid { grid-template-columns:1fr; }
-      .step,.step + .step { min-height:0; padding:25px 0; border-right:0; border-bottom:1px solid var(--ink); }
-      .num { margin-bottom:18px; }
-      .alt-row { display:block; }
-      .setup-grid { grid-template-columns:1fr; }
-      .mini { margin-top:22px; }
-    }
-    @media (max-width:600px) { .panel-link { display:none; } }
-    @media (max-width:480px) { .online .version { display:none; } h1 { font-size:54px; } .foot { flex-direction:column; } }
-  </style>
-</head>
-<body>
-  <header class="wrap">
-    <a class="brand" href="/"><span class="mark">A</span> ATTACCA</a>
-    <div class="head-actions"><a class="panel-link" href="/app">Open control panel</a><div class="online"><span class="dot"></span> Server online <span class="version">v__VERSION__</span></div></div>
-  </header>
-
-  <main>
-    <section class="wrap hero">
-      <div>
-        <p class="eyebrow">Universal setup for AI coding</p>
-        <h1>One install.<br>Every tool <em>in sync.</em></h1>
-        <p class="lede">Attacca finds your supported AI coding tools and connects all of them to the same handoff, task board, decisions and project room.</p>
-        <div class="actions">
-          <a class="button primary" href="#install">Show me the install ↓</a>
-          <a class="button" href="/app">Open control panel</a>
-          <a class="button" href="#steps">How it works</a>
-        </div>
-      </div>
-      <aside class="memory">
-        <div class="memory-head"><span>Project handoff</span><span>Current</span></div>
-        <div class="memory-body">
-          <span class="memory-label">Everyone sees the latest state</span>
-          <h2>Ship the migration without losing the plot.</h2>
-          <div class="event"><span class="agent">DIRECTOR</span><span>Updated the handoff</span></div>
-          <div class="event"><span class="agent">WORKER</span><span>Claimed the API work</span></div>
-          <div class="event"><span class="agent">REVIEWER</span><span>Ran tests and left evidence</span></div>
-        </div>
-      </aside>
-    </section>
-
-    <section class="install" id="install">
-      <div class="wrap install-grid">
-        <div>
-          <p class="eyebrow">Install once</p>
-          <h2>One command.<br>Every tool.</h2>
-          <p class="install-copy">Run it once. Attacca detects and configures every supported AI coding tool already on your machine.</p>
-        </div>
-        <div>
-          <div class="terminal">
-            <div class="terminal-top">Terminal · universal setup</div>
-            <div class="command"><code id="install-command"><span class="prompt">$ </span>curl -fsSL __BASE__/install.sh | sh</code></div>
-            <button class="copy" id="copy" type="button">COPY INSTALL COMMAND</button>
-          </div>
-          <p class="fine" id="copy-note" aria-live="polite">Python 3.8+ · macOS, Linux or WSL · no pip packages</p>
-          <div class="tools">
-            <span class="tool">Auto-detects tools</span><span class="tool">Configures all at once</span>
-            <span class="tool">One shared connection</span><span class="tool">Confirm workspace once</span>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <section class="wrap steps" id="steps">
-      <h2>From install to shared context in three moves.</h2>
-      <div class="step-grid">
-        <article class="step"><span class="num">01 — INSTALL</span><h3>Paste the line</h3><p>Attacca finds the coding tools already on your machine and connects them.</p></article>
-        <article class="step"><span class="num">02 — RESTART</span><h3>Open your project</h3><p>Every detected tool loads the same shared Attacca connection.</p></article>
-        <article class="step"><span class="num">03 — CONNECT</span><h3>Confirm the workspace</h3><p>Setup detects the Git remote, suggests a match, or lists existing workspaces plus Create new.</p></article>
-      </div>
-    </section>
-
-    <section class="wrap setup-guide" id="setup-guide">
-      <h2>Connect this project once.</h2>
-      <p>After installation, open the checkout in your coding client and run its setup command. Choose or create the hosted workspace, then approve this client in the browser if prompted. The stable MCP process hot-loads the approved private key on its next tool call—no MCP reconnect or key copy/paste.</p>
-      <div class="setup-grid">
-        <article class="setup-card"><h3>Codex</h3><code>$attacca:setup</code></article>
-        <article class="setup-card"><h3>Claude Code / Kimi</h3><code>/attacca:setup</code></article>
-        <article class="setup-card"><h3>Direct terminal fallback</h3><code>attacca setup --interactive</code></article>
-      </div>
-    </section>
-
-    <section class="wrap alt">
-      <div class="alt-row">
-        <div><h2>No tool-by-tool installation.</h2><p>The universal installer handles every supported tool it detects in one pass.</p></div>
-        <div class="mini"><code>ONE INSTALL → EVERY DETECTED TOOL</code></div>
-      </div>
-    </section>
-  </main>
-
-  <footer><div class="wrap foot"><span>Attacca · one install for every tool</span><span><a href="/app">Control panel</a> · <a href="/healthz">Health</a> · <a href="/install.sh">Installer script</a></span></div></footer>
-  <script>
-    document.getElementById('copy').addEventListener('click', async function () {
-      var text = document.getElementById('install-command').textContent.replace(/^\\$\\s*/, '');
-      try {
-        await navigator.clipboard.writeText(text);
-        this.textContent = 'COPIED ✓';
-        document.getElementById('copy-note').textContent = 'Copied — paste it into your terminal.';
-      } catch (_) {
-        document.getElementById('copy-note').textContent = 'Select the command above and copy it.';
-      }
-    });
-  </script>
-</body>
-</html>
-"""
 
 
 def server_settings_load(conn):
@@ -15440,8 +15280,22 @@ class AttaccaServer(ThreadingHTTPServer):
         if auth_mode not in AUTH_MODES:
             raise AttaccaError(
                 "auth_mode must be one of: %s" % ", ".join(AUTH_MODES))
+        # Load this generation's boundary checks before serving any request.
+        _local_access_runtime()
         settings_conn = connect(db_path)
         try:
+            # Only an empty, never-configured installation gets onboarding.
+            # Upgrades must not reinterpret existing accounts or workspaces.
+            with write_tx(settings_conn):
+                has_history = any(settings_conn.execute(
+                    "SELECT 1 FROM %s LIMIT 1" % table).fetchone()
+                    for table in ("auth_users", "projects")) or \
+                    settings_conn.execute(
+                        "SELECT 1 FROM server_settings"
+                        " WHERE setting_key <> 'sync.server_id' LIMIT 1").fetchone()
+                if not has_history:
+                    server_settings_store(settings_conn,
+                                          {"server.setup_mode": "pending"})
             if allow_self_registration:
                 # One-way switch: the flag opens self-registration and persists
                 # it, so a later restart without the flag keeps the owner's
@@ -15649,7 +15503,7 @@ class AttaccaHandler(BaseHTTPRequestHandler):
                 modern_credential = bool(
                     kind in ("client", "terminal", "service", "human") or
                     raw_bearer.startswith(
-                        ("atkey_", "atd_", "atsvc_", "ats_")))
+                        ("atkey_", "atpair_", "atd_", "atsvc_", "ats_")))
                 if modern_credential:
                     # Compatibility is a bounded bridge for stale historical
                     # actor credentials, never a revocation bypass for modern
@@ -16236,6 +16090,18 @@ class AttaccaHandler(BaseHTTPRequestHandler):
         self.principal = None
         set_current_request_auth_user(active=False)
         try:
+            access_mode = server_access_mode(self._conn())
+            if access_mode in ("pending", "local") or path in (
+                    "/v1/setup", "/v1/auth/bootstrap"):
+                guard = _local_access_runtime()
+                try:
+                    guard.validate_request(self, require_loopback=(
+                        path in ("/v1/setup", "/v1/auth/bootstrap") or
+                        (access_mode == "pending" and path not in (
+                            "/", "/app", "/app/", "/healthz",
+                            "/v1/auth/status"))))
+                except guard.LocalAccessError as error:
+                    raise AuthorizationError(str(error)) from error
             self.principal = self._authenticate_request()
             set_current_request_auth_user(
                 self.principal.get("user_id") if self.principal else None,
@@ -16243,7 +16109,7 @@ class AttaccaHandler(BaseHTTPRequestHandler):
             public = (path in ("/", "/app", "/app/", "/healthz",
                                "/install.sh", "/plugin.zip",
                                "/plugin/marketplace.json",
-                               "/v1/auth/status", "/v1/auth/bootstrap",
+                               "/v1/auth/status", "/v1/auth/bootstrap", "/v1/setup",
                                "/v1/auth/login", "/v1/auth/register",
                                "/v1/auth/invitations/accept",
                                "/v1/auth/client-authorizations",
@@ -16675,15 +16541,6 @@ def _distribution_headers(headers=None):
     return result
 
 
-def _r_landing(h, m, q):
-    snapshot = h.server.distribution_snapshot
-    page = (snapshot["landing_template"]
-            .replace(b"__VERSION__", snapshot["version"].encode("utf-8"))
-            .replace(b"__BASE__", _distribution_base_url(h).encode("utf-8")))
-    _reply_bytes(h, 200, "text/html; charset=utf-8", page,
-                 headers=_distribution_headers())
-
-
 def _r_app(h, m, q):
     snapshot = h.server.distribution_snapshot
     page = (snapshot["app_template"]
@@ -16916,7 +16773,16 @@ def _auth_status_payload(h):
     bootstrapped = auth_is_enabled(h._conn())
     readiness = auth_activation_readiness(
         h._conn(), server=h.server, include_details=False)
+    access_mode = server_access_mode(h._conn())
+    guard = _local_access_runtime()
+    network_exposed = guard.network_exposed(h.server.server_address)
     result = {
+        "setup_required": access_mode == "pending",
+        "access_mode": access_mode,
+        "anonymous_access": access_mode == "local" and not enabled,
+        "network_exposed": network_exposed,
+        "login_recommended": network_exposed or h.server.auth_requested,
+        "setup_allowed": guard.setup_allowed(h),
         "authentication_required": enabled,
         "authentication_mode": h.server.auth_mode,
         "compatibility_active": h._compatibility_active(),
@@ -16930,7 +16796,7 @@ def _auth_status_payload(h):
         # The API remains backward-compatible before the first account, but
         # /app deliberately stops here so the owner creates that account
         # before the panel reads any workspace data.
-        "bootstrap_required": not bootstrapped,
+        "bootstrap_required": not bootstrapped and access_mode != "local",
         "bootstrap_available": not bootstrapped,
         # The sign-in page shows its "Create account" link only when this is
         # "open"; the register route re-checks the same stored setting, so the
@@ -17033,17 +16899,63 @@ def _r_auth_status(h, m, q):
     h._reply_json(200, _auth_status_payload(h), {"Cache-Control": "no-store"})
 
 
-def _r_auth_bootstrap(h, m, q):
-    if auth_is_enabled(h._conn()):
-        raise AttaccaError("authentication is already bootstrapped; sign in")
+def _r_setup(h, m, q):
+    """Choose first-run policy, or explicitly protect a local installation."""
     body = h._body_json()
-    created = auth_create_user(
-        h._conn(), body.get("username"), body.get("password"),
-        display_name=body.get("display_name"), is_admin=True, bootstrap=True)
-    row = h._conn().execute(
-        "SELECT * FROM auth_users WHERE user_id=?",
-        (created["user"]["user_id"],)).fetchone()
-    _reply_auth_session(h, 201, auth_create_session(h._conn(), row))
+    mode = body.get("mode")
+    if mode not in ("local", "protected") or body.get("confirmed") is not True:
+        raise AttaccaError("choose mode local or protected with confirmed=true")
+    if mode == "local" and _local_access_runtime().network_exposed(
+            h.server.server_address) and body.get("acknowledge_network_risk") is not True:
+        raise AttaccaError(
+            "network_exposure_confirmation_required: login protection is strongly"
+            " recommended; confirm acknowledge_network_risk=true to continue")
+    if mode == "protected" and h.server.auth_mode != "auto":
+        raise AttaccaError("restart with --auth-mode auto before enabling protection")
+    conn = h._conn()
+    session = None
+    with write_tx(conn):
+        current = server_access_mode(conn)
+        if current not in ("pending", "local") or (
+                current == "local" and (mode != "protected" or
+                                        body.get("upgrade_local") is not True)):
+            raise AuthorizationError("setup_already_completed: current policy is unchanged")
+        if conn.execute("SELECT 1 FROM auth_users LIMIT 1").fetchone():
+            raise AuthorizationError("setup_already_completed: existing accounts are unchanged")
+        if mode == "protected":
+            created = auth_create_user(
+                conn, body.get("username"), body.get("password"),
+                is_admin=True, bootstrap=True)
+            row = conn.execute("SELECT * FROM auth_users WHERE user_id=?",
+                               (created["user"]["user_id"],)).fetchone()
+            principal = _auth_principal(conn, row, "session")
+            auth_activate(conn, principal, confirmed=True, server=h.server)
+            session = auth_create_session(conn, row)
+        server_settings_store(conn, {"server.setup_mode": mode,
+                                    "server.setup_completed_at": now_iso()})
+    if session:
+        _reply_auth_session(h, 201, session)
+    else:
+        h._reply_json(200, _auth_status_payload(h), {"Cache-Control": "no-store"})
+
+
+def _r_auth_bootstrap(h, m, q):
+    body = h._body_json()
+    conn = h._conn()
+    with write_tx(conn):
+        if auth_is_enabled(conn):
+            raise AttaccaError("authentication is already bootstrapped; sign in")
+        if server_access_mode(conn) == "local":
+            raise AuthorizationError("use /v1/setup to explicitly enable protection")
+        created = auth_create_user(
+            conn, body.get("username"), body.get("password"),
+            display_name=body.get("display_name"), is_admin=True, bootstrap=True)
+        if server_access_mode(conn) == "pending":
+            server_settings_store(conn, {"server.setup_mode": "legacy"})
+        row = conn.execute("SELECT * FROM auth_users WHERE user_id=?",
+                           (created["user"]["user_id"],)).fetchone()
+        session = auth_create_session(conn, row)
+    _reply_auth_session(h, 201, session)
 
 
 def _r_auth_login(h, m, q):
@@ -17951,6 +17863,10 @@ def _require_project_export_access(h, project):
     """Full backup data is restricted to a human owner or server admin."""
     principal = getattr(h, "principal", None)
     if not principal:
+        if server_access_mode(h._conn()) == "local" and not h._auth_enabled():
+            # The local operator already has full access to this installation.
+            # No account is invented; Host/Origin checks ran before routing.
+            return None
         raise AuthenticationError(
             "full project export: Attacca login required (or use a human API"
             " token)")
@@ -17973,7 +17889,8 @@ def _require_project_export_access(h, project):
 def _r_project_export(h, m, q):
     # Authenticate before resolving the id so anonymous callers cannot probe
     # private workspace names through the backup endpoint.
-    if not getattr(h, "principal", None):
+    if not getattr(h, "principal", None) and not (
+            server_access_mode(h._conn()) == "local" and not h._auth_enabled()):
         raise AuthenticationError(
             "full project export: Attacca login required (or use a human API"
             " token)")
@@ -18892,7 +18809,7 @@ def _r_verify(h, m, q):
 
 _PID = "([^/]+)"
 ROUTES = [
-    (*_route_def("GET", "/"), _r_landing),
+    (*_route_def("GET", "/"), _r_app),
     (*_route_def("GET", "/app/?"), _r_app),
     (*_route_def("GET", "/install.sh"), _r_install_sh),
     (*_route_def("GET", "/plugin.zip"), _r_plugin_zip),
@@ -18900,6 +18817,7 @@ ROUTES = [
     (*_route_def("GET", "/plugin\\.git/(.+)"), _r_plugin_git),
     (*_route_def("GET", "/healthz"), _r_healthz),
     (*_route_def("GET", "/v1/auth/status"), _r_auth_status),
+    (*_route_def("POST", "/v1/setup"), _r_setup),
     (*_route_def("GET", "/v1/managed-law"), _r_managed_law),
     (*_route_def("GET", "/v1/migration-directive"), _r_migration_directive),
     (*_route_def("POST", "/v1/auth/bootstrap"), _r_auth_bootstrap),
@@ -19045,9 +18963,14 @@ def run_server(db_path, host="127.0.0.1", port=DEFAULT_PORT,
     print("attacca server listening on %s" % base, flush=True)
     print("  db:   %s" % db_path, flush=True)
     print("  MCP:  %s/mcp    REST: %s/v1/projects" % (base, base), flush=True)
+    print("  console: %s/" % base, flush=True)
     print("  plugin install: curl -fsSL %s/install.sh | sh" % base, flush=True)
     auth_state = auth_activation_readiness(
         server.conn(), server=server, include_details=False)
+    access_mode = server_access_mode(server.conn())
+    if access_mode == "pending":
+        print("  first-run setup: open the console on localhost to choose login"
+              " protection and install coding clients", flush=True)
     if host not in ("127.0.0.1", "localhost", "::1") \
             and auth_state["effective_authentication"] != "required":
         print("  WARNING: unauthenticated server bound to a non-localhost "
@@ -19055,8 +18978,9 @@ def run_server(db_path, host="127.0.0.1", port=DEFAULT_PORT,
     elif auth_state["effective_authentication"] == "required":
         print("  authentication: required", flush=True)
     else:
-        print("  authentication: optional migration mode (%s)" %
-              server.auth_mode, flush=True)
+        print("  authentication: %s" % (
+            "optional — local access without login" if access_mode == "local"
+            else "not enabled; choose protection in the console"), flush=True)
     if server_self_registration_mode(server.conn()) == "open":
         print("  self-registration: open (anyone who can reach this server "
               "may create an account; no rate limiting)", flush=True)
@@ -21535,7 +21459,7 @@ def _read_machine_config(home=None):
 
 def _packaged_server_url():
     root = Path(script_path()).parent
-    for name in ("plugin-mcp.json", "kimi.plugin.json", ".mcp.json"):
+    for name in ("plugin-mcp.json", "kimi.plugin.json", ".codex-plugin/plugin.json", ".mcp.json"):
         manifest = root / name
         if not manifest.is_file():
             continue
@@ -22052,6 +21976,7 @@ def _switch_json_candidates(home, watcher_state, codex_root=None,
         add("plugin", root / "plugin-mcp.json")
         add("kimi-plugin", root / "kimi.plugin.json")
         add("codex-plugin", root / ".mcp.json")
+        add("codex-plugin", root / ".codex-plugin" / "plugin.json")
     return [("+".join(sorted(tools)), path)
             for path, tools in sorted(candidates.items(), key=lambda item: str(item[0]))]
 
@@ -22512,6 +22437,10 @@ def _ensure_client_setup_auth(url, actor_id, interactive=False,
     anonymous = remote_json(
         server_url, "GET", "/v1/auth/status", actor=actor_id,
         actor_type="agent", use_auth=False)
+    if anonymous.get("setup_required"):
+        raise AuthenticationError(
+            "server_setup_required: open %s/ and choose login protection first"
+            % server_url)
     if anonymous.get("bootstrap_required"):
         raise AuthenticationError(
             "account_bootstrap_required: open %s/app#settings" % server_url)
@@ -22595,6 +22524,13 @@ def _ensure_client_setup_auth(url, actor_id, interactive=False,
                 "hot_reload": True,
                 "credentials_file": str(CREDENTIALS_FILE),
             }
+    if anonymous.get("access_mode") == "local" and anonymous.get("anonymous_access"):
+        # Verify with normal credential loading: a supplied rejected key must
+        # not silently become an anonymous session in local mode.
+        remote_json(server_url, "GET", "/v1/auth/status", actor=actor_id,
+                    actor_type="agent", project_id=project_id)
+        return {"required": False, "authenticated": False, "kind": "local",
+                "client_instance": client_instance, "hot_reload": True}
     if not anonymous.get("authentication_required") and not (
             interactive or paste_token):
         return {"required": False, "authenticated": False,
@@ -22804,6 +22740,23 @@ def provision_setup_agent_token(url, project_id, actor_id):
     runtime = normalize_agent_runtime(actor=actor_id)
     flow = _terminal_flow_runtime()
     client_instance = load_client_instance_id(runtime)
+    access = remote_json(configured_server_url(url), "GET", "/v1/auth/status",
+                         actor=actor_id, actor_type="agent", project_id=project_id)
+    if access.get("access_mode") == "local" and access.get("anonymous_access") \
+            and not access.get("authentication_required"):
+        checked = remote_json(configured_server_url(url), "GET",
+            "/v1/projects/%s/agents?q=%s" % (
+                urllib.parse.quote(project_id, safe=""),
+                urllib.parse.quote(actor_id, safe="")),
+            actor=actor_id, actor_type="agent", project_id=project_id)
+        if not any(item.get("agent_id") == actor_id
+                   for item in (checked.get("agents") or [])):
+            raise AuthorizationError("local setup requires an exact registered agent")
+        return {"created": False, "credential_kind": "local", "status": "ready",
+                "actor_id": actor_id, "project_id": project_id, "runtime": runtime,
+                "client_instance": client_instance, "credential_saved": False,
+                "authentication_required": False, "authenticated": False,
+                "hot_reload": True}
     active = _remote_setup_session(url) or {}
     if active.get("kind") == "token" \
             and active.get("token_kind") == "client" \

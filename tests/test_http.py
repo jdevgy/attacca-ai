@@ -262,13 +262,11 @@ class HttpTestCase(unittest.TestCase):
         import zipfile as zf
         import io as iolib
         with rq.urlopen(self.server.base + "/", timeout=10) as resp:
-            landing = resp.read().decode()
-        self.assertIn(
-            "curl -fsSL %s/install.sh | sh" % self.server.base, landing)
-        self.assertIn("$attacca:setup", landing)
-        self.assertIn("/attacca:setup", landing)
-        self.assertIn("attacca setup --interactive", landing)
-        self.assertIn("no MCP reconnect", landing)
+            console = resp.read().decode()
+        with rq.urlopen(self.server.base + "/app", timeout=10) as resp:
+            self.assertEqual(console, resp.read().decode())
+        self.assertIn("Attacca", console)
+        self.assertNotIn("No tool-by-tool installation.", console)
         with rq.urlopen(self.server.base + "/install.sh", timeout=10) as resp:
             script = resp.read().decode()
         syntax = subprocess.run(["sh", "-n"], input=script, text=True,
@@ -318,7 +316,7 @@ class HttpTestCase(unittest.TestCase):
         names = set(archive.namelist())
         for required in ("attacca.py", ".claude-plugin/plugin.json",
                          ".claude-plugin/marketplace.json",
-                         ".codex-plugin/plugin.json", ".mcp.json",
+                         ".codex-plugin/plugin.json",
                          ".agents/plugins/marketplace.json",
                          "skills/setup/SKILL.md",
                          "skills/msg/SKILL.md", "skills/update/SKILL.md",
@@ -415,10 +413,10 @@ class HttpTestCase(unittest.TestCase):
             archive.read(".codex-plugin/plugin.json"))
         self.assertTrue(codex_manifest["version"].startswith(
             c.VERSION + "+codex."))
-        self.assertEqual(codex_manifest["mcpServers"], "./.mcp.json")
-        codex_mcp = json.loads(archive.read(".mcp.json"))
+        self.assertIsInstance(codex_manifest["mcpServers"], dict)
+        self.assertNotIn(".mcp.json", archive.namelist())
         self.assertEqual(
-            codex_mcp["mcpServers"]["attacca"]["env"]["ATTACCA_URL"],
+            codex_manifest["mcpServers"]["attacca"]["env"]["ATTACCA_URL"],
             self.server.base)
         codex_marketplace = json.loads(
             archive.read(".agents/plugins/marketplace.json"))
@@ -741,6 +739,9 @@ class HttpTestCase(unittest.TestCase):
             def start_server(name):
                 db = root / (name + ".db")
                 conn = c.connect(db)
+                # This distribution/proxy regression represents an existing
+                # installation, not the new loopback-only first-run wizard.
+                c.server_settings_store(conn, {"server.setup_mode": "legacy"})
                 conn.close()
                 server = c.AttaccaServer(("127.0.0.1", 0), db)
                 thread = threading.Thread(target=server.serve_forever,
@@ -945,13 +946,9 @@ class HttpTestCase(unittest.TestCase):
 
                     changed_install = c.INSTALL_SH_TEMPLATE + (
                         "\n# %s\n" % runtime_marker)
-                    changed_landing = c.LANDING_TEMPLATE.replace(
-                        "</body>", "<!-- %s --></body>" % runtime_marker)
                     with mock.patch.object(c, "VERSION", new_version), \
                             mock.patch.object(
-                                c, "INSTALL_SH_TEMPLATE", changed_install), \
-                            mock.patch.object(
-                                c, "LANDING_TEMPLATE", changed_landing):
+                                c, "INSTALL_SH_TEMPLATE", changed_install):
                         # Every old-server byte remains the exact startup byte,
                         # including base-wired ZIPs and marketplace metadata.
                         for path, expected in startup.items():
@@ -973,11 +970,11 @@ class HttpTestCase(unittest.TestCase):
                         new_server = start_server("new")
                         new_app = fetch(new_server, "/app")[1]
                         new_install = fetch(new_server, "/install.sh")[1]
-                        new_landing = fetch(new_server, "/")[1]
+                        new_root = fetch(new_server, "/")[1]
                         new_zip = fetch(new_server, "/plugin.zip")[1]
                         self.assertIn(marker.encode(), new_app)
                         self.assertIn(runtime_marker.encode(), new_install)
-                        self.assertIn(runtime_marker.encode(), new_landing)
+                        self.assertEqual(new_root, new_app)
                         self.assertIn(
                             ('EXPECTED_VERSION="%s"' % new_version).encode(),
                             new_install)

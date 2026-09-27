@@ -1,142 +1,120 @@
 # Contributing to Attacca
 
-Attacca is a hosted project-continuity layer for humans and AI coding tools.
-This file covers what you need to build, run, and test it locally.
+Attacca is a self-hosted project-continuity layer for humans and AI coding
+tools. Contributions can be bug reports, documentation improvements, tests,
+or focused code changes. You do not need an Attacca account, access to a
+private workspace, or machine-specific configuration to contribute.
 
-Please read [`SECURITY.md`](SECURITY.md) before running a server anywhere other
-people can reach.
+For security issues, follow [SECURITY.md](SECURITY.md) instead of posting
+sensitive details in a public issue.
 
-## Ground rules
+## Prepare a development checkout
 
-### Standard library only
+Clone the repository, or clone your fork if you plan to submit a pull request.
+The repository root contains `attacca.py`, `tests/`, and `.github/`; there is
+no additional package directory to enter.
 
-Attacca targets **Python 3.8+ and uses the standard library exclusively**.
-There are no third-party runtime dependencies and there is no build step:
-`attacca.py` is run directly.
+Attacca requires **Python 3.8+ and the standard library only**. There is no
+build step or third-party runtime dependency. `requirements.txt` is
+intentionally empty. Propose substantial dependency or architecture changes
+in an issue before implementing them.
 
-`requirements.txt` exists as conventional scaffolding and deliberately lists
-nothing — `pip install -r requirements.txt` is a successful no-op. **Do not add
-a runtime dependency.** If you find yourself wanting one, that is a design
-discussion (an Attacca decision record), not a patch.
-
-The floor is real: 3.8 is the oldest interpreter CI runs, so avoid syntax and
-stdlib APIs newer than 3.8 (no `match`, no `X | Y` type unions at runtime, no
-`str.removeprefix`, no `functools.cache`, no `zoneinfo` without a fallback).
-You can check a file's syntax against the floor without installing 3.8:
+Use syntax and standard-library APIs supported by Python 3.8. For example,
+avoid `match`, runtime `X | Y` unions, `str.removeprefix`, and
+`functools.cache`. This command checks syntax against that floor:
 
 ```bash
 python3 -c "import ast; ast.parse(open('attacca.py').read(), feature_version=(3,8))"
 ```
 
-That catches post-3.8 *syntax* only. Post-3.8 *stdlib APIs* are caught by the
-3.8 leg of CI.
+It does not validate API availability; the Python 3.8 CI job covers that.
 
-### Repository layout
+## Run an isolated development server
 
-The Git repository root **is** the `attacca` package directory — `attacca.py`,
-`tests/`, and `.github/` all sit at the top level of the checkout. There is no
-extra `attacca/` subdirectory inside the repo.
-
-## Running the server locally
-
-The server is the app: it owns all state and exposes MCP, REST, and the
-Control Panel from one process.
+Use a scratch database and a free loopback port, separate from any server you
+or other people depend on:
 
 ```bash
-python3 attacca.py serve                       # http://127.0.0.1:8722
+ATTACCA_DB=/tmp/attacca-dev.db python3 attacca.py serve --host 127.0.0.1 --port 8799
 ```
 
-Useful flags (`python3 attacca.py serve --help` for the full list):
+Choose a different scratch path if that file already contains data you want
+to preserve. Open `http://127.0.0.1:8799/` to complete the first-run guide. A
+fresh installation offers local use without login or login protection with a
+first administrator. Existing installations retain their access policy.
 
-| Flag | Meaning |
-| --- | --- |
-| `--host` | Bind address, default `127.0.0.1`. |
-| `--port` | Port, default `8722`. |
-| `--verbose` | Request logging. |
-| `--auth` | Request authentication *readiness*; never enforces on its own. |
+Useful surfaces are:
 
-Surfaces on a running server:
+- `/` — the Control Panel; `/app` is an alias.
+- `/healthz` — health and the running version.
+- `/mcp` — the streamable HTTP MCP endpoint.
+- `/v1/...` — REST resources.
+- `/install.sh` and `/plugin.zip` — the installer and plugin distribution.
 
-- `/mcp` — streamable HTTP MCP endpoint
-- `/v1/...` — REST resources
-- `/app` — the Control Panel (workspaces, activity, rooms, tasks, decisions,
-  agents, rules, Cloud Context, settings, export)
-- `/install.sh`, `/plugin.zip` — the self-hosted installer and plugin bundle
+Use `python3 attacca.py serve --help` for server options. `--auth` requests
+authentication readiness; it does not activate enforcement by itself. Stay
+on loopback for development, and read [deployment guidance](SECURITY.md#deployment-guidance)
+before exposing a server beyond your computer.
 
-### Keep your dev server off shared state
+Never point tests or an experimental migration at a shared database or server.
+Local databases, credentials, logs, workspace links, and personal coding-tool
+configuration are excluded from the public repository by `.gitignore`.
 
-- Point the development server at a **scratch database**:
-  `ATTACCA_DB=/tmp/attacca-dev.db python3 attacca.py serve --port 8799`.
-- Use a **port other than the default** if a shared instance is
-  already running on this machine, and never point development work, tests, or
-  a migration at a shared instance.
-- Stay on loopback. `--host 0.0.0.0` publishes an unencrypted, unthrottled
-  admin surface — see `SECURITY.md`.
-- Never commit a database. `.gitignore` already excludes `*.db`, `*.db-wal`,
-  `*.db-shm`, `server.log`, and `.attacca/` (except the non-secret
-  `project.json`).
+### Source, running server, and installed plugin are separate
 
-### A running server serves a frozen snapshot
+At startup the server captures an immutable distribution snapshot: the
+Control Panel, installer, plugin archive, version, and managed protocol.
+Editing source does not replace that snapshot. Restart only your isolated
+development server to test new distribution bytes. Never interrupt a shared
+server just to run tests.
 
-This trips people up constantly, so it is worth stating plainly:
+An installed plugin is a separate copy again. Verification should identify
+whether it covered source, a served download, an installed plugin, or a
+running client. A client may need a fresh session to load an updated plugin.
 
-> **When the server starts, it captures an immutable distribution snapshot** —
-> its landing page, Control Panel assets, installer, plugin archive, version
-> string, and managed-law bundle. Editing the source files on disk does **not**
-> mutate what a running server hands out.
+### Test plugin installation carefully
 
-Consequences:
+The universal installer configures coding tools on the machine where it
+runs. Use a disposable environment for installer changes. Run it from a
+directory **outside the Attacca source checkout**, and use the URL of your
+isolated test server. Do not point installation tests at an existing personal
+coding-tool configuration.
 
-1. After changing anything a client downloads (installer, plugin, panel assets,
-   managed law, version), you must **restart the server** before it serves the
-   new bytes.
-2. `git log` showing a change is not evidence that a running server, a packaged
-   plugin, or an *installed* plugin has it. Those are four distinct artifacts.
-   Release evidence must say which one was tested.
-3. A running coding client may additionally need a fresh session to load newly
-   installed plugin code. That is a client lifecycle fact, not a bug.
-4. Never interrupt a live shared server just to run tests — the test suite
-   never needs one (see below).
+For normal user installation and project linking, follow the
+[README quick start](README.md#quick-start-local-server).
 
-## Running the tests
+## Run tests
+
+From the repository root:
 
 ```bash
 python3 -m unittest $(cd tests && ls test_*.py | sed 's/\.py$//; s/^/tests./')
 ```
 
-Run it from the repository root. It expands to the explicit module list
-`tests.test_auth_http tests.test_auth_onboarding ...` and is the form CI uses.
+This explicit module list is also used by CI. Plain discovery from the root
+can run no tests because `tests/` is a namespace package. Discovery with
+`-s tests` can load modules under different names from their cross-test
+imports, so use the command above.
 
-### Why not plain discovery
-
-`tests/` has no `__init__.py`, and Python 3.11+ no longer discovers namespace
-packages. So:
+For a focused change, run the relevant modules while developing:
 
 ```bash
-python3 -m unittest discover          # Ran 0 tests — exits 5, NO TESTS RAN
-python3 -m unittest discover -s tests -t .   # ImportError: Start directory is not importable
+python3 -m unittest tests.test_store tests.test_http -v
 ```
 
-The first form is the dangerous one: it **silently runs nothing and does not
-fail loudly**, so it can look like a green run. Do not use it.
+Run the full suite before submitting a pull request. Include relevant
+authentication, concurrency, lifecycle, sync, export, or panel coverage when
+those areas change. Panel tests that execute JavaScript need Node.js; this is
+a test tool, not an Attacca runtime dependency.
 
-`python3 -m unittest discover -s tests` does execute tests, but it imports each
-module top-level (as `test_http`) while a handful of modules import their
-siblings as package members (`from tests.test_http import ServerFixture`).
-That loads the same module twice under two names. Use the explicit form.
+Tests must use temporary databases, temporary homes and configurations, and
+ephemeral loopback ports. They must not restart, reconfigure, authenticate,
+migrate, or write to a configured shared server or a real user configuration.
+Reuse the existing fixtures, such as `ServerFixture` in `tests/test_http.py`,
+and clean up test processes and temporary resources.
 
-### Keep the suite importable on 3.8
-
-The runtime floor applies to `tests/` too: every test module must **import**
-cleanly on Python 3.8. `unittest` substitutes a placeholder failing test for a
-module it cannot import, so the rest of the run still completes -- but that
-module reports an error and the run exits non-zero.
-
-If a test needs a newer stdlib module, guard the import and skip the affected
-tests rather than importing it at top level. `tomllib` (3.11+) is the existing
-example -- `tests/test_codex_config_repair.py`,
-`tests/test_server_switch.py`, and
-`tests/test_codex_toml_concurrency_regression.py` all do:
+Test modules must also import on Python 3.8. Guard newer optional test APIs and
+skip only the affected tests. For example:
 
 ```python
 try:
@@ -144,124 +122,42 @@ try:
 except ImportError:  # Python < 3.11
     tomllib = None
 
-...
-
 @unittest.skipUnless(tomllib is not None, "tomllib requires Python 3.11+")
-def test_something_that_parses_toml(self):
+def test_toml_parsing(self):
+    ...
 ```
 
-Skip the tests that need the feature *indirectly* too. `validate_repaired_toml`
-in `tools/repair_codex_config.py` falls back to a structural check when
-`tomllib` is absent and raises a different error message, so a test asserting
-the `tomllib`-branch message needs the same guard even though it never names
-`tomllib`.
+## Submit a change
 
-### Running a subset
+1. Open an issue for a bug or a substantial proposed change. Include expected
+   behavior, actual behavior, reproduction steps, and relevant versions.
+   Remove credentials, personal paths, and private project data from examples.
+2. Make a focused change on a branch in your fork. Preserve unrelated work in
+   a shared checkout rather than reverting or committing it with your patch.
+3. Add regression coverage and update public documentation when behavior
+   changes. Describe user-visible changes under `Unreleased` in
+   [CHANGELOG.md](CHANGELOG.md), or the release section being prepared.
+4. Submit a pull request explaining the change, the problem it solves, and
+   the exact verification performed. Mention limitations or untested cases.
 
-Individual modules take the same package path:
+Keep commits focused and describe the change plainly. Do not include generated
+attribution trailers or personal development notes. Do not rewrite published
+history or force-push the shared main branch as part of normal contribution.
 
-```bash
-python3 -m unittest tests.test_store tests.test_http -v
-python3 -m unittest tests.test_mcp.McpTestCase.test_some_case
-```
+Never commit credentials, databases, private agent instructions, personal
+configuration, or logs. Check the staged diff before committing. Sanitized
+test fixtures should use fictional identities and deliberately non-secret
+values.
 
-### What the tests may and may not touch
+## Public documentation
 
-Tests must use **temporary databases, temporary homes and configurations, and
-ephemeral loopback ports**. They must never restart, reconfigure, authenticate,
-migrate, or write to a configured shared server, and they must not write to a
-real `~/.attacca`. If you add a test that needs a server, use the existing
-`ServerFixture` in `tests/test_http.py` rather than starting one by hand.
-
-Beyond the baseline suite, risk-specific coverage lives in dedicated modules:
-concurrent writers and claimants, MCP and HTTP contracts, Control Panel
-behaviour, native client configuration, hook lifecycle and cache replacement,
-managed-law monotonicity, bridge participation and routing, search and
-pagination, task-plan optimistic revisions, export integrity, watcher cadence,
-offline corruption/revocation/ambiguity, exact-once replay, and authentication
-red-team cases. `demo/` contains the cold-handoff and two-agent MCP acceptance
-demonstrations.
-
-## Installing the plugin (the cwd rule)
-
-The installer is served by a running server and wires every AI coding tool it
-finds on the machine:
-
-```bash
-curl -fsSL http://127.0.0.1:8722/install.sh | sh
-```
-
-> **Run the installer from a directory outside this checkout.**
-
-The installer inspects its working directory to decide what to configure. Run
-it from inside the Attacca source checkout and it will treat the development
-tree as a user project — rewriting local MCP configuration and plugin
-registrations against your working copy. `cd ~` (or any unrelated directory)
-first.
-
-Two more installer facts:
-
-- Run it **inside the same host or container where the coding tool actually
-  runs**. Server URL, client installation, and credentials are machine-local; a
-  machine-specific MCP configuration cannot be generated remotely.
-- It is deliberately **rerunnable and idempotent**. It refreshes one managed
-  registration rather than stacking a second active Attacca server, and
-  preserves unrelated configuration. Rerun it only to add a client, switch
-  servers, or repair an installation.
-
-## The Attacca protocol (this project uses itself)
-
-Attacca is developed *through* Attacca. `AGENTS.md` and `CLAUDE.md` in this
-repository each carry two marker-bounded managed blocks:
-
-- **`MANAGED_ATTACCA`** — the versioned protocol/"managed law" block.
-- **`ATTACCA_CLOUD_CONTEXT`** — a synchronized read-only copy of the hosted
-  Cloud Context record.
-
-**Never hand-edit inside either marker pair.** Both are machine-owned:
-lifecycle sync rewrites them atomically when the hosted version or hash
-changes, so local edits are lost and can trip the monotonicity checks. To
-change Cloud Context, edit the hosted record (`cloud_context_get` /
-`cloud_context_set`) — humans and registered Directors only. Content **outside**
-both marker regions is human-authored and is preserved.
-
-If you are an AI worker on this repository, follow the protocol in the managed
-block: load the session brief, rules, and Cloud Context; search Attacca history
-before filesystem archaeology; claim a task with declared path scope before
-substantive edits; coordinate scope overlap in the room; record durable choices
-as decisions; and report task evidence at the end. The hosted project — not a
-chat transcript — is the source of truth.
-
-Human contributors do not need an Attacca account to send a patch.
-
-## Commits and pull requests
-
-- **Small, focused commits on `main`.** Keep each commit to one coherent change
-  with a subject line that says what changed. The existing log is the style
-  guide — release commits read `Release 0.5.8: <summary>`, and a work commit
-  references the issue or change it closes in the subject.
-- **Tests green before you commit.** Run the full suite above. If a change is
-  risk-specific (concurrency, auth, hooks, sync, export), run and mention the
-  matching module.
-- **Don't rewrite published history**, and don't force-push `main`.
-- **Preserve other people's work.** Do not revert, stash, or commit unrelated
-  dirty files you find in the tree — another agent or human may have them
-  claimed.
-- **Update `README.md` when shipped behaviour changes**, and add a
-  `CHANGELOG.md` entry under `## [Unreleased]`.
-- **Never commit a secret.** Ledger events, room messages, tasks, decisions,
-  rules, Cloud Context, `AGENTS.md`/`CLAUDE.md`, `.attacca/project.json`,
-  command arguments, logs, plugin archives, and exports are all copied, synced,
-  and exported verbatim.
-
-## Where the documentation lives
-
-| File | What it is |
+| File | Purpose |
 | --- | --- |
-| [`README.md`](README.md) | **The maintained user and developer guide.** Current architecture and usage. Start here, and keep it true when shipped behaviour changes. |
-| [`SECURITY.md`](SECURITY.md) | Vulnerability reporting process, scope, and what the server does not provide. |
-| [`CHANGELOG.md`](CHANGELOG.md) | Release history, Keep a Changelog format. |
-| `AGENTS.md` / `CLAUDE.md` | Managed protocol block plus the synced Cloud Context copy. Machine-owned inside the markers. |
-| `docs/blueprint.txt` | **Vision, not implemented.** The broader SaaS direction — end-to-end encryption, Project Brain, capability marketplaces, billing, production identity. Nothing here is implemented merely because the blueprint describes it. Do not cite it as shipped behaviour. |
+| [README.md](README.md) | Installation, architecture, current behavior, and API/CLI usage. |
+| [SECURITY.md](SECURITY.md) | Security reporting and deployment guidance. |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Development and contribution workflow. |
+| [CHANGELOG.md](CHANGELOG.md) | User-visible release history. |
 
-When these disagree, current source and tests are the implementation truth.
+Describe implemented behavior, not private plans or future features. Current
+source and tests are the implementation reference. All instructions needed
+to build and test a public checkout belong in these public files.

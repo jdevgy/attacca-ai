@@ -146,6 +146,7 @@ class MachineServerSwitchTests(unittest.TestCase):
         plugin.mkdir(parents=True)
         (plugin / "attacca.py").write_text("# installed marker\n")
         for name, actor in ((".mcp.json", "codex"),
+                            (".codex-plugin/plugin.json", "codex"),
                             ("plugin-mcp.json", "claude"),
                             ("kimi.plugin.json", "kimi")):
             self.write_json(plugin / name, {
@@ -225,6 +226,7 @@ class MachineServerSwitchTests(unittest.TestCase):
             paths["codex"], paths["cursor"], paths["project_mcp"],
             paths["watcher"], c.machine_config_path(self.home),
             paths["plugin"] / ".mcp.json",
+            paths["plugin"] / ".codex-plugin" / "plugin.json",
             paths["plugin"] / "plugin-mcp.json",
             paths["plugin"] / "kimi.plugin.json",
         ]

@@ -1,6 +1,6 @@
 # Attacca
 
-Attacca is a durable project-continuity layer for humans and AI coding tools.
+Attacca is a self-hosted project-continuity layer for humans and AI coding tools.
 It keeps the parts of a project that outlive a chat window — an append-only
 event ledger, a shared task board, decisions, handoffs, binding rules, and one
 human+AI room — on a small server you run yourself. Claude Code, Codex CLI,
@@ -11,62 +11,81 @@ disposable; the project is not.
 
 ## Quick start (local server)
 
-You need Python 3.8+ and Git. There is nothing else to install: Attacca is
-Python standard library only.
+You need Python 3.8+ and Git; the plugin-install example also uses `curl` and a
+POSIX shell. Attacca itself is Python standard library only. Clone the source
+and run it directly; no package manager, build step, subscription, or hosted
+account is required.
 
 **1. Clone the repository and start the server**
 
 ```bash
-git clone https://github.com/jdevgy/attacca-ai.git && cd attacca-ai
+git clone https://github.com/jdevgy/attacca-ai.git
+cd attacca-ai
 python3 attacca.py serve --host 127.0.0.1 --port 4173
 ```
 
-All state lives in one SQLite file (`~/.attacca/attacca.db`; override with
+Leave that terminal running. All state lives in one SQLite file
+(`~/.attacca/attacca.db`; override with
 `ATTACCA_DB`), and `http://127.0.0.1:4173/healthz` reports the running version.
 Any free port works — `8722` is the built-in default the examples further down
 use.
 
-**2. Open the Control Panel and create the first admin account**
+**2. Open the console and choose whether to require login**
 
 ```
-http://127.0.0.1:4173/app
+http://127.0.0.1:4173/
 ```
 
-While no account exists the panel opens on a **Create the first administrator**
-form; submitting it creates that account and signs you in.
+The server opens directly into its Control Panel; there is no separate landing
+page. `/app` remains an alias. On a new installation, the first-run guide
+explains plugin installation and offers two choices:
 
-**3. Give other people their own accounts** *(optional)*
+- **Local use without login:** open the console and connect agents without
+  creating an account or approving client keys.
+- **Protect with login:** create the first administrator and enable login
+  protection together. Browser users sign in; coding clients use the existing
+  browser-approval flow to get their own installation credential.
 
-An admin opens self-service sign-up — start the server with
-`--allow-self-registration`, or set `self_registration` to `open` in server
-settings (`PUT /v1/settings`) — and everyone else joins through the **Create
-account** form on the sign-in page (0.5.9 and later). The alternative: a
-signed-in admin creates one invitation per person with
-`POST /v1/auth/invitations`, and the invited person accepts it in the panel.
-A new account has no workspace yet: an admin adds it from **Workspaces →
-Members** in the panel (or `POST /v1/projects/{id}/members`).
+Complete this first choice from a browser on the server's computer, or through
+an SSH tunnel. For a server bound beyond localhost, the guide selects and
+strongly recommends login protection; proceeding without it requires a
+separate acknowledgement. See [deployment guidance](SECURITY.md#deployment-guidance)
+before using a LAN or remote address.
 
-**4. Install the Attacca plugin into your coding tools**
+You can enable login protection later in **Settings** from the server's local
+browser. The choice is saved: normal restarts and upgrades do not ask again or
+switch an existing protected installation to no-login mode. Agent names,
+workspace roles, and task ownership remain separate from the login choice.
+
+**3. Install the Attacca plugin into your coding tools**
 
 ```bash
-cd ~ && curl -fsSL http://127.0.0.1:4173/install.sh | sh
+cd ~
+curl -fsSL http://127.0.0.1:4173/install.sh | sh
 ```
 
 Run this from your home directory, not from this checkout. The server serves
 its own plugin pre-wired to the URL it came from, installs it under
 `~/.attacca/plugin/attacca`, and configures every AI coding tool it finds.
 
-**5. Link a project and register the AI**
+**4. Link a project and register the AI**
 
 Open your own project in Claude Code and run `/attacca:setup` (Codex:
 `$attacca:setup`; Kimi: `/attacca:setup`). The guided flow picks or creates a
 workspace, registers this AI's role and identity, and writes the non-secret
 workspace link into `.attacca/project.json`.
 
-**6. Verify**
+**5. Verify**
 
 Run `/attacca:status` in Claude Code or Kimi (Codex: `$attacca:update`). It
 reports the linked workspace, this AI's identity, and the current handoff.
+
+To add accounts to a protected installation, see
+[optional login protection](#optional-login-protection). For updates, keep
+your database, stop your own server when convenient, pull the new source, and
+start it again with the same database and options. Running servers keep their
+existing distribution snapshot until they are restarted; installing a client
+update is a separate action.
 
 ## What you get
 
@@ -78,8 +97,9 @@ reports the linked workspace, this AI's identity, and the current handoff.
   immutable plan revisions, decisions, and evidence-based completion.
 - **A room humans and AIs share** — group messages, persistent per-identity
   inbox cursors, and explicit dispositions so addressed work is never dropped.
-- **Separate identity and authority** — the AI actor, the authenticated human
-  operator, the runtime, the role, and the Git checkout stay distinct on every write.
+- **Separate identity and authority** — the AI actor, human operator, runtime,
+  role, and Git checkout stay distinct. Protected mode verifies the human
+  account; local no-login mode does not claim an authenticated human.
 - **The tools you already run** — native plugins for Claude Code, Codex CLI, and
   Kimi Code; MCP config for Cline, Cursor, Windsurf, and any other MCP client;
   REST and a CLI for everything else.
@@ -91,7 +111,7 @@ reports the linked workspace, this AI's identity, and the current handoff.
 - [What Attacca gives a project](#what-attacca-gives-a-project) — the full feature list
 - [Architecture](#architecture) — server, clients, and installation-bound AI identity
 - [Setup and installation in detail](#setup-and-installation-in-detail) — every install path, flag, and side effect
-- [Hosted authentication](#hosted-authentication) — accounts, client API keys, enforcement
+- [Optional login protection](#optional-login-protection) — local access, accounts, and client API keys
 - [How a tool connects](#how-a-tool-connects-three-shapes-one-server) — the three client shapes; two computers, one workspace
 - [REST API](#rest-api-server-mode) — every `/v1` endpoint and the shared paging contract
 - [The protocol agents follow](#the-protocol-agents-follow) — what every AI session is required to do
@@ -134,11 +154,6 @@ The runtime is Python 3.8+ standard library only. One hosted Attacca process
 serves many isolated workspaces from SQLite; projects do not receive their own
 hidden server or database.
 
-The broader design in [`docs/blueprint.txt`](docs/blueprint.txt) also describes
-future encryption, Project Brain/context packs, capability marketplaces, and
-commercial layers. Those features are not implemented merely because the
-blueprint discusses them.
-
 ## Architecture
 
 ![Attacca architecture: native Claude, Codex, and Kimi sessions use lifecycle plugins before a stable stdio proxy; other supported MCP clients use that proxy directly, while a machine watcher maintains a verified local mirror and outbox for one hosted service.](docs/assets/attacca-architecture.svg)
@@ -156,8 +171,10 @@ attacca server — it owns the state and exposes two client surfaces:
 
 The installed **`connect` stdio client** normally forwards MCP to the configured
 host. If that transport is unavailable, it can continue only from the exact
-schema-v1 mirror previously authenticated for this server, workspace, human
-principal, exact canonical AI actor and role, checkout, and device. Cached reads
+schema-v1 mirror previously verified for this server, workspace, exact canonical
+AI actor and role, checkout, and device. Protected mode also binds the
+authenticated human principal; no-login mode uses its explicit compatibility
+scope and never claims a human authenticated. Cached reads
 are marked offline/stale; allowlisted writes are fsynced to a device outbox and
 replayed idempotently after reconnect. Missing, ambiguous, forged, or role-
 changed mirrors fail closed.
@@ -197,13 +214,22 @@ the flags for non-default installations.
 lifecycle — and owns all state. Tools are pure clients; no Attacca server or
 database is installed inside a user's project.
 
-**1. Host the server** (whoever runs the platform; once):
+**1. Run the server** (once on the computer that stores your workspaces):
 
 ```bash
 python3 attacca.py serve                   # http://127.0.0.1:8722
-# bootstrap the owner, create per-install client keys, and enable auth in /app Settings
-# LAN or remote access: --host 0.0.0.0 behind your own TLS/network controls
 ```
+
+Open that URL and complete the console's first-run guide: choose local use
+without login or create an administrator and turn on login protection. This is
+server setup; the native `/attacca:setup` or `$attacca:setup` command later links
+each project and selects the agent identity. Changing a project's identity
+does not change the server's login setting.
+
+For LAN access, `--host 0.0.0.0` listens beyond localhost. Complete first-run
+setup locally or through an SSH tunnel, choose login protection, and follow
+[SECURITY.md](SECURITY.md#deployment-guidance). Existing servers retain their
+saved protection setting; changing a bind address does not silently change it.
 
 **2. Users install the plugin from the server — one line, every tool:**
 
@@ -343,22 +369,39 @@ only through that current MCP connection. Direct CLI `temporary` is rejected
 because a child process cannot alter its parent,
 `--skip-tools codex,cline` / `--skip-tools all`, and `--no-server`.
 
-## Hosted authentication
+## Optional login protection
 
-The Control Panel at `/app` is the first-run entry point. Before it loads
-workspace data, it checks public authentication status and asks for the first
-owner account when needed. Bootstrap establishes that human account but does
-**not** enable enforcement. The owner enables or disables enforcement with the
-single explicit toggle in Settings; the toggle sends `{enabled, confirmed:true}`.
-There is no separate readiness workflow or automatic activation side effect.
+Login is a server-level choice, not a prerequisite for using Attacca on your
+own computer. The console at `/` (also `/app`) reads the server's saved choice.
+On first use it offers **local use without login** or **login-protected use**.
+Choosing protected use creates the first owner account and enables enforcement
+in the same operation; a failed setup does not leave a half-configured owner.
+Choosing local use requires neither a browser account nor an agent API key.
+Only a loopback browser connection can complete the initial choice, including
+an SSH tunnel to the server. A non-loopback bind strongly recommends protection
+and requires a separate acknowledgement before accepting no-login use.
 
-Attacca supports exactly two advertised authentication forms:
+First-run setup is not repeated on normal restart or upgrade. Existing account
+and enforcement settings are preserved. On a no-login server, a local browser
+can later use **Settings** to create the administrator and enable protection.
+On a protected server, the signed-in server owner manages the explicit
+protection toggle in Settings. Merely registering an agent or running project
+setup never changes that server setting.
+
+**Identity is still required; account login is optional.** In local mode,
+agents retain their registered workspace, role, generated name, identity
+handoff, inbox cursor, and task leases. These describe which agent performed
+the work; they do not prove a human signed in. Protected mode separately
+verifies the accountable human and client installation.
+
+When login protection is enabled, Attacca uses two authentication forms:
 
 - A browser uses an expiring `HttpOnly`, `SameSite=Strict` session cookie and a
   separate CSRF token for every state-changing request. Signing out in Settings
   revokes the session.
-- Each installed Attacca client keeps its own human-owned API key with prefix
-  `atkey_`. The key identifies that concrete installation through its required
+- Each installed Attacca client keeps its own human-owned API credential.
+  Clients treat delivered credentials as opaque values, not as AI identities.
+  The key identifies that concrete installation through its required
   stable `client_instance`; it does not identify or bind an AI model, runtime,
   actor, role, or Git checkout.
 
@@ -375,6 +418,14 @@ memberships. Stored records contain only a
 hash, prefix, human owner, client installation, scope, timestamps, and status.
 Revoking one installation does not revoke another installation or rewrite any
 AI identity or audit history.
+
+To add other people, an administrator can enable self-service account creation
+with `serve --allow-self-registration` or the `self_registration: "open"`
+server setting. They then use **Create account** on the sign-in page. The
+alternative is one invitation per person from `POST /v1/auth/invitations`.
+A new account has no workspace yet: add it through **Workspaces → Members**
+or `POST /v1/projects/{id}/members`. Account creation, workspace membership,
+and an AI's registered role are separate choices.
 
 Every authenticated AI request still supplies the exact
 `X-Attacca-Project: <workspace>` and
@@ -412,11 +463,11 @@ normalized server URL, workspace, runtime, and that installation. Neither file
 uses a coding host's conversation/session ID, and repairing authorization never
 changes the actor binding.
 
-The landing page, `/install.sh`, plugin zip/marketplace, health check, auth
-status, bootstrap, and login remain public so a new machine can install and
-connect. Attacca does not terminate TLS, provide SSO/MFA, rate-limit login, or
-encrypt the database. Put TLS and appropriate network controls in front of any
-remotely reachable instance.
+The console shell, `/install.sh`, plugin zip/marketplace, health check, auth
+status, and login remain public so a new machine can install and connect.
+Serving the console shell does not grant access to a protected workspace.
+See [SECURITY.md](SECURITY.md) for trust boundaries and remote deployment
+requirements.
 
 The native plugins bundle lifecycle continuity. Claude/Codex use `SessionStart`,
 `UserPromptSubmit`, and `Stop`; Kimi uses its manifest startup skill plus native
@@ -506,7 +557,8 @@ for confirmation. The link contains no token, user identity, database path, or
 absolute directory.
 
 Each computer keeps a separate installation-scoped outbox and a verified mirror
-scoped to its human-owned client key plus exact project and actor headers. Its
+scoped to its exact project and actor; protected mode also binds its human-owned
+client credential. Its
 actor choice is also installation-local: a fresh home/container has no actor
 binding and setup asks whether to take over an existing named identity, create
 the next permanent generated name, or select another same-owner compatibility
@@ -525,15 +577,16 @@ conflicts remain visible and block dependent work instead of being overwritten.
 Keep the server running across reboots with anything you like, e.g.
 `nohup python3 /abs/attacca.py serve >/tmp/attacca.log 2>&1 &` or a
 systemd user unit. It binds `127.0.0.1` by default; `--host 0.0.0.0` exposes an
-unencrypted HTTP listener. Bootstrap an account, create a separate key for every
-active client installation, explicitly enable enforcement in Settings, and put
-TLS in front of it before using it outside a trusted development network.
+HTTP listener beyond localhost. Choose login protection, authorize each client
+installation separately, and follow [deployment guidance](SECURITY.md#deployment-guidance)
+before making it reachable from another machine.
 
 ## REST API (server mode)
 
 ```
 GET  /                         GET /app[/]                 GET /healthz
 GET  /v1/auth/status
+POST /v1/setup
 POST /v1/auth/bootstrap       POST /v1/auth/login         POST /v1/auth/logout
 GET/POST /v1/auth/client-keys
 DELETE /v1/auth/client-keys/{token_id}
@@ -570,7 +623,19 @@ GET  /v1/projects/{id}/freshness?context_version=
 GET  /v1/projects/{id}/verify
 ```
 
-In legacy anonymous mode, actor identity uses `X-Attacca-Actor` /
+`GET /v1/auth/status` reports `setup_required`, `access_mode`,
+`anonymous_access`, `setup_allowed`, `network_exposed`, and `login_recommended`
+alongside the authentication status. The console submits the first-run choice
+to `POST /v1/setup` with `mode: "local" | "protected"` and `confirmed: true`.
+Protected setup also needs `username` and `password`; network-exposed local
+setup also needs `acknowledge_network_risk: true`. The endpoint checks the
+local connection and request origin on the server, and refuses attempts to
+reset an existing protected installation. It can also explicitly upgrade an
+account-free local installation to protected mode. The compatibility
+`/v1/auth/bootstrap` route creates an account without enabling enforcement;
+the console's protected setup uses `/v1/setup` for the combined operation.
+
+In local no-login mode, actor identity uses `X-Attacca-Actor` /
 `X-Attacca-Actor-Type`. Once authenticated, browser/human writes derive an
 immutable `web.<username>` actor and owner from the account; spoofable browser
 identity headers are ignored or rejected. Agent requests instead authenticate
@@ -820,16 +885,15 @@ python3 attacca.py event verify  # hash-chain + sequence integrity of a real led
 
 ## Notes and limits (honest edges)
 
-- **Authentication is account sign-in plus per-installation API keys.** Account
-  sessions, CSRF, hash-only per-install client keys, exact project/actor request
-  selection, human attribution, Director-governed shared project handoff,
-  exact-AI-identity handoff ownership, Director-managed Role Scope/directive
-  rules, and stale versions are enforced. TLS, SSO, MFA and login rate limiting
-  are provided by what you put in front of the server.
-- **No encryption.** Everything is plaintext on your machine.
+- **Login protection is optional.** When enabled, browser sessions and
+  per-installation API keys authenticate access. Agent identities and registered
+  roles remain distinct in either mode. Review [SECURITY.md](SECURITY.md) for
+  the security model, documented limits, and deployment requirements.
 - **Offline mode is identity-scoped, not a second database.** It activates only
-  after an authenticated snapshot has bound server, project, human principal,
-  canonical AI actor/role, visibility policy and client installation. Bridge/agent/lead-policy
+  after a verified snapshot has bound server, project, canonical AI actor/role,
+  visibility policy and client installation. Protected mode also binds the
+  authenticated human principal; no-login mode uses the explicit compatibility
+  scope, not an authenticated account. Bridge/agent/lead-policy
   changes and cross-project sends remain unavailable offline. A timeout after a
   mutation may be ambiguous, so `connect` refuses to queue that request; a proven
   connection refusal can be queued safely.

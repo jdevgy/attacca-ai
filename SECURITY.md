@@ -89,31 +89,50 @@ Related properties worth knowing:
 - The portable administrative export is an audit/backup artifact. It carries
   project-authored content verbatim and **never** grants a client any authority,
   so it must never be treated as an offline credential.
-- Authentication enforcement is **off by default** until an owner explicitly
-  enables it in the Control Panel. An unenforced server trusts whatever
-  connects to it.
+- **Local no-login mode is a trust choice, not authentication.** The first-run
+  console offers no-login local use or login-protected use. Without protection,
+  reachable clients are trusted: an actor name, role, or owner label is
+  attribution, not proof of a person's identity. Do not treat workspace
+  separation or agent naming as an access-control boundary against an untrusted
+  client in this mode.
+- First-run setup can be completed only through a loopback connection (or an
+  SSH tunnel). Choosing protected use creates the administrator and enables
+  enforcement together. A network bind recommends protection and requires an
+  additional explicit acknowledgement to choose no-login use instead. This
+  warning does not make no-login remote access safe.
+- Restarts and upgrades preserve an existing installation's account and
+  protection settings. A local no-login installation can enable protection in
+  Settings; changing a bind address never enables or disables it implicitly.
 
 ## Deployment guidance
 
 **Run Attacca on your own machine, or behind your own network and TLS controls.
 Never expose the server directly to the internet.**
 
-- Default to loopback (`127.0.0.1`). Binding `0.0.0.0` publishes an
+- Default to loopback (`127.0.0.1`). No-login use is intended for a computer
+  whose local users and coding clients you trust. Binding `0.0.0.0` publishes an
   unencrypted, unthrottled admin surface to every host that can route to you.
 - If you need remote access, put it behind something you already trust: a
   VPN/WireGuard/Tailscale network, an SSH tunnel, or a reverse proxy that
   terminates TLS and does its own authentication and rate limiting.
-- Enable authentication enforcement in Control Panel → Settings before any
-  second machine or second person can reach the server, and keep the API key
-  per installation so a single revocation is meaningful.
+- No-login access accepts localhost or an IP-literal host, not an arbitrary
+  DNS name. Use login-protected mode for a named reverse-proxy deployment;
+  do not disable the host check to make an unprotected proxy work.
+- Choose login protection in first-run setup, or enable it later in Control
+  Panel → Settings from the server's local browser, before any second machine
+  or untrusted local user can reach the server. If setting up remotely, use an
+  SSH tunnel first rather than leaving initial ownership open over the network.
+  Keep the API key per installation so a single revocation is meaningful.
 - Treat the SQLite database, its `-wal`/`-shm` sidecars, and any export as
   secrets at rest: back them up encrypted, and never commit them. `.gitignore`
-  already excludes `*.db`, `*.db-wal`, `*.db-shm`, `server.log`, and `.attacca/`
-  (except the non-secret `project.json`).
+  already excludes database files, logs, and the entire local `.attacca/`
+  state directory in this source repository.
 - Never put a credential into content Attacca stores or distributes: ledger
   events, room messages, tasks, decisions, rules, Cloud Context, `AGENTS.md` /
   `CLAUDE.md`, `.attacca/project.json`, command arguments, logs, plugin
   archives, or exports. Those are copied, synced, and exported verbatim.
-- Keep `.attacca/project.json` in Git if you like — it holds only a schema
-  version and a stable non-secret project ID. Server URL, client installation,
-  and credentials stay machine-local and are never committed.
+- A consumer project may choose to share `.attacca/project.json` in its own
+  repository: it holds only a schema version and a stable non-secret project
+  ID. This source repository intentionally ignores its private workspace link.
+  Server URL, client installation, and credentials stay machine-local and
+  are never committed.

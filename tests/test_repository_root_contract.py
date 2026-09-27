@@ -14,11 +14,14 @@ class RepositoryRootContractTest(unittest.TestCase):
         self.assertTrue((ROOT / "hooks" / "session_start.py").is_file())
         self.assertFalse((ROOT / "attacca" / "attacca.py").exists())
 
-    def test_devcontainer_starts_server_from_repository_root(self):
-        script = (ROOT / ".devcontainer" / "start-attacca.sh").read_text()
-        self.assertIn('cd "$ROOT" || exit 1', script)
-        self.assertNotIn('cd "$ROOT/attacca"', script)
-        self.assertIn("python3 attacca.py", script)
+    def test_public_packaging_does_not_require_personal_workspace_configuration(self):
+        import json
+        manifest = json.loads((ROOT / ".codex-plugin/plugin.json").read_text())
+        self.assertEqual(manifest["mcpServers"]["attacca"]["env"]["ATTACCA_ACTOR"],
+                         "codex")
+        ignores = (ROOT / ".gitignore").read_text().splitlines()
+        for private in ("AGENTS.md", "CLAUDE.md", ".mcp.json", ".devcontainer/"):
+            self.assertIn(private, ignores)
 
 
 if __name__ == "__main__":

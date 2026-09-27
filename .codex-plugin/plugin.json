@@ -1,12 +1,22 @@
 {
   "name": "attacca",
-  "version": "0.5.10+codex.20260906",
+  "version": "0.5.11+codex.20260927",
   "description": "Shared project memory and workspace continuity across AI coding tools.",
   "author": {
     "name": "agentg"
   },
   "skills": "./skills/",
-  "mcpServers": "./.mcp.json",
+  "mcpServers": {
+    "attacca": {
+      "command": "python3",
+      "args": ["./attacca.py", "connect"],
+      "cwd": ".",
+      "env": {
+        "ATTACCA_ACTOR": "codex",
+        "ATTACCA_URL": "http://127.0.0.1:4173"
+      }
+    }
+  },
   "interface": {
     "displayName": "Attacca",
     "shortDescription": "Shared project memory across coding agents",

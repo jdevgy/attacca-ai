@@ -74,11 +74,10 @@ class AuthOnboardingTestCase(unittest.TestCase):
         source = README.read_text(encoding="utf-8")
         normalized = " ".join(source.split())
         for phrase in (
-                "Hosted authentication (prototype)",
+                "Optional login protection",
                 "first owner account",
                 "HttpOnly",
                 "CSRF",
-                "atkey_",
                 "client_instance",
                 "one-time credential directly",
                 "~/.attacca/credentials.json",
@@ -86,8 +85,7 @@ class AuthOnboardingTestCase(unittest.TestCase):
                 "no copy/paste step",
                 "Signing out",
                 "Settings authorizes, lists, and revokes client-install keys",
-                "remain public",
-                "does not terminate TLS"):
+                "remain public"):
             self.assertIn(phrase, normalized)
         self.assertIn("full server base URL", normalized)
         self.assertIn("stable client installation ID", normalized)
@@ -96,8 +94,11 @@ class AuthOnboardingTestCase(unittest.TestCase):
         self.assertNotIn("Authentication, permissions, and hostile-client",
                          source)
         self.assertNotIn("**unauthenticated** server", source)
-        self.assertIn("does **not** enable enforcement", normalized)
-        self.assertIn("single explicit toggle", normalized)
+        self.assertIn("local use without login", normalized)
+        self.assertIn("enables enforcement in the same operation", normalized)
+        self.assertIn("Existing account and enforcement settings are preserved", normalized)
+        security = (README.parent / "SECURITY.md").read_text(encoding="utf-8")
+        self.assertIn("TLS", security)
         self.assertIn("does not identify or bind an AI model", normalized)
         self.assertIn("key's workspace scope", normalized)
         self.assertIn("Run by user", normalized)

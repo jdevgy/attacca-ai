@@ -15,6 +15,33 @@ Git tags in this repository, so versions are dated by their bump commit.
 
 Nothing yet.
 
+## [0.5.11] - 2026-09-27
+
+### Added
+
+- First-run console setup for local use without login or login-protected use,
+  followed by coding-client installation instructions. Protected setup creates
+  the owner account and enables enforcement atomically. Existing installations
+  retain their authentication settings.
+- Local-access Host and browser-origin checks, loopback-only initial setup,
+  and an explicit warning acknowledgement for network-exposed no-login use.
+
+### Changed
+
+- The console is now the only web interface at both `/` and `/app`; the
+  promotional landing page has been removed.
+- Source installation documentation now covers optional login and agent
+  identity separately. Public packaging embeds generic Codex MCP configuration,
+  keeping local
+  workspace configuration and instructions outside the distributed source.
+
+### Fixed
+
+- Local-mode workspace setup no longer requires an account or client key;
+  registered agent identities and role checks are preserved.
+- Renewed browser approvals are saved before acknowledgement, with serialized
+  receipt handling so a stale credential cannot discard a new approval.
+
 ## [0.5.10] - 2026-09-06
 
 ### Fixed

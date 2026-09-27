@@ -830,6 +830,8 @@
         pendingInvitationToken: consumeInvitationTokenFromLocation(),
         invitationAcceptanceError: "",
         authMode: "sign-in",
+        setupWizard: "",
+        setupMode: "",
         authTokens: [],
         health: null,
         serverSettings: null,
@@ -1295,6 +1297,45 @@
 
       const API_TIMEOUT_MS = 15000;
 
+      // TESTABLE_LOCAL_ACCESS_HELPERS:BEGIN
+      function localConsoleAccess(auth = state.auth) {
+        return auth?.access_mode === "local" && auth?.anonymous_access === true &&
+          auth?.authentication_required !== true && auth?.setup_required !== true;
+      }
+
+      function consoleAccessAllowed(auth = state.auth) {
+        return auth?.setup_required !== true &&
+          (auth?.authenticated === true || localConsoleAccess(auth));
+      }
+
+      function setupChoice(auth = state.auth, chosen = state.setupMode) {
+        if (chosen === "local" || chosen === "protected") return chosen;
+        return auth?.network_exposed === true || auth?.login_recommended === true
+          ? "protected" : "local";
+      }
+
+      function setupRequest(values, auth = state.auth, upgradeLocal = false) {
+        if (auth?.setup_allowed !== true) throw new Error("Complete setup from the server's local computer or a loopback tunnel.");
+        if (!["local", "protected"].includes(values.mode)) throw new Error("Choose a login protection option.");
+        const body = { mode: values.mode, confirmed: true };
+        if (values.mode === "local") {
+          if (auth?.network_exposed === true && values.acknowledge_network_risk !== "on") {
+            throw new Error("Confirm that anyone who can reach this server will have access without signing in.");
+          }
+          body.acknowledge_network_risk = values.acknowledge_network_risk === "on";
+        } else {
+          if (values.password !== values.confirm_password) throw new Error("Passwords do not match.");
+          if (!String(values.username || "").trim() || String(values.password || "").length < 8) {
+            throw new Error("Enter an account name and a password of at least 8 characters.");
+          }
+          body.username = values.username.trim();
+          body.password = values.password;
+          if (upgradeLocal && localConsoleAccess(auth)) body.upgrade_local = true;
+        }
+        return body;
+      }
+      // TESTABLE_LOCAL_ACCESS_HELPERS:END
+
       async function api(path, options = {}) {
         const headers = { "Accept": "application/json", "X-Attacca-Actor": state.prefs.actor, "X-Attacca-Actor-Type": state.prefs.actorType };
         if (state.prefs.owner) headers["X-Attacca-Owner"] = state.prefs.owner;
@@ -1404,7 +1445,7 @@
       }
 
       async function loadWorkspaceAgentDirectory(projects = state.projects) {
-        if (!state.auth?.authenticated) {
+        if (!consoleAccessAllowed()) {
           state.workspaceAgents = {};
           state.workspaceAgentErrors = {};
           return;
@@ -1573,12 +1614,13 @@
         select.innerHTML = state.projects.length
           ? state.projects.map(project => `<option value="${h(project.project_id)}" ${project.project_id === state.projectId ? "selected" : ""}>${h(project.name || project.project_id)} · ${h(project.project_id)}</option>`).join("")
           : `<option value="">No workspaces yet</option>`;
-        select.disabled = !state.auth?.authenticated || !state.projects.length;
+        select.disabled = !consoleAccessAllowed() || !state.projects.length;
         const account = state.auth?.user;
         $("#identity-mini").textContent = account
           ? `Signed in: @${account.username}`
-          : "Authentication required";
-        $$("[data-view]").forEach(button => { button.disabled = !state.auth?.authenticated; });
+          : localConsoleAccess() ? "Local mode · no sign-in"
+          : state.auth?.setup_required ? "First-time setup" : "Authentication required";
+        $$("[data-view]").forEach(button => { button.disabled = !consoleAccessAllowed() || Boolean(state.setupWizard); });
         const dot = $("#server-dot");
         dot.className = `dot ${state.health?.ok ? "online" : state.health ? "offline" : ""}`;
         $("#server-label").textContent = state.health?.ok ? `Server ${state.health.version}` : state.health ? "Server unavailable" : "Checking server…";
@@ -1598,7 +1640,40 @@
         ruleBadge.title = `${enabledTotal} enabled of ${ruleTotal} workspace rules`;
       }
 
+      function installClientInstructions() {
+        const installerUrl = `${location.origin}/install.sh`;
+        const quotedUrl = `'${installerUrl.replace(/'/g, "'\\''")}'`;
+        const command = `curl -fsSL ${quotedUrl} -o attacca-install.sh\nsh attacca-install.sh`;
+        return `<ol class="stack"><li><strong>Install on the computer running your coding agent.</strong><p class="muted">The installer configures supported clients it finds. Run it outside the Attacca source checkout. Review the downloaded script before running it.</p><pre class="event-payload">${h(command)}</pre><p class="help">For another computer, replace the address with this server's reachable address. A localhost address always refers to the computer running the command.</p></li><li><strong>Open your project in the coding client.</strong><p class="muted">Trust the Attacca hooks when your client asks, then open a new session so it loads the plugin.</p></li><li><strong>Run the project's guided setup.</strong><p class="muted">In Codex: <code>$attacca:setup</code>. In Claude Code: <code>/attacca:setup</code>. Setup connects the checkout, selects or creates the workspace, and registers the AI's role and identity.</p></li><li><strong>Continue in the console.</strong><p class="muted">Create or select a workspace, review its tasks and messages, and let the installed lifecycle hooks keep the agent's project context current.</p></li></ol><div class="notice section-gap"><span>i</span><div><strong>Human access and AI identity are separate.</strong><br>${localConsoleAccess() ? "Local mode does not ask for a browser login or an API key. Agents still use registered workspace identities and role checks." : "With login protection, client setup opens the browser for your approval. The human account authorizes access; it never replaces the AI's registered identity or role."}</div></div>`;
+      }
+
+      function renderClientInstallGuide() {
+        content.innerHTML = pageHead("Setup · connect your agents", "Install Attacca clients", "The server is ready. Connect the tools you use to work on your projects.") +
+          `<section class="card"><div class="card-head"><h2>Connect a coding client</h2><span class="badge accepted">server configured</span></div><div class="card-body">${installClientInstructions()}<div class="form-actions"><button class="button primary" type="button" data-action="finish-server-setup">Open console</button></div><p class="help">You can reopen these instructions from Settings at any time.</p></div></section>`;
+        content.setAttribute("aria-busy", "false");
+      }
+
+      function renderServerSetup() {
+        clearInterval(state.poller);
+        const auth = state.auth || {};
+        const upgrading = !auth.setup_required;
+        const mode = upgrading ? "protected" : setupChoice();
+        if (auth.setup_allowed !== true) {
+          content.innerHTML = pageHead("Setup · local confirmation required", "Finish setup on the server's computer", "Initial access settings can only be changed through a local connection.") +
+            `<div class="notice"><span>!</span><div>Open the console using the server's loopback address, or use an SSH loopback tunnel. Reload after setup is complete. ${auth.network_exposed ? "This server is reachable beyond localhost: login protection is strongly recommended." : ""}</div></div>`;
+          content.setAttribute("aria-busy", "false");
+          return;
+        }
+        content.innerHTML = pageHead("Setup · access protection", upgrading ? "Add login protection" : "Welcome to Attacca", "Choose how people and coding agents access this server. Your AI identities stay separate from browser login.") +
+          `<section class="card"><div class="card-head"><h2>${upgrading ? "Protect this server" : "1. Choose access settings"}</h2><span class="badge pending">${upgrading ? "explicit change" : "first run"}</span></div><div class="card-body">${auth.network_exposed || auth.login_recommended ? `<div class="notice error"><span>!</span><div><strong>Login protection is strongly recommended.</strong><br>${auth.network_exposed ? "This server is listening beyond localhost. Without login, anyone who can reach it can read and change project data. Use a trusted network and HTTPS when allowing remote access." : "Login protection was requested when this server started. Create an administrator to keep that protection enabled."}</div></div>` : `<div class="notice"><span>i</span><div>This server is bound to localhost. No-login mode is convenient for a private computer; login protection is available if you prefer it.</div></div>`}<form data-form="server-setup" class="section-gap"><div class="field"><label for="setup-mode">Access mode</label><select id="setup-mode" name="mode" ${upgrading ? 'aria-readonly="true"' : ""}>${upgrading ? "" : `<option value="local" ${mode === "local" ? "selected" : ""}>No login — private local use</option>`}<option value="protected" ${mode === "protected" ? "selected" : ""}>Require login${auth.login_recommended || auth.network_exposed ? " — recommended" : ""}</option></select><span class="help">This choice is stored on the server. Existing workspaces, agent names, and roles are preserved.</span></div>${mode === "protected" ? `<div class="form-grid section-gap"><div class="field"><label for="setup-username">Administrator account name</label><input id="setup-username" name="username" autocomplete="username" minlength="2" maxlength="64" pattern="[a-z0-9][a-z0-9._-]+" required></div><div class="field"><label for="setup-password">Password</label><input id="setup-password" name="password" type="password" autocomplete="new-password" minlength="8" required></div><div class="field"><label for="setup-password-confirm">Confirm password</label><input id="setup-password-confirm" name="confirm_password" type="password" autocomplete="new-password" minlength="8" required></div></div><p class="help">Creating this administrator also enables login protection. Client installations will need your browser approval.</p>` : `<p class="muted">No account is required. Human actions use a clearly labeled local operator; registered AI actors and role checks remain separate.</p>${auth.network_exposed ? `<label class="section-gap"><input type="checkbox" name="acknowledge_network_risk" required> I understand that anyone who can reach this server can read and change its data without signing in.</label>` : ""}`}<div class="form-actions">${upgrading ? `<button class="button quiet" type="button" data-action="cancel-server-setup">Cancel</button>` : ""}<button class="button primary" type="submit">${mode === "protected" ? "Create administrator and protect server" : "Use without login"}</button></div></form></div></section>`;
+        content.setAttribute("aria-busy", "false");
+      }
+
       function renderAuth() {
+        if (state.auth?.setup_required === true || state.setupWizard === "security") {
+          renderServerSetup();
+          return;
+        }
         const acceptingInvitation = Boolean(state.pendingInvitationToken);
         const bootstrapRequired = Boolean(state.auth?.bootstrap_required);
         // Self-registration is a server setting the panel only mirrors. The
@@ -1614,16 +1689,16 @@
         const description = acceptingInvitation
           ? "Create your own human account from this one-time invitation. Its workspace and administrator scope cannot be widened here."
           : bootstrapRequired
-          ? "Create the human control account first. Authentication enforcement remains off until the server owner enables it in Settings."
+          ? "Create the human control account for this existing installation. Its current authentication settings are preserved."
           : creatingAccount
           ? "Create your own human account on this server. A new account starts with no workspace access: an administrator grants it, or you create your own workspace."
           : "Use your Attacca account to open the hosted control room.";
         const form = acceptingInvitation
           ? `<form data-form="accept-human-invitation"><div class="form-grid"><div class="field"><label for="invite-accept-username">Account name</label><input id="invite-accept-username" name="username" autocomplete="username" minlength="2" maxlength="64" pattern="[a-z0-9][a-z0-9._-]+" required autofocus><span class="help">This immutable name is used for login and audit attribution.</span></div><div class="field"><label for="invite-accept-password">Create password</label><input id="invite-accept-password" name="password" type="password" autocomplete="new-password" minlength="8" required><span class="help">The invitation token remains only in this page's memory and is submitted once over the same-origin API.</span></div></div><div class="form-actions"><button class="button quiet" type="button" data-action="dismiss-invitation-acceptance">Cancel</button><button class="button primary" type="submit">Accept invitation and sign in</button></div></form>`
           : bootstrapRequired
-          ? `<form data-form="auth-bootstrap"><div class="form-grid"><div class="field"><label for="auth-username">Account name</label><input id="auth-username" name="username" autocomplete="username" minlength="2" maxlength="64" pattern="[a-z0-9][a-z0-9._-]+" required><span class="help">This immutable name is used for login and audit attribution.</span></div><div class="field"><label for="auth-password">Password</label><input id="auth-password" name="password" type="password" autocomplete="new-password" minlength="8" required><span class="help">At least 8 characters. The prototype stores a salted password hash, never this plaintext value.</span></div></div><div class="form-actions"><button class="button primary" type="submit">Create administrator and sign in</button></div></form>`
+          ? `<form data-form="auth-bootstrap"><div class="form-grid"><div class="field"><label for="auth-username">Account name</label><input id="auth-username" name="username" autocomplete="username" minlength="2" maxlength="64" pattern="[a-z0-9][a-z0-9._-]+" required><span class="help">This immutable name is used for login and audit attribution.</span></div><div class="field"><label for="auth-password">Password</label><input id="auth-password" name="password" type="password" autocomplete="new-password" minlength="8" required><span class="help">At least 8 characters. Attacca stores a salted password hash, never this plaintext value.</span></div></div><div class="form-actions"><button class="button primary" type="submit">Create administrator and sign in</button></div></form>`
           : creatingAccount
-          ? `<form data-form="auth-register"><div class="form-grid"><div class="field"><label for="auth-username">Account name</label><input id="auth-username" name="username" autocomplete="username" minlength="2" maxlength="64" pattern="[a-z0-9][a-z0-9._-]+" required autofocus><span class="help">This immutable name is used for login and audit attribution.</span></div><div class="field"><label for="auth-password">Password</label><input id="auth-password" name="password" type="password" autocomplete="new-password" minlength="8" required><span class="help">At least 8 characters. The prototype stores a salted password hash, never this plaintext value.</span></div><div class="field"><label for="auth-password-confirm">Confirm password</label><input id="auth-password-confirm" name="confirm_password" type="password" autocomplete="new-password" minlength="8" required></div></div><div class="form-actions"><button class="button quiet" type="button" data-action="dismiss-account-registration">Back to sign in</button><button class="button primary" type="submit">Create account and sign in</button></div></form>`
+          ? `<form data-form="auth-register"><div class="form-grid"><div class="field"><label for="auth-username">Account name</label><input id="auth-username" name="username" autocomplete="username" minlength="2" maxlength="64" pattern="[a-z0-9][a-z0-9._-]+" required autofocus><span class="help">This immutable name is used for login and audit attribution.</span></div><div class="field"><label for="auth-password">Password</label><input id="auth-password" name="password" type="password" autocomplete="new-password" minlength="8" required><span class="help">At least 8 characters. Attacca stores a salted password hash, never this plaintext value.</span></div><div class="field"><label for="auth-password-confirm">Confirm password</label><input id="auth-password-confirm" name="confirm_password" type="password" autocomplete="new-password" minlength="8" required></div></div><div class="form-actions"><button class="button quiet" type="button" data-action="dismiss-account-registration">Back to sign in</button><button class="button primary" type="submit">Create account and sign in</button></div></form>`
           : `<form data-form="auth-login"><div class="form-grid"><div class="field"><label for="auth-username">Username</label><input id="auth-username" name="username" autocomplete="username" required autofocus></div><div class="field"><label for="auth-password">Password</label><input id="auth-password" name="password" type="password" autocomplete="current-password" required></div></div><div class="form-actions">${registrationOpen ? `<button class="button quiet" type="button" data-action="show-account-registration">Create account</button>` : ""}<button class="button primary" type="submit">Sign in</button></div></form>`;
         const context = acceptingInvitation
           ? "Acceptance creates and signs in as a separate human account. It never reuses the inviter's identity or credential, and a consumed, expired, or revoked invitation cannot be replayed."
@@ -1639,7 +1714,8 @@
       async function bootstrap() {
         busy(true);
         // Trust boundary: auth/status is the first application-data request.
-        // Do not fetch projects or settings until bootstrap/login succeeds.
+        // Do not fetch projects or settings until the server admits either
+        // authenticated access or its explicitly configured local mode.
         try {
           state.auth = await api("/v1/auth/status");
         } catch (error) {
@@ -1651,9 +1727,15 @@
           return;
         }
         state.loading = false;
-        if (state.pendingInvitationToken || state.auth.bootstrap_required ||
+        if (state.auth.setup_required === true || state.setupWizard === "security") {
+          updateChrome();
+          renderServerSetup();
+          busy(false);
+          return;
+        }
+        if (state.pendingInvitationToken || !consoleAccessAllowed() || (!localConsoleAccess() && (state.auth.bootstrap_required ||
             (state.auth.bootstrapped && !state.auth.authenticated) ||
-            (state.auth.authentication_required && !state.auth.authenticated)) {
+            (state.auth.authentication_required && !state.auth.authenticated)))) {
           state.projects = [];
           state.serverSettings = null;
           state.credentialAccess = null;
@@ -1666,6 +1748,14 @@
         if (state.auth.user) {
           state.prefs = { ...state.prefs, actor: `web.${state.auth.user.username}`,
             actorType: "human", owner: state.auth.user.username };
+        } else if (localConsoleAccess()) {
+          state.prefs = { ...state.prefs, actor: "web.local", actorType: "human", owner: "" };
+        }
+        if (state.setupWizard === "clients" && consoleAccessAllowed()) {
+          updateChrome();
+          renderClientInstallGuide();
+          busy(false);
+          return;
         }
         let projectsResult;
         try {
@@ -2065,7 +2155,9 @@
             cloudContext: pathFor("/cloud-context"),
             events: pathFor(`/activity${feedQuery("activity", { q: state.activityFilter })}`),
             agents: pathFor(`/agents${listQuery("agents", { q: state.agentSearch })}`),
-            members: pathFor("/members"),
+            ...(state.auth?.authenticated ? {
+              members: pathFor("/members"),
+            } : {}),
             agentOptions: pathFor("/agents?options=1"),
             log: pathFor(`/log${listQuery("log", { q: state.logSearch })}`),
             overviewTasks: pathFor(`/tasks?limit=7&offset=0&sort=newest&status=active&detail=full`),
@@ -2197,8 +2289,18 @@
         const context = { viewport, feedTransition, feedResetApplied: null };
         state.renderContext = context;
         updateChrome();
-        if (!state.auth?.authenticated) {
+        if (state.auth?.setup_required === true || state.setupWizard === "security") {
+          renderServerSetup();
+          state.renderContext = null;
+          return true;
+        }
+        if (!consoleAccessAllowed()) {
           renderAuth();
+          state.renderContext = null;
+          return true;
+        }
+        if (state.setupWizard === "clients") {
+          renderClientInstallGuide();
           state.renderContext = null;
           return true;
         }
@@ -2293,7 +2395,7 @@
       // the server grants the creator membership on the workspace it makes,
       // so there is no separate administrator gate to mirror here.  Keep this
       // the single place the panel answers "may this account create one?".
-      function canCreateWorkspace() { return Boolean(state.auth?.authenticated); }
+      function canCreateWorkspace() { return Boolean(state.auth?.authenticated) || localConsoleAccess(); }
 
       const NO_WORKSPACE_NOTICE =
         "Your account has no workspace yet — ask an administrator to add you, or create a workspace";
@@ -2301,6 +2403,7 @@
         "Your account has no workspace yet — ask an administrator to add you";
 
       function noWorkspaceNotice() {
+        if (localConsoleAccess()) return `<div class="notice"><span>i</span><div><strong>Create your first workspace.</strong><br>A workspace keeps your project's tasks, messages, and AI identities together. You can create one here or connect a project through your coding client's Attacca setup.</div></div>`;
         const text = canCreateWorkspace()
           ? NO_WORKSPACE_NOTICE : NO_WORKSPACE_NOTICE_WITHOUT_CREATE;
         return `<div class="notice"><span>i</span><div><strong>${h(text)}.</strong><br>Workspace access is granted per workspace. Other workspaces may exist on this server; they stay hidden until an administrator or a workspace owner adds your account.</div></div>`;
@@ -2641,7 +2744,7 @@
             ${canWriteShared ? `<div class="notice"><span>✓</span><div><strong>Registered Director project brief.</strong><br>Your update becomes the shared cold-start state for every AI in this workspace; optimistic versions prevent silent Director overwrites.</div></div>` : `<div class="notice error"><span>i</span><div><strong>Shared handoff is read only.</strong><br>Only an exact registered AI Director may edit it. Signed-in web/console humans, Advisors, Workers, and unregistered actors may read it but cannot write it.</div></div>`}
             <form data-form="update-shared-handoff" class="section-gap"><input type="hidden" name="expected_handoff_version" value="${h(sharedVersion)}"><div class="form-grid">${HANDOFF_FIELDS.map((field, index) => `<div class="field ${field === "objective" || field === "notes" ? "wide" : ""}"><label for="shared-handoff-${field}">${h(labels[field])}</label><textarea id="shared-handoff-${field}" name="${field}" ${index === 0 ? "required" : ""} ${canWriteShared ? "" : "disabled"} placeholder="${field === "blockers" ? "None" : "Write a concise, durable project update…"}">${h(sharedHandoff[field] || "")}</textarea></div>`).join("")}</div><div class="form-actions"><button class="button primary" type="submit" ${canWriteShared ? "" : "disabled"}>Update shared project handoff</button></div></form>
           </div></section>
-          <aside class="stack"><div class="card pad"><div class="eyebrow">Repository snapshot</div><div class="list section-gap"><div class="list-row"><span class="muted">Branch</span><code>${h(sharedResponse.git?.branch || "—")}</code></div><div class="list-row"><span class="muted">Revision</span><code>${h(sharedResponse.git?.head || "—")}</code></div><div class="list-row"><span class="muted">Open tasks</span><strong>${h(sharedResponse.open_tasks?.length || 0)}</strong></div><div class="list-row"><span class="muted">Live decisions</span><strong>${h(sharedResponse.decisions?.length || 0)}</strong></div></div></div><div class="notice"><span>i</span><div><strong>Project-wide, not a pseudo-identity</strong><br>Shared handoff v${h(sharedVersion)} has no web.jack, console.jack, or AI owner namespace. Each revision still records the exact Director and human operator that ran it.</div></div></aside></div>
+          <aside class="stack"><div class="card pad"><div class="eyebrow">Repository snapshot</div><div class="list section-gap"><div class="list-row"><span class="muted">Branch</span><code>${h(sharedResponse.git?.branch || "—")}</code></div><div class="list-row"><span class="muted">Revision</span><code>${h(sharedResponse.git?.head || "—")}</code></div><div class="list-row"><span class="muted">Open tasks</span><strong>${h(sharedResponse.open_tasks?.length || 0)}</strong></div><div class="list-row"><span class="muted">Live decisions</span><strong>${h(sharedResponse.decisions?.length || 0)}</strong></div></div></div><div class="notice"><span>i</span><div><strong>Project-wide, not a pseudo-identity</strong><br>Shared handoff v${h(sharedVersion)} is not stored under a browser, console, or AI owner namespace. Each revision still records the exact Director and human operator that ran it.</div></div></aside></div>
           <section class="card section-gap"><div class="card-head"><h2>Shared handoff history</h2><span class="faint small">Project-wide Director revisions</span></div><div class="card-body"><div class="filterbar"><input id="shared-handoff-search" type="search" value="${h(state.sharedHandoffSearch)}" placeholder="Search shared handoff versions…" aria-label="Search shared handoff history">${sortControl("sharedHandoff")}</div><div class="list">${sharedVersions.length ? sharedVersions.map(version => `<details class="list-row" style="display:block"><summary><span class="list-title">v${h(version.version)}</span> <span class="faint small">${h(attributionText(version.updated_by || "unknown", "agent", version.updated_owner))} · ${h(fmtTime(version.updated_at))}</span></summary><div class="message-body section-gap">${HANDOFF_FIELDS.map(field => (version.content && version.content[field]) ? `<div><strong>${h(labels[field])}:</strong> ${h(version.content[field])}</div>` : "").join("")}</div></details>`).join("") : empty(state.sharedHandoffSearch ? "No matching shared handoff versions" : listPage("sharedHandoff").offset ? "No shared handoff versions at this offset" : "No shared handoff history yet", state.sharedHandoffSearch ? "Change or clear the project-wide history search." : listPage("sharedHandoff").offset ? "Use Previous to return to an available page." : "The first registered Director update will create shared handoff v1.")}</div>${pageToolbar("sharedHandoff", sharedHistory, "versions", "shared handoff versions")}</div></section>
           <section class="card section-gap"><div class="card-head"><div><h2>Exact AI identity handoff</h2><span class="faint small">Independent continuity after the shared project brief</span></div></div><div class="card-body">${identityChoices.length ? `<div class="form-grid"><div class="field wide"><label for="handoff-identity">Registered AI identity</label><select id="handoff-identity">${identityChoices.map(choice => `<option value="${h(choice.actor_id)}" ${choice.actor_id === requestedActor ? "selected" : ""}>${h(choice.label)}</option>`).join("")}</select><span class="help">Only registered AI identities appear here; web and console human operators never receive identity handoffs. Selecting another AI is read-only and never changes this panel's authenticated actor.</span></div></div>` : empty("No registered AI identities", "Register an AI before an exact identity handoff can be selected. Human web/console actors are intentionally excluded.")}</div></section>
           ${identityChoices.length ? `<div class="grid main-side section-gap"><section class="card"><div class="card-head"><div><h2>Current identity handoff · ${h(actorDisplay(requestedActor))}</h2><span class="faint small">identity v${h(identityVersion)} · context v${h(response.context_version ?? sharedResponse.context_version ?? "—")}</span></div><span class="faint small">${(response.identity_handoff_updated_by || response.handoff_updated_by) ? h(attributionText(response.identity_handoff_updated_by || response.handoff_updated_by, "agent", response.identity_handoff_updated_owner || response.handoff_updated_owner)) : "not written"} · ${h(fmtTime(response.identity_handoff_updated_at || response.handoff_updated_at))}</span></div><div class="card-body">
@@ -2705,7 +2808,7 @@
         const pagedEvents = activityPage.rows;
         const verify = state.data.verify;
         return pageHead("Append-only record", "Activity & ledger", "Inspect raw events, append a custom event, and verify the local hash chain.", `<button class="button" data-action="verify-ledger">Verify ledger</button>`) +
-          `<div class="notice"><span>i</span><div><strong>Attribution is recorded literally.</strong><br>New canonical AI actors have an internal <code>&lt;workspace&gt;.&lt;role&gt;.&lt;runtime&gt;.&lt;persona&gt;</code> identity and a server-unique friendly name such as <strong>Gibbs</strong> / <strong>@Gibbs</strong>. Names are reserved forever across all workspaces. Existing Red/Blue and three-part identities remain compatibility records; explicit setup repair safely aliases a grandfathered duplicate to its unique replacement. <strong>Run by user</strong> is the separate authenticated human responsible for that AI action. Browser identity headers cannot override the signed-in human account. Legacy <code>jack.vscode</code> rows marked human/tool came from the <code>vscode</code> shell account; they are not evidence that the VS Code AI performed that work.</div></div>` +
+          `<div class="notice"><span>i</span><div><strong>Attribution is recorded literally.</strong><br>New canonical AI actors have an internal <code>&lt;workspace&gt;.&lt;role&gt;.&lt;runtime&gt;.&lt;persona&gt;</code> identity and a server-unique friendly name such as <strong>Gibbs</strong> / <strong>@Gibbs</strong>. Names are reserved forever across all workspaces. Existing Red/Blue and three-part identities remain compatibility records; explicit setup repair safely aliases a grandfathered duplicate to its unique replacement. <strong>Run by user</strong> is the separate authenticated human responsible for that AI action. Browser identity headers cannot override the signed-in human account. Legacy shell-attributed rows marked human/tool record the operating-system account; they are not evidence that the VS Code AI performed that work.</div></div>` +
           (state.errors.events ? errorNotice(state.errors.events) : "") +
           `<div class="grid main-side"><section class="card"><div class="card-head"><h2>${h(activityPage.total)} matching events</h2>${verify ? statusBadge(verify.ok ? "ok" : "error") : ""}</div><div class="card-body"><div class="filterbar"><input id="activity-search" type="search" value="${h(state.activityFilter)}" placeholder="Search full ledger by type, actor, task, user, or payload…" aria-label="Filter activity history"><span class="faint small">Raw Activity semantics are unchanged; the server searches the complete authorized ledger before paging.</span></div>${activityPage.total || activityPage.offset ? feedToolbar("activity", activityPage, `${pagedEvents.length} raw events returned`) : ""}${pagedEvents.length ? `<div class="history-feed" id="activity-feed" role="log" aria-label="Activity event history" aria-live="off" tabindex="0" data-feed-scope="${h(activityScope)}">${pagedEvents.map(event => { const operational = event.operational_actor_id || event.actor_id; return `<details class="event-row" data-feed-key="${h(event.seq)}"><summary><span class="mono faint">#${h(event.seq)}</span><span class="truncate">${statusBadge(event.event_type)}</span><span class="event-actor truncate muted" title="Ledger actor: ${h(event.actor_id)}">${h(attributionText(operational, event.actor_type, event.owner, event.attribution))}</span><span class="faint small">${h(fmtTime(event.created_at, false))}</span></summary><pre class="event-payload">${j(event.payload)}</pre></details>`; }).join("")}</div>` : empty(state.activityFilter ? "No matching events" : activityPage.offset ? "No events at this offset" : "No events yet", state.activityFilter ? "Change or clear the full-ledger search." : activityPage.offset ? "Use Newer to return to an available page." : "Append a custom event or wait for project activity.")}</div></section>
           <aside class="stack"><div class="card"><div class="card-head"><h2>Search project memory</h2>${state.searchResults ? `<span class="badge accepted">${h(state.searchResults.total ?? state.searchResults.total_hits ?? 0)} hits</span>` : ""}</div><div class="card-body"><form data-form="search-project"><div class="field"><label for="project-memory-search">Query</label><input id="project-memory-search" type="search" name="query" required value="${h(state.searchQuery)}" placeholder="decision, filename, message…"></div><div class="form-actions">${sortControl("search")}<button class="button primary small" type="submit">Search everything</button></div></form>${renderSearchResults(state.searchResults)}</div></div>
@@ -2842,13 +2945,16 @@
         const activationButton = eligibility.enabled
           ? "Disable authentication enforcement"
           : "Enable authentication enforcement";
-        return pageHead("Account and access", "Settings", "Manage browser sign-in, human-owned API keys for installed clients, and server behavior. AI identities remain separate.") +
-          `<div class="notice"><span>✓</span><div><strong>Signed in as @${h(account.username)}</strong><br>This immutable account name is used for login and audit attribution. It authorizes clients but never renames or replaces an AI identity.</div></div>
+        const local = localConsoleAccess() && !state.auth?.authenticated;
+        return pageHead("Account and access", "Settings", "Manage access protection, client installation, and server behavior. AI identities remain separate.", `<button class="button" type="button" data-action="show-client-install">Install clients</button>`) +
+          `${local ? `<div class="notice"><span>i</span><div><strong>Local mode · no sign-in required</strong><br>Project actions are attributed to a local operator, not an authenticated account. AI identities and roles remain separately registered.</div></div>` : `<div class="notice"><span>✓</span><div><strong>Signed in as @${h(account.username)}</strong><br>This immutable account name is used for login and audit attribution. It authorizes clients but never renames or replaces an AI identity.</div></div>`}
           <div class="grid two section-gap">
+            ${local ? `<section class="card" style="grid-column:1/-1"><div class="card-head"><h2>Login protection</h2><span class="badge pending">off</span></div><div class="card-body"><p class="muted">${state.auth?.network_exposed ? "This server is listening beyond localhost. Login protection is strongly recommended: anyone who can reach it currently has access." : "No login is required on this private server. You can enable protection without changing existing project or AI identities."}</p>${state.auth?.setup_allowed ? `<div class="form-actions"><button class="button primary" type="button" data-action="protect-local-server">Set up login protection</button></div>` : `<p class="help">To add protection, open this console on the server's computer using its loopback address or an SSH loopback tunnel.</p>`}</div></section>` : `
             ${renderPendingClientAuthorization()}
             <section class="card"><div class="card-head"><h2>Human account</h2><span class="badge accepted">${account.is_owner ? "server owner" : account.is_admin ? "admin" : "user"}</span></div><div class="card-body"><div class="list"><div class="list-row"><span class="muted">Account name</span><strong>@${h(account.username)}</strong></div><div class="list-row"><span class="muted">Authentication authority</span><strong>${account.is_owner ? "Owner toggle available" : "Read only · server owner required"}</strong></div></div><div class="form-actions"><button class="button danger" type="button" data-action="auth-logout">Sign out</button></div></div></section>
             <section class="card"><div class="card-head"><h2>Authentication enforcement</h2>${statusBadge(eligibility.enabled ? "enabled" : "off")}</div><div class="card-body"><p class="muted">${h(activationText)}</p>${eligibility.reasons.length ? `<div class="notice section-gap"><span>i</span><div>${h(eligibility.reasons.join(" "))}</div></div>` : ""}<div class="form-actions"><button class="button ${eligibility.enabled ? "danger" : "primary"}" type="button" data-action="toggle-authentication" ${eligibility.allowed ? "" : "disabled"} data-enabled="${eligibility.enabled ? "false" : "true"}">${h(activationButton)}</button></div></div></section>
             <section class="card" style="grid-column:1/-1"><div class="card-head"><div><h2>Client API keys</h2><span class="faint small">one human-owned key per authorized client</span></div><span class="badge">${h(keyPage.unfilteredTotal)} key${keyPage.unfilteredTotal === 1 ? "" : "s"}</span></div><div class="card-body"><div class="notice"><span>i</span><div><strong>Client authorization and AI identity are separate.</strong><br>New installations open a short-lived authorization request here. Review the client and scope, then explicitly authorize or deny it. The browser never displays or asks you to copy an API key.</div></div>${access.supported ? "" : `<div class="notice error section-gap"><span>!</span><div><strong>Client API key management is unavailable.</strong><br>Upgrade the hosted Attacca service before enabling authentication.</div></div>`}${state.errors.clientKeys ? errorNotice(state.errors.clientKeys) : ""}<div class="filterbar section-gap"><input id="client-key-search" type="search" value="${h(state.clientKeySearch)}" placeholder="Search all client keys by label, installation, owner, status, or scope…" aria-label="Search client API keys">${sortControl("clientKeys")}</div><div class="list section-gap">${keyRows}</div>${pageToolbar("clientKeys", access, "client_keys", "client API keys")}</div></section>
+            `}
             <section class="card"><div class="card-head"><h2>Browser refresh</h2></div><div class="card-body"><form data-form="save-panel-behavior"><div class="form-grid"><div class="field"><label for="settings-refresh">Refresh interval</label><input id="settings-refresh" name="refreshSeconds" type="number" min="5" max="300" value="${h(state.prefs.refreshSeconds)}"></div><div class="field"><label for="settings-auto">Live refresh</label><select id="settings-auto" name="autoRefresh"><option value="true" ${state.prefs.autoRefresh ? "selected" : ""}>On</option><option value="false" ${!state.prefs.autoRefresh ? "selected" : ""}>Off</option></select></div></div><div class="form-actions"><button class="button primary" type="submit">Save browser settings</button></div></form></div></section>
             <section class="card"><div class="card-head"><h2>Server runtime</h2>${statusBadge(state.health?.ok ? "ok" : "error")}</div><div class="card-body"><form data-form="save-runtime"><div class="form-grid"><div class="field wide"><label for="runtime-default">Default workspace</label><select id="runtime-default" name="default_project"><option value="">No server default</option>${state.projects.map(project => `<option value="${h(project.project_id)}" ${settings.default_project === project.project_id ? "selected" : ""}>${h(project.name)} · ${h(project.project_id)}</option>`).join("")}</select></div><div class="field"><label for="runtime-update-interval">AI update checks</label><select id="runtime-update-interval" name="update_interval_seconds">${[[0,"Off"],[60,"Every minute (default)"],[300,"Every 5 minutes"],[600,"Every 10 minutes"],[1800,"Every 30 minutes"],[3600,"Every hour"]].map(([seconds,label]) => `<option value="${seconds}" ${Number(settings.update_interval_seconds) === seconds ? "selected" : ""}>${label}</option>`).join("")}</select></div><div class="field"><label for="runtime-verbose">Request logging</label><select id="runtime-verbose" name="verbose"><option value="false" ${!settings.verbose ? "selected" : ""}>Quiet</option><option value="true" ${settings.verbose ? "selected" : ""}>Verbose</option></select></div></div><div class="form-actions"><button class="button primary" type="submit">Save watcher settings</button></div></form><div class="notice section-gap"><span>↗</span><div><strong>Connection changes stay local to each client installation.</strong><br>The active AI opens sign-in and secure key collection itself; this panel never asks a human to run a shell command.</div></div></div></section>
             <section class="card" style="grid-column:1/-1"><div class="card-head"><h2>Download all workspace data</h2></div><div class="card-body"><p class="muted">Download a deterministic snapshot of the selected workspace, including the ledger and full logs. Authentication secrets are excluded. This is a private human backup, not the agent sync mirror; a failed download stays visible and no empty placeholder file is saved.</p><div class="form-actions" style="justify-content:flex-start"><button class="button primary" type="button" data-action="download-export" data-format="zip" ${state.projectId ? "" : "disabled"}>ZIP</button><button class="button" type="button" data-action="download-export" data-format="json" ${state.projectId ? "" : "disabled"}>Full JSON</button><button class="button" type="button" data-action="download-export" data-format="ledger.ndjson" ${state.projectId ? "" : "disabled"}>Ledger NDJSON</button><button class="button" data-action="download-export" data-format="full-log.txt" ${state.projectId ? "" : "disabled"}>Full log</button></div></div></section>
@@ -2983,6 +3089,21 @@
         if (!button || button.disabled) return;
         const action = button.dataset.action;
         try {
+          if (action === "show-client-install") {
+            state.setupWizard = "clients";
+            render({ force: true });
+          }
+          if (action === "finish-server-setup" || action === "cancel-server-setup") {
+            state.setupWizard = "";
+            state.setupMode = "";
+            await bootstrap();
+          }
+          if (action === "protect-local-server") {
+            if (!localConsoleAccess() || state.auth?.setup_allowed !== true) throw new Error("Login protection must be set up through a local connection.");
+            state.setupMode = "protected";
+            state.setupWizard = "security";
+            render({ force: true });
+          }
           if (action === "list-previous") {
             await navigateList(button.dataset.listPage, -1);
           }
@@ -3199,6 +3320,11 @@
       });
 
       document.addEventListener("change", async event => {
+        if (event.target.id === "setup-mode") {
+          state.setupMode = event.target.value;
+          renderServerSetup();
+          return;
+        }
         try {
           if (event.target.id === "project-select" && event.target.value) await selectProject(event.target.value);
           if (event.target.id === "room-workspace" && event.target.value) {
@@ -3396,6 +3522,21 @@
         const submit = form.querySelector("button[type=submit]");
         if (submit) submit.disabled = true;
         try {
+          if (kind === "server-setup") {
+            const body = setupRequest(values, state.auth, state.setupWizard === "security");
+            const result = await api("/v1/setup", { method: "POST", body });
+            if (result.setup_required === true || result.access_mode !== body.mode ||
+                (body.mode === "local" ? !localConsoleAccess(result) :
+                  result.authentication_required !== true || result.authenticated !== true)) {
+              throw new Error("Setup was not confirmed. Reload the console to check the server's current access settings.");
+            }
+            state.auth = result;
+            form.reset();
+            state.setupWizard = "clients";
+            state.setupMode = "";
+            await bootstrap();
+            toast(body.mode === "protected" ? "Login protection enabled" : "Local no-login mode configured");
+          }
           if (kind === "auth-bootstrap") {
             state.auth = await api("/v1/auth/bootstrap", { method: "POST", body: { username: values.username.trim(), password: values.password } });
             form.reset();
