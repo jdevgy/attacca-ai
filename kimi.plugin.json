@@ -1,6 +1,6 @@
 {
   "name": "attacca",
-  "version": "0.5.11",
+  "version": "0.5.12",
   "description": "Shared project memory for AI coding tools: event ledger, task claims, decisions, human+AI room, and cold-start handoffs across Kimi Code, Claude Code, Codex, GLM, Cline and any MCP client.",
   "interface": {
     "displayName": "Attacca — Project Continuity Layer",

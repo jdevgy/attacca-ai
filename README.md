@@ -1,22 +1,15 @@
 # Attacca
 
-Attacca is a self-hosted project-continuity layer for humans and AI coding tools.
-It keeps the parts of a project that outlive a chat window — an append-only
-event ledger, a shared task board, decisions, handoffs, binding rules, and one
-human+AI room — on a small server you run yourself. Claude Code, Codex CLI,
-Kimi Code, Cline, Cursor, Windsurf, other MCP clients, and the browser Control
-Panel all read and write the same workspace, so any one session can end, crash,
-or be replaced without taking the project state with it. Sessions are
-disposable; the project is not.
+Attacca keeps shared project memory, tasks, decisions, and messages for humans
+and AI coding tools. Run it on your own computer; Claude, Codex, Kimi, other
+MCP clients, and the browser console share the same workspace.
 
 ## Quick start (local server)
 
-You need Python 3.8+ and Git; the plugin-install example also uses `curl` and a
-POSIX shell. Attacca itself is Python standard library only. Clone the source
-and run it directly; no package manager, build step, subscription, or hosted
-account is required.
+You need Python 3.8+, Git, and a POSIX shell (Linux, macOS, or WSL). There are no
+Python packages to install. Login protection is optional.
 
-**1. Clone the repository and start the server**
+**1. Start Attacca**
 
 ```bash
 git clone https://github.com/jdevgy/attacca-ai.git
@@ -24,68 +17,99 @@ cd attacca-ai
 python3 attacca.py serve --host 127.0.0.1 --port 4173
 ```
 
-Leave that terminal running. All state lives in one SQLite file
-(`~/.attacca/attacca.db`; override with
-`ATTACCA_DB`), and `http://127.0.0.1:4173/healthz` reports the running version.
-Any free port works — `8722` is the built-in default the examples further down
-use.
+Leave that terminal running. Open **http://127.0.0.1:4173/** — the console,
+not a landing page — and choose **local use without login** or **protect with
+login**. Use login protection for network access; complete first-run setup
+locally or through an SSH tunnel. Your choice persists across restarts.
 
-**2. Open the console and choose whether to require login**
+**2. Install the coding-tool plugin**
 
+In a second terminal, from the cloned `attacca-ai` directory:
+
+```bash
+python3 install.py --url http://127.0.0.1:4173
 ```
-http://127.0.0.1:4173/
-```
 
-The server opens directly into its Control Panel; there is no separate landing
-page. `/app` remains an alias. On a new installation, the first-run guide
-explains plugin installation and offers two choices:
+This installs **the code in your local clone**, with no `curl` or plugin
+download, and configures the coding tools it finds. It is safe to rerun.
 
-- **Local use without login:** open the console and connect agents without
-  creating an account or approving client keys.
-- **Protect with login:** create the first administrator and enable login
-  protection together. Browser users sign in; coding clients use the existing
-  browser-approval flow to get their own installation credential.
-
-Complete this first choice from a browser on the server's computer, or through
-an SSH tunnel. For a server bound beyond localhost, the guide selects and
-strongly recommends login protection; proceeding without it requires a
-separate acknowledgement. See [deployment guidance](SECURITY.md#deployment-guidance)
-before using a LAN or remote address.
-
-You can enable login protection later in **Settings** from the server's local
-browser. The choice is saved: normal restarts and upgrades do not ask again or
-switch an existing protected installation to no-login mode. Agent names,
-workspace roles, and task ownership remain separate from the login choice.
-
-**3. Install the Attacca plugin into your coding tools**
+Alternatively, install from a running server (useful for Docker or a remote
+server; run this on the machine where your coding tool runs):
 
 ```bash
 cd ~
 curl -fsSL http://127.0.0.1:4173/install.sh | sh
 ```
 
-Run this from your home directory, not from this checkout. The server serves
-its own plugin pre-wired to the URL it came from, installs it under
-`~/.attacca/plugin/attacca`, and configures every AI coding tool it finds.
+Replace `127.0.0.1:4173` with the address reachable from that machine. Both
+methods install under `~/.attacca/plugin/attacca`; neither changes your server's
+login policy.
 
-**4. Link a project and register the AI**
+**3. Connect your project**
 
-Open your own project in Claude Code and run `/attacca:setup` (Codex:
-`$attacca:setup`; Kimi: `/attacca:setup`). The guided flow picks or creates a
-workspace, registers this AI's role and identity, and writes the non-secret
-workspace link into `.attacca/project.json`.
+Start a new coding-tool session in your own project. Run `/attacca:setup` in
+Claude or Kimi, or `$attacca:setup` in Codex. Pick a workspace and AI identity;
+approve the browser link if login protection is enabled. Normal resumes reuse
+that identity. Check it with `/attacca:status` (Codex: `$attacca:update`).
 
-**5. Verify**
+## Everyday commands
 
-Run `/attacca:status` in Claude Code or Kimi (Codex: `$attacca:update`). It
-reports the linked workspace, this AI's identity, and the current handoff.
+### Reset a forgotten password
 
-To add accounts to a protected installation, see
-[optional login protection](#optional-login-protection). For updates, keep
-your database, stop your own server when convenient, pull the new source, and
-start it again with the same database and options. Running servers keep their
-existing distribution snapshot until they are restarted; installing a client
-update is a separate action.
+On the **server's computer**, from its source directory and using the same OS
+user that runs the server:
+
+```bash
+python3 attacca.py auth reset-password USERNAME
+```
+
+Enter the new password twice at the hidden prompts. No AI, existing login, or
+server restart is needed. This signs out that account's browser sessions;
+client API keys, project identities, and the server's login setting are unchanged.
+Local access to the server's database is required. Never put the password on the
+command line.
+
+The default database is `~/.attacca/attacca.db` (`ATTACCA_DB` can override it).
+If the server uses another file, pass that **same file**:
+
+```bash
+python3 attacca.py --db /path/to/attacca.db auth reset-password USERNAME
+```
+
+### Change the server address without reinstalling
+
+On each client machine, when your **existing server** moves to another IP or
+hostname:
+
+```bash
+attacca server set http://NEW_HOST:4173 --same-server
+```
+
+Or use `python3 ~/.attacca/plugin/attacca/attacca.py` in place of `attacca`.
+This verifies the saved credential and exact AI identities at the new address
+and copies their bindings. A new scoped mirror is rebuilt at the next
+authenticated lifecycle sync.
+Use `--from-url http://OLD_HOST:4173` if the old endpoint is not the currently
+configured one. Only use `--same-server` for a trusted address of the **same
+server**, never for a different installation. Address changes cannot be
+automatically discovered without a stable hostname or reachable old address.
+
+Old cached mirrors and **unsent offline writes stay under the old URL**; they
+are not moved or replayed at the new address. Restore access to the old address
+to sync those writes before retiring it.
+
+Use `127.0.0.1` when client and server run in the same machine/container. From
+elsewhere, use stable DNS or the Docker host's published port — not a container's
+changing private IP.
+
+## Advanced reference
+
+The quick start above is enough for normal use. Expand this for architecture,
+account administration, installation details, APIs, and development.
+
+<details>
+<summary>Show advanced documentation</summary>
+
 
 ## What you get
 
@@ -231,7 +255,21 @@ setup locally or through an SSH tunnel, choose login protection, and follow
 [SECURITY.md](SECURITY.md#deployment-guidance). Existing servers retain their
 saved protection setting; changing a bind address does not silently change it.
 
-**2. Users install the plugin from the server — one line, every tool:**
+**2. Install clients from the local source or running server:**
+
+From a clone on the machine where the coding tool runs:
+
+```bash
+python3 install.py --url http://127.0.0.1:8722
+```
+
+The Python entrypoint builds the allowlisted plugin bundle from that clone and
+runs the same universal installer from a temporary neutral directory. It needs
+a POSIX shell but neither `curl` nor a running download endpoint. It does not
+start or restart the server, choose its login policy, or link a project.
+
+For a Docker/remote server, or a machine without the source clone, run from
+outside the source checkout:
 
 ```bash
 curl -fsSL http://127.0.0.1:8722/install.sh | sh
@@ -257,6 +295,11 @@ one managed MCP entry instead of stacking active copies, and it configures a
 newly installed client that was absent on the previous run. Claude user/project/
 local registrations in the current checkout are normalized to one user plugin;
 old `.orphaned_at` cache directories are inactive retention, not registrations.
+
+For updates, keep the database, stop your own server when convenient, pull the
+new source, and restart with the same database and options. Running servers
+retain their original distribution snapshot until restarted. Updating installed
+clients is separate: rerun either installer with the intended source or server.
 
 Prefer a native in-tool install? The same zip carries Claude, Kimi, and Codex
 plugin manifests:
@@ -445,8 +488,9 @@ opens the browser directly on Settings with only a short-lived pairing code in
 the URL. The signed-in human explicitly Authorizes or Denies the reviewed
 installation. The helper polls silently, stores the delivered credential, and
 automatically reconnects MCP and watcher sync in the same running client. The
-AI runs this flow itself: the product never tells the human to run a recovery
-shell command or asks anyone to create, copy, reveal, or paste a key.
+AI runs this client-pairing flow itself: nobody needs to create, copy, reveal,
+or paste a key. A forgotten browser password is different; use the local
+[password-reset command](#reset-a-forgotten-password).
 
 After verification, the helper atomically stores the key in the private
 `~/.attacca/credentials.json` registry with mode `0600`, scoped by the full
@@ -906,3 +950,5 @@ python3 attacca.py event verify  # hash-chain + sequence integrity of a real led
   separately visible on every new event.
 - The room is a projection of `room.message` events in the ledger — chat is not the
   database.
+
+</details>

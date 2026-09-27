@@ -54,6 +54,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import warnings
 import zipfile
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -65,7 +66,7 @@ try:
 except ImportError:  # pragma: no cover - Windows keeps thread serialization
     fcntl = None
 
-VERSION = "0.5.11"
+VERSION = "0.5.12"
 MCP_SUPPORTED_PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18")
 MCP_DEFAULT_PROTOCOL = "2025-06-18"
 DEFAULT_UPDATE_INTERVAL_SECONDS = 60
@@ -2218,6 +2219,7 @@ DEVICE_ENROLLMENT_INTERVAL_SECONDS = 5
 AUTH_MODES = ("auto", "compatibility")
 AUTH_ARTIFACT_FILES = (
     "attacca.py",
+    "install.py",
     "local_access.py",
     "terminal_flow.py",
     "sync_client.py",
@@ -2228,6 +2230,9 @@ AUTH_ARTIFACT_FILES = (
     "hooks/hooks.json",
     "hooks/session_start.py",
     "web/admin.html",
+    "hooks/wait_for_change.py",
+    "hooks/codex_wake.py",
+    "monitors/monitors.json",
     "plugin-mcp.json",
     "kimi.plugin.json",
     ".codex-plugin/plugin.json",
@@ -3682,6 +3687,81 @@ def auth_reset_password(conn, username, password):
             " FROM auth_users WHERE username=?) AND revoked_at IS NULL",
             (now_iso(), username))
     return {"ok": True, "username": username, "sessions_revoked": True}
+
+
+def auth_reset_password_cli(db_path, username):
+    """Recover an existing account as the local database's OS owner.
+
+    This deliberately bypasses connect(): recovery must not create a database,
+    migrate its schema, or change any authentication policy. It is not exposed
+    over HTTP or MCP and never accepts a password through arguments or stdin.
+    """
+    username = _clean_username(username)
+    path = Path(db_path).expanduser().absolute()
+    try:
+        info = path.lstat()
+    except OSError:
+        raise AttaccaError(
+            "password recovery requires an existing server database; "
+            "check --db (no database was created)") from None
+    if not stat.S_ISREG(info.st_mode):
+        raise AttaccaError(
+            "password recovery requires a regular database file, not a "
+            "directory or symbolic link")
+    if hasattr(os, "geteuid") and os.geteuid() not in (0, info.st_uid):
+        raise AttaccaError(
+            "run password recovery as the operating-system user who owns "
+            "the server database (or the local administrator)")
+    if not sys.stdin.isatty():
+        raise AttaccaError(
+            "password recovery requires an interactive terminal; passwords "
+            "cannot be supplied through command arguments or a pipe")
+
+    conn = None
+    try:
+        # mode=rw never creates a missing database, including if the path was
+        # removed after the filesystem check. as_uri also quotes '#' and '?'.
+        conn = sqlite3.connect(path.as_uri() + "?mode=rw", uri=True,
+                               isolation_level=None, timeout=10)
+        conn.row_factory = sqlite3.Row
+        current = path.lstat()
+        if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino) \
+                or not stat.S_ISREG(current.st_mode):
+            raise AttaccaError("database path changed; retry password recovery")
+        # Check the existing schema before prompting; no schema repair or new
+        # account creation is an incidental side effect of recovery.
+        conn.execute("SELECT session_hash, user_id, revoked_at "
+                     "FROM auth_sessions LIMIT 0")
+        row = conn.execute(
+            "SELECT user_id FROM auth_users WHERE username=? "
+            "AND disabled_at IS NULL", (username,)).fetchone()
+        if row is None:
+            raise AttaccaError("unknown active Attacca user '%s'" % username)
+        print("Resetting password for '%s' in %s" % (username, path),
+              file=sys.stderr)
+        try:
+            # getpass normally falls back to echoed stdin on unsupported
+            # terminals. Treat its warning as an error before it can do that.
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", getpass.GetPassWarning)
+                password = getpass.getpass("New password: ")
+                confirmation = getpass.getpass("Confirm new password: ")
+        except (EOFError, KeyboardInterrupt, getpass.GetPassWarning):
+            raise AttaccaError(
+                "password recovery cancelled or a hidden terminal prompt "
+                "was unavailable; password unchanged") from None
+        if password != confirmation:
+            raise AttaccaError("passwords do not match; password unchanged")
+        result = auth_reset_password(conn, username, password)
+        result["database"] = str(path)
+        return result
+    except (OSError, sqlite3.Error):
+        raise AttaccaError(
+            "cannot reset password in this existing Attacca database; "
+            "check --db, file permissions, and database availability") from None
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def auth_verify_user(conn, username, password):
@@ -14669,6 +14749,7 @@ def save_project_export_artifact(path, data, force=False):
 # install payload.
 PLUGIN_FILES = [
     "attacca.py",
+    "install.py",
     "local_access.py",
     "codex_hook_compat.py",
     "offline_sync.py",
@@ -14693,6 +14774,9 @@ PLUGIN_FILES = [
     "kimi-skills/session/SKILL.md",
     "hooks/hooks.json",
     "hooks/session_start.py",
+    "hooks/wait_for_change.py",
+    "hooks/codex_wake.py",
+    "monitors/monitors.json",
     "web/admin.html",
     "commands/status.md",
     "commands/brief.md",
@@ -14892,10 +14976,14 @@ BASE="{base}"
 DEST="$HOME/.attacca/plugin/attacca"
 EXPECTED_VERSION="{version}"
 TMP="$(mktemp -d)"
-echo "downloading attacca from $BASE/plugin.zip ..."
-if command -v curl >/dev/null 2>&1; then
+if [ -n "$ATTACCA_INSTALL_ARCHIVE" ]; then
+  echo "installing attacca from the local source archive ..."
+  cp "$ATTACCA_INSTALL_ARCHIVE" "$TMP/plugin.zip"
+elif command -v curl >/dev/null 2>&1; then
+  echo "downloading attacca from $BASE/plugin.zip ..."
   curl -fsS "$BASE/plugin.zip" -o "$TMP/plugin.zip"
 else
+  echo "downloading attacca from $BASE/plugin.zip ..."
   wget -qO "$TMP/plugin.zip" "$BASE/plugin.zip"
 fi
 python3 - "$TMP/plugin.zip" "$DEST" "$EXPECTED_VERSION" <<'PYEOF'
@@ -21830,6 +21918,14 @@ _WATCHER_REMOTE_STATE_FIELDS = (
     "context_version", "offline_mode", "offline_failure_count",
     "offline_pending_sync", "offline_mirror_stale", "wake_reason",
     "wake_requested_at_epoch",
+    "sync_scope", "sync_mirror_key", "identity_verified_at",
+    "sync_schema_version", "sync_visibility_fingerprint",
+    "sync_projection_capabilities", "sync_activated_at",
+    "offline_mirror_cursor", "offline_mirror_verified_at",
+    "offline_pending_count", "offline_conflict_count",
+    "offline_convergence_awaiting_count",
+    "auth_required", "auth_required_at", "last_auth_error_fingerprint",
+    "offline_retry_seconds", "offline_next_retry_at_epoch",
 )
 
 
@@ -21842,7 +21938,9 @@ def _merge_watcher_pending(left, right):
         if marker not in seen:
             seen.add(marker)
             output.append(item)
-    return output[-50:]
+    # Endpoint relocation can collapse two subscriptions. Their pending mail
+    # is a durable FIFO, not a display preview; never discard older rows.
+    return output
 
 
 def _retarget_watcher_state(state, server_url):
@@ -21869,6 +21967,10 @@ def _retarget_watcher_state(state, server_url):
             entry["cursor_registered_at_epoch"] = time.time()
             for field in _WATCHER_REMOTE_STATE_FIELDS:
                 entry.pop(field, None)
+            if isinstance(entry.get("pending"), list):
+                entry["pending"] = [row for row in entry["pending"]
+                                    if not (isinstance(row, dict) and row.get("kind") ==
+                                            "authentication_required")]
             changed_count += 1
         existing = rewritten.get(new_key)
         if existing is not None:
@@ -22074,7 +22176,124 @@ def machine_server_show(home=None):
     }
 
 
-def machine_server_set(server_url, home=None, validate=True, probe=None):
+@contextlib.contextmanager
+def _server_relocation_store(home, enabled):
+    """Hold the private credential lock across switch preparation and commit."""
+    if not enabled:
+        yield None
+        return
+    flow = _terminal_flow_runtime()
+    path = flow.default_credentials_path(home) if home is not None else \
+        Path(CREDENTIALS_FILE)
+    with flow._private_file_lock(path):
+        data = flow._read_private_json_unlocked(
+            path, {"schema": flow.SCHEMA_VERSION, "servers": {}},
+            "Attacca credentials", flow.MAX_CREDENTIALS_BYTES)
+        yield {"path": path, "data": data, "changed": False}
+
+
+def _prepare_same_server_relocation(machine, store, source_url, target_url,
+                                    transport=None):
+    """Copy only explicitly entrusted, freshly verified installation state.
+
+    A health response or matching server ID is not proof of an endpoint's
+    identity. The operator's --same-server declaration is the trust decision;
+    the authenticated checks below detect wrong instances/scopes before any
+    local configuration changes. Redirects are never followed with a bearer.
+    Existing URL-partitioned mirrors, outboxes and old credentials stay put.
+    """
+    flow = _terminal_flow_runtime()
+    if source_url == target_url:
+        return {"client_keys": 0, "actor_bindings": 0}
+    if source_url.startswith("https://") and target_url.startswith("http://"):
+        raise AttaccaError("same-server relocation refuses an HTTPS to HTTP downgrade")
+    data = store["data"]
+    source = flow.server_record_for_url(data, source_url) or {}
+    destination = flow.server_record_for_url(data, target_url) or {}
+    keys = source.get("client_api_keys") or {}
+    existing = destination.get("client_api_keys") or {}
+    if not isinstance(keys, dict) or not isinstance(existing, dict):
+        raise AttaccaError("invalid client key store; no server configuration changed")
+    bindings = machine.get("actor_bindings") or {}
+    if not isinstance(bindings, dict):
+        raise AttaccaError("machine Attacca config actor_bindings must be an object")
+    selected = []
+    for key, record in bindings.items():
+        if not isinstance(record, dict) or record.get("server_url") != source_url:
+            continue
+        expected_key, _ = _machine_actor_binding_key(
+            source_url, record.get("project_id"), record.get("runtime"),
+            record.get("client_instance"))
+        parsed = parse_canonical_agent_id(record.get("actor_id"), record.get("project_id"))
+        if key != expected_key or not parsed or parsed["runtime"] != record.get("runtime"):
+            raise AttaccaError("source actor binding is invalid; no server configuration changed")
+        selected.append(record)
+    transport = transport or flow.UrllibJsonTransport()
+    verified = {}
+    for instance, raw in keys.items():
+        checked = flow._validate_client_credential(raw, instance)
+        target_record = existing.get(instance)
+        if target_record and target_record.get("token") != checked["token"]:
+            raise AttaccaError("target already has another client credential; refusing to overwrite it")
+        verified[instance] = flow.verify_client_api_key(
+            target_url, checked["token"], client_instance=instance,
+            transport=transport)
+        if any(checked.get(field) and checked[field] != verified[instance].get(field)
+               for field in ("username", "token_id")):
+            raise AttaccaError("target returned a different credential identity")
+    local_mode = False
+    if not verified or any(row["client_instance"] not in verified for row in selected):
+        response = transport.request("GET", target_url + "/v1/auth/status", headers={})
+        local_mode = response.status == 200 and \
+            response.value.get("access_mode") == "local" and \
+            response.value.get("authentication_required") is False and \
+            response.value.get("anonymous_access") is True
+        if not local_mode:
+            raise AttaccaError(
+                "no saved client key for this relocation; authorize the target "
+                "with setup (reinstallation is not required)")
+    migrated = {}
+    for record in selected:
+        instance = record["client_instance"]
+        if instance in verified:
+            flow.verify_client_api_key(
+                target_url, verified[instance]["token"], client_instance=instance,
+                project_id=record["project_id"], actor_id=record["actor_id"],
+                transport=transport)
+        elif local_mode:
+            response = transport.request(
+                "GET", target_url + "/v1/projects/%s/agents?q=%s" % (
+                    urllib.parse.quote(record["project_id"], safe=""),
+                    urllib.parse.quote(record["actor_id"], safe="")),
+                headers={"X-Attacca-Project": record["project_id"],
+                         "X-Attacca-Actor": record["actor_id"]})
+            rows = response.value.get("agents", [])
+            if response.status != 200 or not any(
+                    row.get("agent_id") == record["actor_id"] for row in rows):
+                raise AttaccaError("selected actor is not registered at the new server URL")
+        new_key, _ = _machine_actor_binding_key(
+            target_url, record["project_id"], record["runtime"], instance)
+        target_record = bindings.get(new_key)
+        if target_record and target_record.get("actor_id") != record["actor_id"]:
+            raise AttaccaError("target already selects another actor; refusing to replace it")
+        if not target_record:
+            migrated[new_key] = dict(record, server_url=target_url,
+                                     updated_at=now_iso())
+    if verified:
+        target = flow.canonical_server_record_for_update(data, target_url)
+        target_keys = target.setdefault("client_api_keys", {})
+        for instance, record in verified.items():
+            if instance not in target_keys:
+                target_keys[instance] = record
+                store["changed"] = True
+        data["schema"] = max(int(data.get("schema") or 1), flow.SCHEMA_VERSION)
+    if migrated:
+        machine.setdefault("actor_bindings", {}).update(migrated)
+    return {"client_keys": len(verified), "actor_bindings": len(migrated)}
+
+
+def machine_server_set(server_url, home=None, validate=True, probe=None,
+                       same_server=False, from_url=None, transport=None):
     """Atomically switch every installed Attacca client on one machine.
 
     The hosted server cannot perform this operation remotely: the command must
@@ -22082,6 +22301,11 @@ def machine_server_set(server_url, home=None, validate=True, probe=None):
     watcher files. On any failure every touched byte is restored.
     """
     server_url = _normalize_hosted_server_url(server_url)
+    if from_url is not None and not same_server:
+        raise AttaccaError("--from-url requires --same-server")
+    if same_server and not validate:
+        raise AttaccaError("--same-server cannot be combined with --no-check")
+    source_url = _normalize_hosted_server_url(from_url) if from_url else None
     if validate:
         health = (probe or _probe_server_for_switch)(server_url)
         if health is False or (isinstance(health, dict) and
@@ -22107,7 +22331,8 @@ def machine_server_set(server_url, home=None, validate=True, probe=None):
 
     with _MACHINE_CONFIG_THREAD_LOCK, _exclusive_config_lock(machine_lock), \
             _exclusive_config_lock(watcher_lock), \
-            _exclusive_config_lock(codex_lock):
+            _exclusive_config_lock(codex_lock), \
+            _server_relocation_store(home, same_server) as relocation_store:
         try:
             os.chmod(str(codex_lock), 0o600)
         except OSError as error:
@@ -22125,6 +22350,15 @@ def machine_server_set(server_url, home=None, validate=True, probe=None):
         previous = machine.get("server_url")
         if previous is None and len(watcher_server_urls) == 1:
             previous = watcher_server_urls[0]
+        relocation = {"client_keys": 0, "actor_bindings": 0}
+        if same_server:
+            source_url = source_url or previous or _effective_server_url(home)[0]
+            try:
+                relocation = _prepare_same_server_relocation(
+                    machine, relocation_store, source_url, server_url,
+                    transport=transport)
+            except Exception as error:
+                raise AttaccaError("same-server relocation rejected: %s" % error) from None
         candidates = _switch_json_candidates(
             resolved_home, watcher_state,
             codex_root=effective_codex_root,
@@ -22165,8 +22399,9 @@ def machine_server_set(server_url, home=None, validate=True, probe=None):
             except (OSError, UnicodeDecodeError) as error:
                 raise AttaccaError("cannot read Codex config: %s" % error)
 
-        machine_changed = previous != server_url or \
-            machine.get("version") != MACHINE_CONFIG_SCHEMA_VERSION
+        machine_changed = machine.get("server_url") != server_url or \
+            machine.get("version") != MACHINE_CONFIG_SCHEMA_VERSION or \
+            bool(relocation["actor_bindings"])
         if machine_changed:
             machine["version"] = MACHINE_CONFIG_SCHEMA_VERSION
             machine["server_url"] = server_url
@@ -22176,7 +22411,8 @@ def machine_server_set(server_url, home=None, validate=True, probe=None):
             _preserved_offline_outbox_summary(
                 resolved_home, watcher_path, candidate)
             for candidate in sorted(set(
-                watcher_server_urls + ([previous] if previous else [])))
+                watcher_server_urls + ([previous] if previous else []) +
+                ([source_url] if source_url else [])))
             if candidate != server_url]
         preserved_outbox = {
             "server_url": previous,
@@ -22197,6 +22433,8 @@ def machine_server_set(server_url, home=None, validate=True, probe=None):
             paths.append(watcher_path)
         if codex_present:
             paths.extend((codex_target, codex_backup))
+        if relocation_store and relocation_store["changed"]:
+            paths.append(relocation_store["path"])
         snapshots = _snapshot_switch_paths(paths)
         codex_changed = False
         try:
@@ -22213,6 +22451,9 @@ def machine_server_set(server_url, home=None, validate=True, probe=None):
                 _atomic_switch_write(watcher_path, watcher_bytes)
             if machine_changed or not config_path.exists():
                 _atomic_switch_write(config_path, machine_bytes, mode=0o600)
+            if relocation_store and relocation_store["changed"]:
+                _terminal_flow_runtime()._atomic_private_json(
+                    relocation_store["path"], relocation_store["data"])
         except Exception as error:
             rollback_failures = _restore_switch_snapshots(snapshots)
             detail = "server switch rolled back after: %s" % error
@@ -22227,6 +22468,7 @@ def machine_server_set(server_url, home=None, validate=True, probe=None):
         rewired.append({"tool": "codex", "path": str(codex_target),
                         "changed": codex_changed})
     changed = bool(machine_changed or codex_changed or watcher_changed or
+                   (relocation_store and relocation_store["changed"]) or
                    any(item["changed"] for item in prepared))
     return {
         "ok": True,
@@ -22240,10 +22482,15 @@ def machine_server_set(server_url, home=None, validate=True, probe=None):
         "watcher_subscriptions_rewired": watcher_changed,
         "old_server_outbox": preserved_outbox,
         "url_scoped_credentials_preserved": True,
+        "same_server_relocation": dict(relocation, requested=bool(same_server),
+                                       source_url=source_url),
         "restart_required": sorted({item["tool"] for item in rewired
                                     if item["changed"]}),
-        "note": ("Restart/reconnect listed coding clients. The watcher will "
-                 "poll the new server on its next lightweight tick."),
+        "note": ("No reinstall required. Installed stdio proxies re-read the "
+                 "machine URL on their next request; directly configured HTTP "
+                 "clients may need reconnecting. The watcher polls the new "
+                 "server on its next tick; the next authenticated lifecycle "
+                 "sync refreshes the scoped mirror."),
     }
 
 
@@ -26363,6 +26610,18 @@ def build_parser():
                         help="print raw JSON instead of human-readable output")
     sub = parser.add_subparsers(dest="command")
 
+    p = sub.add_parser(
+        "auth", help="local server account recovery (database owner only)")
+    p.add_argument("--db", default=argparse.SUPPRESS,
+                   help="existing server database path")
+    auth_sub = p.add_subparsers(dest="auth_command", required=True)
+    password_parser = auth_sub.add_parser(
+        "reset-password", help="reset an existing account using hidden prompts")
+    password_parser.add_argument("username", help="existing account username")
+    password_parser.add_argument(
+        "--db", default=argparse.SUPPRESS,
+        help="existing server database path (no database is created)")
+
     p = sub.add_parser("init", help="register the current directory as a project")
     p.add_argument("path", nargs="?", default=None)
     p.add_argument("--project-id", default=None)
@@ -26595,6 +26854,12 @@ def build_parser():
     ps.add_argument(
         "--no-check", action="store_true",
         help="store an intentionally offline/future URL without /healthz validation")
+    ps.add_argument(
+        "--same-server", action="store_true",
+        help="trust this URL as the same server; verify and retain saved client keys and identities")
+    ps.add_argument(
+        "--from-url", default=None,
+        help="previous trusted URL for --same-server recovery after the URL was already changed")
 
     p = sub.add_parser("setup", help="one-shot project setup: register this "
                                      "directory, write .mcp.json, install the "
@@ -26802,6 +27067,19 @@ def cli_main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.command == "auth":
+        result = auth_reset_password_cli(
+            args.db or os.environ.get(ENV_DB) or DEFAULT_DB, args.username)
+        if args.json:
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        else:
+            print("Password reset for '%s'. Existing browser sessions were "
+                  "signed out; sign in with the new password." %
+                  result["username"])
+            print("Login protection, account roles, and client API keys "
+                  "were not changed. No server restart is required.")
+        return 0
+
     # Resolve to an absolute path: MCP servers and hooks may run from any cwd.
     db_path = Path(args.db or os.environ.get(ENV_DB) or DEFAULT_DB).expanduser().resolve()
     owner = load_owner()
@@ -26869,7 +27147,8 @@ def cli_main(argv=None):
         server_cmd = args.server_cmd or "show"
         if server_cmd == "set":
             result = machine_server_set(
-                args.url, validate=not args.no_check)
+                args.url, validate=not args.no_check,
+                same_server=args.same_server, from_url=args.from_url)
         else:
             result = machine_server_show()
         if args.json:
@@ -26895,6 +27174,31 @@ def cli_main(argv=None):
             print("Attacca server: %s" % result["server_url"])
             print("Source: %s" % result["source"])
             print("Machine config: %s" % result["config_path"])
+        return 0
+
+    if args.command == "setup" and args.tools_only and not (
+            args.discover or args.details or args.tools):
+        # Client installation must not create, migrate, or open a local
+        # project database. Both local Python and hosted shell installs use
+        # this same global-tool configuration path.
+        skip = None
+        if args.skip_tools:
+            skip = ({"codex", "cline", "cursor", "windsurf", "kimi",
+                     "gemini", "vscode", "opencode"}
+                    if args.skip_tools.strip() == "all"
+                    else {t.strip() for t in args.skip_tools.split(",")})
+        info = one_shot_setup(None, actor, actor_type, db_path,
+                              url=configured_server_url(args.url),
+                              stdio=args.stdio, manage_server=False,
+                              skip_tools=skip, tools_only=True)
+        for entry in info["configured_tools"]:
+            print("✔ %s: %s" % (entry["tool"], entry["path"]))
+        if info["not_detected"]:
+            print("· not detected (skipped): %s"
+                  % ", ".join(info["not_detected"]))
+        if not info["configured_tools"]:
+            print("· no supported tools detected — `setup --details` "
+                  "prints configs to paste by hand")
         return 0
 
     conn = connect(db_path)
@@ -27185,28 +27489,6 @@ def cli_main(argv=None):
                 pass
             print(setup_details_text(proj_id, db_path, url=setup_url,
                                      tools=args.tools or None))
-            return 0
-        if args.tools_only:
-            # install.sh mode: global tool configs only — no identity
-            # interview, no project registration, nothing written to cwd.
-            skip = None
-            if args.skip_tools:
-                skip = ({"codex", "cline", "cursor", "windsurf", "kimi",
-                         "gemini", "vscode", "opencode"}
-                        if args.skip_tools.strip() == "all"
-                        else {t.strip() for t in args.skip_tools.split(",")})
-            info = one_shot_setup(conn, actor, actor_type, db_path,
-                                  url=setup_url, stdio=args.stdio,
-                                  manage_server=False, skip_tools=skip,
-                                  tools_only=True)
-            for entry in info["configured_tools"]:
-                print("✔ %s: %s" % (entry["tool"], entry["path"]))
-            if info["not_detected"]:
-                print("· not detected (skipped): %s"
-                      % ", ".join(info["not_detected"]))
-            if not info["configured_tools"]:
-                print("· no supported tools detected — `setup --details` "
-                      "prints configs to paste by hand")
             return 0
         if not args.interactive and not args.stdio and not args.attach \
                 and not args.create and sys.stdin.isatty():

@@ -15,6 +15,30 @@ Git tags in this repository, so versions are dated by their bump commit.
 
 Nothing yet.
 
+## [0.5.12] - 2026-09-27
+
+### Added
+
+- Local account recovery with `attacca auth reset-password USERNAME`, using
+  two hidden password prompts and revoking the account's browser sessions.
+- Direct installation from a source checkout with `python3 install.py --url
+  http://127.0.0.1:4173`, without downloading the plugin or requiring curl.
+- Verified same-server address changes with `attacca server set URL
+  --same-server`, preserving the selected agent identities and installation
+  credentials without reinstalling.
+
+### Fixed
+
+- Client-only installation no longer opens or creates a local project database.
+- Changing server addresses clears obsolete watcher authentication and mirror
+  scope state before fetching a fresh identity-scoped snapshot. Existing
+  unsent writes remain in their original URL partitions.
+
+### Changed
+
+- The README separates a short quick start and everyday commands from the
+  expandable advanced reference.
+
 ## [0.5.11] - 2026-09-27
 
 ### Added
