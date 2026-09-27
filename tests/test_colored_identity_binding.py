@@ -495,6 +495,9 @@ class GuidedSetupIdentityRepairTest(unittest.TestCase):
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
+        # Cleanups run in reverse order: stop the server before deleting its
+        # database directory, including when setup fails partway through.
+        self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.db = self.root / "setup.db"
         self.checkout = self.root / "checkout"
@@ -520,7 +523,6 @@ class GuidedSetupIdentityRepairTest(unittest.TestCase):
             conn.close()
         self.server = ServerFixture(self.db)
         self.addCleanup(self.server.stop)
-        self.addCleanup(self.temporary.cleanup)
 
     def _restore_owner(self):
         if self.previous_owner is None:

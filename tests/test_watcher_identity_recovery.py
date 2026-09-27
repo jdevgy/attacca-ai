@@ -198,6 +198,69 @@ class WatcherIdentityRecoveryTest(unittest.TestCase):
         self.assertNotIn("auth_required", self.entry())
         self.assertNotEqual(self.entry()["sync_visibility_fingerprint"], stale)
 
+    def replace_persisted_mirror_visibility(self):
+        """Model another client replacing disk while our subscription stays current."""
+        protocol, _, _ = hook._watcher_sync_modules()
+        adapter = hook._watcher_build_offline_adapter(self.entry())
+        snapshot = adapter.local_snapshot()
+        changed = protocol.make_snapshot(
+            snapshot["scope"], protocol.visibility_fingerprint(
+                snapshot["scope"], {"other_client_generation": True}),
+            snapshot["cursor"], snapshot["projection"], snapshot["records"])
+        adapter.install_snapshot(changed, reset=True,
+                                 reset_reason="isolated other-client replacement")
+        return adapter
+
+    def test_current_subscription_recovers_actual_persisted_visibility_mismatch(self):
+        self.assertTrue(self.tick()["ok"])
+        previous = self.entry()
+        changed = self.replace_persisted_mirror_visibility()
+        _, offline, _ = hook._watcher_sync_modules()
+        with self.assertRaisesRegex(offline.OfflineVisibilityChangedError,
+                                   "stored mirror visibility differs"):
+            hook._watcher_build_offline_adapter(self.entry()).status()
+        self.assertNotEqual(changed.visibility_fingerprint,
+                            previous["sync_visibility_fingerprint"])
+        self.update(next_poll_at_epoch=0)
+        result = self.tick(now=200)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.entry()["sync_visibility_fingerprint"],
+                         previous["sync_visibility_fingerprint"])
+        recovered = hook._watcher_build_offline_adapter(self.entry())
+        self.assertEqual(recovered.local_snapshot()["visibility_fingerprint"],
+                         previous["sync_visibility_fingerprint"])
+
+    def test_actual_persisted_visibility_recovery_preserves_pending_outbox(self):
+        self.assertTrue(self.tick()["ok"])
+        original = hook._watcher_build_offline_adapter(self.entry())
+        original.queue_mutation("room.send", {"body": "Isolated original actor write"},
+                                client_mutation_id="cm_original_visibility_write")
+        journal = {path.name: path.read_bytes() for path in original.journal_directory.iterdir()}
+        self.replace_persisted_mirror_visibility()
+        self.update(auth_required=True, identity_refresh_required=True,
+                    last_error="historical hosted HTTP 401")
+        current, recovered = hook._watcher_recover_identity(self.key, self.entry())
+        self.assertNotIn("auth_required", current)
+        self.assertNotIn("identity_refresh_required", current)
+        self.assertEqual(recovered.scope["actor_id"], self.actor)
+        self.assertEqual(recovered.pending_mutations(), original.pending_mutations())
+        self.assertEqual(len(recovered.pending_mutations()), 1)
+        self.assertEqual(journal, {path.name: path.read_bytes()
+                                  for path in original.journal_directory.iterdir()})
+
+    def test_visibility_reset_does_not_overwrite_corrupt_persisted_mirror(self):
+        self.assertTrue(self.tick()["ok"])
+        changed = self.replace_persisted_mirror_visibility()
+        wrapper = json.loads(changed.mirror_path.read_text())
+        wrapper["snapshot_sha256"] = "0" * 64
+        changed.mirror_path.write_text(json.dumps(wrapper))
+        before = changed.mirror_path.read_bytes()
+        self.update(auth_required=True, identity_refresh_required=True)
+        with self.assertRaisesRegex(Exception, "stored snapshot digest mismatch"):
+            hook._watcher_recover_identity(self.key, self.entry())
+        self.assertEqual(changed.mirror_path.read_bytes(), before)
+        self.assertTrue(self.entry()["auth_required"])
+
     def test_local_recovery_failure_is_not_reported_as_another_hosted_401(self):
         self.assertTrue(self.tick()["ok"])
         self.update(next_poll_at_epoch=0, auth_required=True,

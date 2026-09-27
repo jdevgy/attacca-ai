@@ -2949,9 +2949,20 @@ def _watcher_install_sync_snapshot(key, entry, snapshot, previous_identity=None)
         wake_callback=lambda: _watcher_wake_subscription(
             key, "local_write"))
     reset = previous_scope != scope or previous_visibility != visibility
-    engine.install_snapshot(
-        checked, reset=reset,
-        reset_reason="authenticated sync bootstrap" if reset else None)
+    try:
+        engine.install_snapshot(
+            checked, reset=reset,
+            reset_reason="authenticated sync bootstrap" if reset else None)
+    except offline.OfflineVisibilityChangedError:
+        # Another client may have replaced the shared on-disk mirror while
+        # both this subscription and the fresh hosted snapshot still agree.
+        # Metadata equality alone therefore cannot prove reset=False is safe.
+        # Retry only this visibility mismatch with the already authenticated
+        # snapshot. install_snapshot still validates every stored byte and
+        # refuses actor/role changes with unresolved old-scope outbox writes.
+        engine.install_snapshot(
+            checked, reset=True,
+            reset_reason="authenticated recovery of persisted visibility drift")
     proof = engine.convergence_proof()
     engine_status = engine.status()
     offline.validate_convergence_proof(
