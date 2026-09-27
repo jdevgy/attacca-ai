@@ -22716,13 +22716,41 @@ def _ensure_client_setup_auth(url, actor_id, interactive=False,
     runtime = normalize_agent_runtime(actor=actor_id)
     client_instance = load_client_instance_id(runtime)
     flow = _terminal_flow_runtime()
+    # A valid old key must not strand a browser-approved replacement. This
+    # collector only advances a request already owned by this installation;
+    # it cannot start enrollment or open a browser on a healthy setup check.
+    collected = None
+    collection_status = {}
+    try:
+        collected = flow.collect_pending_client_pairing(
+            server_url, client_instance=client_instance, runtime=runtime,
+            credentials_path=CREDENTIALS_FILE)
+        if collected is not None:
+            collection_status["pending_authorization_status"] = collected.get("status")
+    except flow.TerminalFlowProtocolError:
+        # A one-time delivery may already have been privately preserved before
+        # its metadata failed validation. Never mask that invalid replacement
+        # by selecting an older environment key or anonymous authority.
+        _remote_setup_auth.context = None
+        raise AuthenticationError(
+            "client_authorization_collection_failed: pending client approval "
+            "could not be validated; private delivery state was preserved") from None
+    except flow.TerminalFlowError:
+        # Retry the pending request later without treating its failure as a
+        # rejection of a separately verified, still-valid current key.
+        collection_status["pending_authorization_status"] = "retry_required"
+    replacement_received = bool(collected and collected.get("authorized"))
+    if replacement_received:
+        # A previous successful setup in this process is no longer authority
+        # for the newly selected credential, even if verification below fails.
+        _remote_setup_auth.context = None
     # Native MCP configs may inject the already-issued install key through
     # ATTACCA_API_TOKEN instead of the private registry.  Treat that exact
     # process-local secret as a first-class hot-load source; verify the signed
     # client instance with the server before setup uses it and never copy the
     # value into another file or response.
     environment_token = str(os.environ.get(ENV_API_TOKEN) or "").strip()
-    if environment_token:
+    if environment_token and not replacement_received:
         try:
             checked = remote_json(
                 server_url, "GET", "/v1/auth/status", actor=actor_id,
@@ -22751,6 +22779,7 @@ def _ensure_client_setup_auth(url, actor_id, interactive=False,
                 "username": (checked.get("user") or {}).get("username"),
                 "hot_reload": True,
                 "credential_source": "environment",
+                **collection_status,
             }
     local = flow.client_api_key_status(
         server_url, client_instance=client_instance, runtime=runtime,
@@ -22787,7 +22816,14 @@ def _ensure_client_setup_auth(url, actor_id, interactive=False,
                 "username": (checked.get("user") or {}).get("username"),
                 "hot_reload": True,
                 "credentials_file": str(CREDENTIALS_FILE),
+                **collection_status,
             }
+    if replacement_received:
+        # Do not fall back to a former/environment key or anonymous authority
+        # when the human-approved replacement does not authorize this scope.
+        raise AuthenticationError(
+            "client_authorization_scope_required: the received client key "
+            "could not verify this installation and linked workspace")
     if anonymous.get("access_mode") == "local" and anonymous.get("anonymous_access"):
         # Verify with normal credential loading: a supplied rejected key must
         # not silently become an anonymous session in local mode.

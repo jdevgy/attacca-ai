@@ -8,6 +8,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -181,6 +182,90 @@ class PairingRecoveryTest(unittest.TestCase):
         first = self.start()
         self.assertEqual(self.start()["authorization_url"], first["authorization_url"])
         self.assertEqual(self.transport.starts, 1)
+
+    def collect(self):
+        return flow.collect_pending_client_pairing(
+            self.url, client_instance=self.instance,
+            credentials_path=self.credentials, transport=self.transport)
+
+    def test_pending_only_collection_without_request_is_read_only(self):
+        before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns)
+                  for p in self.credentials.parent.iterdir() if p.is_file()}
+        self.assertIsNone(self.collect())
+        after = {p.name: (p.read_bytes(), p.stat().st_mtime_ns)
+                 for p in self.credentials.parent.iterdir() if p.is_file()}
+        self.assertEqual(before, after)
+        self.assertEqual(self.transport.calls, [])
+
+    def test_pending_only_collection_does_not_create_a_virgin_store_or_identity(self):
+        missing = Path(self.temp.name) / "missing" / "credentials.json"
+        with mock.patch.object(flow, "load_client_instance_id",
+                               side_effect=AssertionError("must not create identity")):
+            for instance in (self.instance, None):
+                self.assertIsNone(flow.collect_pending_client_pairing(
+                    self.url, client_instance=instance, credentials_path=missing,
+                    transport=self.transport))
+        self.assertFalse(missing.parent.exists())
+        self.assertEqual(self.transport.calls, [])
+
+    def test_pending_only_collection_receives_replacement_even_when_old_key_works(self):
+        self.transport.accept_old = True
+        self.start()
+        self.transport.calls.clear()
+        self.transport.state = "approved"
+        result = self.collect()
+        self.assertTrue(result["authorized"])
+        self.assertTrue(self.transport.calls[0][1].endswith("/poll"))
+        self.assertEqual(flow.load_client_api_key(
+            self.url, client_instance=self.instance,
+            credentials_path=self.credentials), self.new_token)
+        self.assertIsNone(self.pairing())
+        self.assertEqual((self.transport.starts, self.transport.deliveries,
+                          self.transport.acks), (1, 1, 1))
+        self.transport.calls.clear()
+        self.assertIsNone(self.collect())
+        self.assertEqual(self.transport.calls, [])
+
+    def test_pending_only_collection_retains_valid_key_while_waiting_or_expired(self):
+        self.transport.accept_old = True
+        self.start()
+        for state in ("pending", "expired"):
+            self.transport.state = state
+            result = self.collect()
+            self.assertEqual(result["status"], state)
+            self.assertEqual(flow.load_client_api_key(
+                self.url, client_instance=self.instance,
+                credentials_path=self.credentials), self.old_token)
+        self.assertIsNone(self.pairing())
+        self.assertEqual((self.transport.starts, self.transport.acks), (1, 0))
+
+    def test_pending_only_collection_transport_failure_preserves_request_and_key(self):
+        self.start()
+        before = self.credentials.read_bytes()
+        with mock.patch.object(self.transport, "request", side_effect=
+                               flow.TerminalFlowTransportError("unavailable")):
+            with self.assertRaises(flow.TerminalFlowTransportError):
+                self.collect()
+        self.assertEqual(self.credentials.read_bytes(), before)
+        self.assertEqual((self.transport.starts, self.transport.acks), (1, 0))
+
+    def test_pending_only_collection_rechecks_after_another_collector_finished(self):
+        self.start()
+        self.transport.state = "approved"
+        real_lock = flow._client_authorization_lock
+        from contextlib import contextmanager
+
+        @contextmanager
+        def finish_first(*args, **kwargs):
+            with real_lock(*args, **kwargs):
+                flow._poll_client_pairing(self.url, self.instance,
+                    self.credentials, self.transport, 5)
+                yield
+
+        with mock.patch.object(flow, "_client_authorization_lock", finish_first):
+            self.assertIsNone(self.collect())
+        self.assertEqual((self.transport.starts, self.transport.deliveries,
+                          self.transport.acks), (1, 1, 1))
 
     def test_expired_request_is_reported_then_a_later_recovery_can_replace_it(self):
         self.start()

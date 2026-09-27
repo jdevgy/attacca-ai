@@ -1110,6 +1110,38 @@ def _start_client_pairing(server_url, instance, client_label, device_id,
             "interval": pairing["interval"], "hot_reload": True}
 
 
+def collect_pending_client_pairing(server_url, *, client_instance=None,
+                                   runtime=None, storage_path=None,
+                                   credentials_path=None, transport=None,
+                                   timeout=DEFAULT_TIMEOUT_SECONDS):
+    """Silently collect an existing request, never enroll or create an identity.
+
+    Normal healthy clients use this before selecting their cached credential.
+    The unlocked read keeps the no-request path entirely read-only; the
+    locked re-read prevents a concurrent collector's ACK from becoming a
+    cached-key verification or a second authorization request.
+    """
+    if client_instance is None:
+        return None
+    instance = _bounded_client_instance(client_instance)
+    peek = _read_private_json_unlocked(
+        credentials_path or default_credentials_path(),
+        {"schema": SCHEMA_VERSION, "servers": {}},
+        "Attacca credentials", MAX_CREDENTIALS_BYTES)
+    if peek.get("servers") is None:
+        peek["servers"] = {}
+    elif not isinstance(peek["servers"], dict):
+        raise TerminalFlowProtocolError("Attacca credentials servers must be an object")
+    if not isinstance(_pairing_record(peek, server_url, instance), dict):
+        return None
+    with _client_authorization_lock(server_url, instance, credentials_path):
+        if not isinstance(_pairing_record(
+                read_credentials_store(credentials_path), server_url, instance), dict):
+            return None
+        return _poll_client_pairing(
+            server_url, instance, credentials_path, transport, timeout)
+
+
 def poll_client_pairing(server_url, *, client_instance=None, runtime=None,
                         storage_path=None, credentials_path=None,
                         transport=None, timeout=DEFAULT_TIMEOUT_SECONDS):

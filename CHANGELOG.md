@@ -40,6 +40,9 @@ Nothing yet.
   supported Linux hosts, preserving pending notifications and queue receipts.
 - Recheck receiver health at real prompt/stop boundaries, reporting changed
   failures once without introducing scheduled model prompts.
+- Collect already-approved replacement credentials during healthy setup and
+  idle watcher checks even when the previous key remains valid, without
+  starting another authorization request or prompting an idle AI.
 
 ## [0.5.13] - 2026-09-27
 
