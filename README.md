@@ -589,6 +589,14 @@ deletes credentials, changes an identity, or creates a second project store.
 If a bounded recovery cycle and recheck do not restore the missing layer, the
 failure stays visible instead of entering a prompt/restart loop.
 
+Real prompt/stop boundaries also check the receiver without a scheduled model
+turn. On Linux with safe process-handle support, an outdated managed Codex
+receiver can be replaced after verifying its exact session, owning process,
+executable, and lifetime lock. Pending notifications and queue receipts survive
+the handover. Unsupported or mismatched processes are left alone and reported;
+Claude Monitor replacement remains a host-managed operation. Healthy checks
+do not launch another receiver, and unchanged failures are not repeated.
+
 `attacca watch status` shows watcher and subscription diagnostics. A local
 `.attacca/mirror/ROOM.md` is a read-only projection, not a second inbox: stale
 projection content or an old file timestamp alone cannot prove that no new

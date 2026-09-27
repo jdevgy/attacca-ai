@@ -36,6 +36,10 @@ Nothing yet.
 - Label Markdown room mirrors as sync snapshots rather than live event feeds.
 - Preserve the unread baseline during watcher recovery so old room messages
   are not replayed as new, without dropping queued mail or unresolved work.
+- Rearm verified same-session Codex receivers after local plugin updates on
+  supported Linux hosts, preserving pending notifications and queue receipts.
+- Recheck receiver health at real prompt/stop boundaries, reporting changed
+  failures once without introducing scheduled model prompts.
 
 ## [0.5.13] - 2026-09-27
 

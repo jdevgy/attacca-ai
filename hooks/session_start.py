@@ -8642,7 +8642,7 @@ def _periodic_output(status, event_name, offline_adapter=None,
 
 
 def _session_wake_notice(status, payload):
-    """Arm host-native event delivery only at an actual session boundary."""
+    """Arm host-native event delivery only at an actual lifecycle boundary."""
     if os.environ.get("ATTACCA_DISABLE_SESSION_WAKE") == "1":
         return None
     runtime = _runtime_name()
@@ -8707,18 +8707,100 @@ def _session_wake_notice(status, payload):
             "queue acceptance does not prove AI processing."
             if health.get("running") and health.get("current_generation") else
             "ATTACCA EVENT RECEIVER: an older receiver generation is still running. "
-            "Current idle delivery is not verified; restart this session's receiver "
-            "or its coding session, not the Attacca server. Do not launch duplicate receivers."
+            "Bounded automatic repair did not complete (%s). Current idle delivery "
+            "is not verified; repair this session's receiver or its coding session, "
+            "not the Attacca server. Do not launch duplicate receivers." %
+            _trim(health.get("upgrade_state") or "receiver_generation_stale", 100)
             if health.get("diagnostic") == "receiver_generation_stale" else
             "ATTACCA EVENT RECEIVER: targeted Codex launch requested; waiting for "
             "a fresh receiver heartbeat. Idle delivery is not verified yet. Quiet "
             "polls create no prompts; delivery may wait until the active turn ends."
             if armed else
-            "ATTACCA EVENT RECEIVER: automatic idle wake is unavailable on "
-            "this Codex host (requires native queue and an exact live CLI "
-            "session). The watcher still stages mail for the next turn; do "
-            "not create a recurring prompt as a substitute."),
+            "ATTACCA EVENT RECEIVER: automatic idle wake is unverified "
+            "(receiver=%s; repair=%s). A native queue and exact live CLI "
+            "session are required; unsafe repairs are refused. The watcher "
+            "still stages mail for the next turn; do not create a recurring "
+            "prompt as a substitute." % (
+                _trim(health.get("diagnostic") or health.get("state") or "unknown", 100),
+                _trim(health.get("upgrade_state") or "unavailable", 100))),
     }
+
+
+def _session_wake_repair_notice(status, payload):
+    """Recheck an exact session at real turn boundaries, never on a timer.
+
+    Healthy sessions do no launch work. Failed attempts are bounded and the
+    same diagnostic is shown once, so a Stop failure cannot create a loop.
+    Claude's native Monitor remains host-owned; its notice instructs the host
+    to repair that monitor instead of spawning an unattached stdout consumer.
+    """
+    if os.environ.get("ATTACCA_DISABLE_SESSION_WAKE") == "1" or \
+            payload.get("hook_event_name") not in {"UserPromptSubmit", "Stop"}:
+        return None
+    runtime = _runtime_name()
+    session_id = str(payload.get("session_id") or "")
+    if runtime not in {"claude", "codex"} or not re.fullmatch(
+            r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", session_id):
+        return None
+    health = _session_receiver_health(status["root"], runtime, session_id)
+    ready = bool(health.get("running") and health.get("current_generation"))
+    try:
+        _, config = _plugin_and_config()
+        key, entry = _watcher_subscription_entry(status, config, runtime=runtime)
+        if not entry or entry.get("interval_seconds") == 0:
+            return None
+        session_key = hashlib.sha256((runtime + ":" + session_id).encode()).hexdigest()
+        prior = (entry.get("receiver_boundary_checks") or {}).get(session_key) or {}
+        if ready and (not prior or prior.get("diagnostic") == "ready"):
+            return None
+        now = time.time()
+        if not ready and now < float(prior.get("retry_after") or 0):
+            return None
+        reserved = {"ok": False}
+
+        def reserve(state):
+            live = (state.get("subscriptions") or {}).get(key)
+            if live is None:
+                return
+            checks = live.setdefault("receiver_boundary_checks", {})
+            previous = checks.get(session_key) or {}
+            if not ready and now < float(previous.get("retry_after") or 0):
+                return
+            if ready and previous.get("diagnostic") == "ready":
+                return
+            reserved.update(ok=True, previous=dict(previous))
+            checks[session_key] = dict(previous, checked_at=now, retry_after=now + 60)
+            for old in sorted(checks, key=lambda item: float(
+                    checks[item].get("checked_at") or 0))[:-32]:
+                checks.pop(old, None)
+
+        _mutate_state(_watcher_state_path(), reserve)
+        if not reserved["ok"]:
+            return None
+        notice = None if ready else _session_wake_notice(status, payload)
+        after = health if ready else _session_receiver_health(status["root"], runtime, session_id)
+        recovered = bool(after.get("running") and after.get("current_generation"))
+        diagnostic = "ready" if recovered else str(
+            after.get("diagnostic") or after.get("state") or "receiver_unverified")
+
+        def record(state):
+            live = (state.get("subscriptions") or {}).get(key)
+            if live is not None:
+                live.setdefault("receiver_boundary_checks", {})[session_key] = {
+                    "checked_at": now, "retry_after": now + 60,
+                    "diagnostic": diagnostic}
+
+        _mutate_state(_watcher_state_path(), record)
+        if diagnostic == reserved["previous"].get("diagnostic"):
+            return None
+        if recovered:
+            return {"system_message": "Attacca event receiver recovered",
+                    "context": "ATTACCA EVENT RECEIVER: a fresh current-generation receiver is now observed for this session. This verifies receiver liveness, not AI processing; no server restart was performed."}
+        return notice
+    except Exception:
+        # Normal lifecycle state diagnostics remain responsible for corrupt
+        # local storage. Never mask the tool/turn or mutate another session.
+        return None
 
 
 def _post_tool_local_diagnostic(status, failed):
@@ -9029,6 +9111,9 @@ def main(argv=None):
                 result, hook_payload=payload, event_name=event_name)
         else:
             output = _periodic_output(result, event_name, hook_payload=payload)
+        if event_name in {"UserPromptSubmit", "Stop"}:
+            wake_notice = _session_wake_repair_notice(result, payload)
+            output = _append_notices(output, event_name, (wake_notice,))
         if output:
             output = _with_migration_notice(output, migration)
             print(json.dumps(output))

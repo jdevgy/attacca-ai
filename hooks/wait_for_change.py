@@ -13,6 +13,8 @@ import json
 import os
 from pathlib import Path
 import re
+import select
+import signal
 import subprocess
 import sys
 import time
@@ -22,6 +24,7 @@ import session_start as hook
 
 HEARTBEAT_TTL_SECONDS = 120
 REPAIR_BACKOFF_SECONDS = (60, 120, 300)
+RECEIVER_STOP_TIMEOUT_SECONDS = 1.5
 
 
 def _session_id(value):
@@ -231,8 +234,14 @@ def receiver_status(cwd, runtime, session_id=None):
         process = (health.get("pid"), health.get("pid_start"))
         alive = bool(health.get("running") and process[0] and process[1]
                      and host_alive(process))
+        if any(key in health and health[key] != value for key, value in {
+                "runtime": runtime, "cwd": str(Path(cwd).resolve()),
+                "session_id": selected}.items()) \
+                or (alive and parent and "parent" in health and health["parent"] != list(parent)):
+            raise ValueError("receiver health scope mismatch")
         running = alive and 0 <= age <= HEARTBEAT_TTL_SECONDS
         current_generation = health.get("generation") == RECEIVER_GENERATION
+        upgrade = _read_receipt(directory / "repair" / hook.WATCHER_STATE_NAME)
         return {"configured": bool(health), "running": running,
                 "current_generation": current_generation,
                 "runtime": runtime, "session_id": selected,
@@ -243,6 +252,8 @@ def receiver_status(cwd, runtime, session_id=None):
                 "diagnostic": ("receiver_generation_stale" if running and not current_generation else None) or health.get("problem") or (
                     None if running else "receiver_heartbeat_stale" if alive else "receiver_not_running"),
                 "repair_attempts": int((saved.get("_repair") or {}).get("attempts") or 0),
+                "upgrade_state": "ready" if running and current_generation else upgrade.get("status"),
+                "upgrade_attempts": int(upgrade.get("attempts") or 0),
                 "watcher_healthy": health.get("watcher_healthy"),
                 "producer_running": health.get("producer_running"),
                 "subscription_state": health.get("subscription_state"),
@@ -304,10 +315,10 @@ def _repair_watcher(saved, problem, status, plugin_root, config, runtime, key, e
         record["result"] = "repair_failed"
 
 
-def _monitor_lock(directory):
+def _monitor_lock(directory, name="receiver.lock"):
     if hook.fcntl is None:
         return None
-    fd = hook._open_private_watcher_file(directory / "receiver.lock",
+    fd = hook._open_private_watcher_file(directory / name,
                                        os.O_RDWR, create=True)
     try:
         hook.fcntl.flock(fd, hook.fcntl.LOCK_EX | hook.fcntl.LOCK_NB)
@@ -315,6 +326,32 @@ def _monitor_lock(directory):
         os.close(fd)
         return None
     return fd
+
+
+def _pending_delivery(saved, scope):
+    pending = saved.get("_pending_deliveries", {})
+    if not isinstance(pending, dict):
+        raise ValueError("invalid pending delivery mapping")
+    notice = pending.get(scope)
+    if notice is None:
+        return None
+    if not isinstance(notice, dict) or notice.get("scope") != scope:
+        raise ValueError("pending delivery scope mismatch")
+    sequence = notice.get("sequence")
+    previous = saved.get(scope) or {}
+    next_state = notice.get("next")
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence <= 0 \
+            or not isinstance(previous, dict) \
+            or sequence != int(previous.get("sequence") or 0) + 1 \
+            or notice.get("event_id") != "%s:%d" % (scope, sequence) \
+            or notice.get("kind") not in {"connection_problem", "connection_recovered", "actionable_change"} \
+            or not isinstance(notice.get("message"), str) \
+            or len(notice["message"].encode()) > 4096 or "\0" in notice["message"] \
+            or not isinstance(next_state, dict) or next_state.get("sequence") != sequence \
+            or not isinstance(next_state.get("announced"), list) \
+            or any(not isinstance(value, str) for value in next_state["announced"]):
+        raise ValueError("invalid pending delivery envelope")
+    return notice
 
 
 def run(cwd, runtime, session_id=None, parent=None, interval=3, max_ticks=None,
@@ -368,6 +405,8 @@ def run(cwd, runtime, session_id=None, parent=None, interval=3, max_ticks=None,
                        "generation": RECEIVER_GENERATION,
                        "pid": os.getpid(), "pid_start": identity[1] if identity else None,
                        "runtime": runtime, "session_id": receipt_session,
+                       "cwd": str(Path(cwd).resolve()),
+                       "parent": list(parent) if parent else None,
                        "heartbeat_at_epoch": time.time(), "problem": problem,
                        "watcher_healthy": watcher_healthy,
                        "ai_processing": "unverified", **changes})
@@ -445,9 +484,32 @@ def run(cwd, runtime, session_id=None, parent=None, interval=3, max_ticks=None,
             if entry.get("interval_seconds") == 0 and not entry.get("auth_required"):
                 time.sleep(interval)
                 continue
-            notice = observer.prepare(scope, entry, reported_problem)
+            try:
+                notice = _pending_delivery(observer.saved, scope) if runtime == "codex" else None
+            except (ValueError, TypeError):
+                persist_health(problem="receiver_state_invalid", watcher_healthy=False,
+                               last_delivery_state="state_error")
+                time.sleep(interval)
+                continue
+            pending = observer.saved.setdefault("_pending_deliveries", {}) if runtime == "codex" else {}
+            if notice and notice["kind"] != "connection_problem" and reported_problem in {
+                    "authorization_required", "identity_refresh_required", "identity_sync_failed"}:
+                # Preserve the old exact envelope, but never let it override
+                # a newly invalidated authority boundary after a restart.
+                time.sleep(interval)
+                continue
+            notice = notice or observer.prepare(scope, entry, reported_problem)
             if notice:
                 if runtime == "codex":
+                    # Preserve the exact event envelope before an external
+                    # queue command can be interrupted. A resumed receiver
+                    # must resolve this batch first, not absorb later mail
+                    # into the same uncertain event ID.
+                    pending[scope] = notice
+                    persist_health(problem=reported_problem,
+                                   watcher_healthy=reported_problem is None,
+                                   last_delivery_state="prepared",
+                                   last_event_id=notice["event_id"])
                     result = queue_event(directory, session_id, notice["event_id"],
                                          True, notice["message"], cwd=cwd)
                     accepted = result.get("status") in (
@@ -474,6 +536,7 @@ def run(cwd, runtime, session_id=None, parent=None, interval=3, max_ticks=None,
                     accepted = True
                 if accepted:
                     observer.accept(notice)
+                    pending.pop(scope, None)
                 persist_health(problem=reported_problem, watcher_healthy=reported_problem is None,
                                last_delivery_state=delivery, last_event_id=notice["event_id"])
             time.sleep(interval)
@@ -504,32 +567,231 @@ def daemon_process_alive(daemon):
     return bool(daemon.get("pid"))
 
 
+def _receiver_command(cwd, session_id, parent):
+    return [sys.executable, str(Path(__file__).resolve()), "--runtime", "codex",
+            "--cwd", str(Path(cwd).resolve()), "--session-id", session_id,
+            "--parent-pid", str(parent[0]), "--parent-start", str(parent[1])]
+
+
+def _owned_receiver_process(health, cwd, session_id, parent):
+    """Prove one exact receiver, including legacy health without cwd/parent."""
+    try:
+        identity = (int(health["pid"]), str(health["pid_start"]))
+        if identity[0] <= 1 or identity[0] in {os.getpid(), parent[0]} \
+                or health.get("runtime") != "codex" \
+                or _session_id(health.get("session_id")) != session_id \
+                or ("cwd" in health and health["cwd"] != str(Path(cwd).resolve())) \
+                or ("parent" in health and health["parent"] != list(parent)) \
+                or not host_alive(parent) or _process_identity(identity[0]) != identity:
+            return False
+        process = Path("/proc/%d" % identity[0])
+        if process.stat().st_uid != os.getuid():
+            return False
+        command = (process / "cmdline").read_bytes()
+        if not command.endswith(b"\0") or len(command) > 16384:
+            return False
+        argv = [os.fsdecode(value) for value in command[:-1].split(b"\0")]
+        expected = _receiver_command(cwd, session_id, parent)
+        if len(argv) != len(expected) \
+                or Path(argv[0]).resolve() != Path(sys.executable).resolve() \
+                or (process / "exe").resolve() != Path(sys.executable).resolve() \
+                or argv[1:] != expected[1:]:
+            return False
+        return _process_identity(identity[0]) == identity and host_alive(parent)
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+
+
+def _stop_owned_stale_receiver(health, cwd, session_id, parent):
+    """Pin and terminate only a proven receiver; never signal a bare PID."""
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        return "pidfd_unavailable"
+    if not _owned_receiver_process(health, cwd, session_id, parent):
+        return "ownership_unverified"
+    descriptor = None
+    try:
+        descriptor = os.pidfd_open(int(health["pid"]), 0)
+        # Pin first, then revalidate PID/start, argv and owner. PID reuse in
+        # either window cannot redirect this signal to a different process.
+        if not _owned_receiver_process(health, cwd, session_id, parent):
+            return "ownership_changed"
+        signal.pidfd_send_signal(descriptor, signal.SIGTERM, None, 0)
+        poll = select.poll()
+        poll.register(descriptor, select.POLLIN)
+        if not poll.poll(int(RECEIVER_STOP_TIMEOUT_SECONDS * 1000)):
+            return "stop_timeout"
+        return "stopped"
+    except (OSError, ValueError, TypeError):
+        return "stop_failed"
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _queue_checkpoint_verified(directory, session_id):
+    """Called with the queue lock held; never interrupt uncheckpointed intent."""
+    from codex_wake import MAX_RECEIPTS_PER_SESSION, _read_receipt as read_queue_receipt
+    saved = _read_receipt(directory / hook.WATCHER_STATE_NAME)
+    known = set()
+    budget = MAX_RECEIPTS_PER_SESSION
+    for scope, value in saved.items():
+        if scope.startswith("_"):
+            continue
+        if not isinstance(value, dict):
+            return False
+        sequence = value.get("sequence", 0)
+        if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0 \
+                or sequence > budget:
+            return False
+        budget -= sequence
+        for index in range(1, sequence + 1):
+            known.add(hashlib.sha256(("%s:%d" % (scope, index)).encode()).hexdigest())
+    pending = saved.get("_pending_deliveries", {})
+    if not isinstance(pending, dict):
+        return False
+    for scope in pending:
+        notice = _pending_delivery(saved, scope)
+        if notice is None:
+            return False
+        known.add(hashlib.sha256(notice["event_id"].encode()).hexdigest())
+    paths = list((directory / session_id).iterdir())
+    if len(paths) > MAX_RECEIPTS_PER_SESSION + 1:
+        return False
+    for path in paths:
+        if path.name == ".lock":
+            continue
+        if not re.fullmatch(r"[0-9a-f]{64}\.json", path.name):
+            return False
+        receipt = read_queue_receipt(path)
+        if not receipt or receipt.get("thread") != session_id \
+                or receipt.get("event_sha256") != path.stem \
+                or receipt.get("status") not in {"queued", "pending_unknown", "retryable"}:
+            return False
+        if receipt["status"] != "retryable" and path.stem not in known:
+            return False
+    return True
+
+
 def start_codex_receiver(cwd, session_id):
     """Request a session receiver; True never proves heartbeat or AI delivery."""
     from codex_wake import queue_supported
-    if not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}",
-                        str(session_id or "")):
+    session_id = _session_id(session_id)
+    if not session_id:
         return False
     native_thread = os.environ.get("CODEX_THREAD_ID")
-    if native_thread and native_thread != session_id:
+    if native_thread and _session_id(native_thread) != session_id:
         return False
     parent = host_process("codex")
-    if parent is None or not queue_supported():
+    if parent is None or not queue_supported() or hook.fcntl is None:
         return False
-    current = receiver_status(cwd, "codex", session_id)
-    if current.get("running"):
-        # A fresh heartbeat from old executable bytes is not upgrade success.
-        # Never stack children behind its lifetime lock or kill an unrelated
-        # session. The hook surfaces a precise receiver/session restart need.
-        return bool(current.get("current_generation"))
-    register_session(cwd, "codex", session_id, parent=parent)
-    command = [sys.executable, str(Path(__file__).resolve()), "--runtime", "codex",
-               "--cwd", str(cwd), "--session-id", session_id,
-               "--parent-pid", str(parent[0]), "--parent-start", parent[1]]
-    subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL, start_new_session=True,
-                     close_fds=True)
-    return True
+    directory = _state_directory("codex", cwd, parent, session_id)
+    repair_path = directory / "repair" / hook.WATCHER_STATE_NAME
+    launch_lock = None
+    lifetime_lock = None
+    queue_lock = None
+    try:
+        # This lock serializes old-process verification, stop, lifetime-lock
+        # proof and replacement launch across simultaneous lifecycle hooks.
+        launch_lock = _monitor_lock(directory, "receiver-launch.lock")
+        if launch_lock is None:
+            return False
+        current = receiver_status(cwd, "codex", session_id)
+        saved = _read_receipt(directory / hook.WATCHER_STATE_NAME)
+        health = dict(saved.get("_health") or {})
+        repair = _read_receipt(repair_path)
+        scope = {"runtime": "codex", "cwd": str(Path(cwd).resolve()),
+                 "session_id": session_id, "parent": list(parent)}
+        if health and any(key in health and health[key] != scope[key]
+                          for key in ("runtime", "cwd", "session_id")):
+            return False  # Launch records never override contradictory scope.
+        if "parent" in health and health["parent"] != list(parent) \
+                and health.get("pid") and _process_identity(health["pid"]) is not None:
+            return False  # A resumed host cannot stop a still-live other owner.
+        if current.get("running") and current.get("current_generation"):
+            return health.get("runtime") == "codex" and \
+                _session_id(health.get("session_id")) == session_id
+        if repair and any(repair.get(key) != value for key, value in scope.items()):
+            # A resumed owner can reuse receipts, not another process's
+            # pending launch or permission to stop its child.
+            if repair.get("session_id") != session_id or repair.get("cwd") != scope["cwd"] \
+                    or repair.get("runtime") != "codex":
+                return False
+            repair = {}
+        launch = repair.get("launched_process") or {}
+        if launch and _owned_receiver_process(launch, cwd, session_id, parent):
+            if repair.get("target_generation") == RECEIVER_GENERATION:
+                return True
+            if health.get("pid") and health["pid"] != launch["pid"] \
+                    and _process_identity(health["pid"]) is not None:
+                return False  # Conflicting live ownership is never guessed.
+            # A previous successful upgrade is still an old receiver after
+            # the next installation. Its launch proof can bridge startup
+            # before that child writes a health heartbeat of its own.
+            health = {**launch, "generation": repair.get("target_generation")}
+        if repair.get("target_generation") != RECEIVER_GENERATION:
+            repair = {**scope, "schema_version": 1,
+                      "target_generation": RECEIVER_GENERATION, "attempts": 0}
+        attempts = int(repair.get("attempts") or 0)
+        if attempts >= len(REPAIR_BACKOFF_SECONDS) \
+                or time.time() < float(repair.get("next_at_epoch") or 0):
+            return False
+        repair.update({"attempts": attempts + 1,
+                       "next_at_epoch": time.time() + REPAIR_BACKOFF_SECONDS[attempts],
+                       "status": "rearm_reserved"})
+        hook._write_state(repair_path, repair)
+        # Guard both live replacement and a dead legacy receiver's restart.
+        # Without its exact checkpoint an uncertain prior event cannot be
+        # reconstructed safely, so later mail must not be folded into it.
+        queue_lock = _monitor_lock(directory / session_id, ".lock")
+        try:
+            checkpoint_verified = queue_lock is not None and \
+                _queue_checkpoint_verified(directory, session_id)
+        except (OSError, ValueError, TypeError, hook.WatcherStateSecurityError):
+            checkpoint_verified = False
+        if not checkpoint_verified:
+            repair["status"] = "queue_checkpoint_unverified"
+            hook._write_state(repair_path, repair)
+            return False
+        if current.get("running") or (
+                health.get("pid") and _process_identity(health["pid"]) is not None):
+            if health.get("generation") == RECEIVER_GENERATION:
+                repair["status"] = "current_receiver_not_ready"
+                hook._write_state(repair_path, repair)
+                return False
+            result = _stop_owned_stale_receiver(health, cwd, session_id, parent)
+            repair["status"] = result
+            hook._write_state(repair_path, repair)
+            if result != "stopped":
+                return False
+        # Exit alone is insufficient: a foreign/competing owner may hold the
+        # exact session's lifetime lock. Never launch behind that owner.
+        lifetime_lock = _monitor_lock(directory)
+        if lifetime_lock is None or not host_alive(parent):
+            repair["status"] = "lifetime_lock_unavailable"
+            hook._write_state(repair_path, repair)
+            return False
+        register_session(cwd, "codex", session_id, parent=parent)
+        os.close(lifetime_lock)
+        lifetime_lock = None
+        process = subprocess.Popen(
+            _receiver_command(cwd, session_id, parent), stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, close_fds=True)
+        identity = _process_identity(process.pid)
+        repair.update({"status": "launch_requested", "launched_process": {
+            **scope, "pid": process.pid,
+            "pid_start": identity[1] if identity else None}})
+        hook._write_state(repair_path, repair)
+        return True
+    except (OSError, ValueError, TypeError, hook.WatcherStateSecurityError):
+        return False
+    finally:
+        if queue_lock is not None:
+            os.close(queue_lock)
+        if lifetime_lock is not None:
+            os.close(lifetime_lock)
+        if launch_lock is not None:
+            os.close(launch_lock)
 
 
 def main(argv=None):

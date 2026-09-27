@@ -218,6 +218,203 @@ class SessionDeliveryHealthTest(unittest.TestCase):
         self.assertEqual(status.call_count, 3)
         launch.assert_not_called()
 
+    def test_pidfd_stop_revalidates_after_pin_and_never_signals_reused_pid(self):
+        health = {"pid": 123, "pid_start": "original"}
+        with mock.patch.object(receiver, "_owned_receiver_process", side_effect=[True, False]), \
+                mock.patch.object(receiver.os, "pidfd_open", return_value=71, create=True) as pin, \
+                mock.patch.object(receiver.signal, "pidfd_send_signal", create=True) as signal, \
+                mock.patch.object(receiver.os, "close") as close, \
+                mock.patch.object(receiver.os, "kill", side_effect=AssertionError("bare PID forbidden")):
+            self.assertEqual(receiver._stop_owned_stale_receiver(
+                health, self.root, THREAD, (42, "parent")), "ownership_changed")
+        pin.assert_called_once_with(123, 0)
+        signal.assert_not_called()
+        close.assert_called_once_with(71)
+
+    def test_verified_stale_receiver_uses_bounded_pidfd_term_only(self):
+        health = {"pid": 123, "pid_start": "original"}
+        poll = mock.Mock()
+        poll.poll.return_value = [(71, receiver.select.POLLIN)]
+        with mock.patch.object(receiver, "_owned_receiver_process", return_value=True), \
+                mock.patch.object(receiver.os, "pidfd_open", return_value=71, create=True), \
+                mock.patch.object(receiver.signal, "pidfd_send_signal", create=True) as signal, \
+                mock.patch.object(receiver.select, "poll", return_value=poll), \
+                mock.patch.object(receiver.os, "close"), \
+                mock.patch.object(receiver.os, "kill", side_effect=AssertionError("bare PID forbidden")):
+            self.assertEqual(receiver._stop_owned_stale_receiver(
+                health, self.root, THREAD, (42, "parent")), "stopped")
+        signal.assert_called_once_with(71, receiver.signal.SIGTERM, None, 0)
+        poll.poll.assert_called_once_with(int(receiver.RECEIVER_STOP_TIMEOUT_SECONDS * 1000))
+
+    def test_stale_receiver_stop_timeout_does_not_force_kill(self):
+        poll = mock.Mock()
+        poll.poll.return_value = []
+        with mock.patch.object(receiver, "_owned_receiver_process", return_value=True), \
+                mock.patch.object(receiver.os, "pidfd_open", return_value=71, create=True), \
+                mock.patch.object(receiver.signal, "pidfd_send_signal", create=True) as signal, \
+                mock.patch.object(receiver.select, "poll", return_value=poll), \
+                mock.patch.object(receiver.os, "close"), \
+                mock.patch.object(receiver.os, "kill", side_effect=AssertionError("bare PID forbidden")):
+            self.assertEqual(receiver._stop_owned_stale_receiver(
+                {"pid": 123}, self.root, THREAD, (42, "parent")), "stop_timeout")
+        self.assertEqual(signal.call_count, 1)
+
+    def test_unverified_stale_receiver_is_never_signalled(self):
+        with mock.patch.object(receiver, "_owned_receiver_process", return_value=False), \
+                mock.patch.object(receiver.os, "pidfd_open", create=True) as pin, \
+                mock.patch.object(receiver.signal, "pidfd_send_signal", create=True) as signal:
+            self.assertEqual(receiver._stop_owned_stale_receiver(
+                {"pid": 123}, self.root, THREAD, (42, "parent")), "ownership_unverified")
+        pin.assert_not_called()
+        signal.assert_not_called()
+
+    def test_stale_receiver_rearm_preserves_receipts_and_serializes_launch(self):
+        parent = (42, "parent")
+        directory = receiver._state_directory("codex", self.root, parent, THREAD)
+        receipt = directory / receiver.hook.WATCHER_STATE_NAME
+        saved = {"_health": {"pid": 123, "pid_start": "old", "runtime": "codex",
+                             "session_id": THREAD, "generation": "old-generation"},
+                 "scope": {"announced": ["already-announced"], "sequence": 7},
+                 "_pending_deliveries": {}}
+        saved["_pending_deliveries"]["scope"] = receiver.ChangeObserver(saved).prepare(
+            "scope", entry([mail()]))
+        receiver.hook._write_state(receipt, saved)
+        before = receipt.read_bytes()
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD}), \
+                mock.patch.object(receiver, "host_process", return_value=parent), \
+                mock.patch.object(receiver, "host_alive", return_value=True), \
+                mock.patch("codex_wake.queue_supported", return_value=True), \
+                mock.patch.object(receiver, "receiver_status", return_value={
+                    "running": True, "current_generation": False}), \
+                mock.patch.object(receiver, "_stop_owned_stale_receiver", return_value="stopped") as stop, \
+                mock.patch.object(receiver, "_process_identity", side_effect=lambda pid: (pid, "new")), \
+                mock.patch.object(receiver, "_owned_receiver_process", return_value=True), \
+                mock.patch.object(receiver.subprocess, "Popen", return_value=mock.Mock(pid=456)) as launch:
+            self.assertTrue(receiver.start_codex_receiver(self.root, THREAD))
+            self.assertTrue(receiver.start_codex_receiver(self.root, THREAD))
+        self.assertEqual(stop.call_count, 1)
+        self.assertEqual(launch.call_count, 1)
+        self.assertEqual(receipt.read_bytes(), before)
+        repair = receiver._read_receipt(directory / "repair" / receiver.hook.WATCHER_STATE_NAME)
+        self.assertEqual(repair["attempts"], 1)
+        self.assertEqual(repair["status"], "launch_requested")
+
+    def test_stale_rearm_failure_is_bounded_and_never_spawns(self):
+        directory = receiver._state_directory("codex", self.root, None, THREAD)
+        receiver.hook._write_state(directory / receiver.hook.WATCHER_STATE_NAME, {
+            "_health": {"pid": 123, "pid_start": "old", "runtime": "codex",
+                        "session_id": THREAD, "generation": "old"}})
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD}), \
+                mock.patch.object(receiver, "host_process", return_value=(42, "parent")), \
+                mock.patch("codex_wake.queue_supported", return_value=True), \
+                mock.patch.object(receiver, "receiver_status", return_value={
+                    "running": True, "current_generation": False}), \
+                mock.patch.object(receiver, "_stop_owned_stale_receiver", return_value="stop_timeout") as stop, \
+                mock.patch.object(receiver.subprocess, "Popen") as launch:
+            for unused in range(5):
+                self.assertFalse(receiver.start_codex_receiver(self.root, THREAD))
+        stop.assert_called_once()
+        launch.assert_not_called()
+
+    def test_previous_successful_launch_does_not_block_the_next_generation_upgrade(self):
+        parent = (42, "parent")
+        directory = receiver._state_directory("codex", self.root, parent, THREAD)
+        scope = {"runtime": "codex", "cwd": str(self.root.resolve()),
+                 "session_id": THREAD, "parent": list(parent)}
+        health = {**scope, "pid": 123, "pid_start": "old", "generation": "previous"}
+        receiver.hook._write_state(directory / receiver.hook.WATCHER_STATE_NAME, {"_health": health})
+        receiver.hook._write_state(directory / "repair" / receiver.hook.WATCHER_STATE_NAME, {
+            **scope, "target_generation": "previous", "attempts": 1,
+            "next_at_epoch": time.time() + 300, "status": "launch_requested",
+            "launched_process": health})
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD}), \
+                mock.patch.object(receiver, "host_process", return_value=parent), \
+                mock.patch.object(receiver, "host_alive", return_value=True), \
+                mock.patch("codex_wake.queue_supported", return_value=True), \
+                mock.patch.object(receiver, "receiver_status", return_value={
+                    "running": True, "current_generation": False}), \
+                mock.patch.object(receiver, "_owned_receiver_process", return_value=True), \
+                mock.patch.object(receiver, "_stop_owned_stale_receiver", return_value="stopped") as stop, \
+                mock.patch.object(receiver, "_process_identity", side_effect=lambda pid: (pid, "start")), \
+                mock.patch.object(receiver.subprocess, "Popen", return_value=mock.Mock(pid=456)) as launch:
+            self.assertTrue(receiver.start_codex_receiver(self.root, THREAD))
+        stop.assert_called_once()
+        launch.assert_called_once()
+        repair = receiver._read_receipt(directory / "repair" / receiver.hook.WATCHER_STATE_NAME)
+        self.assertEqual(repair["target_generation"], receiver.RECEIVER_GENERATION)
+        self.assertEqual(repair["attempts"], 1)
+
+    def test_current_generation_does_not_override_contradictory_health_scope(self):
+        parent = (42, "parent")
+        directory = receiver._state_directory("codex", self.root, parent, THREAD)
+        baseline = {"runtime": "codex", "cwd": str(self.root.resolve()),
+                    "session_id": THREAD, "parent": list(parent),
+                    "generation": receiver.RECEIVER_GENERATION}
+        for field, wrong in (("runtime", "claude"), ("session_id", SECOND_THREAD),
+                             ("cwd", str(self.root / "other"))):
+            receiver.hook._write_state(directory / receiver.hook.WATCHER_STATE_NAME,
+                                       {"_health": {**baseline, field: wrong}})
+            with self.subTest(field=field), \
+                    mock.patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD}), \
+                    mock.patch.object(receiver, "host_process", return_value=parent), \
+                    mock.patch("codex_wake.queue_supported", return_value=True), \
+                    mock.patch.object(receiver, "receiver_status", return_value={
+                        "running": True, "current_generation": True}), \
+                    mock.patch.object(receiver.subprocess, "Popen") as launch, \
+                    mock.patch.object(receiver, "_stop_owned_stale_receiver") as stop:
+                self.assertFalse(receiver.start_codex_receiver(self.root, THREAD))
+            launch.assert_not_called()
+            stop.assert_not_called()
+
+    def test_queue_checkpoint_requires_exact_committed_or_pending_envelope(self):
+        import codex_wake
+        directory = receiver._state_directory("codex", self.root, None, THREAD)
+        with mock.patch.object(codex_wake, "queue_supported", return_value=True), \
+                mock.patch.object(codex_wake.subprocess, "run", side_effect=
+                                  codex_wake.subprocess.TimeoutExpired("isolated", 1)):
+            self.assertEqual(codex_wake.queue_event(
+                directory, THREAD, "scope:1", True, "isolated notice")["status"], "pending_unknown")
+        receipt = directory / receiver.hook.WATCHER_STATE_NAME
+        receiver.hook._write_state(receipt, {})
+        self.assertFalse(receiver._queue_checkpoint_verified(directory, THREAD))
+        pending = receiver.ChangeObserver().prepare("scope", entry([mail()]))
+        receiver.hook._write_state(receipt, {"_pending_deliveries": {"scope": pending}})
+        self.assertTrue(receiver._queue_checkpoint_verified(directory, THREAD))
+        receiver.hook._write_state(receipt, {"scope": pending["next"]})
+        self.assertTrue(receiver._queue_checkpoint_verified(directory, THREAD))
+        receiver.hook._write_state(receipt, {"other-scope": pending["next"]})
+        self.assertFalse(receiver._queue_checkpoint_verified(directory, THREAD))
+
+    def test_dead_legacy_receiver_with_uncheckpointed_receipt_cannot_relaunch(self):
+        import codex_wake
+        parent = (42, "parent")
+        directory = receiver._state_directory("codex", self.root, parent, THREAD)
+        with mock.patch.object(codex_wake, "queue_supported", return_value=True), \
+                mock.patch.object(codex_wake.subprocess, "run", side_effect=
+                                  codex_wake.subprocess.TimeoutExpired("isolated", 1)):
+            codex_wake.queue_event(directory, THREAD, "scope:1", True, "isolated notice")
+        receiver.hook._write_state(directory / receiver.hook.WATCHER_STATE_NAME, {
+            "_health": {"runtime": "codex", "session_id": THREAD, "pid": 123,
+                        "pid_start": "old", "generation": "old", "running": False}})
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": THREAD}), \
+                mock.patch.object(receiver, "host_process", return_value=parent), \
+                mock.patch.object(codex_wake, "queue_supported", return_value=True), \
+                mock.patch.object(receiver, "receiver_status", return_value={"running": False}), \
+                mock.patch.object(receiver, "_process_identity", return_value=None), \
+                mock.patch.object(receiver, "_stop_owned_stale_receiver") as stop, \
+                mock.patch.object(receiver.subprocess, "Popen") as launch:
+            self.assertFalse(receiver.start_codex_receiver(self.root, THREAD))
+        stop.assert_not_called()
+        launch.assert_not_called()
+        repair = receiver._read_receipt(directory / "repair" / receiver.hook.WATCHER_STATE_NAME)
+        self.assertEqual(repair["status"], "queue_checkpoint_unverified")
+
+    def test_queue_checkpoint_bound_refuses_unbounded_history(self):
+        directory = receiver._state_directory("codex", self.root, None, THREAD)
+        receiver.hook._write_state(directory / receiver.hook.WATCHER_STATE_NAME, {
+            "scope": {"sequence": 10000000, "announced": []}})
+        self.assertFalse(receiver._queue_checkpoint_verified(directory, THREAD))
+
     def test_live_producer_does_not_mask_auth_identity_or_sync_failure(self):
         for failure, diagnostic in (({"auth_required": True}, "authorization_required"),
                                     ({"identity_refresh_required": True}, "identity_refresh_required"),
