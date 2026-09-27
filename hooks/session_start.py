@@ -1687,7 +1687,8 @@ dismiss, or import anything until the user explicitly chooses.""" % (
 def _connection_config(plugin_root):
     runtime = _runtime_name()
     if runtime == "codex":
-        candidates = [plugin_root / ".mcp.json",
+        candidates = [plugin_root / ".codex-plugin" / "plugin.json",
+                      plugin_root / ".mcp.json",
                       plugin_root / "plugin-mcp.json"]
     elif runtime == "kimi":
         candidates = [plugin_root / "kimi.plugin.json",
@@ -1700,7 +1701,7 @@ def _connection_config(plugin_root):
     for path in candidates:
         try:
             data = json.loads(path.read_text())
-            configured = next(iter((data.get("mcpServers") or {}).values()))
+            configured = (data.get("mcpServers") or {}).get("attacca") or {}
             if configured:
                 break
         except Exception:

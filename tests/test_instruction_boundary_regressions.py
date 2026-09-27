@@ -14,7 +14,6 @@ from pathlib import Path
 os.environ["ATTACCA_OWNER"] = ""
 
 ROOT = Path(__file__).resolve().parent.parent
-WORKSPACE = ROOT
 HOOK = ROOT / "hooks" / "session_start.py"
 spec = importlib.util.spec_from_file_location(
     "attacca_instruction_boundary_under_test", ROOT / "attacca.py")
@@ -22,10 +21,10 @@ c = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(c)
 
 LOCAL_ONLY_TEXT = (
-    "Local Agentg development instructions (not distributed by Attacca)",
-    "Use maximum effort",
-    "Proactively use every available subagent slot",
-    "Every task requires two recorded QA passes",
+    "Local fixture instructions (not distributed by Attacca)",
+    "LOCAL-PREFIX: preserve editor preferences.",
+    "LOCAL-MIDDLE: use this checkout's scratch directory.",
+    "LOCAL-SUFFIX: retain the human's notes.",
 )
 DEFAULT_AUTHORITY_TITLE = "Acknowledge local Director hierarchy"
 DEFAULT_AUTHORITY_BODY = (
@@ -54,24 +53,80 @@ def managed_and_outside(text):
 
 
 class InstructionBoundaryRegressionTest(unittest.TestCase):
-    def test_agentg_specific_instructions_are_outside_both_managed_blocks(self):
-        expected = c.managed_instruction_block("agentg", None)
+    def test_local_instructions_survive_refresh_outside_both_managed_blocks(self):
+        project = "fixture"
+        expected_managed = c.managed_instruction_block(project, None)
+        old_managed = expected_managed.replace(
+            "v=%d " % c.MANAGED_BLOCK_VERSION,
+            "v=%d " % (c.MANAGED_BLOCK_VERSION - 1), 1)
+        self.assertNotEqual(old_managed, expected_managed)
+        old_context = {"version": 1, "content": "HOSTED-CONTEXT: fixture v1"}
+        old_context["sha256"] = c.sha256_hex(old_context["content"])
+        new_context = {"version": 2, "content": "HOSTED-CONTEXT: fixture v2"}
+        new_context["sha256"] = c.sha256_hex(new_context["content"])
+        old_cloud = c.cloud_context_block(old_context, project)
+        expected_cloud = c.cloud_context_block(new_context, project)
 
-        for filename in ("AGENTS.md", "CLAUDE.md"):
-            with self.subTest(filename=filename):
-                text = (WORKSPACE / filename).read_text()
-                self.assertEqual(text.count("MANAGED_ATTACCA:BEGIN"), 1)
-                self.assertEqual(text.count("MANAGED_ATTACCA:END"), 1)
-                managed, outside = managed_and_outside(text)
-                self.assertEqual(managed, expected)
-                self.assertIn(
-                    "Project Rules — binding dynamic instructions", managed)
-                for local_text in LOCAL_ONLY_TEXT:
-                    self.assertNotIn(local_text, managed)
-                    self.assertIn(local_text, outside)
-                self.assertGreater(
-                    text.index(LOCAL_ONLY_TEXT[0]),
-                    text.index(c.MANAGED_END))
+        def outside_owned_blocks(text):
+            spans = (c._managed_block_span(text),
+                     c._cloud_context_block_span(text))
+            self.assertTrue(all(span is not None for span in spans))
+            for start, end in sorted(spans, reverse=True):
+                text = text[:start] + text[end:]
+            return text
+
+        # Actual public product refreshes, using disposable files. Nothing in
+        # this test depends on a developer's ignored instruction files.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            originals = {}
+            for filename in ("AGENTS.md", "CLAUDE.md"):
+                text = ("# %s\n\n%s\n%s\n\n%s\n\n%s\n\n%s\n\n%s\n" % (
+                    filename, LOCAL_ONLY_TEXT[0], LOCAL_ONLY_TEXT[1],
+                    old_managed, LOCAL_ONLY_TEXT[2], old_cloud,
+                    LOCAL_ONLY_TEXT[3]))
+                (root / filename).write_text(text, encoding="utf-8")
+                originals[filename] = text
+
+            installed = c.install_instructions(
+                project, str(root), None, cloud_context_payload=new_context)
+            self.assertTrue(installed["ok"], installed)
+            self.assertTrue(installed["changed"], installed)
+            for filename, original in originals.items():
+                with self.subTest(filename=filename):
+                    text = (root / filename).read_text(encoding="utf-8")
+                    self.assertEqual(text.count("MANAGED_ATTACCA:BEGIN"), 1)
+                    self.assertEqual(text.count("MANAGED_ATTACCA:END"), 1)
+                    self.assertEqual(text.count("ATTACCA_CLOUD_CONTEXT:BEGIN"), 1)
+                    self.assertEqual(text.count("ATTACCA_CLOUD_CONTEXT:END"), 1)
+                    managed, _ = managed_and_outside(text)
+                    start, end = c._cloud_context_block_span(text)
+                    cloud = text[start:end]
+                    self.assertEqual(managed, expected_managed)
+                    self.assertEqual(cloud, expected_cloud)
+                    outside = outside_owned_blocks(text)
+                    self.assertEqual(outside, outside_owned_blocks(original))
+                    self.assertIn(
+                        "Project Rules — binding dynamic instructions", managed)
+                    self.assertNotIn(new_context["content"], managed)
+                    self.assertNotIn(new_context["content"], outside)
+                    for local_text in LOCAL_ONLY_TEXT:
+                        self.assertNotIn(local_text, managed)
+                        self.assertNotIn(local_text, cloud)
+                        self.assertIn(local_text, outside)
+
+            before_rerun = {
+                filename: ((root / filename).read_bytes(),
+                           (root / filename).stat().st_mtime_ns)
+                for filename in originals
+            }
+            unchanged = c.install_instructions(
+                project, str(root), None, cloud_context_payload=new_context)
+            self.assertTrue(unchanged["ok"], unchanged)
+            self.assertFalse(unchanged["changed"], unchanged)
+            for filename, (contents, mtime) in before_rerun.items():
+                self.assertEqual((root / filename).read_bytes(), contents)
+                self.assertEqual((root / filename).stat().st_mtime_ns, mtime)
 
     def test_generated_project_files_never_copy_local_or_server_rule_text(self):
         with tempfile.TemporaryDirectory() as tmp:

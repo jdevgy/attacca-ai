@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900" role="img" aria-labelledby="attacca-architecture-title attacca-architecture-desc">
-  <title id="attacca-architecture-title">Attacca hosted continuity architecture</title>
-  <desc id="attacca-architecture-desc">Native Claude, Codex, and Kimi sessions use lifecycle plugins before a stable local standard-input-output connector. Other supported MCP clients use that connector directly. Both paths reach one hosted Attacca MCP and REST service. A browser uses the Control Panel. A machine-global watcher polls the hosted service and maintains an integrity-verified, identity-scoped local mirror plus durable outbox. That mirror is a fail-closed continuity cache, not another project database. The hosted domain layer owns authority and stores many isolated workspaces in SQLite.</desc>
+  <title id="attacca-architecture-title">Attacca self-hosted continuity architecture</title>
+  <desc id="attacca-architecture-desc">Native Claude, Codex, and Kimi sessions use lifecycle plugins before a stable local standard-input-output connector. Other supported MCP clients use that connector directly. Both paths reach one self-hosted Attacca MCP and REST service on the same or another computer. A browser uses the Control Panel with optional login protection. A machine-global watcher polls the server and maintains an integrity-verified, identity-scoped local mirror plus durable outbox. That mirror is a fail-closed continuity cache, not another project database. The server domain layer owns authority and stores many isolated workspaces in SQLite.</desc>
 
   <defs>
     <linearGradient id="canvas" x1="0" y1="0" x2="1" y2="1">
@@ -60,7 +60,7 @@
   <circle cx="100" cy="820" r="220" fill="#23c9b8" opacity="0.045"/>
 
   <g class="label">
-    <text class="title" x="48" y="54">One hosted project. Many replaceable clients.</text>
+    <text class="title" x="48" y="54">Your server. Replaceable clients.</text>
     <text class="subtitle" x="48" y="80">Lifecycle context, coordination, attribution, and outage-safe continuity without a hidden per-project server.</text>
 
     <!-- Trust and deployment boundaries -->
@@ -72,10 +72,10 @@
     <rect x="571" y="130" width="93" height="25" rx="12.5" fill="#15394a" stroke="#2e6973"/>
     <text class="chip" x="590" y="147">LOCAL</text>
 
-    <text class="boundary-title" x="772" y="145">Hosted Attacca service</text>
-    <text class="boundary-note" x="772" y="166">cross-device source of truth</text>
+    <text class="boundary-title" x="772" y="145">Your Attacca server</text>
+    <text class="boundary-note" x="772" y="166">local or shared workspaces</text>
     <rect x="1262" y="130" width="106" height="25" rx="12.5" fill="#2a2956" stroke="#5d5fa5"/>
-    <text class="chip" x="1280" y="147">HOSTED</text>
+    <text class="chip" x="1280" y="147">SERVER</text>
 
     <!-- Client-side cards -->
     <g filter="url(#shadow)">
@@ -125,8 +125,8 @@
 
     <rect x="92" y="714" width="78" height="22" rx="11" fill="#203f55"/>
     <text class="chip" x="108" y="729">HUMAN</text>
-    <text class="card-title" x="190" y="732">Browser Control Panel <tspan fill="#75ddd4" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">/app</tspan></text>
-    <text class="card-copy" x="190" y="758">sign-in · workspaces · activity · tasks · policy · settings</text>
+    <text class="card-title" x="190" y="732">Browser Control Panel <tspan fill="#75ddd4" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">/</tspan></text>
+    <text class="card-copy" x="190" y="758">optional login · tasks · activity · settings</text>
 
     <!-- Local flows -->
     <path class="flow-local" d="M 324 264 L 364 264"/>
@@ -144,7 +144,7 @@
       <rect x="790" y="696" width="564" height="86" rx="18" fill="#161f36" stroke="#46517f"/>
     </g>
 
-    <text class="card-title" x="814" y="235">Hosted interfaces</text>
+    <text class="card-title" x="814" y="235">Server interfaces</text>
     <rect x="812" y="253" width="230" height="48" rx="12" fill="#202950" stroke="#555aa0"/>
     <text class="card-title" x="830" y="282">MCP <tspan class="micro" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">/mcp</tspan></text>
     <rect x="812" y="317" width="230" height="48" rx="12" fill="#202950" stroke="#555aa0"/>
@@ -170,7 +170,7 @@
     <rect x="812" y="714" width="104" height="22" rx="11" fill="#293456"/>
     <text class="chip" x="828" y="729">DISTRIBUTION</text>
     <text class="card-title" x="936" y="732">Server-owned client bundle</text>
-    <text class="card-copy" x="936" y="758">landing page · installer · native plugins · managed law</text>
+    <text class="card-copy" x="936" y="758">console · installer · native plugins · managed law</text>
 
     <!-- Cross-boundary network flows -->
     <path class="flow-teal" d="M 656 432 C 724 432 718 277 790 277"/>
@@ -189,9 +189,9 @@
 
     <!-- Legend -->
     <circle cx="48" cy="856" r="5" fill="#59d8cf"/>
-    <text class="micro" x="62" y="860">authenticated network flow</text>
+    <text class="micro" x="62" y="860">client/server HTTP flow</text>
     <line x1="248" y1="856" x2="286" y2="856" stroke="#e7b96b" stroke-width="2" stroke-dasharray="7 6"/>
     <text class="micro" x="298" y="860">verified transport-outage fallback only</text>
-    <text class="micro" x="1080" y="860">Not production-hardened · no built-in TLS</text>
+    <text class="micro" x="1080" y="860">Self-hosted · no cloud required</text>
   </g>
 </svg>

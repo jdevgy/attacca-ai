@@ -320,6 +320,53 @@ class CodexSessionStartHookTestCase(unittest.TestCase):
                     hook_module._runtime_actor(config, "shared")["runtime"],
                     "claude")
 
+    def test_codex_hook_prefers_inline_manifest_without_private_mcp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".codex-plugin").mkdir()
+            (root / ".codex-plugin" / "plugin.json").write_text(json.dumps({
+                "mcpServers": {
+                    "unrelated": {"env": {"ATTACCA_ACTOR": "wrong"}},
+                    "attacca": {"env": {
+                        "ATTACCA_ACTOR": "codex",
+                        "ATTACCA_URL": "http://inline.example:4173"}}}}))
+            (root / "plugin-mcp.json").write_text(json.dumps({
+                "mcpServers": {"attacca": {"env": {
+                    "ATTACCA_ACTOR": "claude",
+                    "ATTACCA_URL": "http://claude.example:4173"}}}}))
+            with mock.patch.dict(os.environ, {"PLUGIN_ROOT": str(root)}, clear=True), \
+                    mock.patch.object(hook_module.Path, "home", return_value=root):
+                config = hook_module._connection_config(root)
+                self.assertEqual(config["actor"], "codex")
+                self.assertEqual(config["url"], "http://inline.example:4173")
+                self.assertFalse((root / ".mcp.json").exists())
+                # A retained private checkout descriptor must not override
+                # the native plugin's runtime-specific configuration.
+                (root / ".mcp.json").write_text(json.dumps({
+                    "mcpServers": {"attacca": {"env": {
+                        "ATTACCA_ACTOR": "claude",
+                        "ATTACCA_URL": "http://private.example:4173"}}}}))
+                self.assertEqual(hook_module._connection_config(root), config)
+                with mock.patch.dict(os.environ, {"ATTACCA_ACTOR": "example.worker.codex.gibbs"}):
+                    self.assertEqual(hook_module._connection_config(root)["actor"],
+                                     "example.worker.codex.gibbs")
+
+    def test_codex_hook_retains_legacy_private_descriptor_support(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".codex-plugin").mkdir()
+            (root / ".codex-plugin" / "plugin.json").write_text(json.dumps({
+                "mcpServers": "./.mcp.json"}))
+            (root / ".mcp.json").write_text(json.dumps({
+                "mcpServers": {"attacca": {"env": {
+                    "ATTACCA_ACTOR": "codex",
+                    "ATTACCA_URL": "http://legacy.example:4173"}}}}))
+            with mock.patch.dict(os.environ, {"PLUGIN_ROOT": str(root)}, clear=True), \
+                    mock.patch.object(hook_module.Path, "home", return_value=root):
+                config = hook_module._connection_config(root)
+                self.assertEqual(config["actor"], "codex")
+                self.assertEqual(config["url"], "http://legacy.example:4173")
+
     def test_claude_session_start_is_silent_about_crons_without_a_job(self):
         """The retired pulse is never mentioned unless one still exists."""
         status = {"project_id": "shared"}
